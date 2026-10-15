@@ -43,6 +43,8 @@ IGR_PARAMETERS = {'regularization', 'active_igr_wave', 'c_alpha', 'igr_alpha_len
 # optional inverse/probe experiments inherited from an interactive shell.
 IGR_CONTROLS = {'IGR_PARTIAL_ASSEMBLY': '1', 'IGR_DEVICE_QF': '1',
                 'IGR_DENSE_INVERSE': '', 'IGR_TWO_LEVEL_INVERSE': '',
+                'IGR_TWO_LEVEL_COARSE': 'cg', 'IGR_TWO_LEVEL_ORDER': '1',
+                'IGR_FACE_DENSITY_CUDA': '0', 'IGR_FACE_DENSITY_CACHE': '0',
                 'IGR_PATCH_RADIUS': '', 'IGR_STATIONARY_SWEEPS': '',
                 'IGR_EXTRAPOLATION_DEGREE': '', 'IGR_SIGMA_BASIS': '',
                 'IGR_CHEB_ORDER': '3', 'IGR_CHEB_POWER_ITERATIONS': '10',
@@ -100,7 +102,8 @@ def parameters(case):
         'dgsem': {'n': 4, 'elements': 1024, 'iterations': 100, 'method': 'existing-fp64'},
     }
     require(adapter in defaults and isinstance(supplied, dict), 'unknown adapter or invalid parameters')
-    allowed = set(defaults[adapter]) | ((IGR_PARAMETERS | {'cuda_admissibility'}) if adapter == 'dg' else set())
+    allowed = set(defaults[adapter]) | ((IGR_PARAMETERS | {'cuda_admissibility', 'solver_policy', 'timing_scope'})
+                                       if adapter == 'dg' else set())
     require(set(supplied) <= allowed, f'unknown {adapter} parameter')
     result = {**defaults[adapter], **supplied}
     if adapter in ('dg', 'hdg'):
@@ -110,6 +113,12 @@ def parameters(case):
                 'order exceeds the native CLI integer range')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
+        if 'timing_scope' in supplied:
+            require(supplied['timing_scope'] == 'process-wall', 'unknown application timing_scope')
+        if 'solver_policy' in supplied:
+            require(supplied['solver_policy'] in ('reference', 'qualified-fp64'), 'unknown solver_policy')
+            require(supplied.get('regularization') == 'igr' and result['device'] == 'cuda',
+                    'solver_policy requires an active IGR CUDA application')
         if IGR_PARAMETERS & set(supplied):
             require(supplied.get('regularization') == 'igr', 'explicit IGR mode requires regularization=igr')
             result.update(regularization='igr', active_igr_wave=supplied.get('active_igr_wave', True),
@@ -141,7 +150,7 @@ def parameters(case):
             require(type(supplied['cuda_admissibility']) is bool, 'cuda_admissibility must be a boolean')
             require(not supplied['cuda_admissibility'] or
                     (result['device'] == 'cuda' and result['discretization'] in ('dg', 'dgsem') and
-                     result['engine'] == 'ordinary' and result['dgsem_residual'] == 'unfused' and
+                     result['engine'] == 'ordinary' and
                      result.get('regularization') == 'igr' and result.get('active_igr_wave') is True),
                     'CUDA admissibility requires ordinary CUDA active IGR DG/DGSEM')
         number(result['final_time'], 'final_time', positive=True)
@@ -266,7 +275,8 @@ def command(case, binary: Path, source: Path, workdir: Path, *, profile=False, f
                     argv += ['--regularization', 'igr']
                 argv += ['--time-integrator', 'rk3ssp', '--igr-space', 'L2', '--igr-grad', 'BrokenL2',
                          '--igr-solve-mode', 'krylov', '--igr-ip-kind', 'sipg', '--igr-exact-dg-face',
-                         '--igr-stage-rtol-scale', '1', '--igr-linear-solver', 'cg',
+                         '--igr-stage-rtol-scale', '1', '--igr-linear-solver',
+                         'fgmres' if p.get('solver_policy') == 'qualified-fp64' else 'cg',
                          '--igr-preconditioner', 'chebyshev', '--igr-lin-rtol', '1e-10',
                          '--igr-lin-atol', '0', '--igr-lin-maxit', '2000',
                          '--igr-nonconvergence-policy', 'error', '--igr-lin-print', '0',
@@ -306,8 +316,17 @@ def environment(case, workdir, fields=False, *, profile=False):
                           for prefix in ('IGRLAB_', 'DG_IGR_'))]
         require(not unexpected, 'active IGR reference forbids inherited experimental controls: ' +
                 ', '.join(sorted(unexpected)))
-        result.update({prefix + name: value for name, value in IGR_CONTROLS.items()
+        controls = dict(IGR_CONTROLS)
+        if p.get('solver_policy') == 'qualified-fp64' and p['discretization'] != 'hdg':
+            controls.update(IGR_TWO_LEVEL_INVERSE='fp64', IGR_FACE_DENSITY_CUDA='1',
+                            IGR_FACE_DENSITY_CACHE='1')
+        result.update({prefix + name: value for name, value in controls.items()
                        for prefix in ('IGRLAB_', 'DG_IGR_')})
+        if 'solver_policy' in p and p['discretization'] == 'hdg':
+            trace = ('ordinary-ilu-jacobi5-refresh' if
+                     p['solver_policy'] == 'qualified-fp64' and p['engine'] == 'ordinary'
+                     else 'engine-default')
+            result.update({prefix + 'HDG_TRACE_POLICY': trace for prefix in ('IGRLAB_', 'DG_IGR_')})
     if case['adapter'] == 'dg' and p['discretization'] == 'dgsem':
         controls = {'DGSEM_PRODUCTION_STRICT': '1', 'DGSEM_HIGH_ORDER_RESEARCH': '0',
                     'DGSEM_VOLUME_QUADRATURE_MIN_ORDER': '0', 'DGSEM_SUBCELL_BLEND': '0',
@@ -350,7 +369,9 @@ def log_row(text, prefix):
 def active_igr_evidence(p, text):
     """Admit existing production convergence and the final native certificate."""
     options = log_row(text, '[igr-options] event=effective ')
-    fixed = {'exact_dg_face': 'on', 'solver': 'cg', 'preconditioner': 'chebyshev',
+    qualified = p.get('solver_policy') == 'qualified-fp64'
+    solver, preconditioner = ('fgmres', 'two-level-inverse-fp64') if qualified else ('cg', 'operatorchebyshev')
+    fixed = {'exact_dg_face': 'on', 'solver': solver, 'preconditioner': 'chebyshev',
              'nonconvergence_policy': 'error', 'sigma_cfl': 'off', 'sigma_rusanov': 'off',
              'frozen_sigma_spectral_speed': 'off', 'invariant_domain_flux': 'off'}
     require(all(options.get(key) == value for key, value in fixed.items()), 'IGR production policy differs')
@@ -372,10 +393,17 @@ def active_igr_evidence(p, text):
             all(counts[key] == counts[key.replace('calls', 'converged_calls')]
                 for key in ('calls', 'production_calls', 'output_only_calls')),
             'IGR production solve missing or did not converge')
-    require(linear.get('last_solver') == 'cg' and linear.get('last_precond') == 'operatorchebyshev' and
+    require(linear.get('last_solver') == solver and linear.get('last_precond') == preconditioner and
             linear.get('exact_face_requested') == '1' and linear.get('exact_face_effective') == '1' and
             integer(int(linear['exact_face_operator_uses']), 'exact face uses', 1) > 0,
             'IGR exact-face Krylov closure was not used')
+    if qualified:
+        coarse = log_row(text, '[igr-two-level] ')
+        require(coarse.get('coarse_mode') == 'cg' and coarse.get('coarse_order') == '1',
+                'IGR two-level coarse policy differs')
+        face = log_row(text, '[igr-linear] event=face-density-path ')
+        require(face.get('arithmetic') == 'cuda' and face.get('geometry_cache') == 'per-solver',
+                'IGR device face-density cache policy differs')
     # Identity here describes DOF prolongation, not the physical closure
     # operator. The direct setup path still performs the recorded CG solves.
     identity_flag = linear.get('direct_identity_system')
@@ -447,6 +475,23 @@ def parse_hdg_application(p, text, wall_seconds):
         require(all(row.get(key) for key in ('requested_trace_policy', 'resolved_trace_policy',
                                             'trace_solver', 'trace_preconditioner')),
                 'HDG application trace policy missing')
+        if p.get('solver_policy') == 'qualified-fp64' and p['engine'] == 'ordinary':
+            require(all(row.get(key) == value for key, value in {
+                'requested_trace_policy': 'ordinary-ilu-jacobi5-refresh',
+                'resolved_trace_policy': 'ordinary-ilu-jacobi5-refresh',
+                'trace_ilu_lower_jacobi_iterations': '5',
+                'trace_ilu_upper_jacobi_iterations': '5',
+                'trace_ilu_factor_reuse_policy': 'refresh_each_trace_solve',
+                'trace_ilu_triangular_solve_kind': 'iterative_jacobi',
+                'trace_solver': 'hypre-parcsr-gmres', 'trace_preconditioner': 'hypre_ilu0',
+            }.items()), 'HDG qualified trace policy differs')
+        elif p.get('solver_policy') == 'qualified-fp64' and p['engine'] == 'tensor':
+            require(all(row.get(key) == value for key, value in {
+                'requested_trace_policy': 'engine-default',
+                'resolved_trace_policy': 'native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64',
+                'trace_solver': 'native-rank1-fp64',
+                'trace_preconditioner': 'native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64',
+            }.items()), 'HDG qualified trace policy differs')
     else:
         require('cuda_engine' not in row and not re.search(r'^\[device\] requested=cuda\b', text, re.M),
                 'CPU HDG application selected CUDA')
@@ -469,6 +514,31 @@ def parse_hdg_application(p, text, wall_seconds):
             'gate_scope': 'existing application success contract; no benchmark per-step gate records'}
 
 
+def normalize_application(case, result, text):
+    """Normalize only explicit uniform-quad suites; retain historical observations."""
+    if 'expected_conserved_dofs' not in case:
+        return result
+    p = parameters(case)
+    require(p.get('timing_scope') == 'process-wall' and p['mesh'] == DG_MESH,
+            'DOF normalization requires the fixed periodic quad mesh and process-wall timing')
+    n = 32 * 2**p['serial_refine']
+    dofs = 4 * n*n * (p['order'] + 1)**2
+    require(type(case['expected_conserved_dofs']) is int and case['expected_conserved_dofs'] == dofs and
+            case.get('mesh_n') == n and case.get('elements') == n*n,
+            'declared conserved DOFs differ from the uniform-quad workload')
+    source = 'derived: four conserved components * uniform quad elements * (order+1)^2'
+    if p['discretization'] != 'hdg':
+        callbacks = re.findall(r'dofs \(local/global\):\s*([0-9]+)\s*/\s*([0-9]+)', text)
+        require(callbacks and all(int(local) == dofs and int(global_) == dofs for local, global_ in callbacks),
+                'native conserved DOF callback differs from the declared workload')
+        source = 'native dofs (local/global) callback, checked against uniform-quad workload'
+    steps = result['signature']['work']['steps']
+    result['normalization'] = {'conserved_dofs': dofs, 'accepted_steps': steps, 'dof_source': source,
+        'process_microseconds_per_dof_step': result['seconds'] * 1e6 / (dofs * steps)}
+    result['signature']['conserved_dofs'] = dofs
+    return result
+
+
 def parse(case, stdout: Path, stderr: Path, expected_gpu: dict, *, wall_seconds=None):
     p, adapter = parameters(case), case['adapter']
     cpu_application = adapter == 'dg' and p['device'] == 'cpu'
@@ -476,7 +546,8 @@ def parse(case, stdout: Path, stderr: Path, expected_gpu: dict, *, wall_seconds=
     text = Path(stdout).read_text(errors='replace') + '\n' + Path(stderr).read_text(errors='replace')
     if adapter == 'dg':
         if p['discretization'] == 'hdg':
-            return parse_hdg_application(p, text, wall_seconds)
+            result = parse_hdg_application(p, text, wall_seconds)
+            return normalize_application(case, result, text)
         if p['device'] == 'cpu' or p['discretization'] == 'dgsem':
             require(re.findall(r'^\[device\] requested=([^\s]+)', text, re.M) == [p['device']],
                     'application selected device differs')
@@ -527,8 +598,15 @@ def parse(case, stdout: Path, stderr: Path, expected_gpu: dict, *, wall_seconds=
             result['signature']['igr'] = {key: evidence[key] for key in
                 ('policy', 'alpha_policy', 'production_calls', 'production_converged_calls')}
             result['igr_evidence'] = evidence
-            result['scope'] += '; active IGR wave, FP64 CG/Chebyshev closure with final certificate'
-        return result
+            closure = ('FGMRES/two-level' if p.get('solver_policy') == 'qualified-fp64' else 'CG/Chebyshev')
+            result['scope'] += '; active IGR wave, FP64 ' + closure + ' closure with final certificate'
+        if p.get('timing_scope') == 'process-wall':
+            result['solver_seconds'] = seconds
+            result['seconds'] = number(wall_seconds, 'application runner wall seconds', positive=True)
+            result['scope'] = (f"rank-one {p['device'].upper()} {p['discretization'].upper()} "
+                               'full application process wall time, including startup/setup/shutdown; '
+                               'fixed accepted horizon, NaN scans enabled')
+        return normalize_application(case, result, text)
     rows = json_rows(text)
     if adapter == 'hdg':
         require(not any(row.get('schema') == 2 and row.get('success') is False for row in rows),

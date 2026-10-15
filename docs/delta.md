@@ -10,10 +10,12 @@ CPU and native A100 (`cuda-sm80`), funded by `bdiy-delta-cpu` and
 `bdiy-delta-gpu`. CUDA compilation runs on the `cpu` partition; validation
 runs separately on `gpuA100x4` or in an already owned A100 allocation.
 
-The current optimization work targets representative order 5. CPU resources
-are used to compile CUDA software and dependencies; broad CPU/order sweeps are
-outside this work. A successful build is separate from GPU qualification and
-paired end-to-end timing/profiling.
+CPU resources compile CUDA software and dependencies. A successful build is
+separate from GPU qualification and paired end-to-end timing/profiling. The
+[bounded multiorder suite](gpu-studies.md#current-architecture-order-comparisons)
+covers DG, DGSEM and both HDG engines at p1, p3, p5 and p7, with mesh sizes
+chosen by conserved DOFs. Select a backend/order subset for an individual edit;
+suite availability alone is not native numerical or performance qualification.
 
 The site policy in `cmake/sites/delta.json` selects installed NCSA GCC, CMake,
 OpenMPI/HPC-X, CUDA and OpenBLAS modules. Discovery records their actual

@@ -149,7 +149,7 @@ class PoolFixtures(unittest.TestCase):
             (run / 'state.json').write_text(json.dumps(original_state if stage == 'profiles' else
                                                       {'attempts': [], 'jobs': []}))
             with mock.patch.object(gpu_study, 'verify', return_value=self.plans[run]), \
-                 mock.patch.object(gpu_study.study_workloads, 'load_suite', return_value={}), \
+                 mock.patch.object(gpu_study.study_workloads, 'load_suite', return_value={'cases': []}), \
                  mock.patch.object(gpu_study, 'worker_budget'), \
                  mock.patch.object(gpu_study, 'delta_allocation', side_effect=RuntimeError('fixture stop')) as admit:
                 with self.assertRaisesRegex(RuntimeError, 'fixture stop'):

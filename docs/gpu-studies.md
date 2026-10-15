@@ -1,5 +1,9 @@
 # Repeatable GPU optimization studies
 
+For an edit/build/timing loop, start with [IGRlab-only iteration](iteration.md).
+The full study workflow below is for retained comparisons and qualification;
+it is not required for each application edit.
+
 Use `perf.sh` to compare two source versions on PACE A100 hardware. It freezes
 inputs, invokes the canonical `build.sh`, schedules correctness validation,
 collects independent paired timings, and then captures bounded kernel profiles.
@@ -330,6 +334,63 @@ orders. This ordinary-DG suite does not establish high-order support for the
 separate DGSEM or HDG implementations; their actual kernel/storage paths must
 be extended and validated rather than merely changing study admission.
 
+## Current-architecture order comparisons
+
+Generate a compact suite using the existing full-application adapter:
+
+```bash
+python3 scripts/perf/make_order_suite.py > /tmp/igr-orders.json
+# One backend, selected orders, using the same existing application binary:
+python3 scripts/perf/make_order_suite.py --backends hdg-ordinary --orders 1 3 5 7 \
+  > /tmp/igr-hdg-orders.json
+```
+
+The default contains DG, DGSEM, ordinary HDG and tensor HDG at p1, p3, p5 and
+p7. A subset avoids repeating unrelated work. HDG qualification suites accept
+the registered test orders p1, p2, p3, p4, p5, p7 and p10; a mixed suite that
+requests an unregistered HDG order fails during generation. DG/DGSEM selections
+accept other positive native orders, but that does not extend the existing
+fused kernel coverage beyond p10 or establish accuracy/performance at another
+order. The HDG application itself remains generic; other orders need explicit
+numerical validation outside this bounded qualification suite. Each generated
+suite is bounded to 16 cases. Mesh
+refinement is selected from n32/n64/n128 to approach 262,144 conserved DOFs:
+the default points are p1/n128, p3/n64, p5/n32 and p7/n32. All have 262,144
+conserved DOFs except p5, which has 147,456. These compare work size, not equal
+discretization error; higher order still increases HDG's local dense storage.
+
+Cases use ten fixed `dt=1e-5` steps, one warmup and three alternating process
+pairs, preserving the existing convergence and physical-field gates. The
+explicit `solver_policy=qualified-fp64` selects FGMRES with the FP64 two-level
+inverse, CG coarse solve at order one, and cached device face density for DG
+and DGSEM. Ordinary HDG selects refreshed ILU with five lower/five upper Jacobi
+sweeps; tensor HDG retains its native engine-default trace policy. Both
+environment aliases are pinned and native logs must confirm the selected
+solver/preconditioner. `--solver-policy reference` selects the existing
+CG/Chebyshev and HDG engine-default policies. Omitted selectors in historical
+suites keep their previous contracts. The name `qualified-fp64` identifies
+the configuration measured at p5; it does not itself qualify another order,
+mesh, revision or site.
+
+All generated cases explicitly use process wall time including startup and
+shutdown. Reports include microseconds per conserved DOF per accepted step.
+DG/DGSEM counts must match the native DOF callback. HDG currently lacks that
+callback in its application log, so its denominator is explicitly labeled as
+derived from four conserved components, uniform quad count and `(p+1)^2`;
+IGR auxiliary and trace unknowns are excluded. DG/DGSEM solver elapsed time
+is retained separately. Historical suites keep their original timing scope.
+
+The generated JSON can be passed to `perf.sh submit --suite` on PACE, or to
+the existing `perf.sh import --suite` route for already built and validated
+PACE/Delta artifacts. Prepare first with `--prepare-only`, then run only the
+needed stage, for example `perf.sh resume --run-dir RUN --stage timings`.
+For direct exploratory runs, the same `study_workloads.command` and
+`study_workloads.environment` helpers supply the arguments and controls without
+invoking study preparation or dependency checks. No build, allocation or
+profiling happens when generating the suite. Native validation must select
+tests actually registered for the requested order; unsupported test selections
+fail rather than silently establish qualification.
+
 The order-ten implementation extends DGSEM's fused path with WMMA row tiling
 and bounded shared storage. Packed/unfused DGSEM and dynamic generic HDG
 use checked dimensions and allocation sizes rather than a chosen order
@@ -523,6 +584,17 @@ outputs. For this zero-capture case, optional `--profile-timeout-seconds 3600`
 and `--profiles-budget-seconds 3600` set the new capture and stage budgets;
 the original run and timing bytes remain unchanged. The new worker still
 reserves 120 seconds before its actual allocation ends.
+
+For that first zero-capture continuation, add `--profile-cases ID1,ID2` to
+profile only selected enabled GPU cases. This preserves the full frozen suite
+and original timing bytes; reports mark the other profiles `not_requested`.
+Later missing-only continuations preserve that subset and retain completed
+tools. The option requires `--profiles-only --continue-profiles` and cannot
+shrink a cohort whose profiling has already started. Delta's four-GPU profile
+pool accepts these prepared runs by binding the original binary admission;
+the compute worker still performs its normal application admission. Use one
+case per GPU when preparing concurrent counter experiments, while keeping
+unprofiled timing pairs separate from concurrent profiling.
 
 To inspect an admission mismatch, run
 `./perf.sh diagnose-admission --run-dir /absolute/scratch/studies/old-run`

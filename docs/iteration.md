@@ -20,6 +20,13 @@ needs it; repeat `--target` for multiple targets. Omitting `--target` builds all
 configured IGRlab targets incrementally. On Delta, compilation still runs on
 CPU compute. Omit `--submit` inside the CPU allocation.
 
+The same command works on PACE with `--site pace` and that site's retained
+dependency/build roots. Choose `--jobs` within the allocated CPU count; extra
+cores help only when the changed application targets have independent compile
+work. Changing polynomial order is a runtime argument and does not require a
+rebuild. See the [bounded order comparison suite](gpu-studies.md#current-architecture-order-comparisons)
+for consistent DG, DGSEM and HDG commands and DOF normalization.
+
 The cached configuration supplies the compiler, dependency paths and build
 options. Changing those options requires the normal configuration route.
 CMake may regenerate its application build files when application CMake files

@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import study_workloads as workloads
+import make_order_suite
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITE = ROOT / 'scripts/perf/suites/pace-a100.json'
@@ -482,13 +483,21 @@ class WorkloadTests(unittest.TestCase):
 
     def test_cuda_admissibility_requires_ordinary_active_igr_cuda_dg_or_dgsem(self):
         for changed in ({'device': 'cpu'}, {'discretization': 'hdg'},
-                        {'discretization': 'hdg', 'engine': 'tensor'},
-                        {'discretization': 'dgsem', 'dgsem_residual': 'fused-simt'},
-                        {'discretization': 'dgsem', 'dgsem_residual': 'fused-dmma'}):
+                        {'discretization': 'hdg', 'engine': 'tensor'}):
             case = self.igr_case()
             case['parameters'].update(changed, cuda_admissibility=True)
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 workloads.parameters(case)
+        for residual in ('fused-simt', 'fused-dmma'):
+            case = self.igr_case('dgsem')
+            case['parameters'].update(dgsem_residual=residual, cuda_admissibility=True,
+                                      solver_policy='qualified-fp64')
+            self.assertTrue(workloads.parameters(case)['cuda_admissibility'])
+            with mock.patch.dict(os.environ, {}, clear=True):
+                env = workloads.environment(case, self.work)
+            self.assertEqual(env['IGRLAB_EULER_ADMISSIBILITY_CUDA'], '1')
+            self.assertEqual(env['IGRLAB_DGSEM_FUSED_RESIDUAL'], '1')
+            self.assertEqual(env['IGRLAB_DGSEM_FUSED_DMMA'], '1' if residual == 'fused-dmma' else '0')
         inactive = copy.deepcopy(self.dg)
         inactive['parameters']['cuda_admissibility'] = True
         with self.assertRaisesRegex(ValueError, 'ordinary CUDA active IGR'):
@@ -580,6 +589,123 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(evidence['direct_identity_uses'], 31)
         self.assertEqual(evidence['policy']['direct_identity_system'], '1')
         self.assertEqual(evidence['linear_counts']['total_iters'], 4262)
+
+    def qualified_igr_log(self):
+        return (self.igr_log().replace('solver=cg', 'solver=fgmres').replace(
+            'last_precond=operatorchebyshev', 'last_precond=two-level-inverse-fp64') +
+            '[igr-two-level] n=65536 coarse_mode=cg coarse_order=1\n' +
+            '[igr-linear] event=face-density-path arithmetic=cuda geometry_cache=per-solver\n')
+
+    def test_qualified_policy_pins_solver_and_environment_and_checks_native_selection(self):
+        for backend in ('dg', 'dgsem'):
+            case = self.igr_case(backend)
+            case['parameters']['solver_policy'] = 'qualified-fp64'
+            args = workloads.command(case, Path('/binary'), ROOT, self.work)
+            self.assertEqual(args[args.index('--igr-linear-solver') + 1], 'fgmres')
+            self.assertEqual(args[args.index('--igr-lin-rtol') + 1], '1e-10')
+            with mock.patch.dict(os.environ, {'IGRLAB_IGR_TWO_LEVEL_COARSE': 'dense'}, clear=True):
+                env = workloads.environment(case, self.work)
+            for prefix in ('IGRLAB_', 'DG_IGR_'):
+                for key, value in {'IGR_TWO_LEVEL_INVERSE': 'fp64', 'IGR_TWO_LEVEL_COARSE': 'cg',
+                                   'IGR_TWO_LEVEL_ORDER': '1', 'IGR_FACE_DENSITY_CUDA': '1',
+                                   'IGR_FACE_DENSITY_CACHE': '1'}.items():
+                    self.assertEqual(env[prefix + key], value)
+            p = workloads.parameters(case)
+            self.assertEqual(workloads.active_igr_evidence(p, self.qualified_igr_log())['policy']['solver'], 'fgmres')
+            for before, after in (('coarse_mode=cg', 'coarse_mode=dense'), ('coarse_order=1', 'coarse_order=0'),
+                                  ('arithmetic=cuda', 'arithmetic=host'), ('geometry_cache=per-solver', 'geometry_cache=none'),
+                                  ('last_precond=two-level-inverse-fp64', 'last_precond=operatorchebyshev'),
+                                  ('relative_limit=5e-10', 'relative_limit=5e-8')):
+                with self.subTest(backend=backend, before=before), self.assertRaises(ValueError):
+                    workloads.active_igr_evidence(p, self.qualified_igr_log().replace(before, after))
+        for mutation in ({'solver_policy': 'fp32'}, {'device': 'cpu'}, {'regularization': 'none'}):
+            invalid = copy.deepcopy(case)
+            invalid['parameters'].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                workloads.parameters(invalid)
+
+    def test_qualified_hdg_pins_exact_trace_policy_and_records_both_aliases(self):
+        import gpu_study
+        for engine in ('ordinary', 'tensor'):
+            case = self.igr_case('hdg')
+            case['parameters'].update(engine=engine, solver_policy='qualified-fp64')
+            with mock.patch.dict(os.environ, {'IGRLAB_HDG_TRACE_POLICY': 'wrong'}, clear=True):
+                env = workloads.environment(case, self.work)
+            selected = 'ordinary-ilu-jacobi5-refresh' if engine == 'ordinary' else 'engine-default'
+            for prefix in ('IGRLAB_', 'DG_IGR_'):
+                self.assertEqual(env[prefix + 'HDG_TRACE_POLICY'], selected)
+                self.assertIn(prefix + 'HDG_TRACE_POLICY', gpu_study.SAFE_ENV)
+            resolved = selected if engine == 'ordinary' else 'native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64'
+            solver = 'hypre-parcsr-gmres' if engine == 'ordinary' else 'native-rank1-fp64'
+            precond = 'hypre_ilu0' if engine == 'ordinary' else 'native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64'
+            text = (self.hdg_application_log(engine=engine).replace('regularization=none', 'regularization=igr')
+                    .replace('requested_trace_policy=engine-default', 'requested_trace_policy=' + selected)
+                    .replace('resolved_trace_policy=engine-default', 'resolved_trace_policy=' + resolved)
+                    .replace('trace_solver=native', 'trace_solver=' + solver)
+                    .replace('trace_preconditioner=ilu0', 'trace_preconditioner=' + precond)).strip()
+            text += (' c_alpha=1 alpha_effective=0.01 alpha_length_policy=min h_eff=0.1 euler_trace_penalty=1'
+                     ' trace_ilu_factor_reuse_policy=refresh_each_trace_solve'
+                     ' trace_ilu_triangular_solve_kind=iterative_jacobi'
+                     ' trace_ilu_lower_jacobi_iterations=5 trace_ilu_upper_jacobi_iterations=5\n')
+            p = workloads.parameters(case)
+            workloads.parse_hdg_application(p, text, 0.5)
+            changes = [('trace_solver=' + solver, 'trace_solver=other'),
+                       ('resolved_trace_policy=' + resolved, 'resolved_trace_policy=other')]
+            if engine == 'ordinary':
+                changes += [('trace_ilu_upper_jacobi_iterations=5', 'trace_ilu_upper_jacobi_iterations=4'),
+                            ('refresh_each_trace_solve', 'first_trace_solve_per_attempt')]
+            for before, after in changes:
+                with self.subTest(engine=engine, before=before), self.assertRaises(ValueError):
+                    workloads.parse_hdg_application(p, text.replace(before, after), 0.5)
+
+    def test_order_suite_is_bounded_and_every_backend_preserves_matched_physical_work(self):
+        suite = make_order_suite.make_suite()
+        path = self.work / 'orders.json'
+        path.write_text(json.dumps(suite))
+        admitted = workloads.load_suite(path)
+        self.assertEqual(len(admitted['cases']), 16)
+        sizes = {1: 262144, 3: 262144, 5: 147456, 7: 262144}
+        for case in admitted['cases']:
+            p = case['parameters']
+            self.assertEqual(case['expected_conserved_dofs'], sizes[p['order']])
+            self.assertEqual(p['final_time'], 10 * p['dt'])
+            self.assertEqual(p['timing_scope'], 'process-wall')
+            self.assertEqual(p['solver_policy'], 'qualified-fp64')
+            command = workloads.command(case, Path('/binary'), ROOT, self.work)
+            self.assertEqual(command[command.index('-o') + 1], str(p['order']))
+        selected = make_order_suite.make_suite((7,), ('hdg-tensor',), 'reference')
+        self.assertEqual(len(selected['cases']), 1)
+        self.assertEqual(selected['cases'][0]['parameters']['solver_policy'], 'reference')
+        with self.assertRaises(ValueError):
+            make_order_suite.make_suite((1, 1))
+        for selected_backends in (('dg', 'hdg-tensor'), ('hdg-ordinary',)):
+            with self.subTest(backends=selected_backends), self.assertRaisesRegex(ValueError, 'registered test orders'):
+                make_order_suite.make_suite((5, 6), selected_backends)
+        self.assertEqual(len(make_order_suite.make_suite((2, 4, 6, 10), ('dg', 'dgsem'))['cases']), 8)
+        hdg_checks = make_order_suite.make_suite((1, 3, 4, 7), ('hdg-ordinary', 'hdg-tensor'))['correctness_regex']
+        for name in ('p1_rank1', 'tensor_p3_rank1', 'p4_ordinary_rank1', 'p7_tensor_rank1'):
+            self.assertRegex('dg_igr_hdg_runtime_cuda_generic_euler_extension_' + name, hdg_checks)
+
+    def test_process_wall_and_actual_dof_normalization_preserve_solver_time(self):
+        case = make_order_suite.make_suite((1,), ('dg',))['cases'][0]
+        case['parameters']['final_time'] = 0.002
+        callback = 'dofs (local/global): 262144 / 262144\n'
+        self.stdout.write_text(self.dg_log() + self.qualified_igr_log() + callback)
+        result = workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=3)
+        self.assertEqual(result['seconds'], 3)
+        self.assertEqual(result['solver_seconds'], 0.5)
+        self.assertEqual(result['normalization']['process_microseconds_per_dof_step'], 3e6 / (262144 * 200))
+        for text in (self.dg_log() + self.qualified_igr_log(),
+                     self.dg_log() + self.qualified_igr_log() + callback.replace('262144', '1')):
+            self.stdout.write_text(text)
+            with self.assertRaisesRegex(ValueError, 'native conserved DOF'):
+                workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=3)
+        hdg = make_order_suite.make_suite((7,), ('hdg-tensor',))['cases'][0]
+        observed = workloads.normalize_application(hdg, {'seconds': 2, 'signature': {'work': {'steps': 10}}}, '')
+        self.assertIn('derived:', observed['normalization']['dof_source'])
+        hdg['expected_conserved_dofs'] += 1
+        with self.assertRaisesRegex(ValueError, 'declared conserved DOFs'):
+            workloads.normalize_application(hdg, {'seconds': 2, 'signature': {'work': {'steps': 10}}}, '')
 
     def test_active_igr_suite_six_gpu_variants_and_bounded_same_wave(self):
         suite = workloads.load_suite(IGR_SUITE)

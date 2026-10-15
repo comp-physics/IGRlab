@@ -60,6 +60,7 @@ SAFE_ENV = ('CUDA_VISIBLE_DEVICES', 'SLURM_JOB_ID', 'SLURM_JOB_ACCOUNT',
             'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
             'IGRLAB_PROFILE_NVTX', 'DG_IGR_PROFILE_NVTX',
             'IGRLAB_EULER_ADMISSIBILITY_CUDA', 'DG_IGR_EULER_ADMISSIBILITY_CUDA',
+            'IGRLAB_HDG_TRACE_POLICY', 'DG_IGR_HDG_TRACE_POLICY',
             'DG_IGR_DGSEM_FUSED_RESIDUAL', 'DG_IGR_DGSEM_FUSED_DMMA',
             'IGRLAB_DGSEM_FUSED_RESIDUAL', 'IGRLAB_DGSEM_FUSED_DMMA') + tuple(
                 prefix + name for prefix in ('IGRLAB_', 'DG_IGR_')
@@ -471,6 +472,37 @@ def verify(root, *, binaries=False):
 
 def selected_cases(suite):
     return [case for case in suite['cases'] if case.get('enabled', True)]
+
+
+def selected_profile_cases(plan, suite):
+    """A profiling subset never changes the frozen suite or timing reference."""
+    cases = selected_cases(suite)
+    names = plan.get('profile_case_ids')
+    if names is None:
+        return cases
+    eligible = {case['id'] for case in cases if case.get('parameters', {}).get('device') != 'cpu'}
+    if (not isinstance(names, list) or not names or
+            any(not isinstance(name, str) or not name for name in names) or
+            len(set(names)) != len(names) or not set(names) <= eligible):
+        raise ValueError('profile_case_ids requires unique enabled GPU case IDs')
+    return [case for case in cases if case['id'] in names]
+
+
+def retry_profile_selection(plan, state, suite, requested):
+    previous = plan.get('profile_case_ids')
+    if requested is None:
+        selected_profile_cases(plan, suite)
+        return list(previous) if previous is not None else None
+    names = requested.split(',') if isinstance(requested, str) else []
+    chosen = selected_profile_cases({'profile_case_ids': names}, suite)
+    normalized = [case['id'] for case in chosen]
+    started = plan.get('profile_continuation') or any(
+        attempt['stage'] == 'profiles' for attempt in state['attempts'])
+    original = [case['id'] for case in selected_profile_cases(plan, suite)
+                if case.get('parameters', {}).get('device') != 'cpu']
+    if started and normalized != original:
+        raise ValueError('missing-only profile continuation must preserve its original case subset')
+    return normalized
 
 
 def cpu_only(plan):
@@ -1210,7 +1242,8 @@ def observe(runner, root, plan, admission, case, member, label, gpu, *, fields=F
         environment.update(overrides)
     directory = runner.run(label, command, cwd=workdir, env=environment)
     timing_metadata = {}
-    if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
+    if case['adapter'] == 'dg' and (case['parameters'].get('discretization') == 'hdg' or
+                                   case['parameters'].get('timing_scope') == 'process-wall'):
         timing_metadata['wall_seconds'] = read_json(directory / 'result.json')['process_wall_seconds']
     observation = study_workloads.parse(case, directory / 'stdout.log', directory / 'stderr.log', gpu,
                                        **timing_metadata)
@@ -1322,6 +1355,12 @@ def timings(root, plan, suite, admission, runner, gpu):
                                       'statistics': sample_statistics(values['baseline'], values['candidate']),
                                       'observations': observations, 'fields': field_gate,
                                       'exported_observations': exported}
+        if 'normalization' in observations[0]:
+            factor = observations[0]['normalization']['conserved_dofs'] * observations[0]['normalization']['accepted_steps']
+            result['cases'][identifier]['normalization'] = {**observations[0]['normalization'],
+                'baseline_microseconds_per_dof_step': [value * 1e6 / factor for value in values['baseline']],
+                'candidate_microseconds_per_dof_step': [value * 1e6 / factor for value in values['candidate']]}
+            result['cases'][identifier]['normalization'].pop('process_microseconds_per_dof_step')
         if case['adapter'] == 'dg':
             field_directories[identifier] = directories
     # Compare backends only within the same discretization and numerical workload.
@@ -1376,6 +1415,9 @@ def profiles(root, plan, suite, admission, runner, gpu):
     admit_reused_timing_gpu(plan, gpu)
     value = {'schema_version': SCHEMA, 'status': 'analysis_complete', 'gpu': gpu,
              'scope': 'fresh matched profile cohort; profiled durations are diagnostic', 'cases': {}}
+    profile_cases = selected_profile_cases(plan, suite)
+    if plan.get('profile_case_ids') is not None:
+        value['profile_case_ids'] = list(plan['profile_case_ids'])
     timing_attempt = completed(read_json(root / 'state.json'), 'timings')
     timing_reference = read_json(timing_attempt['summary'])
     def save_partial():
@@ -1388,7 +1430,8 @@ def profiles(root, plan, suite, admission, runner, gpu):
             raise RuntimeError('complete profiler capture has no application validation logs')
         for logs in logs_to_validate:
             timing_metadata = {}
-            if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
+            if case['adapter'] == 'dg' and (case['parameters'].get('discretization') == 'hdg' or
+                                           case['parameters'].get('timing_scope') == 'process-wall'):
                 timing_metadata['wall_seconds'] = read_json(logs['receipt'])['process_wall_seconds']
             observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), capture_gpu or gpu,
                                                **timing_metadata)
@@ -1406,6 +1449,8 @@ def profiles(root, plan, suite, admission, runner, gpu):
     if continuation:
         value.update(scope='continued per-tool diagnostics; per-capture GPU identity; no matched profiler timing claim',
                      profile_continuation=continuation)
+        if plan.get('profile_case_ids') is not None:
+            value['scope'] += '; analysis covers selected profile_case_ids only, other cases not requested'
         # These files include native reports/full CSV: verify only here on compute,
         # never during login-side preparation, status, or compact collection.
         for path, expected in continuation['compute_artifact_sha256'].items():
@@ -1414,14 +1459,14 @@ def profiles(root, plan, suite, admission, runner, gpu):
                 raise RuntimeError(f'retained native profile artifact changed: {artifact}')
         # A completed native tool checkpoint can precede the old coordinator's
         # application gate. Admit every retained log before any new application.
-        for case in selected_cases(suite):
+        for case in profile_cases:
             for member, tools in retained.get(case['id'], {}).items():
                 for item in tools.values():
                     count = validate_application(case, member, item['capture'], item['gpu'])
                     item['capture']['application_validation'] = {'status': 'complete',
                         'validated_log_count': count, 'scope': 'retained capture matches original unprofiled policy/work'}
 
-    for case in selected_cases(suite):
+    for case in profile_cases:
         captures = {}
         if case['adapter'] == 'dg' and case['parameters'].get('device') == 'cpu':
             value['cases'][case['id']] = {member: {
@@ -1548,6 +1593,8 @@ def worker(args):
             raise RuntimeError('stage already complete; create a new study for new measurements')
         if args.stage == 'profiles' and not completed(state, 'timings'):
             raise RuntimeError('complete and admit unprofiled timings before profiling')
+        if args.stage == 'profiles':
+            selected_profile_cases(plan, suite)
         worker_budget(plan, suite, args.stage, entered)  # Fail before queries/captures if time is exhausted.
         site = study_site.name(plan)
         cpu = (cpu_allocation() if site == 'pace' else cpu_allocation(site)) if only_cpu else None
@@ -1748,6 +1795,7 @@ def profile_only_overrides(original, replacement):
 
 def retained_profile_tools(plan, state, old, suite):
     """Seal completed tool checkpoints; application/native admission stays compute-only."""
+    selected = selected_profile_cases(plan, suite)
     attempt = next((item for item in reversed(state['attempts']) if item['stage'] == 'profiles'), None)
     if attempt is None:
         # A failed admission occurs before attempt creation. Explicit continuation
@@ -1757,7 +1805,7 @@ def retained_profile_tools(plan, state, old, suite):
         directory = old / 'attempts'
         if directory.exists() and any(path.name.startswith('profiles') for path in directory.iterdir()):
             raise RuntimeError('unrecorded profile directory prevents zero-capture continuation')
-        if not any(case.get('parameters', {}).get('device') != 'cpu' for case in selected_cases(suite)):
+        if not any(case.get('parameters', {}).get('device') != 'cpu' for case in selected):
             raise RuntimeError('continuation requires an enabled GPU workload')
         return {'run_dir': str(old), 'plan_sha256': plan['plan_sha256'], 'suite_sha256': plan['suite_sha256'],
                 'origin_kind': 'no-profile-attempt', 'checkpoint': None, 'checkpoint_sha256': None,
@@ -1774,7 +1822,7 @@ def retained_profile_tools(plan, state, old, suite):
     data = read_json(checkpoint)
     if data.get('schema_version') != SCHEMA or data.get('status') not in ('profiles_partial', 'analysis_complete'):
         raise RuntimeError('invalid original profile checkpoint')
-    cases = {case['id']: case for case in selected_cases(suite)}
+    cases = {case['id']: case for case in selected}
     if not set(data.get('cases', {})) <= set(cases):
         raise RuntimeError('profile checkpoint contains an unselected case')
     prior = plan.get('profile_continuation', {})
@@ -2079,10 +2127,15 @@ def retry(args):
         cases = getattr(args, 'cases', None)
         profiles_only = bool(getattr(args, 'profiles_only', False))
         continue_profiles = bool(getattr(args, 'continue_profiles', False))
+        requested_profile_cases = getattr(args, 'profile_cases', None)
+        if requested_profile_cases is not None and not (profiles_only and continue_profiles):
+            raise ValueError('--profile-cases requires --profiles-only --continue-profiles')
         if continue_profiles and (not profiles_only or suite_path is not None or cases is not None):
             raise ValueError('--continue-profiles requires --profiles-only and forbids --suite/--cases')
         if profiles_only and cases is not None:
             raise ValueError('profiles-only retry forbids --cases; timing workload selection must match')
+        profile_ids = (retry_profile_selection(plan, state, old_suite, requested_profile_cases)
+                       if profiles_only else None)
         reconciled_attempts = []
         if reuse_artifacts:
             plan, state = retry_validated_artifacts(plan, state)
@@ -2200,6 +2253,9 @@ def retry(args):
         new_plan = {k: v for k, v in plan.items() if k != 'plan_sha256'}
         new_plan.pop('timing_reuse', None)
         new_plan.pop('profile_continuation', None)
+        new_plan.pop('profile_case_ids', None)
+        if profile_ids is not None:
+            new_plan['profile_case_ids'] = profile_ids
         new_plan.update(run_dir=str(root), created_unix_seconds=time.time(), wall_time_limits=limits,
                         retry_origin={'run_dir': str(old), 'plan_sha256': plan['plan_sha256'],
                                       'state_sha256': sha(old / 'state.json'),
@@ -2349,6 +2405,9 @@ def report(root):
         raise RuntimeError('frozen workload suite changed')
     timing_cases = (result['timings'] or {}).get('cases', {})
     profile_cases = (result['profiles'] or result.get('profile_partial') or {}).get('cases', {})
+    requested_profiles = {case['id'] for case in selected_profile_cases(plan, suite)}
+    if plan.get('profile_case_ids') is not None:
+        result['profile_case_ids'] = list(plan['profile_case_ids'])
     coverage = []
     for case in selected_cases(suite):
         name, adapter, parameters = case['id'], case.get('adapter'), case.get('parameters', {})
@@ -2357,7 +2416,8 @@ def report(root):
                                         'dg' if adapter == 'dg' else 'not-recorded')
         device = parameters.get('device', 'cuda' if adapter in ('dg', 'hdg', 'dgsem') else 'not-recorded')
         declared_scope = ('whole-process wall time including startup/setup/shutdown'
-                          if adapter == 'dg' and discretization == 'hdg' else
+                          if adapter == 'dg' and (discretization == 'hdg' or
+                                                 parameters.get('timing_scope') == 'process-wall') else
                           'full-solver elapsed time' if adapter == 'dg' else
                           'accepted-step median per process' if adapter == 'hdg' else
                           'central-volume per-call GPU duration' if adapter == 'dgsem' else 'not-recorded')
@@ -2366,7 +2426,10 @@ def report(root):
         member_profiles = {member: captured.get(member, {}).get('status', 'pending') for member in MEMBERS}
         if device == 'cpu':
             member_profiles = dict.fromkeys(MEMBERS, 'not_applicable')
+        elif name not in requested_profiles:
+            member_profiles = dict.fromkeys(MEMBERS, 'not_requested')
         profile_status = ('not_applicable' if device == 'cpu' else
+                          'not_requested' if name not in requested_profiles else
                           'complete' if all(value == 'complete' for value in member_profiles.values()) else
                           'partial' if captured else 'pending')
         coverage.append({'case_id': name, 'adapter': adapter, 'discretization': discretization,
@@ -2400,6 +2463,9 @@ def report(root):
                    if plan['profile_continuation'].get('origin_kind') == 'no-profile-attempt' else
                    'Completed tool captures are retained with their original GPU identities. ') +
                   'Continuation captures have their own GPU identities; these diagnostics do not claim matched profiler timing or speedup.', '']
+    if plan.get('profile_case_ids') is not None:
+        lines += ['Profile analysis covers only: ' + ', '.join(plan['profile_case_ids']) +
+                  '. Other enabled cases retain their original timings; their profiles are not requested.', '']
     lines += ['Validation execution: ' + ', '.join(
         f'{member}={mode}' for member, mode in result['validation_execution'].items()) + '.', '']
     if 'legacy-driver' in result['validation_execution'].values():
@@ -2412,7 +2478,7 @@ def report(root):
                      f"{case['engine']} / {case['dgsem_residual']} | {case['timing_scope']} | "
                      f"{case['timing_status']} | {case['profile_status']} |")
     lines += ['', 'Compare timing values only within the same numerical workload and timing scope; '
-              'HDG whole-process wall time is distinct from DG/DGSEM solver elapsed time and accepted-step or volume-kernel timings.', '']
+              'Explicit process-wall cases include startup/setup/shutdown; historical DG/DGSEM cases use solver elapsed time.', '']
     if any(case['device'] == 'cpu' for case in coverage):
         lines += [('CPU cases use one application/MPI rank and one BLAS/OpenMP thread in the free cpu-small allocation. '
                    if only_cpu else 'CPU cases use one thread on the host CPUs of this A100 allocation. ') +
@@ -2424,6 +2490,15 @@ def report(root):
             stats = case['statistics']
             low, high = stats['paired_range_percent_less_time']
             lines.append(f"| {name} | {stats['baseline_median_seconds']:.6g} | {stats['candidate_median_seconds']:.6g} | {stats['paired_median_percent_less_time']:.3f}% | {low:.3f}% to {high:.3f}% |")
+        normalized = {name: case['normalization'] for name, case in result['timings']['cases'].items()
+                      if 'normalization' in case}
+        if normalized:
+            lines += ['', '| Case | Conserved DOFs | Accepted steps | Baseline µs/DOF/step | Candidate µs/DOF/step | DOF source |',
+                      '|---|---:|---:|---:|---:|---|']
+            for name, item in normalized.items():
+                lines.append(f"| {name} | {item['conserved_dofs']} | {item['accepted_steps']} | "
+                             f"{statistics.median(item['baseline_microseconds_per_dof_step']):.6g} | "
+                             f"{statistics.median(item['candidate_microseconds_per_dof_step']):.6g} | {item['dof_source']} |")
     else:
         lines.append('Timings have not completed.')
     if comparison_kind == 'identical-source-control' and result['timings']:
@@ -2552,6 +2627,8 @@ def main(argv=None):
                    help='reuse completed timings on the same GPU; --suite may change only case.profile; no --cases')
     p.add_argument('--continue-profiles', action='store_true',
                    help='with --profiles-only, retain completed tools or recover a zero-attempt admission failure; capture missing tools with independent GPU identities, no --suite/--cases')
+    p.add_argument('--profile-cases',
+                   help='profiles-only continuation: unique enabled GPU case IDs; preserve the full suite/timings and lock this subset for later missing-only continuations')
     p.add_argument('--reuse-validated-artifacts', action='store_true',
                    help='prepare-only profile continuation: revalidate canonical artifact/Passed seals, query original measurement owners only')
     p.add_argument('--reconcile-terminal-profile-attempt', action='store_true',

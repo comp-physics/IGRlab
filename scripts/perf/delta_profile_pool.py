@@ -95,6 +95,10 @@ def intent(path, expected):
         require(set(task.get('executor_sha256', {})) == {'gpu_study.py', 'delta_runtime.sh'} and
                 all(isinstance(digest, str) and HEX.fullmatch(digest)
                     for digest in task['executor_sha256'].values()), 'task needs frozen executor pins')
+        if 'origin_admission_sha256' in task:
+            require(isinstance(task['origin_admission_sha256'], str) and
+                    HEX.fullmatch(task['origin_admission_sha256']), 'invalid original admission pin')
+            confined(task['origin_run_dir'], root / 'studies')
     return value
 
 
@@ -111,8 +115,28 @@ def check_task(task):
                 plan['executor_sha256'].get(name) == expected, 'frozen task executor changed')
     require(task['executor_sha256']['gpu_study.py'] == sha(gpu_study.__file__),
             'task executor lacks this reviewed pool admission')
-    admission = read(run / 'admission.json')
-    require(admission['plan_sha256'] == task['plan_sha256'], 'task has no matching binary admission')
+    if (run / 'admission.json').exists():
+        admission = read(run / 'admission.json')
+        require(admission['plan_sha256'] == task['plan_sha256'], 'task has no matching binary admission')
+    else:
+        # Public prepare-only retries intentionally defer fresh admission until
+        # the canonical in-step worker; bind the actual admitted timing origin.
+        site_root = next((p.parent for p in run.parents if p.name == 'studies'), None)
+        require(site_root is not None and HEX.fullmatch(task.get('origin_admission_sha256', '')),
+                'prepared continuation needs its original admission pin')
+        origin = confined(task['origin_run_dir'], site_root / 'studies')
+        original = gpu_study.load_plan(origin)
+        require(all(plan.get(k) == original.get(k) for k in ('site', 'site_root', 'spack_root', 'sources')) and
+                original.get('site') == 'delta', 'original admission belongs to different frozen sources/site')
+        for source in original['sources'].values():
+            confined(source['source_snapshot'], site_root)
+        for section in ('retry_origin', 'timing_reuse', 'profile_continuation'):
+            require(plan.get(section, {}).get('run_dir') == str(origin) and
+                    plan[section]['plan_sha256'] == original['plan_sha256'],
+                    'continuation original plan/path binding changed')
+        prior = origin / 'admission.json'
+        require(not prior.is_symlink() and sha(prior) == task['origin_admission_sha256'] and
+                read(prior)['plan_sha256'] == original['plan_sha256'], 'original binary admission seal changed')
     state = read(run / 'state.json')
     timing = gpu_study.completed(state, 'timings')
     require(timing and sha(timing['summary']) == timing['summary_sha256'], 'timings not complete/sealed')

@@ -439,6 +439,147 @@ class RetryTests(unittest.TestCase):
         case = study.selected_cases(study.study_workloads.load_suite(self.old / 'suite.json'))[0]
         return gpu, case, summary
 
+    def prepare_mixed_unstarted_profiles(self):
+        suite = study.read_json(self.old / 'suite.json')
+        cases = [case for case in suite['cases'] if case['adapter'] == 'dg' and
+                 case.get('parameters', {}).get('device') != 'cpu'][:2]
+        self.assertEqual(len(cases), 2)
+        names = {case['id'] for case in cases}
+        for case in suite['cases']:
+            case['enabled'] = case['id'] in names
+        study.write_json(self.old / 'suite.json', suite)
+        self.plan['suite_sha256'] = study.sha(self.old / 'suite.json')
+        self.save_plan()
+        gpu, _, summary = self.prepare_unstarted_profiles()
+        frozen = study.study_workloads.load_suite(self.old / 'suite.json')
+        return gpu, frozen, study.selected_cases(frozen), summary
+
+    def test_profile_subset_preserves_full_suite_timing_bytes_and_unselected_coverage(self):
+        gpu, suite, cases, summary = self.prepare_mixed_unstarted_profiles()
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True, continue_profiles=True, profile_cases=cases[1]['id'])
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(plan['profile_case_ids'], [cases[1]['id']])
+        self.assertEqual((self.new / 'suite.json').read_bytes(), (self.old / 'suite.json').read_bytes())
+        shadow = study.completed(study.read_json(self.new / 'state.json'), 'timings')
+        self.assertEqual(Path(shadow['summary']).read_bytes(), summary.read_bytes())
+        result, calls, _, output = self.run_continuation(plan, cases[1], gpu, suite=suite)
+        self.assertEqual(set(result['cases']), {cases[1]['id']})
+        self.assertEqual(result['profile_case_ids'], [cases[1]['id']])
+        self.assertEqual(len(calls), 2)
+        self.assertIn('selected profile_case_ids only', result['scope'])
+        study.write_json(output / 'summary.json', result)
+        state = study.read_json(self.new / 'state.json')
+        state['attempts'].append({'id': 'profiles-fixture', 'stage': 'profiles', 'status': 'analysis_complete',
+            'summary': str(output / 'summary.json'), 'summary_sha256': study.sha(output / 'summary.json'),
+            'artifact_sha256': {'attempts/profiles-new/summary.json': study.sha(output / 'summary.json')}})
+        study.write_json(self.new / 'state.json', state)
+        report = study.report(self.new)
+        coverage = {row['case_id']: row for row in report['coverage']['cases']}
+        self.assertEqual(coverage[cases[0]['id']]['profile_status'], 'not_requested')
+        self.assertEqual(coverage[cases[1]['id']]['profile_status'], 'complete')
+        self.assertTrue(all(row['timing_status'] == 'measured' for row in coverage.values()))
+        self.assertFalse(any(command[0] == 'sbatch' for command in self.calls))
+
+    def test_default_profile_selection_retains_full_enabled_suite(self):
+        gpu, suite, cases, _ = self.prepare_mixed_unstarted_profiles()
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        self.assertNotIn('profile_case_ids', plan)
+        result, calls, _, _ = self.run_continuation(plan, cases[0], gpu, suite=suite)
+        self.assertEqual(set(result['cases']), {case['id'] for case in cases})
+        self.assertEqual(len(calls), 4)
+
+    def test_profile_subset_invalid_ids_modes_and_cpu_selection_reject_before_preparation(self):
+        _, _, cases, _ = self.prepare_mixed_unstarted_profiles()
+        before = self.snapshot()
+        for names in ('', 'unknown', cases[0]['id'] + ',', cases[0]['id'] + ',' + cases[0]['id']):
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, 'unique enabled GPU'):
+                self.retry(profiles_only=True, continue_profiles=True, profile_cases=names)
+            self.assertFalse(self.new.exists())
+        for options in ({}, {'profiles_only': True}):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, 'requires --profiles-only'):
+                self.retry(profile_cases=cases[0]['id'], **options)
+        with self.assertRaisesRegex(ValueError, 'enabled GPU'):
+            study.selected_profile_cases({'profile_case_ids': ['cpu']}, {'cases': [
+                {'id': 'cpu', 'enabled': True, 'parameters': {'device': 'cpu'}}]})
+        self.assertEqual(before, self.snapshot())
+
+    def test_selected_profile_keeps_original_numerical_gate(self):
+        gpu, suite, cases, _ = self.prepare_mixed_unstarted_profiles()
+        plan = self.retry(profiles_only=True, continue_profiles=True, profile_cases=cases[1]['id'])
+        result, _, _, _ = self.run_continuation(plan, cases[1], gpu, suite=suite, wrong_signature=True)
+        self.assertEqual(set(result['cases']), {cases[1]['id']})
+        self.assertEqual(result['cases'][cases[1]['id']]['baseline']['application_validation']['status'], 'failed')
+
+    def test_missing_only_continuation_locks_subset_and_reuses_successful_tools(self):
+        gpu, suite, cases, _ = self.prepare_mixed_unstarted_profiles()
+        first = self.retry(profiles_only=True, continue_profiles=True, profile_cases=cases[1]['id'])
+        _, _, _, output = self.run_continuation(first, cases[1], gpu, suite=suite, fail_ncu=True)
+        state = study.read_json(self.new / 'state.json')
+        state['attempts'].append({'id': 'profiles-new', 'stage': 'profiles', 'status': 'profiles_partial',
+                                 'job_id': '35', 'directory': str(output), 'gpu': gpu})
+        study.write_json(self.new / 'state.json', state)
+        self.old, self.new = self.new, self.base / 'next'
+        self.plan, self.state = first, state
+        self.outcomes['35'] = ('TIMEOUT', '0:0')
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'preserve its original case subset'):
+            self.retry(profiles_only=True, continue_profiles=True, profile_cases=cases[0]['id'])
+        self.assertEqual(before, self.snapshot())
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        self.assertEqual(plan['profile_case_ids'], [cases[1]['id']])
+        self.assertEqual(set(plan['profile_continuation']['captures']), {cases[1]['id']})
+        result, calls, _, _ = self.run_continuation(plan, cases[1], gpu, suite=suite)
+        self.assertEqual(calls, [('baseline', ['ncu']), ('candidate', ['nsys', 'ncu'])])
+        self.assertEqual(result['status'], 'analysis_complete')
+
+    def test_existing_full_profile_continuation_cannot_shrink_selection(self):
+        self.prepare_continuation(names=('nsys',))
+        suite = study.study_workloads.load_suite(self.old / 'suite.json')
+        case = study.selected_cases(suite)[0]
+        # Historical default is its complete enabled GPU selection, not any new subset.
+        other = {**case, 'id': 'other-profile'}
+        suite['cases'].append(other)
+        with self.assertRaisesRegex(ValueError, 'preserve its original case subset'):
+            study.retry_profile_selection(self.plan, self.state, suite, case['id'])
+
+    def test_new_timing_cohort_does_not_inherit_a_profile_only_subset(self):
+        _, _, cases, _ = self.prepare_mixed_unstarted_profiles()
+        self.plan['profile_case_ids'] = [cases[1]['id']]
+        self.save_plan()
+        plan = self.retry()
+        self.assertNotIn('profile_case_ids', plan)
+        self.assertEqual((self.new / 'suite.json').read_bytes(), (self.old / 'suite.json').read_bytes())
+
+    def test_public_prepare_only_shape_binds_original_admission_for_pool(self):
+        import delta_profile_pool as pool
+        original = self.old
+        self.old = self.base / 'studies' / 'old'
+        self.old.parent.mkdir()
+        original.rename(self.old)
+        self.new = self.base / 'studies' / 'profiles-new'
+        attempt = self.state['attempts'][0]
+        attempt['directory'] = str(self.old / 'attempts/old-measurement')
+        attempt['summary'] = str(Path(attempt['directory']) / 'summary.json')
+        self.plan.update(run_dir=str(self.old), site='delta', site_root=str(self.base / 'dependencies'),
+                         spack_root=str(self.base / 'spack'))
+        self.save_plan()
+        self.save_state()
+        _, case, _ = self.prepare_unstarted_profiles()
+        study.write_json(self.old / 'admission.json', {'plan_sha256': self.plan['plan_sha256'], 'artifact_sha256': {}})
+        plan = self.retry(profiles_only=True, continue_profiles=True, profile_cases=case['id'])
+        self.assertFalse((self.new / 'admission.json').exists())
+        task = {'id': 'prepared', 'run_dir': str(self.new), 'plan_sha256': plan['plan_sha256'],
+                'executor_sha256': {name: plan['executor_sha256'][name]
+                                   for name in ('gpu_study.py', 'delta_runtime.sh')},
+                'origin_run_dir': str(self.old), 'origin_admission_sha256': study.sha(self.old / 'admission.json')}
+        self.assertEqual(pool.check_task(task), 'ready')
+        with self.assertRaisesRegex(RuntimeError, 'admission seal changed'):
+            pool.check_task({**task, 'origin_admission_sha256': '0' * 64})
+        with self.assertRaises((RuntimeError, FileNotFoundError)):
+            pool.check_task({**task, 'origin_run_dir': str(self.new)})
+        self.assertFalse((self.new / 'admission.json').exists())
+
     def test_zero_attempt_continuation_preserves_timings_and_collects_only_new_diagnostics(self):
         gpu, case, summary = self.prepare_unstarted_profiles()
         before = self.snapshot()
@@ -1131,7 +1272,7 @@ def admit(root,plan,suite):
         self.save_state()
         return gpu, case, checkpoint
 
-    def run_continuation(self, plan, case, gpu, *, fail_ncu=False, wrong_signature=False):
+    def run_continuation(self, plan, case, gpu, *, fail_ncu=False, wrong_signature=False, suite=None):
         output = self.new / 'attempts' / 'profiles-new'
         output.mkdir()
         runner = SimpleNamespace(output=output)
@@ -1156,10 +1297,10 @@ def admit(root,plan,suite):
                 patch.object(study.study_workloads, 'parse', return_value=observed) as parse:
             if fail_ncu or wrong_signature:
                 with self.assertRaises(RuntimeError):
-                    study.profiles(self.new, plan, {'cases': [case]}, admission, runner, gpu)
+                    study.profiles(self.new, plan, suite or {'cases': [case]}, admission, runner, gpu)
                 result = study.read_json(output / 'partial.json') if (output / 'partial.json').exists() else None
             else:
-                result = study.profiles(self.new, plan, {'cases': [case]}, admission, runner, gpu)
+                result = study.profiles(self.new, plan, suite or {'cases': [case]}, admission, runner, gpu)
         return result, calls, parse.call_args_list, output
 
     def test_continue_profiles_freezes_successful_baseline_without_timing_or_original_mutation(self):

@@ -6,6 +6,13 @@ and invokes that same driver. It does not require a campaign script or patches t
 MFEM. The profile uses the free `gts-sbryngelson3` account and `embers` background
 queue.
 
+After configuring once, use the [IGRlab-only iteration route](iteration.md)
+with `--site pace --iterate --target NAME`. It reuses the configured application
+build without dependency inspection, hashing, installation or automatic tests.
+The [bounded multiorder suite](gpu-studies.md#current-architecture-order-comparisons)
+uses the same application contracts on PACE and Delta; native results remain
+specific to the tested source, configuration and site.
+
 Initialize the pinned MFEM submodule after cloning:
 
 ```bash
