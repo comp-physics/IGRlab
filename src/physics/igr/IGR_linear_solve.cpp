@@ -1065,6 +1065,31 @@ public:
 
   const ExactFaceTimingStats& Timing() const { return timing_; }
 
+  bool TryAddToBase(const mfem::Vector& x, mfem::Vector& y) const
+  {
+    if (!OwnedScratchChebyshev::UsesOrdinaryCUDA() ||
+        !HasDirectIdentityLayout() || info_.nf <= 0 ||
+        x.Size() != Width() || y.Size() != Height() || &x == &y ||
+        !x.OwnsData() || !y.OwnsData())
+    {
+      return false;
+    }
+    ::igrlab::NVTXRange range("IGR/exact-face/add-to-base");
+    const auto start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    bool added;
+    {
+      ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
+      added = dg_face::TryLaunchInteriorFaceDGDiffusionAddToBase2D(
+        info_, scratch_, x, ip_sigma_, y);
+    }
+    if (added && timing_enabled_)
+    {
+      timing_.local_apply_seconds += ElapsedSeconds(start);
+      ++timing_.mult_calls;
+    }
+    return added;
+  }
+
   mfem::MemoryClass GetMemoryClass() const override
   {
     return mfem::Device::GetDeviceMemoryClass();
@@ -1278,12 +1303,14 @@ public:
   ExactFaceSumOperator(mfem::Operator* base,
                        mfem::Operator* face,
                        bool own_base = true,
-                       bool own_face = true)
+                       bool own_face = true,
+                       bool direct_identity_system = false)
     : mfem::Operator(base->Height(), base->Width()),
       base_(base),
       face_(face),
       own_base_(own_base),
       own_face_(own_face),
+      direct_identity_system_(direct_identity_system),
       exact_face_(dynamic_cast<ExactL2DGFaceOperator*>(face)),
       timing_enabled_(exact_face_ != nullptr && exact_face_->TimingEnabled()),
       scratch_(base->Height())
@@ -1420,10 +1447,14 @@ public:
         ::igrlab::NVTXRange base_range("IGR/exact-sum/base");
         base_->Mult(x, y);
       }
+      bool added = false;
       {
         ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
-        face_->Mult(x, scratch_);
+        added = direct_identity_system_ && exact_face_ &&
+          exact_face_->TryAddToBase(x, y);
+        if (!added) { face_->Mult(x, scratch_); }
       }
+      if (!added)
       {
         ::igrlab::NVTXRange axpy_range("IGR/exact-sum/axpy");
         y += scratch_;
@@ -1439,18 +1470,22 @@ public:
     timing_.base_seconds += ElapsedSeconds(base_start);
 
     const auto face_start = Clock::now();
+    bool added = false;
     {
       ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
-      face_->Mult(x, scratch_);
+      added = direct_identity_system_ && exact_face_ &&
+        exact_face_->TryAddToBase(x, y);
+      if (!added) { face_->Mult(x, scratch_); }
     }
     timing_.face_seconds += ElapsedSeconds(face_start);
 
-    const auto axpy_start = Clock::now();
+    if (!added)
     {
+      const auto axpy_start = Clock::now();
       ::igrlab::NVTXRange axpy_range("IGR/exact-sum/axpy");
       y += scratch_;
+      timing_.sum_axpy_seconds += ElapsedSeconds(axpy_start);
     }
-    timing_.sum_axpy_seconds += ElapsedSeconds(axpy_start);
     ++timing_.mult_calls;
   }
 
@@ -1466,6 +1501,7 @@ private:
   mfem::Operator* face_ = nullptr;
   bool own_base_ = true;
   bool own_face_ = true;
+  bool direct_identity_system_ = false;
   ExactL2DGFaceOperator* exact_face_ = nullptr;
   bool timing_enabled_ = false;
   mutable mfem::Vector scratch_;
@@ -2156,7 +2192,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     Ah_.Reset(new ExactFaceSumOperator(base_op,
                                        face_op,
                                        !direct_identity_system_,
-                                       false));
+                                       false,
+                                       direct_identity_system_));
     last_exact_face_effective_ = true;
     last_exact_face_reason_ = "active";
 

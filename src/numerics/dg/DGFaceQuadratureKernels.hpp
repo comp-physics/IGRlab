@@ -348,6 +348,16 @@ void LaunchInteriorFaceDGDiffusionApply2D(
   mfem::real_t ip_sigma,
   mfem::Vector& y);
 
+// Add the completed face action to an existing base result, retaining the
+// original zero-initialized face scratch addition. Unsupported backends
+// decline without changing y; the caller owns layout/alias admission.
+bool TryLaunchInteriorFaceDGDiffusionAddToBase2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  mfem::Vector& y);
+
 void LaunchSharedFaceDGDiffusionApply2D(
   const SharedFaceDGDiffusionApplyInfo& info,
   const SharedFaceDGDiffusionApplyScratch& work,
@@ -1851,6 +1861,7 @@ struct InteriorFaceDGDiffusionGather2D
   const int* element_face_sides = nullptr;
   const mfem::real_t* contribution = nullptr;
   mfem::real_t* y = nullptr;
+  bool add_to_base = false;
 
   MFEM_HOST_DEVICE void operator()(int row) const
   {
@@ -1869,7 +1880,25 @@ struct InteriorFaceDGDiffusionGather2D
     }
     // One CUDA row owns each discontinuous scalar dof.  Interior and shared
     // gathers execute in stream order, so the latter may safely add here.
-    y[D(local_dof, 0, element)] += sum;
+    const int output = D(local_dof, 0, element);
+    if (add_to_base)
+    {
+      // Original order: scratch = +0; scratch += sum; base += scratch.
+      // Explicit CUDA adds retain both roundings, including signed zeros and
+      // NaN propagation, without a scratch-vector zero or vector-add launch.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      y[output] = __dadd_rn(y[output], __dadd_rn(0.0, sum));
+#elif defined(__CUDA_ARCH__) && defined(MFEM_USE_SINGLE)
+      y[output] = __fadd_rn(y[output], __fadd_rn(0.0f, sum));
+#else
+      const mfem::real_t scratch_value = mfem::real_t(0.0) + sum;
+      y[output] += scratch_value;
+#endif
+    }
+    else
+    {
+      y[output] += sum;
+    }
   }
 };
 
@@ -1975,7 +2004,8 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   const InteriorFaceDGDiffusionApplyScratch& work,
   const mfem::Vector& scalar,
   mfem::real_t ip_sigma,
-  mfem::Vector& y)
+  mfem::Vector& y,
+  bool add_to_base = false)
 {
   MFEM_VERIFY(info.vdim == 1 &&
                 scalar.Size() == info.ne * info.dof &&
@@ -2031,6 +2061,7 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   gather.element_face_sides = work.element_face_sides.Read();
   gather.contribution = work.face_contribution.Read();
   gather.y = y.ReadWrite();
+  gather.add_to_base = add_to_base;
   mfem::forall(info.ne * info.dof, gather);
 }
 

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -174,6 +175,73 @@ Vector OriginalRecordAndGather(const InteriorFaceDGDiffusionApplyInfo& info,
   gather.y = result.ReadWrite();
   forall(info.ne * info.dof, gather);
   return result;
+}
+
+void CheckGatherToBaseRounding()
+{
+  // The combined production path admits ordinary CUDA only. Host arithmetic
+  // may select a different quiet-NaN operand payload; CPU production fallback
+  // equivalence is covered by CheckProductionIdentityCopies instead.
+  if (!::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+  { return; }
+  // Compare the original two device launches with the combined gather. In
+  // particular, do not reassociate the base value into the incidence sum.
+  constexpr int n = 8, nf = 2 * (n - 1);
+  Array<int> map(n), offsets(n + 1), ids(nf), sides(nf);
+  for (int i = 0; i < n; ++i)
+  {
+    map[i] = i;
+    offsets[i] = 2 * i;
+  }
+  offsets[n] = nf; // The final row has no incident interior faces.
+  for (int i = 0; i < nf; ++i) { ids[i] = i; sides[i] = 0; }
+  real_t nan1, nan2;
+#if defined(MFEM_USE_SINGLE)
+  const std::uint32_t payload1 = UINT32_C(0x7fc00042);
+  const std::uint32_t payload2 = UINT32_C(0x7fc00017);
+#else
+  const std::uint64_t payload1 = UINT64_C(0x7ff8000000000042);
+  const std::uint64_t payload2 = UINT64_C(0x7ff8000000000017);
+#endif
+  static_assert(sizeof(real_t) == sizeof(payload1), "Matching NaN payload precision required.");
+  std::memcpy(&nan1, &payload1, sizeof(real_t));
+  std::memcpy(&nan2, &payload2, sizeof(real_t));
+  const real_t tiny = std::numeric_limits<real_t>::denorm_min();
+  const real_t inf = std::numeric_limits<real_t>::infinity();
+  const real_t bases[n] = {-0.0, tiny, 1.0, 7.0, 3.0, nan1, nan1, -0.0};
+  const real_t terms[n - 1][2] = {
+    {-0.0, -0.0}, {-tiny, 0.0}, {1.0e16, -1.0e16},
+    {nan2, 0.0}, {inf, -inf}, {2.0, 3.0}, {nan2, 0.0}};
+  Vector contribution(2 * nf), scratch(n), expected(n), actual(n);
+  contribution.UseDevice(true); scratch.UseDevice(true);
+  expected.UseDevice(true); actual.UseDevice(true);
+  real_t* c = contribution.HostWrite();
+  std::fill(c, c + contribution.Size(), 0.0);
+  for (int row = 0; row < n - 1; ++row)
+  {
+    for (int incidence = 0; incidence < 2; ++incidence)
+    { c[2 * (2 * row + incidence)] = terms[row][incidence]; }
+  }
+  std::copy(bases, bases + n, expected.HostWrite());
+  std::copy(bases, bases + n, actual.HostWrite());
+  scratch = 0.0;
+  InteriorFaceDGDiffusionGather2D gather;
+  gather.dof = gather.vdim = 1; gather.ne = n; gather.nf = nf;
+  gather.element_vdof_map = map.Read();
+  gather.element_face_offsets = offsets.Read();
+  gather.element_face_ids = ids.Read();
+  gather.element_face_sides = sides.Read();
+  gather.contribution = contribution.Read();
+  gather.y = scratch.ReadWrite();
+  forall(n, gather);
+  expected += scratch;
+  gather.y = actual.ReadWrite();
+  gather.add_to_base = true;
+  forall(n, gather);
+  MFEM_VERIFY(SameBits(expected, actual),
+              "Combined gather changed base + (+0 + face sum) rounding.");
+  MFEM_VERIFY(actual.HostRead()[2] == 1.0,
+              "The base value must not enter the incidence reduction.");
 }
 
 Mesh MakeMesh(int geometry)
@@ -707,6 +775,7 @@ void CheckChebyshevOwnedScratch()
 
 void CheckProductionIdentityCopies()
 {
+  ScopedEnvironment direct_system("IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM", "1");
   for (const int order : {3, 5})
   {
     for (const bool timed : {false, true})
@@ -783,14 +852,25 @@ void CheckProductionIdentityCopies()
         MFEM_VERIFY(direct.Normlinf() > 1.0e-6,
                     "Production fixture needs a nontrivial face action.");
 
-        // Preserve the complete original base + face addition, rather than
-        // accumulating individual face contributions into the base output.
+        // Preserve the completed original base + face addition. The combined
+        // CUDA gather must not accumulate individual incidences into the base.
         Vector expected(full->Height()), actual(full->Height());
         expected.UseDevice(true); actual.UseDevice(true);
         base->Mult(input, expected);
         expected += original;
         full->Mult(input, actual);
         MFEM_VERIFY(SameBits(expected, actual), "Production sum changed base + face bits.");
+        Vector full_fallback(full->Height());
+        full_fallback.UseDevice(true);
+        full->Mult(view, full_fallback);
+        MFEM_VERIFY(SameBits(expected, full_fallback),
+                    "Nonowning sum input must preserve the original scratch path.");
+        Vector output_backing(full->Height() + 1), output_view;
+        output_backing.UseDevice(true);
+        output_view.MakeRef(output_backing, 1, full->Height());
+        full->Mult(input, output_view);
+        MFEM_VERIFY(SameBits(expected, output_view),
+                    "Nonowning sum output must preserve the original scratch path.");
 
         Vector diagonal(full->Height());
         full->AssembleDiagonal(diagonal);
@@ -801,6 +881,12 @@ void CheckProductionIdentityCopies()
           solver.GetLastDirectIdentitySystem() && scalar_fes.Conforming() &&
           scalar_fes.GetNRanks() == 1 &&
           solver.GetLastExactFaceSharedFaceCount() == 0;
+        if (::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA() &&
+            scalar_fes.GetNRanks() == 1)
+        {
+          MFEM_VERIFY(admitted_cuda_layout,
+                      "CUDA fixture must exercise the admitted direct-identity face sum.");
+        }
         auto selected = ::igrlab::igr_internal::MakeIGRChebyshevSmoother(
           *full, diagonal, essential, 3, 4.125, admitted_cuda_layout);
         const bool owned_selected = dynamic_cast<
@@ -861,6 +947,7 @@ int main(int argc, char** argv)
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
   CheckProductionIdentityCopies();
+  CheckGatherToBaseRounding();
   CheckChebyshevOwnedScratch();
   int cases = 0;
   double max_assembled_error = 0.0;
