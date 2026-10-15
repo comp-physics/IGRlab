@@ -249,7 +249,7 @@ private:
               request.backend.cuda_engine,
               request.numerical_policy.stabilization.kind ==
                   generic::RegularizationKind::igr,
-              ranks, request.time_treatment)
+              ranks, request.time_treatment, request.polynomial_order)
         : trace_policy;
     return InitializeAdmitted(config, admitted_trace_policy);
   }
@@ -1599,6 +1599,10 @@ private:
              generic::RegularizationKind::igr);
     const bool time_treatment_abi =
         generic::IsKnownEulerHdgTimeTreatment(config.time_treatment) &&
+        (trace_policy.requested_selection !=
+             cuda_w8a::CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh ||
+         config.time_treatment ==
+             generic::EulerHdgTimeTreatment::backward_euler) &&
         (!partitioned_backward_euler ||
          partitioned_backward_euler_configuration);
     int ranks = 0;

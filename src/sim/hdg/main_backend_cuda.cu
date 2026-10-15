@@ -1505,7 +1505,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             DefaultCudaTracePolicyRequest(
                 cuda_engine,
                 regularization_request.kind == RegularizationKind::igr,
-                ranks, time_treatment));
+                ranks, time_treatment, request.options.order));
         if (!CudaTracePolicyDescriptorIsExact(trace_policy))
           reason = "CUDA HDG trace policy resolution failed";
       }

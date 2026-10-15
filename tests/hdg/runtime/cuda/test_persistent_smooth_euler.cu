@@ -3821,6 +3821,74 @@ constexpr bool OrdinaryRankOneRefreshRoutingPolicy() noexcept
 static_assert(OrdinaryRankOneRefreshRoutingPolicy(),
               "only exact ordinary refresh-each policies use the lean solve");
 
+constexpr bool OrdinaryJacobiRefreshDescriptorPolicy() noexcept
+{
+  using dg::hdg::generic::CudaEngineKind;
+  using dg::hdg::generic::EulerHdgTimeTreatment;
+  constexpr auto selection =
+      CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+  const auto candidate = dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true, 1, 3, selection);
+  auto expected = dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true, 1, 3,
+      CudaTracePolicyKind::engine_default);
+  expected.requested_selection = selection;
+  expected.resolved_selection = selection;
+  expected.ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKind::iterative_jacobi;
+  expected.ilu_lower_jacobi_iterations = 5;
+  expected.ilu_upper_jacobi_iterations = 5;
+  if (!CudaTracePolicyDescriptorIsExact(candidate) ||
+      !CudaTracePolicyDescriptorExact(candidate, expected) ||
+      candidate.ilu_factor_reuse_policy !=
+          CudaIluFactorReusePolicy::refresh_each_trace_solve ||
+      CudaOrdinaryRankOneRefreshPolicyIsExact(candidate) ||
+      std::string_view(CudaTracePolicyKindName(selection)) !=
+          "ordinary-ilu-jacobi5-refresh" ||
+      ResolveCudaTracePolicy(CudaEngineKind::ordinary, false, selection).valid ||
+      ResolveCudaTracePolicy(CudaEngineKind::tensor_core, true, selection).valid ||
+      dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+          CudaEngineKind::ordinary, true, 2, 3, selection).valid)
+    return false;
+  auto stale = candidate;
+  stale.ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+  auto fewer_sweeps = candidate;
+  fewer_sweeps.ilu_lower_jacobi_iterations = 4;
+  for (const int order : {0, 1, 2, 4, 10})
+    if (DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+            EulerHdgTimeTreatment::backward_euler, order) !=
+        CudaTracePolicyKind::engine_default)
+      return false;
+  return !CudaTracePolicyDescriptorIsExact(stale) &&
+      !CudaTracePolicyDescriptorIsExact(fewer_sweeps) &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::backward_euler, 3) == selection &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::backward_euler) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::rodas3, 3) == CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::partitioned_backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 2,
+          EulerHdgTimeTreatment::backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, false, 1,
+          EulerHdgTimeTreatment::backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::tensor_core, true, 1,
+          EulerHdgTimeTreatment::backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      CudaTracePolicyDescriptorIsExact(
+          dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::ordinary, true, 1, 4, selection));
+}
+
+static_assert(OrdinaryJacobiRefreshDescriptorPolicy(),
+              "ordinary Jacobi defaults only to p3 fresh BE factors; explicit policy stays available");
+
 constexpr bool DiagScaleSetupOrderPolicy() noexcept
 {
   using dg::hdg::generic::CudaEngineKind;
@@ -4848,6 +4916,46 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
       ordinary_evidence.ilu_jacobi_factor_spmv_updates_lower_bound != 0 ||
       ordinary_evidence.ilu_jacobi_factor_spmv_updates_upper_bound != 0 ||
       !ordinary_evidence.ilu_accounting_complete)
+    return false;
+
+  CudaTensorCoreEvidence jacobi_refresh_evidence{};
+  jacobi_refresh_evidence.selected_engine = CudaEngineKind::ordinary;
+  jacobi_refresh_evidence.requested_trace_policy =
+      CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+  jacobi_refresh_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+  jacobi_refresh_evidence.trace_policy_rank_count = 1;
+  jacobi_refresh_evidence.trace_policy_order = 3;
+  auto jacobi_refresh = IluDiagnostics(
+      true, CudaEngineKind::ordinary,
+      CudaIluFactorReusePolicy::refresh_each_trace_solve, 1, 0, 0, 9);
+  jacobi_refresh.ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKind::iterative_jacobi;
+  jacobi_refresh.ilu_lower_jacobi_iterations = 5;
+  jacobi_refresh.ilu_upper_jacobi_iterations = 5;
+  jacobi_refresh.ilu_jacobi_factor_spmv_updates_lower_bound =
+      8 * jacobi_refresh.ilu_inner_iterations_lower_bound;
+  jacobi_refresh.ilu_jacobi_factor_spmv_updates_upper_bound =
+      8 * jacobi_refresh.ilu_inner_iterations_upper_bound;
+  if (!CudaInitializeIluEvidence(jacobi_refresh_evidence,
+          CudaTracePreconditionerKind::hypre_ilu0, true) ||
+      !CudaAccumulateIluSolveEvidence(jacobi_refresh_evidence, jacobi_refresh) ||
+      !CudaAccumulateIluSolveEvidence(jacobi_refresh_evidence, jacobi_refresh) ||
+      jacobi_refresh_evidence.ilu_factor_setups != 2 ||
+      jacobi_refresh_evidence.ilu_factor_reuses != 0 ||
+      jacobi_refresh_evidence.ilu_factor_age_generations != 0 ||
+      jacobi_refresh_evidence.ilu_jacobi_factor_spmv_updates_lower_bound !=
+          8 * jacobi_refresh_evidence.ilu_inner_iterations_lower_bound ||
+      jacobi_refresh_evidence.ilu_jacobi_factor_spmv_updates_upper_bound !=
+          8 * jacobi_refresh_evidence.ilu_inner_iterations_upper_bound ||
+      !jacobi_refresh_evidence.ilu_accounting_complete)
+    return false;
+  auto stale_jacobi = jacobi_refresh;
+  stale_jacobi.ilu_factor_setups = 0;
+  stale_jacobi.ilu_factor_reuses = 1;
+  stale_jacobi.ilu_factor_age_generations = 1;
+  auto stale_jacobi_evidence = jacobi_refresh_evidence;
+  if (CudaAccumulateIluSolveEvidence(stale_jacobi_evidence, stale_jacobi))
     return false;
 
   CudaTensorCoreEvidence tensor_igr_evidence{};

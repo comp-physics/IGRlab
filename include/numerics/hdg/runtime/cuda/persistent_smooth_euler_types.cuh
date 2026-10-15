@@ -350,7 +350,7 @@ inline bool IsCudaAbsentBorrowedGlobalTopologyIdentity(
   return value.empty();
 }
 
-/** Benchmark-only selection of the trace-solver policy under comparison. */
+/** Typed trace-solver policy, including explicit benchmark selections. */
 enum class CudaTracePolicyKind : std::uint8_t
 {
   engine_default = 0,
@@ -405,7 +405,8 @@ enum class CudaTracePolicyKind : std::uint8_t
   native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64 = 29,
   native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64 = 30,
   native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64 =
-      31
+      31,
+  ordinary_ilu_jacobi5_refresh = 32
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -413,6 +414,7 @@ constexpr bool IsKnownCudaTracePolicyKind(
 {
   return kind == CudaTracePolicyKind::engine_default ||
       kind == CudaTracePolicyKind::common_fast ||
+      kind == CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh ||
       kind == CudaTracePolicyKind::equilibrated_mgr ||
       kind == CudaTracePolicyKind::native_element_schwarz_fp64 ||
       kind ==
@@ -482,6 +484,8 @@ constexpr const char* CudaTracePolicyKindName(
     return "engine-default";
   case CudaTracePolicyKind::common_fast:
     return "common-fast";
+  case CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh:
+    return "ordinary-ilu-jacobi5-refresh";
   case CudaTracePolicyKind::equilibrated_mgr:
     return "equilibrated-mgr";
   case CudaTracePolicyKind::native_element_schwarz_fp64:
@@ -1885,13 +1889,23 @@ struct CudaTracePolicyDescriptor
  * qualified rank-one conventional tensor surface, request the persistent
  * matrix-free trace action and retained element-Schwarz factors explicitly so
  * consensus, provenance, and the engine all describe the same architecture.
- * Every pre-existing mode keeps the engine-default request.
+ * Rank-one ordinary IGR Backward Euler at p3 selects fresh-factor Jacobi
+ * triangular application. Other existing selections remain unchanged.
+ * An omitted order preserves legacy callers without selecting the trial.
  */
 constexpr CudaTracePolicyKind DefaultCudaTracePolicyRequest(
     const generic::CudaEngineKind engine, const bool igr_active,
     const int rank_count,
-    const generic::EulerHdgTimeTreatment time_treatment) noexcept
+    const generic::EulerHdgTimeTreatment time_treatment,
+    const int polynomial_order = 0) noexcept
 {
+  // Use the existing HYPRE Jacobi triangular application with a fresh
+  // current-matrix factor on every solve. Keep common-shift and rank-two
+  // routes and orders outside p3 on their established policies.
+  if (engine == generic::CudaEngineKind::ordinary && igr_active &&
+      rank_count == 1 && polynomial_order == 3 &&
+      time_treatment == generic::EulerHdgTimeTreatment::backward_euler)
+    return CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
   return engine == generic::CudaEngineKind::tensor_core && !igr_active &&
           rank_count == 1 &&
           time_treatment == generic::EulerHdgTimeTreatment::rodas3
@@ -1923,8 +1937,8 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   // attempts the fast equilibrated lower field split on every new matrix and
   // selects its fully coupled tensor-native leaf only for an exact structural
   // applicability rejection.  Rank two retains the explicitly reported
-  // host-staged HYPRE route.  Non-default selectors remain explicit rank-one
-  // ablations.
+  // host-staged HYPRE route. Other selectors require rank one and retain
+  // their individual engine/mode admission.
   if (requested_selection == CudaTracePolicyKind::engine_default &&
       engine == generic::CudaEngineKind::tensor_core && igr_active &&
       rank_count == 1)
@@ -2113,6 +2127,10 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
     return result;
   }
 
+  if (selection == CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh &&
+      (engine != generic::CudaEngineKind::ordinary || !igr_active))
+    return result;
+
   // common-fast deliberately gives both CUDA engines the already-qualified
   // tensor trace policy.  This changes only the benchmark trace leaf; the
   // selected CUDA engine continues to control condensation and tensor work.
@@ -2140,6 +2158,13 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       : CudaIluAccountingKind::unavailable;
   result.ilu_factor_reuse_policy =
       CudaIluFactorReusePolicyForEngine(policy_engine, igr_active);
+  if (selection == CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh)
+  {
+    result.ilu_triangular_solve_kind =
+        CudaIluTriangularSolveKind::iterative_jacobi;
+    result.ilu_lower_jacobi_iterations = 5;
+    result.ilu_upper_jacobi_iterations = 5;
+  }
   result.valid = true;
   return result;
 }

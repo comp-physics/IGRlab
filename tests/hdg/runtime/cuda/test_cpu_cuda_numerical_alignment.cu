@@ -1053,7 +1053,7 @@ CudaTracePolicyKind SelectedCudaTracePolicy(
     return selection.tensor_igr_trace_policy;
   return dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
       engine, regularization == RegularizationKind::igr, 1,
-      selection.time_treatment);
+      selection.time_treatment, selection.order);
 }
 
 EulerHdgRequest MakeRequest(
