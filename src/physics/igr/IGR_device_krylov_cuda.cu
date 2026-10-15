@@ -180,7 +180,8 @@ protected:
   void TrueResidual(const mfem::Vector& b, const mfem::Vector& x) const
   {
     oper->Mult(x, action_);
-    mfem::subtract(b, action_, residual_);
+    // MFEM declares this vector operation as a hidden friend; use ADL.
+    subtract(b, action_, residual_);
   }
   void InitialResidual(const mfem::Vector& b, mfem::Vector& x) const
   {
