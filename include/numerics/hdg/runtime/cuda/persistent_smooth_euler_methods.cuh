@@ -94,6 +94,66 @@ inline int CudaDecodeSigned(const int encoded, double& sign) noexcept
   return encoded >= 0 ? encoded : -1 - encoded;
 }
 
+// Temporary host setup scratch, never retained by an engine. CSR row ranges
+// are disjoint, so an index outside the current row is a stale lookup entry;
+// no O(number of true rows) clear is needed when switching rows.
+class CudaSparseOwnedRowLookup
+{
+public:
+  static constexpr std::size_t maximum_bytes = 16 * 1024 * 1024;
+
+  bool Initialize(const int columns) noexcept
+  {
+    targets_.clear();
+    begin_ = end_ = -1;
+    if (columns <= 0 || static_cast<std::size_t>(columns) >
+                            maximum_bytes / sizeof(int))
+      return false;
+    try
+    {
+      targets_.assign(static_cast<std::size_t>(columns), -1);
+      return true;
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  bool Admits(const int column) const noexcept
+  {
+    return column >= 0 &&
+        static_cast<std::size_t>(column) < targets_.size();
+  }
+
+  int Find(const std::vector<int>& columns, const int begin,
+           const int end, const int column) noexcept
+  {
+    if (!Admits(column)) return -1;
+    if (begin != begin_ || end != end_)
+    {
+      // Last write wins: walking backwards retains the first CSR occurrence,
+      // including a diagonal-first entry and any unsorted duplicate columns.
+      for (int entry = end; entry > begin;)
+      {
+        --entry;
+        const int owned_column = columns[static_cast<std::size_t>(entry)];
+        if (Admits(owned_column))
+          targets_[static_cast<std::size_t>(owned_column)] = entry;
+      }
+      begin_ = begin;
+      end_ = end;
+    }
+    const int target = targets_[static_cast<std::size_t>(column)];
+    return target >= begin && target < end ? target : -1;
+  }
+
+private:
+  std::vector<int> targets_{};
+  int begin_ = -1;
+  int end_ = -1;
+};
+
 inline bool CudaEvaluateStaticExteriorStateHost(
     const CudaStaticBoundaryPolicy& policy,
     const std::array<double, conserved_components>& interior,
@@ -201,8 +261,11 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
 {
-  const bool explicit_initial_true_trace = shape_.borrowed_host_inputs &&
-      config.borrowed_initial_true_trace.coefficients != nullptr;
+  // Borrowed input initialization below replaces every interior and owned
+  // true-trace coefficient before either state slot is uploaded. Its trace
+  // restriction depends on the supplied interior, never the manufactured
+  // seed. Keep the topology/map checks here without evaluating unused data.
+  const bool manufactured_initial_state = !shape_.borrowed_host_inputs;
   std::vector<double> local_exact_trace(
       static_cast<std::size_t>(shape_.local_trace_count), 0.0);
   std::vector<double> local_perturbed_trace(
@@ -255,6 +318,10 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       }
     }
   }
+  const mfem::FiniteElement* reference_shape_element = nullptr;
+  std::vector<double> reference_volume_shape(
+      static_cast<std::size_t>(shape_.volume_points) *
+          shape_.scalar_interior_dofs);
   for (int element = 0; element < shape_.elements; ++element)
   {
     const mfem::FiniteElement* fe = interior_space_->GetFE(element);
@@ -287,24 +354,28 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
     }
     const mfem::IntegrationRule& nodes = fe->GetNodes();
     if (nodes.GetNPoints() != shape_.scalar_interior_dofs) { return false; }
-    for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+    if (manufactured_initial_state)
     {
-      mfem::Vector physical(dimension);
-      transformation->Transform(nodes.IntPoint(scalar), physical);
-      double exact[conserved_components], perturbed[conserved_components];
-      CudaManufacturedState(physical[0], physical[1], exact);
-      CudaPerturbedState(physical[0], physical[1], perturbed);
-      for (int component = 0; component < conserved_components; ++component)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
       {
-        const int local = scalar + shape_.scalar_interior_dofs * component;
-        const std::size_t index = static_cast<std::size_t>(element) *
-                                      shape_.interior_dofs + local;
-        host_exact_interior_[index] = exact[component];
-        host_perturbed_interior_[index] = perturbed[component];
+        mfem::Vector physical(dimension);
+        transformation->Transform(nodes.IntPoint(scalar), physical);
+        double exact[conserved_components], perturbed[conserved_components];
+        CudaManufacturedState(physical[0], physical[1], exact);
+        CudaPerturbedState(physical[0], physical[1], perturbed);
+        for (int component = 0; component < conserved_components; ++component)
+        {
+          const int local = scalar + shape_.scalar_interior_dofs * component;
+          const std::size_t index = static_cast<std::size_t>(element) *
+                                        shape_.interior_dofs + local;
+          host_exact_interior_[index] = exact[component];
+          host_perturbed_interior_[index] = perturbed[component];
+        }
       }
     }
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
         fe->GetGeomType(), shape_.volume_assembly_order);
+    const bool rebuild_reference_shape = reference_shape_element != fe;
     mfem::Vector shape(shape_.scalar_interior_dofs), physical(dimension);
     mfem::DenseMatrix derivative(shape_.scalar_interior_dofs, dimension);
     for (int q = 0; q < shape_.volume_points; ++q)
@@ -312,7 +383,14 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
       transformation->SetIntPoint(&point);
       transformation->Transform(point, physical);
-      fe->CalcShape(point, shape);
+      if (rebuild_reference_shape)
+      {
+        fe->CalcShape(point, shape);
+        for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+          reference_volume_shape[
+              static_cast<std::size_t>(q) * shape_.scalar_interior_dofs +
+              scalar] = shape[scalar];
+      }
       fe->CalcPhysDShape(*transformation, derivative);
       const std::size_t quadrature =
           static_cast<std::size_t>(element) * shape_.volume_points + q;
@@ -324,13 +402,16 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
       {
         host_volume_shape_[quadrature * shape_.scalar_interior_dofs + scalar] =
-            shape[scalar];
+            reference_volume_shape[
+                static_cast<std::size_t>(q) * shape_.scalar_interior_dofs +
+                scalar];
         for (int direction = 0; direction < dimension; ++direction)
           host_volume_derivative_[
               (quadrature * shape_.scalar_interior_dofs + scalar) * dimension +
               direction] = derivative(scalar, direction);
       }
     }
+    reference_shape_element = fe;
 
     mfem::Array<int> faces, orientations;
     mesh_->GetElementEdges(element, faces, orientations);
@@ -377,11 +458,11 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       const mfem::IntegrationRule& face_nodes = trace_fe->GetNodes();
       for (int scalar = 0; scalar < shape_.scalar_face_dofs; ++scalar)
       {
-        mfem::Vector face_physical(dimension);
-        ft->Face->Transform(face_nodes.IntPoint(scalar), face_physical);
         double exact[conserved_components]{}, perturbed[conserved_components]{};
-        if (!explicit_initial_true_trace)
+        if (manufactured_initial_state)
         {
+          mfem::Vector face_physical(dimension);
+          ft->Face->Transform(face_nodes.IntPoint(scalar), face_physical);
           CudaManufacturedState(face_physical[0], face_physical[1], exact);
           CudaPerturbedState(face_physical[0], face_physical[1], perturbed);
         }
@@ -494,7 +575,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
         return false;
       owned_global_true_[static_cast<std::size_t>(entry.local_true_dof)] =
           static_cast<std::int64_t>(entry.global_true_dof);
-      if (!explicit_initial_true_trace)
+      if (manufactured_initial_state)
       {
         host_exact_true_trace_[static_cast<std::size_t>(entry.local_true_dof)] =
             local_exact_trace[static_cast<std::size_t>(entry.local_dof)];
@@ -1356,6 +1437,7 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildPersistentTrueSystem() noexcept
 {
+  ::igrlab::NVTXRange setup_profile_region("HDG persistent true-system setup");
   const CudaTracePolicyDescriptor& trace_policy = trace_policy_descriptor_;
   if (!CudaTracePolicyDescriptorIsExact(trace_policy) ||
       trace_policy.igr_active != shape_.igr_active)
@@ -1694,6 +1776,19 @@ BuildPersistentTrueSystem() noexcept
       TransportPolicy::Synchronize(CudaTransferSite::initial_trace_upload);
   if (!CollectiveContinue(staging_ready))
     return false;
+  if (borrowed_topology_ && shape_.borrowed_host_inputs)
+  {
+    // Uploads are complete. Runtime assembly reads device maps; Schwarz
+    // retains only its scalar shape/multiplicity metadata on the host.
+    std::vector<int>{}.swap(host_matrix_owned_source_);
+    std::vector<int>{}.swap(host_matrix_owned_section_);
+    std::vector<int>{}.swap(host_matrix_owned_target_);
+    std::vector<int>{}.swap(element_schwarz_plan_.signed_element_true_dofs);
+    std::vector<int>{}.swap(element_schwarz_plan_.first_element_sources);
+    std::vector<int>{}.swap(element_schwarz_plan_.second_element_sources);
+    std::vector<int>{}.swap(element_schwarz_plan_.true_multiplicity);
+    std::vector<int>{}.swap(element_schwarz_plan_.true_incidence_slots);
+  }
   // Materialize the exact Krylov/factor allocation footprint before the
   // allocation baseline. The topology matrix is deliberately diagonally
   // dominant here; each real generation overwrites only its already-fixed
@@ -2065,13 +2160,15 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildSparseStagingPlan() noexcept
 {
+  ::igrlab::NVTXRange staging_profile_region("HDG sparse staging plan");
   // The generic true graph is persistent, so resolve its topology once.  The
   // old staging builder linearly scanned every owned true row for every dense
   // element-Schur entry.  That made setup O(E * n_t^2 * N_true), even for the
   // native rank-one matrix-free operator.  Keep the exact CSR staging needed
   // by the independent residual and robust native checks, but resolve local
-  // rows directly and use logarithmic searches wherever immutable row
-  // topology is sorted (with a bounded row-local fallback otherwise).
+  // rows directly. A bounded temporary row lookup avoids a CSR search for
+  // every local element-Schur column; the original searches remain available
+  // if the scratch allocation is unavailable or a column is outside it.
   std::vector<std::pair<std::int64_t, int>> owned_row_lookup;
   std::vector<unsigned char> diag_tail_sorted;
   std::vector<unsigned char> offd_sorted;
@@ -2142,6 +2239,9 @@ BuildSparseStagingPlan() noexcept
   }
   if (!CollectiveContinue(structure_searchable)) return false;
 
+  CudaSparseOwnedRowLookup owned_row_targets;
+  (void)owned_row_targets.Initialize(shape_.true_trace_count);
+
   const auto find_row = [&](const std::int64_t global)
   {
     const auto found = std::lower_bound(
@@ -2163,6 +2263,15 @@ BuildSparseStagingPlan() noexcept
           static_cast<std::size_t>(row)];
       const int end = true_structure_.diag_offsets[
           static_cast<std::size_t>(row + 1)];
+      if (owned_row_targets.Admits(owned_column))
+      {
+        const int found = owned_row_targets.Find(
+            true_structure_.diag_columns, begin, end, owned_column);
+        if (found < 0) return false;
+        section = 0;
+        target = found;
+        return true;
+      }
       if (begin < end && true_structure_.diag_columns[
               static_cast<std::size_t>(begin)] == owned_column)
       {
@@ -2226,88 +2335,91 @@ BuildSparseStagingPlan() noexcept
   };
 
   bool local_plan_valid = true;
-  for (int element = 0; element < shape_.elements; ++element)
-    for (int row = 0; row < shape_.trace_dofs; ++row)
-    {
-      double row_sign = 1.0;
-      const int row_local = CudaDecodeSigned(
-          signed_element_trace_[static_cast<std::size_t>(element) *
-                                    shape_.trace_dofs + row], row_sign);
-      const std::int64_t row_global =
-          local_global_true_[static_cast<std::size_t>(row_local)];
-      const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
-      const int true_row = row_owner == rank_
-          ? local_true_index_[static_cast<std::size_t>(row_local)] : -1;
-      const int vector_source = element * shape_.trace_dofs + row;
-      if (row_owner == rank_)
+  {
+    ::igrlab::NVTXRange mapping_profile_region("HDG sparse staging local maps");
+    for (int element = 0; element < shape_.elements; ++element)
+      for (int row = 0; row < shape_.trace_dofs; ++row)
       {
-        if (true_row < 0)
-        {
-          local_plan_valid = false;
-        }
-        else
-        {
-          host_vector_owned_source_[static_cast<std::size_t>(
-              shape_.vector_owned_count)] = vector_source;
-          host_vector_owned_target_[static_cast<std::size_t>(
-              shape_.vector_owned_count)] = true_row;
-          ++shape_.vector_owned_count;
-        }
-      }
-      else
-      {
-        host_vector_send_source_[static_cast<std::size_t>(
-            shape_.vector_send_count)] = vector_source;
-        vector_send_keys_[static_cast<std::size_t>(shape_.vector_send_count)] =
-            row_global;
-        ++shape_.vector_send_count;
-      }
-      for (int column = 0; column < shape_.trace_dofs; ++column)
-      {
-        double column_sign = 1.0;
-        const int column_local = CudaDecodeSigned(
+        double row_sign = 1.0;
+        const int row_local = CudaDecodeSigned(
             signed_element_trace_[static_cast<std::size_t>(element) *
-                                      shape_.trace_dofs + column],
-            column_sign);
-        const std::int64_t column_global =
-            local_global_true_[static_cast<std::size_t>(column_local)];
-        const int column_owner =
-            local_owner_[static_cast<std::size_t>(column_local)];
-        const int owned_column = column_owner == rank_
-            ? local_true_index_[static_cast<std::size_t>(column_local)] : -1;
-        const int source = (element * shape_.trace_dofs + row) *
-                               shape_.trace_dofs + column;
+                                      shape_.trace_dofs + row], row_sign);
+        const std::int64_t row_global =
+            local_global_true_[static_cast<std::size_t>(row_local)];
+        const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
+        const int true_row = row_owner == rank_
+            ? local_true_index_[static_cast<std::size_t>(row_local)] : -1;
+        const int vector_source = element * shape_.trace_dofs + row;
         if (row_owner == rank_)
         {
-          int section = -1, target = -1;
-          if (!find_target(
-                  true_row, owned_column, column_global, section, target))
+          if (true_row < 0)
           {
             local_plan_valid = false;
           }
           else
           {
-            host_matrix_owned_source_[static_cast<std::size_t>(
-                shape_.matrix_owned_count)] = source;
-            host_matrix_owned_section_[static_cast<std::size_t>(
-                shape_.matrix_owned_count)] = section;
-            host_matrix_owned_target_[static_cast<std::size_t>(
-                shape_.matrix_owned_count)] = target;
-            ++shape_.matrix_owned_count;
+            host_vector_owned_source_[static_cast<std::size_t>(
+                shape_.vector_owned_count)] = vector_source;
+            host_vector_owned_target_[static_cast<std::size_t>(
+                shape_.vector_owned_count)] = true_row;
+            ++shape_.vector_owned_count;
           }
         }
         else
         {
-          host_matrix_send_source_[static_cast<std::size_t>(
-              shape_.matrix_send_count)] = source;
-          matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count)] =
+          host_vector_send_source_[static_cast<std::size_t>(
+              shape_.vector_send_count)] = vector_source;
+          vector_send_keys_[static_cast<std::size_t>(shape_.vector_send_count)] =
               row_global;
-          matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count) + 1] =
-              column_global;
-          ++shape_.matrix_send_count;
+          ++shape_.vector_send_count;
+        }
+        for (int column = 0; column < shape_.trace_dofs; ++column)
+        {
+          double column_sign = 1.0;
+          const int column_local = CudaDecodeSigned(
+              signed_element_trace_[static_cast<std::size_t>(element) *
+                                        shape_.trace_dofs + column],
+              column_sign);
+          const std::int64_t column_global =
+              local_global_true_[static_cast<std::size_t>(column_local)];
+          const int column_owner =
+              local_owner_[static_cast<std::size_t>(column_local)];
+          const int owned_column = column_owner == rank_
+              ? local_true_index_[static_cast<std::size_t>(column_local)] : -1;
+          const int source = (element * shape_.trace_dofs + row) *
+                                 shape_.trace_dofs + column;
+          if (row_owner == rank_)
+          {
+            int section = -1, target = -1;
+            if (!find_target(
+                    true_row, owned_column, column_global, section, target))
+            {
+              local_plan_valid = false;
+            }
+            else
+            {
+              host_matrix_owned_source_[static_cast<std::size_t>(
+                  shape_.matrix_owned_count)] = source;
+              host_matrix_owned_section_[static_cast<std::size_t>(
+                  shape_.matrix_owned_count)] = section;
+              host_matrix_owned_target_[static_cast<std::size_t>(
+                  shape_.matrix_owned_count)] = target;
+              ++shape_.matrix_owned_count;
+            }
+          }
+          else
+          {
+            host_matrix_send_source_[static_cast<std::size_t>(
+                shape_.matrix_send_count)] = source;
+            matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count)] =
+                row_global;
+            matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count) + 1] =
+                column_global;
+            ++shape_.matrix_send_count;
+          }
         }
       }
-    }
+  }
 
   if (!CollectiveContinue(local_plan_valid)) { return false; }
   if (ranks_ == 2)
@@ -2409,6 +2521,7 @@ BuildSparseStagingPlan() noexcept
           trace_policy_descriptor_.trace_preconditioner);
   if (use_element_schwarz)
   {
+    ::igrlab::NVTXRange schwarz_profile_region("HDG sparse staging Schwarz plan");
     const int expected_patch_rows =
         NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
     const bool direct_rank_one = ranks_ == 1 &&
@@ -2463,6 +2576,7 @@ BuildSparseStagingPlan() noexcept
         destination, source, static_cast<std::size_t>(count) * sizeof(int),
         CudaTransferCategory::topology, CudaTransferSite::map_upload);
   };
+  ::igrlab::NVTXRange upload_profile_region("HDG sparse staging upload");
   bool uploaded = upload(
                 view_.matrix_owned_source, host_matrix_owned_source_.data(),
                 shape_.matrix_owned_count) &&
@@ -2542,8 +2656,16 @@ BindStateSlots() noexcept
       view_.work_true_trace,
       static_cast<std::size_t>(shape_.true_trace_count), {}, {}, 0,
       reinterpret_cast<std::uintptr_t>(view_.work_true_trace), 0, false, true};
-  return UpdateStateHashes(committed_slot_) &&
-      UpdateStateHashes(candidate_slot_);
+  if (!UpdateStateHashes(committed_slot_)) { return false; }
+  // UploadTopologyAndState and BuildPersistentTrueSystem have completed and
+  // synchronized successful uploads of the same host interior/trace bytes to
+  // both slots. Only their storage identities differ. As with a checked state
+  // copy, transfer the hash metadata; all later mutable-state audits remain.
+  candidate_slot_.interior.local_hash = committed_slot_.interior.local_hash;
+  candidate_slot_.interior.hash = committed_slot_.interior.hash;
+  candidate_slot_.trace.local_hash = committed_slot_.trace.local_hash;
+  candidate_slot_.trace.hash = committed_slot_.trace.hash;
+  return true;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>

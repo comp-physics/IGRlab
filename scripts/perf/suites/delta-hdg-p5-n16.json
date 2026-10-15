@@ -1,0 +1,89 @@
+{
+  "cases": [
+    {
+      "adapter": "dg",
+      "binary": "dgsem_smooth_advection_periodic",
+      "enabled": true,
+      "id": "hdg-igr-cuda-p5-n16",
+      "optional": false,
+      "parameters": {
+        "active_igr_wave": true,
+        "atol": 5e-09,
+        "c_alpha": 1,
+        "device": "cuda",
+        "dgsem_residual": "unfused",
+        "discretization": "hdg",
+        "dt": 1e-05,
+        "engine": "ordinary",
+        "final_time": 0.0001,
+        "igr_alpha_length": "min",
+        "mesh": "examples/hdg_smooth_transition_research/hdg_smooth_transition_periodic_n8.mesh",
+        "order": 5,
+        "regularization": "igr",
+        "rtol": 5e-08,
+        "serial_refine": 1
+      },
+      "profile": {
+        "kernel_groups": {
+          "condensation": "BorrowedCondenseKernel",
+          "face": "BorrowedEulerFaceKernel",
+          "recovery": "BorrowedRetainedLuRecoverKernel",
+          "triangular_solve": "cusparse::spsm_v2_kernel",
+          "volume": "BorrowedEulerVolumeKernel"
+        },
+        "kernel_regex": ".*(?:BorrowedEulerVolumeKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|BorrowedRetainedLuRecoverKernel|cusparse::spsm_v2_kernel).*",
+        "launch_count": 32,
+        "launch_skip": 0,
+        "selection": "first-per-kernel",
+        "timeout": 120
+      }
+    },
+    {
+      "adapter": "dg",
+      "binary": "dgsem_smooth_advection_periodic",
+      "enabled": true,
+      "id": "hdg-igr-tensor-p5-n16",
+      "optional": false,
+      "parameters": {
+        "active_igr_wave": true,
+        "atol": 5e-09,
+        "c_alpha": 1,
+        "device": "cuda",
+        "dgsem_residual": "unfused",
+        "discretization": "hdg",
+        "dt": 1e-05,
+        "engine": "tensor",
+        "final_time": 0.0001,
+        "igr_alpha_length": "min",
+        "mesh": "examples/hdg_smooth_transition_research/hdg_smooth_transition_periodic_n8.mesh",
+        "order": 5,
+        "regularization": "igr",
+        "rtol": 5e-08,
+        "serial_refine": 1
+      },
+      "profile": {
+        "kernel_groups": {
+          "condensation": "BorrowedCondenseKernel",
+          "face": "BorrowedEulerFaceKernel",
+          "recovery": "(?:TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel)",
+          "trace_solve": "NativeRankOneTraceSolveKernel",
+          "volume_coefficients": "BorrowedEulerTensorVolumeCoefficientKernel",
+          "volume_contraction": "BorrowedEulerTensorVolumeContractionKernel"
+        },
+        "kernel_regex": ".*(?:BorrowedEulerTensorVolumeCoefficientKernel|BorrowedEulerTensorVolumeContractionKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel|NativeRankOneTraceSolveKernel|ElementSchwarz).*",
+        "launch_count": 32,
+        "launch_skip": 0,
+        "selection": "first-per-kernel",
+        "timeout": 120
+      }
+    }
+  ],
+  "command_timeout_seconds": 120,
+  "correctness_regex": "^dg_igr_hdg_runtime_cuda_(cpu_numerical_alignment_p5_rank1|generic_euler_extension_p5_(ordinary|tensor)_rank1)$",
+  "name": "delta-hdg-p5-n16",
+  "profiles_budget_seconds": 240,
+  "repetitions": 3,
+  "schema_version": 1,
+  "timings_budget_seconds": 480,
+  "warmups": 1
+}

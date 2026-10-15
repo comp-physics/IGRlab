@@ -29,6 +29,16 @@ set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_tensor_volume_chunks
+  COMMAND dg_igr_hdg_runtime_cuda_w8a_leaf --tensor-volume-chunks)
+set_tests_properties(dg_igr_hdg_runtime_cuda_tensor_volume_chunks
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;tensor;assembly;failure"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 300)
+
 add_executable(dg_igr_hdg_runtime_cuda_hash_exact
   test_hash_exact.cu)
 target_include_directories(dg_igr_hdg_runtime_cuda_hash_exact
@@ -457,6 +467,41 @@ foreach(_order IN ITEMS 1 2 3)
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)
+  if(_order EQUAL 1 OR _order EQUAL 3)
+    set_property(TEST dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
+      APPEND PROPERTY LABELS "numerical-acceptance;numerical-smoke;backend-parity")
+  endif()
+endforeach()
+
+# Opt-in high-order validation uses the existing numerical gates on one
+# physical element and nine periodic IGR elements. One committed dt=1e-5
+# step checks CPU/ordinary/tensor parity; each engine lifecycle also checks
+# prepare/abort/retry/commit and copied input ownership at this order.
+foreach(_order IN ITEMS 4 5 7 10)
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+      --order ${_order} --high-order-smoke)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;conventional;physical;periodic;conservation;backend-parity;p${_order};research-order;numerical-acceptance;numerical-high-order"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 900)
+  foreach(_engine IN ITEMS ordinary tensor)
+    add_test(
+      NAME dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_${_engine}_rank1
+      COMMAND dg_igr_hdg_runtime_cuda_generic_euler_extension
+        --order ${_order} --engine ${_engine} --high-order-smoke)
+    set_tests_properties(
+      dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_${_engine}_rank1
+      PROPERTIES
+        LABELS "hdg;runtime;cuda;generic-euler;extension;${_engine};igr;conventional;physical;periodic;source;ownership;lifecycle;p${_order};research-order;numerical-acceptance;numerical-high-order"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 900)
+  endforeach()
 endforeach()
 
 # RODAS3 reuses the complete CPU/ordinary-CUDA/tensor-CUDA alignment fixture,
@@ -823,6 +868,10 @@ foreach(_regularization IN ITEMS conventional igr)
         PROCESSORS 1
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 7200)
+    if(_order EQUAL 1 OR _order EQUAL 3)
+      set_property(TEST dg_igr_hdg_runtime_cuda_generic_euler_convergence_${_regularization}_p${_order}_rank1
+        APPEND PROPERTY LABELS "numerical-acceptance;numerical-convergence")
+    endif()
   endforeach()
 endforeach()
 

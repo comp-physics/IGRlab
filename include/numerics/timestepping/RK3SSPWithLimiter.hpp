@@ -6,6 +6,7 @@
 #include "numerics/limiters/limiters.hpp" // brings limiter option types
 #include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
+#include "utils/diagnostics/euler_admissibility.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -295,6 +296,7 @@ private:
   int quad_order_ = igrlab::LimiterDefaults::kQuadOrder; // 0 => auto: 2*order+2
   int p_bisect_iters_ = igrlab::LimiterDefaults::kBisectIters;
   std::vector<int> face_quad_orders_;
+  igrlab::detail::EulerAdmissibilityCache admissibility_cache_;
   ParGridFunction* zhang_shu_active_field_ = nullptr;
   ParGridFunction* zhang_shu_theta_rho_field_ = nullptr;
   ParGridFunction* zhang_shu_theta_p_field_ = nullptr;
@@ -319,6 +321,7 @@ private:
     igrlab::RK3Defaults::kLimiterSteps; ///< <0 => optional limiters always on
   bool nan_scan_stages_ = false;
   bool stage_nan_detected_ = false;
+  mfem::Array<int> nonfinite_status_scratch_; // one reusable device result
   bool admissibility_scan_stages_ = false;
   bool stage_pair_capture_written_ = false;
   std::uint64_t state_generation_ = 0;

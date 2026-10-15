@@ -11,6 +11,7 @@
  */
 
 #include "numerics/hdg/runtime/cuda/native_cuda_architecture.hpp"
+#include "numerics/hdg/runtime/cuda/native_element_schwarz_plan.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -34,21 +35,29 @@ inline constexpr int native_trace_sigma_jacobi_maximum_sweeps = 10;
 inline constexpr double native_trace_sigma_jacobi_damping =
     0x1.5555555555555p-1;
 
-/** Exact conventional-Uhat4 p1--p3 quadrilateral patches. */
+/** Exact conventional-Uhat4 quadrilateral patches at the admitted orders. */
 constexpr bool NativeTraceConventionalElementSchwarzPatchRowsSupported(
     const int rows) noexcept
 {
-  return rows == 32 || rows == 48 || rows == 64;
+  constexpr int face_components = native_element_schwarz_faces *
+      native_element_schwarz_euler_trace_components;
+  return rows >= face_components * (generic::minimum_polynomial_order + 1) &&
+      rows % face_components == 0 &&
+      generic::PlanPolynomialShape(rows / face_components - 1).valid;
 }
 
-/** Exact IGR-Uhat4/sigmahat p1--p3 quadrilateral patches. */
+/** Exact IGR-Uhat4/sigmahat quadrilateral patches at the admitted orders. */
 constexpr bool NativeTraceIgrElementSchwarzPatchRowsSupported(
     const int rows) noexcept
 {
-  return rows == 40 || rows == 60 || rows == 80;
+  constexpr int face_components = native_element_schwarz_faces *
+      native_element_schwarz_igr_trace_components;
+  return rows >= face_components * (generic::minimum_polynomial_order + 1) &&
+      rows % face_components == 0 &&
+      generic::PlanPolynomialShape(rows / face_components - 1, true).valid;
 }
 
-/** Exact conventional and IGR p1--p3 quadrilateral patch union. */
+/** Exact conventional and IGR quadrilateral patch union. */
 constexpr bool NativeTraceElementSchwarzPatchRowsSupported(
     const int rows) noexcept
 {
@@ -62,6 +71,10 @@ static_assert(NativeTraceElementSchwarzPatchRowsSupported(48));
 static_assert(NativeTraceElementSchwarzPatchRowsSupported(60));
 static_assert(NativeTraceElementSchwarzPatchRowsSupported(64));
 static_assert(NativeTraceElementSchwarzPatchRowsSupported(80));
+static_assert(NativeTraceConventionalElementSchwarzPatchRowsSupported(176));
+static_assert(NativeTraceIgrElementSchwarzPatchRowsSupported(220));
+static_assert(NativeTraceConventionalElementSchwarzPatchRowsSupported(192));
+static_assert(NativeTraceIgrElementSchwarzPatchRowsSupported(240));
 static_assert(!NativeTraceElementSchwarzPatchRowsSupported(24));
 static_assert(!NativeTraceElementSchwarzPatchRowsSupported(72));
 static_assert(!NativeTraceIgrElementSchwarzPatchRowsSupported(32));

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <string_view>
 #include <type_traits>
@@ -26,6 +27,134 @@ using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::EulerHdgZhangShuPointSet;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
+
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(1)
+                  .igr_assembly_quadrature_orders.volume_order == 12);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(3)
+                  .igr_assembly_quadrature_orders.face_order == 12);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10)
+                  .conventional_assembly_quadrature_order == 22);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10)
+                  .igr_assembly_quadrature_orders.volume_order == 22);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10)
+                  .igr_assembly_quadrature_orders.face_order == 22);
+static_assert(dg::hdg::generic::PlanPolynomialShape(11).valid);
+static_assert(dg::hdg::generic::PlanPolynomialShape(11).interior_dofs == 576);
+static_assert(dg::hdg::generic::PlanPolynomialShape(11, true).interior_dofs ==
+              1008);
+static_assert(dg::hdg::generic::PlanPolynomialShape(11, true).trace_dofs == 240);
+static_assert(dg::hdg::generic::PlanPolynomialShape(12, true).valid);
+static_assert(dg::hdg::generic::PlanPolynomialShape(12, true)
+                  .scalar_interior_dofs == 169);
+static_assert(dg::hdg::generic::PlanPolynomialShape(12, true).interior_dofs ==
+              1183);
+static_assert(dg::hdg::generic::PlanPolynomialShape(12, true).trace_dofs == 260);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(11)
+                  .igr_assembly_quadrature_orders.volume_order == 24);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(12)
+                  .igr_assembly_quadrature_orders.face_order == 26);
+static_assert(!dg::hdg::generic::PlanPolynomialShape(
+    std::numeric_limits<int>::max()).valid);
+static_assert(!dg::hdg::generic::PlanPolynomialShape(
+    std::numeric_limits<int>::max(), true).valid);
+static_assert(!dg::hdg::generic::PlanPolynomialShape(
+    std::numeric_limits<int>::min(), true).valid);
+static_assert(dg::hdg::generic::ValidAssemblyQuadratureOrder(26));
+static_assert(!dg::hdg::generic::ValidAssemblyQuadratureOrder(0));
+static_assert(!dg::hdg::generic::ValidAssemblyQuadratureOrder(
+    std::numeric_limits<int>::max()));
+
+constexpr int FirstUnrepresentablePolynomialOrder(const bool igr) noexcept
+{
+  int order = 1;
+  while (dg::hdg::generic::PlanPolynomialShape(order, igr).valid) ++order;
+  return order;
+}
+
+// Independently check the first rejected dense row product. These boundaries
+// follow the int representation; they are not selected study-order limits.
+constexpr bool CheckDenseRepresentationBoundary(const bool igr) noexcept
+{
+  const int rejected = FirstUnrepresentablePolynomialOrder(igr);
+  const auto last = dg::hdg::generic::PlanPolynomialShape(rejected - 1, igr);
+  const std::uint64_t face = static_cast<std::uint64_t>(rejected) + 1;
+  const std::uint64_t interior = (igr ? 7u : 4u) * face * face;
+  return last.valid && !dg::hdg::generic::PlanPolynomialShape(rejected, igr).valid &&
+      static_cast<std::uint64_t>(last.interior_dofs) * last.interior_dofs <=
+          static_cast<std::uint64_t>(std::numeric_limits<int>::max()) &&
+      interior * interior >
+          static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+}
+static_assert(CheckDenseRepresentationBoundary(false));
+static_assert(CheckDenseRepresentationBoundary(true));
+
+constexpr bool CheckRankIndexBoundary(const bool igr) noexcept
+{
+  const auto shape = dg::hdg::generic::PlanPolynomialShape(12, igr);
+  const int maximum = std::numeric_limits<int>::max();
+  const int elements = maximum / shape.interior_dofs;
+  const int faces = maximum / (shape.trace_dofs / 4);
+  return dg::hdg::generic::PolynomialRankIndicesFitInt(shape, 0, 0) &&
+      dg::hdg::generic::PolynomialRankIndicesFitInt(shape, elements, faces) &&
+      !dg::hdg::generic::PolynomialRankIndicesFitInt(shape, elements + 1, faces) &&
+      !dg::hdg::generic::PolynomialRankIndicesFitInt(shape, elements, faces + 1) &&
+      !dg::hdg::generic::PolynomialRankIndicesFitInt(shape, -1, 0) &&
+      !dg::hdg::generic::PolynomialRankIndicesFitInt(shape, 0, -1);
+}
+static_assert(CheckRankIndexBoundary(false));
+static_assert(CheckRankIndexBoundary(true));
+static_assert(!dg::hdg::generic::PolynomialRankIndicesFitInt(
+    dg::hdg::generic::PolynomialShapePlan{}, 1, 1));
+
+constexpr bool CheckMalformedRankShape() noexcept
+{
+  dg::hdg::generic::PolynomialShapePlan malformed{};
+  malformed.valid = true;
+  return !dg::hdg::generic::PolynomialRankIndicesFitInt(malformed, 1, 1);
+}
+static_assert(CheckMalformedRankShape());
+
+constexpr int LargestRepresentableQuadratureOrder() noexcept
+{
+  int lower = 1;
+  int upper = std::numeric_limits<int>::max();
+  while (lower < upper)
+  {
+    const int middle = lower + (upper - lower) / 2 + 1;
+    if (dg::hdg::generic::ValidAssemblyQuadratureOrder(middle)) lower = middle;
+    else upper = middle - 1;
+  }
+  return lower;
+}
+
+constexpr bool CheckWorkspaceSliceBoundary(const bool igr) noexcept
+{
+  const auto shape = dg::hdg::generic::PlanPolynomialShape(12, igr);
+  const int elements = std::numeric_limits<int>::max() /
+      (shape.interior_dofs * shape.interior_dofs);
+  const int quadrature = shape.default_quadrature_order;
+  return dg::hdg::generic::PolynomialRankWorkspaceSlicesFitInt(
+             shape, elements, quadrature, quadrature) &&
+      !dg::hdg::generic::PolynomialRankWorkspaceSlicesFitInt(
+             shape, elements + 1, quadrature, quadrature) &&
+      !dg::hdg::generic::PolynomialRankWorkspaceSlicesFitInt(
+             shape, 0, quadrature, quadrature) &&
+      !dg::hdg::generic::PolynomialRankWorkspaceSlicesFitInt(
+             shape, -1, quadrature, quadrature) &&
+      !dg::hdg::generic::PolynomialRankWorkspaceSlicesFitInt(
+             shape, 1, std::numeric_limits<int>::max(), quadrature);
+}
+static_assert(CheckWorkspaceSliceBoundary(false));
+static_assert(CheckWorkspaceSliceBoundary(true));
+// A representable quadrature rule can still exceed the packed rank slices;
+// this must be detected without constructing the huge MFEM rule.
+static_assert(dg::hdg::generic::ValidAssemblyQuadratureOrder(
+    LargestRepresentableQuadratureOrder()));
+static_assert(!dg::hdg::generic::ValidAssemblyQuadratureOrder(
+    LargestRepresentableQuadratureOrder() + 1));
+static_assert(!dg::hdg::generic::PolynomialRankWorkspaceSlicesFitInt(
+    dg::hdg::generic::PlanPolynomialShape(1), 1,
+    LargestRepresentableQuadratureOrder(), 4));
 
 constexpr std::uint32_t all_cpu_capabilities =
     CapabilityBit(Capability::conforming_quadrilateral_mesh) |
@@ -200,12 +329,35 @@ bool CheckAcceptAndReject()
   {
     return false;
   }
-  request.polynomial_order = 4;
+  request.polynomial_order = std::numeric_limits<int>::max();
   if (ValidateEulerHdgRequest(request) !=
       ContractStatus::unsupported_polynomial_order)
   {
     return false;
   }
+  request.polynomial_order = FirstUnrepresentablePolynomialOrder(false);
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::unsupported_polynomial_order)
+    return false;
+  // This finite cohort checks metadata beyond p10 without constructing large
+  // finite-element spaces. The focused p10 runtime fixtures remain numerical.
+  for (int order = 1; order <= 12; ++order)
+  {
+    request = ValidRequest(mesh, initial);
+    request.polynomial_order = order;
+    request.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+    if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+      return false;
+    request.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
+    request.capabilities = all_cuda_capabilities;
+    if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+      return false;
+    request.backend.cuda_engine = CudaEngineKind::tensor_core;
+    if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+      return false;
+  }
+  request = ValidRequest(mesh, initial);
   request.polynomial_order = 1;
   request.capabilities &= ~CapabilityBit(Capability::cpu);
   if (ValidateEulerHdgRequest(request) != ContractStatus::missing_capability)
@@ -279,6 +431,21 @@ bool CheckAcceptAndReject()
       ContractStatus::invalid_numerical_policy)
   {
     return false;
+  }
+  request = ValidRequest(mesh, initial);
+  const std::array<int*, 5> quadrature_orders{{
+      &request.numerical_policy.volume_projection_quadrature_order,
+      &request.numerical_policy.true_trace_projection_quadrature_order,
+      &request.numerical_policy.conventional_assembly_quadrature_order,
+      &request.numerical_policy.igr_assembly_quadrature_orders.volume_order,
+      &request.numerical_policy.igr_assembly_quadrature_orders.face_order}};
+  for (int* order : quadrature_orders)
+  {
+    const int retained = *order;
+    *order = std::numeric_limits<int>::max();
+    const ContractStatus status = ValidateEulerHdgRequest(request);
+    *order = retained;
+    if (status != ContractStatus::invalid_numerical_policy) return false;
   }
   request = ValidRequest(mesh, initial);
   request.boundary.exterior_state = nullptr;
@@ -468,6 +635,11 @@ bool CheckIgrSelectionAdmission()
   const ContractStatus periodic_p1 = admit_igr(mesh, 1);
   const ContractStatus periodic_p2 = admit_igr(mesh, 2);
   const ContractStatus periodic_p3 = admit_igr(mesh, 3);
+  const ContractStatus periodic_p10 = admit_igr(mesh, 10);
+  const ContractStatus periodic_p11 = admit_igr(mesh, 11);
+  const ContractStatus periodic_p12 = admit_igr(mesh, 12);
+  const ContractStatus unrepresentable_igr = admit_igr(
+      mesh, FirstUnrepresentablePolynomialOrder(true));
 
   EulerHdgRequest present_empty_periodic = ValidRequest(mesh, initial);
   present_empty_periodic.boundary.policies = {nullptr, 0, 2, 1.4};
@@ -514,6 +686,21 @@ bool CheckIgrSelectionAdmission()
   const ContractStatus physical_p1 = admit_igr(physical_mesh, 1);
   const ContractStatus physical_p2 = admit_igr(physical_mesh, 2);
   const ContractStatus physical_p3 = admit_igr(physical_mesh, 3);
+  const ContractStatus physical_p10 = admit_igr(physical_mesh, 10);
+  const ContractStatus physical_p11 = admit_igr(physical_mesh, 11);
+  const ContractStatus physical_p12 = admit_igr(physical_mesh, 12);
+
+  EulerHdgRequest high_order_cuda = ValidRequest(mesh, initial);
+  high_order_cuda.polynomial_order = 10;
+  high_order_cuda.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10);
+  high_order_cuda.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.25, 0.5};
+  high_order_cuda.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
+  high_order_cuda.capabilities = all_cuda_capabilities;
+  const ContractStatus cuda_p10 = ValidateEulerHdgRequest(high_order_cuda);
+  high_order_cuda.backend.cuda_engine = CudaEngineKind::tensor_core;
+  const ContractStatus tensor_p10 = ValidateEulerHdgRequest(high_order_cuda);
 
   EulerHdgRequest request = ValidRequest(mesh, initial);
   request.polynomial_order = 1;
@@ -543,6 +730,10 @@ bool CheckIgrSelectionAdmission()
   return periodic_p1 == ContractStatus::accepted &&
       periodic_p2 == ContractStatus::accepted &&
       periodic_p3 == ContractStatus::accepted &&
+      periodic_p10 == ContractStatus::accepted &&
+      periodic_p11 == ContractStatus::accepted &&
+      periodic_p12 == ContractStatus::accepted &&
+      unrepresentable_igr == ContractStatus::unsupported_polynomial_order &&
       present_empty_periodic_status == ContractStatus::accepted &&
       !retained_periodic_policies.empty() &&
       retained_periodic_status == ContractStatus::accepted &&
@@ -554,6 +745,11 @@ bool CheckIgrSelectionAdmission()
       physical_p1 == ContractStatus::accepted &&
       physical_p2 == ContractStatus::accepted &&
       physical_p3 == ContractStatus::accepted &&
+      physical_p10 == ContractStatus::accepted &&
+      physical_p11 == ContractStatus::accepted &&
+      physical_p12 == ContractStatus::accepted &&
+      cuda_p10 == ContractStatus::accepted &&
+      tensor_p10 == ContractStatus::accepted &&
       cuda == ContractStatus::accepted &&
       quadrature_mismatch ==
           (ranks == 1 ? ContractStatus::accepted
@@ -786,7 +982,8 @@ bool CheckCollectiveFailureConvergence()
       MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   EulerHdgRequest request = ValidRequest(mesh, initial);
-  request.polynomial_order = rank == 0 ? 4 : 2;
+  request.polynomial_order = rank == 0
+      ? std::numeric_limits<int>::max() : 2;
   const int local_status = static_cast<int>(ValidateEulerHdgRequest(request));
   int minimum_status = local_status;
   int maximum_status = local_status;

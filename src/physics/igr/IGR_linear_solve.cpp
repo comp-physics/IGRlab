@@ -10,12 +10,16 @@
 #include "IGR_two_level_inverse.hpp"
 #include "IGR_screened_patch_inverse.hpp"
 #include "IGR_face_density_cuda.hpp"
+#include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
+#include "IGR_chebyshev.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -963,8 +967,12 @@ public:
       face_scaling_(face_scaling),
       sfes_sequence_(sfes.GetSequence()),
       mesh_sequence_(sfes.GetMesh() ? sfes.GetMesh()->GetSequence() : -1),
+      nodes_sequence_(sfes.GetMesh() ? sfes.GetMesh()->GetNodesSequence() : -1),
+      rule_order_(shared_ir.GetOrder()),
       local_x_gf_(const_cast<mfem::ParFiniteElementSpace*>(&sfes))
   {
+    for (int q = 0; q < shared_ir.GetNPoints(); ++q)
+      rule_points_.push_back({{shared_ir.IntPoint(q).x, shared_ir.IntPoint(q).weight}});
     info_ = dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
       sfes_,
       fqs,
@@ -977,7 +985,8 @@ public:
       scratch_.element_vdof_map,
       face_scaling,
       &scratch_.normal_dshape_base,
-      &scratch_.penalty_metric);
+      &scratch_.penalty_metric,
+      &scratch_.shape_dictionary);
     timing_enabled_ =
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
                                       false);
@@ -999,17 +1008,32 @@ public:
         &shared_scratch_.penalty_metric);
       has_shared_ = (shared_info_.nf > 0);
     }
+    // Rank-one conforming MFEM spaces expose P as an IdentityOperator and
+    // R as a TransposeOperator over an IdentityOperator. Prove both actions;
+    // equal true/local dimensions alone do not establish an identity layout.
+    direct_identity_layout_ = sfes_.Conforming() && sfes_.GetNRanks() == 1 &&
+      !has_shared_ && mfem::IsIdentityProlongation(prolong_) &&
+      mfem::IsIdentityProlongation(sfes_.GetRestrictionTransposeOperator()) &&
+      info_.vdim == 1 && info_.ne > 0 && info_.dof > 0 &&
+      static_cast<long long>(info_.ne) * info_.dof == sfes_.GetVSize() &&
+      sfes_.GetTrueVSize() == sfes_.GetVSize();
   }
 
   bool CanRefresh(const mfem::ParFiniteElementSpace& sfes,
+                  const mfem::FaceQuadratureSpace& fqs,
+                  const mfem::IntegrationRule& shared_ir,
                   const mfem::Vector& side_q,
                   const mfem::Vector& shared_side_q,
+                  mfem::real_t ip_sigma,
                   mfem::real_t kappa,
                   dg_face::DGDiffusionFaceScaling face_scaling) const
   {
     const mfem::Mesh* mesh = sfes.GetMesh();
     return &sfes == &sfes_ && sfes.GetSequence() == sfes_sequence_ && mesh &&
-           mesh->GetSequence() == mesh_sequence_ && kappa == kappa_ &&
+           mesh->GetSequence() == mesh_sequence_ &&
+           mesh->GetNodesSequence() == nodes_sequence_ &&
+           RuleMatches(fqs.GetIntRule(0)) && RuleMatches(shared_ir) &&
+           ip_sigma == ip_sigma_ && kappa == kappa_ &&
            face_scaling == face_scaling_ &&
            side_q.Size() == 2 * info_.nq * info_.nf &&
            shared_side_q.Size() == 2 * shared_info_.nq * shared_info_.nf &&
@@ -1034,9 +1058,37 @@ public:
 
   bool TimingEnabled() const { return timing_enabled_; }
 
+  bool HasDirectIdentityLayout() const
+  { return direct_identity_layout_ && sfes_.GetSequence() == sfes_sequence_; }
+
   void ResetTiming() const { timing_ = ExactFaceTimingStats{}; }
 
   const ExactFaceTimingStats& Timing() const { return timing_; }
+
+  bool TryAddToBase(const mfem::Vector& x, mfem::Vector& y) const
+  {
+    if (!OwnedScratchChebyshev::UsesOrdinaryCUDA() ||
+        !HasDirectIdentityLayout() || info_.nf <= 0 ||
+        x.Size() != Width() || y.Size() != Height() || &x == &y ||
+        !x.OwnsData() || !y.OwnsData())
+    {
+      return false;
+    }
+    ::igrlab::NVTXRange range("IGR/exact-face/add-to-base");
+    const auto start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    bool added;
+    {
+      ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
+      added = dg_face::TryLaunchInteriorFaceDGDiffusionAddToBase2D(
+        info_, scratch_, x, ip_sigma_, y);
+    }
+    if (added && timing_enabled_)
+    {
+      timing_.local_apply_seconds += ElapsedSeconds(start);
+      ++timing_.mult_calls;
+    }
+    return added;
+  }
 
   mfem::MemoryClass GetMemoryClass() const override
   {
@@ -1046,6 +1098,30 @@ public:
   void Mult(const mfem::Vector& x, mfem::Vector& y) const override
   {
     ::igrlab::NVTXRange range("IGR/exact-face/Mult");
+    // Admit only distinct owning vectors. MFEM aliases and external wrappers
+    // can overlap even when their starting pointers differ; keep the original
+    // staging path for those calls, including in-place Mult.
+    if (direct_identity_layout_ && sfes_.GetSequence() == sfes_sequence_ &&
+        x.Size() == Width() && y.Size() == Height() && &x != &y &&
+        x.OwnsData() && y.OwnsData())
+    {
+      const auto setup_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+      y = 0.0;
+      if (timing_enabled_)
+      { timing_.face_setup_seconds += ElapsedSeconds(setup_start); }
+      const auto apply_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+      {
+        ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
+        dg_face::LaunchInteriorFaceDGDiffusionApply2D(info_, scratch_, x,
+                                                     ip_sigma_, y);
+      }
+      if (timing_enabled_)
+      {
+        timing_.local_apply_seconds += ElapsedSeconds(apply_start);
+        ++timing_.mult_calls;
+      }
+      return;
+    }
     if (!timing_enabled_)
     {
       local_y_.SetSize(sfes_.GetVSize(), y);
@@ -1184,6 +1260,19 @@ public:
   }
 
 private:
+  bool RuleMatches(const mfem::IntegrationRule& ir) const
+  {
+    if (ir.GetOrder() != rule_order_ ||
+        ir.GetNPoints() != static_cast<int>(rule_points_.size())) { return false; }
+    for (int q = 0; q < ir.GetNPoints(); ++q)
+    {
+      const auto& ip = ir.IntPoint(q);
+      if (std::memcmp(&ip.x, &rule_points_[q][0], sizeof(ip.x)) ||
+          std::memcmp(&ip.weight, &rule_points_[q][1], sizeof(ip.weight))) return false;
+    }
+    return true;
+  }
+
   const mfem::ParFiniteElementSpace& sfes_;
   const mfem::Operator* prolong_ = nullptr;
   const mfem::Operator* restrict_ = nullptr;
@@ -1193,9 +1282,13 @@ private:
     dg_face::DGDiffusionFaceScaling::Arithmetic;
   long sfes_sequence_ = -1;
   long mesh_sequence_ = -1;
+  long nodes_sequence_ = -1;
+  int rule_order_ = -1;
+  std::vector<std::array<mfem::real_t, 2>> rule_points_;
   dg_face::InteriorFaceDGDiffusionApplyInfo info_;
   dg_face::InteriorFaceDGDiffusionApplyScratch scratch_;
   bool has_shared_ = false;
+  bool direct_identity_layout_ = false;
   dg_face::SharedFaceDGDiffusionApplyInfo shared_info_;
   dg_face::SharedFaceDGDiffusionApplyScratch shared_scratch_;
   mutable mfem::Vector local_y_;
@@ -1210,12 +1303,14 @@ public:
   ExactFaceSumOperator(mfem::Operator* base,
                        mfem::Operator* face,
                        bool own_base = true,
-                       bool own_face = true)
+                       bool own_face = true,
+                       bool direct_identity_system = false)
     : mfem::Operator(base->Height(), base->Width()),
       base_(base),
       face_(face),
       own_base_(own_base),
       own_face_(own_face),
+      direct_identity_system_(direct_identity_system),
       exact_face_(dynamic_cast<ExactL2DGFaceOperator*>(face)),
       timing_enabled_(exact_face_ != nullptr && exact_face_->TimingEnabled()),
       scratch_(base->Height())
@@ -1246,6 +1341,9 @@ public:
 
   mfem::Operator& BaseOperator() const { return *base_; }
   mfem::Operator& FaceOperator() const { return *face_; }
+
+  bool HasDirectIdentityFaceLayout() const
+  { return exact_face_ && exact_face_->HasDirectIdentityLayout(); }
 
   void ResetTiming() const
   {
@@ -1349,10 +1447,14 @@ public:
         ::igrlab::NVTXRange base_range("IGR/exact-sum/base");
         base_->Mult(x, y);
       }
+      bool added = false;
       {
         ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
-        face_->Mult(x, scratch_);
+        added = direct_identity_system_ && exact_face_ &&
+          exact_face_->TryAddToBase(x, y);
+        if (!added) { face_->Mult(x, scratch_); }
       }
+      if (!added)
       {
         ::igrlab::NVTXRange axpy_range("IGR/exact-sum/axpy");
         y += scratch_;
@@ -1368,18 +1470,22 @@ public:
     timing_.base_seconds += ElapsedSeconds(base_start);
 
     const auto face_start = Clock::now();
+    bool added = false;
     {
       ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
-      face_->Mult(x, scratch_);
+      added = direct_identity_system_ && exact_face_ &&
+        exact_face_->TryAddToBase(x, y);
+      if (!added) { face_->Mult(x, scratch_); }
     }
     timing_.face_seconds += ElapsedSeconds(face_start);
 
-    const auto axpy_start = Clock::now();
+    if (!added)
     {
+      const auto axpy_start = Clock::now();
       ::igrlab::NVTXRange axpy_range("IGR/exact-sum/axpy");
       y += scratch_;
+      timing_.sum_axpy_seconds += ElapsedSeconds(axpy_start);
     }
-    timing_.sum_axpy_seconds += ElapsedSeconds(axpy_start);
     ++timing_.mult_calls;
   }
 
@@ -1395,6 +1501,7 @@ private:
   mfem::Operator* face_ = nullptr;
   bool own_base_ = true;
   bool own_face_ = true;
+  bool direct_identity_system_ = false;
   ExactL2DGFaceOperator* exact_face_ = nullptr;
   bool timing_enabled_ = false;
   mutable mfem::Vector scratch_;
@@ -1860,18 +1967,28 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     MFEM_VERIFY(!cache_face_density || use_cuda_face_density,
                 "Face-density geometry caching requires the CUDA projection option.");
     std::unique_ptr<mfem::FaceQuadratureSpace> uncached_fqs;
+    const mfem::FaceQuadratureSpace* prepared_host_fqs = nullptr;
+    bool host_geometry_changed = false;
     if (cache_face_density)
     {
       if (!face_density_cuda_cache_)
         face_density_cuda_cache_ = std::make_shared<FaceDensityCUDAProjectionCache>();
     }
-    else
+    else if (!use_cuda_face_density)
+    {
+      if (!face_density_host_cache_)
+        face_density_host_cache_ = std::make_shared<HostFaceDensityPreparationCache>();
+      prepared_host_fqs = face_density_host_cache_->Prepare(
+        vfes_, sfes_, exact_face_ir, &host_geometry_changed);
+    }
+    if (!cache_face_density && !prepared_host_fqs)
       uncached_fqs = std::make_unique<mfem::FaceQuadratureSpace>(
         *mesh, exact_face_ir, mfem::FaceType::Interior);
     const mfem::FaceQuadratureSpace& exact_fqs = cache_face_density
-      ? face_density_cuda_cache_->Prepare(vfes_, sfes_, exact_face_ir) : *uncached_fqs;
+      ? face_density_cuda_cache_->Prepare(vfes_, sfes_, exact_face_ir)
+      : (prepared_host_fqs ? *prepared_host_fqs : *uncached_fqs);
     std::string reason;
-    if (!cache_face_density && !dg_face::SupportsInteriorFaceSideDensityProjection2D(vfes_,
+    if (!cache_face_density && !prepared_host_fqs && !dg_face::SupportsInteriorFaceSideDensityProjection2D(vfes_,
                                                               exact_fqs,
                                                               &reason))
     {
@@ -1880,7 +1997,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                   "Unsupported exact IGR side-density face operator: "
                     << reason);
     }
-    if (!cache_face_density && !dg_face::SupportsInteriorFaceScalarTraceProjection2D(sfes_,
+    if (!cache_face_density && !prepared_host_fqs && !dg_face::SupportsInteriorFaceScalarTraceProjection2D(sfes_,
                                                               exact_fqs,
                                                               &reason))
     {
@@ -1913,6 +2030,10 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       MFEM_ABORT("CUDA face-density projection requires a CUDA build.");
 #endif
     }
+    else if (prepared_host_fqs)
+      side_info = face_density_host_cache_->Project(
+        vfes_, U, alpha_, local_alpha ? &device_element_alpha_ : nullptr,
+        rho_floor_, side_q);
     else
       side_info = local_alpha
       ? dg_face::ProjectInteriorFaceDensityCoefficient2D(vfes_,
@@ -1933,7 +2054,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       std::cout << "[igr-linear] event=face-density-path arithmetic="
                 << (use_cuda_face_density ? "cuda" : "host")
                 << " scope=local-interior-faces geometry_cache="
-                << (cache_face_density ? "per-solver" : "none") << std::endl;
+                << (cache_face_density ? "per-solver"
+                    : prepared_host_fqs ? "host-per-solver" : "none") << std::endl;
     if (cache_face_density &&
         (face_density_cuda_cache_->hits == 0 || debug_qf))
       std::cout << "[igr-linear] event=face-density-cache rebuilds="
@@ -1946,15 +2068,16 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
     if (ingestion_audit)
     {
+      const mfem::Vector* audited_side_alpha = local_alpha
+        ? (prepared_host_fqs ? &face_density_host_cache_->CurrentSideAlpha()
+                             : &side_scratch.side_alpha) : nullptr;
       LogFaceCoefficientAudit("local",
                               side_q,
                               alpha_,
                               rho_floor_,
                               linear_solve_calls_ + 1,
                               vfes_.GetComm(),
-                              local_alpha
-                                ? &side_scratch.side_alpha
-                                : nullptr,
+                              audited_side_alpha,
                               side_info.nq);
     }
 
@@ -2033,9 +2156,12 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     face_op = dynamic_cast<ExactL2DGFaceOperator*>(
       exact_face_operator_.get());
     const bool reused_face_geometry =
-      face_op && face_op->CanRefresh(sfes_,
+      !host_geometry_changed && face_op && face_op->CanRefresh(sfes_,
+                                     exact_fqs,
+                                     exact_face_ir,
                                      side_q,
                                      shared_side_q,
+                                     static_cast<mfem::real_t>(ip_kind_),
                                      face_kappa,
                                      face_scaling);
     if (reused_face_geometry)
@@ -2066,7 +2192,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     Ah_.Reset(new ExactFaceSumOperator(base_op,
                                        face_op,
                                        !direct_identity_system_,
-                                       false));
+                                       false,
+                                       direct_identity_system_));
     last_exact_face_effective_ = true;
     last_exact_face_reason_ = "active";
 
@@ -2689,12 +2816,23 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                                                     cheb_power_seed);
       last_chebyshev_eigenvalue_estimate_ =
         static_cast<double>(max_eig_estimate);
-      auto cheb = std::make_unique<mfem::OperatorChebyshevSmoother>(
+      // Only this known rank-one ordinary-CUDA PA/exact-face pipeline has
+      // the stream and stable-output-storage contract needed by owned swaps.
+      // All generic, MPI, nonidentity and constrained routes retain MFEM.
+      const bool owned_cheb_scratch =
+        OwnedScratchChebyshev::UsesOrdinaryCUDA() && direct_identity_system_ &&
+        exact_face_sum_op && !use_base_operator &&
+        sfes_.GetNRanks() == 1 && sfes_.Conforming() &&
+        exact_face_sum_op->HasDirectIdentityFaceLayout() &&
+        &exact_face_sum_op->BaseOperator() == a_.get() &&
+        a_->GetAssemblyLevel() == mfem::AssemblyLevel::PARTIAL;
+      auto cheb = MakeIGRChebyshevSmoother(
         *cheb_smoother_op,
         diag,
         ess_tdof_list_,
         cheb_order,
-        max_eig_estimate);
+        max_eig_estimate,
+        owned_cheb_scratch);
       last_chebyshev_setup_seconds_ = ElapsedSeconds(cheb_setup_start);
       total_chebyshev_setup_seconds_ += last_chebyshev_setup_seconds_;
       ++total_chebyshev_smoother_builds_;

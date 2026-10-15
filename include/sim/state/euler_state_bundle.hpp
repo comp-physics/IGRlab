@@ -26,11 +26,12 @@ struct EulerStateBundle
   EulerVelocityView velocity_view;
   EulerFieldList field_list;
 
-  EulerStateBundle(ExampleContext& ctx, double gamma, double rho_floor)
+  EulerStateBundle(ExampleContext& ctx, double gamma, double rho_floor,
+                   bool project_initial_state = true)
     : sol(&ctx.spaces.vfes),
       state(ctx.spaces.fes, ctx.spaces.dfes, sol, ctx.dim),
-      pressure_view(ctx.spaces.fes, sol, ctx.dim, gamma),
-      velocity_view(ctx.spaces.dfes, sol, ctx.dim, rho_floor)
+      pressure_view(ctx.spaces.fes, sol, ctx.dim, gamma, project_initial_state),
+      velocity_view(ctx.spaces.dfes, sol, ctx.dim, rho_floor, project_initial_state)
   {
     field_list.state = &state;
     field_list.pressure = &pressure_view;

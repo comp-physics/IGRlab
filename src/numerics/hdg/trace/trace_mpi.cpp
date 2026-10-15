@@ -143,10 +143,19 @@ bool TraceMap::IsConsistent() const noexcept
 {
   if (rank < 0 || rank_count <= 0 || rank >= rank_count ||
       local_true_dof_count < 0 || global_true_dof_count < 0 ||
+      static_cast<std::size_t>(local_true_dof_count) > entries.size() ||
       entries.size() > static_cast<std::size_t>(std::numeric_limits<LocalIndex>::max()))
   {
     return false;
   }
+  std::vector<std::uint8_t> seen_owned;
+  try
+  {
+    seen_owned.assign(static_cast<std::size_t>(local_true_dof_count), 0);
+  }
+  catch (const std::bad_alloc&) { return false; }
+  catch (const std::length_error&) { return false; }
+
   LocalIndex owned = 0;
   for (std::size_t i = 0; i < entries.size(); ++i)
   {
@@ -164,14 +173,11 @@ bool TraceMap::IsConsistent() const noexcept
     }
     if (entry.ownership == Ownership::owned)
     {
-      for (std::size_t earlier = 0; earlier < i; ++earlier)
-      {
-        if (entries[earlier].ownership == Ownership::owned &&
-            entries[earlier].local_true_dof == entry.local_true_dof)
-        {
-          return false;
-        }
-      }
+      // The bounds above make local true IDs a compact coverage set.
+      const std::size_t true_dof =
+          static_cast<std::size_t>(entry.local_true_dof);
+      if (seen_owned[true_dof] != 0) { return false; }
+      seen_owned[true_dof] = 1;
       ++owned;
     }
   }

@@ -572,6 +572,12 @@ bool GenericEulerHdgCpuSession::CaptureCheckpoint(
           next->checkpoint.state.interior);
   next->checkpoint.descriptor.trace_hash =
       CpuStateStoragePolicy::HashTrace(next->checkpoint.state.trace);
+  if (!core_->CollectiveAll(
+          next->checkpoint.descriptor.interior_hash != StateHash{} &&
+          next->checkpoint.descriptor.trace_hash != StateHash{}))
+  {
+    return false;
+  }
   output.storage_ = std::move(next);
   return true;
 }

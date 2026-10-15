@@ -249,7 +249,7 @@ private:
               request.backend.cuda_engine,
               request.numerical_policy.stabilization.kind ==
                   generic::RegularizationKind::igr,
-              ranks, request.time_treatment)
+              ranks, request.time_treatment, request.polynomial_order)
         : trace_policy;
     return InitializeAdmitted(config, admitted_trace_policy);
   }
@@ -913,6 +913,7 @@ public:
 
 private:
   friend struct cuda_w8a::detail::CudaQualificationTestAccess;
+  friend class GenericEulerHdgCudaAppSession;
 
   enum class operation_tag : int
   {
@@ -1599,6 +1600,10 @@ private:
              generic::RegularizationKind::igr);
     const bool time_treatment_abi =
         generic::IsKnownEulerHdgTimeTreatment(config.time_treatment) &&
+        (trace_policy.requested_selection !=
+             cuda_w8a::CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh ||
+         config.time_treatment ==
+             generic::EulerHdgTimeTreatment::backward_euler) &&
         (!partitioned_backward_euler ||
          partitioned_backward_euler_configuration);
     int ranks = 0;
@@ -1639,8 +1644,10 @@ private:
         std::isfinite(config.dt) && config.dt > 0.0 &&
         (config.use_borrowed_host_inputs ||
          std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0) &&
-        config.order >= generic::minimum_polynomial_order &&
-        config.order <= generic::maximum_polynomial_order &&
+        generic::PlanPolynomialShape(config.order,
+            config.use_generic_numerical_policy &&
+            config.numerical_policy.stabilization.kind ==
+                generic::RegularizationKind::igr).valid &&
         config.mesh_n >= 0;
     long long local_face_measure = 0;
     long long local_physical_faces = 0;

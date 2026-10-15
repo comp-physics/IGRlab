@@ -12,6 +12,7 @@
 #include "test_dgsem_reference_igr.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,160 @@ double MaxAbsEntry(const mfem::Vector& vec)
     max_val = std::max(max_val, std::abs(vec(i)));
   }
   return max_val;
+}
+
+// A derived wrapper retains the original side-dispatch composition and also
+// checks that optimizing the concrete wrapper does not bypass user overrides.
+class LegacyIGRSpeedOracle final : public mfem::FluxWithIGR
+{
+public:
+  using mfem::FluxWithIGR::FluxWithIGR;
+  mutable int side_calls = 0;
+  mfem::real_t speed_offset = 0.0;
+
+  mfem::real_t ComputeFluxDotNAtSide(
+    const mfem::Vector& state,
+    const mfem::Vector& normal,
+    mfem::FaceElementTransformations& tr,
+    mfem::FaceSide side,
+    mfem::Vector& flux) const override
+  {
+    ++side_calls;
+    const mfem::real_t speed =
+      mfem::FluxWithIGR::ComputeFluxDotNAtSide(state, normal, tr, side, flux);
+    return speed_offset == 0.0 ? speed : speed + speed_offset;
+  }
+};
+
+void CheckEntropySurfaceSpeedOracle(TestContext& ctx)
+{
+  constexpr double gamma = 1.4;
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+    2, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_SELF, serial);
+  mfem::DG_FECollection fec(2, 2, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace fes(&mesh, &fec);
+  mfem::ParGridFunction sigma(&fes);
+  for (int element = 0; element < fes.GetNE(); ++element)
+  {
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(element, dofs);
+    mfem::Vector values(dofs.Size());
+    for (int i = 0; i < values.Size(); ++i)
+    {
+      values(i) = 0.05 + 0.125 * element + 0.01 * i;
+    }
+    sigma.SetSubVector(dofs, values);
+  }
+
+  int interior_face = -1;
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
+  {
+    if (mesh.GetInteriorFaceTransformations(face))
+    {
+      interior_face = face;
+      break;
+    }
+  }
+  MFEM_VERIFY(interior_face >= 0 && mesh.GetNBE() > 0,
+              "Entropy surface oracle requires interior and boundary faces.");
+  const mfem::IntegrationRule& rule =
+    mfem::IntRules.Get(mfem::Geometry::SEGMENT, 3);
+  const mfem::Vector left = EulerConsFromPrim2D(1.1, 0.4, -0.3, 1.3, gamma);
+  const mfem::Vector right = EulerConsFromPrim2D(0.8, -0.2, 0.15, 0.9, gamma);
+  const mfem::Vector normal({1.2, -1.6});
+  mfem::EulerFlux base(2, gamma);
+  mfem::FluxWithIGR actual_igr(base);
+  LegacyIGRSpeedOracle oracle_igr(base);
+  mfem::DGSEMSurfaceFlux actual(actual_igr), oracle(oracle_igr);
+  actual.SetGamma(gamma);
+  oracle.SetGamma(gamma);
+  actual.SetEntropyJacobianMode(mfem::dgsem::EntropyJacobianMode::Analytic);
+  oracle.SetEntropyJacobianMode(mfem::dgsem::EntropyJacobianMode::Analytic);
+  bool exact_values = true;
+  bool side_dispatch = true;
+  bool exact_telemetry = true;
+  bool discontinuous_sigma = false;
+
+  // Change the policies on existing flux objects, including returning to the
+  // fast path after all policies were enabled. Null sigma also remains valid.
+  for (const auto* field : {&sigma, static_cast<mfem::ParGridFunction*>(nullptr)})
+  {
+    actual_igr.SetSigmaField(field);
+    oracle_igr.SetSigmaField(field);
+    for (const int policy : {0, 1, 2, 4, 8, 15, 0})
+    {
+      for (mfem::FluxWithIGR* igr :
+           {&actual_igr, static_cast<mfem::FluxWithIGR*>(&oracle_igr)})
+      {
+        igr->SetSigmaAwareCFL(policy & 1);
+        igr->SetSigmaAwareRusanov(policy & 2);
+        igr->SetFrozenSigmaSpectralSpeed(policy & 4);
+        igr->SetInvariantDomainFlux(policy & 8);
+      }
+      for (const auto type :
+           {mfem::DGSEMSurfaceFluxType::EntropyStableWinters,
+            mfem::DGSEMSurfaceFluxType::EntropyStableLFEntropyVars})
+      {
+        actual.SetSurfaceFluxType(type);
+        oracle.SetSurfaceFluxType(type);
+        for (const bool boundary : {false, true})
+        {
+          auto* tr = boundary ? mesh.GetBdrFaceTransformations(0)
+                              : mesh.GetInteriorFaceTransformations(interior_face);
+          MFEM_VERIFY(tr, "Missing entropy surface oracle transformation.");
+          tr->SetAllIntPoints(&rule.IntPoint(boundary ? 0 : 1));
+          if (field && !boundary)
+          {
+            discontinuous_sigma =
+              actual_igr.GetSigmaAtSide(*tr, mfem::FaceSide::Left) !=
+              actual_igr.GetSigmaAtSide(*tr, mfem::FaceSide::Right);
+          }
+          const auto before = actual_igr.GetFrozenSigmaTelemetry();
+          mfem::Vector actual_flux(4), oracle_flux(4);
+          const mfem::real_t actual_speed =
+            actual.Eval(left, right, normal, *tr, actual_flux);
+          tr->SetAllIntPoints(&rule.IntPoint(boundary ? 0 : 1));
+          oracle_igr.side_calls = 0;
+          const mfem::real_t oracle_speed =
+            oracle.Eval(left, right, normal, *tr, oracle_flux);
+          exact_values = exact_values &&
+            std::memcmp(&actual_speed, &oracle_speed, sizeof(mfem::real_t)) == 0 &&
+            std::memcmp(actual_flux.HostRead(), oracle_flux.HostRead(),
+                        4 * sizeof(mfem::real_t)) == 0;
+          side_dispatch = side_dispatch && oracle_igr.side_calls == 2;
+          const auto a = actual_igr.GetFrozenSigmaTelemetry();
+          const auto b = oracle_igr.GetFrozenSigmaTelemetry();
+          const std::uint64_t expected_samples = field && (policy & 12) ? 2 : 0;
+          exact_telemetry = exact_telemetry &&
+            a.sample_count - before.sample_count == expected_samples &&
+            a.enabled == b.enabled && a.sample_count == b.sample_count &&
+            a.nonpositive_count == b.nonpositive_count &&
+            a.nonfinite_count == b.nonfinite_count &&
+            a.minimum_raw_q_sigma == b.minimum_raw_q_sigma &&
+            a.minimum_q_sigma_over_gamma_p == b.minimum_q_sigma_over_gamma_p;
+        }
+      }
+    }
+  }
+  ctx.Check(discontinuous_sigma, "Entropy surface oracle samples unequal sigma traces");
+  ctx.Check(exact_values,
+            "Entropy surface flux and speed match legacy side dispatch bitwise");
+  ctx.Check(side_dispatch, "Entropy surface retains derived IGR side overrides");
+  ctx.Check(exact_telemetry,
+            "Entropy surface policy transitions retain exact sigma telemetry");
+
+  auto* tr = mesh.GetInteriorFaceTransformations(interior_face);
+  tr->SetAllIntPoints(&rule.IntPoint(0));
+  oracle.SetSurfaceFluxType(mfem::DGSEMSurfaceFluxType::EntropyStableWinters);
+  mfem::Vector flux(4);
+  const mfem::real_t original_speed = oracle.Eval(left, right, normal, *tr, flux);
+  oracle_igr.speed_offset = 0.125;
+  oracle_igr.side_calls = 0;
+  const mfem::real_t overridden_speed = oracle.Eval(left, right, normal, *tr, flux);
+  ctx.Check(oracle_igr.side_calls == 2 &&
+              overridden_speed == original_speed + oracle_igr.speed_offset,
+            "Entropy surface preserves a derived wrapper's speed override");
 }
 
 } // namespace
@@ -292,6 +447,7 @@ int RunDGSEMIGRTests(TestContext& ctx)
   }
 
   RunDGSEMScalarIGRScopeFixture(ctx);
+  CheckEntropySurfaceSpeedOracle(ctx);
 
   return ctx.failures;
 }

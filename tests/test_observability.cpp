@@ -2,6 +2,8 @@
 #include "utils/profiling/nvtx.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <type_traits>
 
 namespace obs = ::igrlab::observability;
@@ -15,6 +17,46 @@ static_assert(obs::region_name(obs::RegionId::dg_mult)[0] == 'D');
 static_assert(obs::region_name(obs::RegionId::hdg_condensation)[0] == 'H');
 static_assert(obs::counter_name(obs::CounterId::iterations)[0] == 'c');
 static_assert(!std::is_polymorphic<obs::NoopBackend>::value);
+
+static int check_environment_startup()
+{
+  struct RestoreEnvironment
+  {
+    const char* name;
+    bool present;
+    std::string value;
+    explicit RestoreEnvironment(const char* key)
+      : name(key), present(std::getenv(key) != nullptr),
+        value(present ? std::getenv(key) : "") {}
+    ~RestoreEnvironment()
+    {
+      if (present) setenv(name, value.c_str(), 1);
+      else unsetenv(name);
+    }
+  } canonical("IGRLAB_PROFILE_NVTX"), legacy("DG_IGR_PROFILE_NVTX");
+  unsetenv(canonical.name);
+  unsetenv(legacy.name);
+  if (obs::configure_nvtx_from_environment() || obs::runtime_enabled())
+    return 10;
+
+  setenv(legacy.name, "1", 1);
+  if (!obs::configure_nvtx_from_environment() ||
+      obs::runtime_enabled() != obs::nvtx_backend_enabled) return 11;
+  // A canonical explicit false/empty setting takes precedence over the alias.
+  const char* disabled_values[] = {"", "0", "false", "FALSE", "off", "OFF"};
+  for (const char* value : disabled_values)
+  {
+    setenv(canonical.name, value, 1);
+    if (obs::configure_nvtx_from_environment() || obs::runtime_enabled())
+      return 12;
+  }
+  setenv(legacy.name, "0", 1);
+  setenv(canonical.name, "1", 1);
+  if (!obs::configure_nvtx_from_environment() ||
+      obs::runtime_enabled() != obs::nvtx_backend_enabled) return 13;
+  obs::set_runtime_enabled(false);
+  return 0;
+}
 
 #if DG_IGR_ENABLE_OBSERVABILITY && !DG_IGR_OBSERVABILITY_USE_CALIPER
 
@@ -123,6 +165,7 @@ static int disabled_probe(const int input) noexcept
 
 int main()
 {
+  if (const int result = check_environment_startup()) return result;
   // Header availability cannot turn on either gate.
 #if DG_IGR_ENABLE_OBSERVABILITY && !DG_IGR_OBSERVABILITY_USE_CALIPER
   static_assert(obs::compile_enabled);

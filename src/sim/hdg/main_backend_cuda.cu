@@ -1,4 +1,5 @@
 #include "igrlab/compat.hpp"
+#include "igrlab/environment.hpp"
 #include "sim/hdg/main_backend.hpp"
 
 #include <algorithm>
@@ -1350,9 +1351,9 @@ std::string Validate(const HdgEulerMainRequest& request,
   if (request.options.vtk_save &&
       (!std::isfinite(request.options.dt_save) || request.options.dt_save <= 0.0))
     return "CUDA HDG ParaView output requires a positive --time-step-save";
-  if (request.options.order < dg::hdg::generic::minimum_polynomial_order ||
-      request.options.order > dg::hdg::generic::maximum_polynomial_order)
-    return "generic CUDA HDG supports polynomial orders one through three";
+  if (!dg::hdg::generic::PlanPolynomialShape(request.options.order,
+          regularization.kind == RegularizationKind::igr).valid)
+    return "generic CUDA HDG requires a positive order with representable dense local dimensions";
   if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
     return "generic CUDA HDG refinement levels must be nonnegative";
   if (!std::isfinite(request.case_config.gamma) ||
@@ -1498,16 +1499,37 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       }
       else
       {
-        trace_policy = ResolveCudaTracePolicy(
-            cuda_engine,
-            regularization_request.kind == RegularizationKind::igr,
-            ranks, request.options.order,
-            DefaultCudaTracePolicyRequest(
-                cuda_engine,
-                regularization_request.kind == RegularizationKind::igr,
-                ranks, time_treatment));
-        if (!CudaTracePolicyDescriptorIsExact(trace_policy))
-          reason = "CUDA HDG trace policy resolution failed";
+        const bool igr_active =
+            regularization_request.kind == RegularizationKind::igr;
+        auto requested_trace_policy = DefaultCudaTracePolicyRequest(
+            cuda_engine, igr_active, ranks, time_treatment,
+            request.options.order);
+        const char* const policy_override =
+            ::igrlab::GetEnv("DG_IGR_HDG_TRACE_POLICY");
+        if (policy_override && policy_override[0] != '\0' &&
+            std::strcmp(policy_override, "engine-default") != 0)
+        {
+          if (std::strcmp(policy_override,
+                          "ordinary-ilu-jacobi5-refresh") != 0)
+            reason = "IGRLAB_HDG_TRACE_POLICY must be engine-default or "
+                     "ordinary-ilu-jacobi5-refresh";
+          else if (cuda_engine != CudaEngineKind::ordinary || !igr_active ||
+                   ranks != 1 ||
+                   time_treatment != EulerHdgTimeTreatment::backward_euler)
+            reason = "ordinary-ilu-jacobi5-refresh requires ordinary CUDA "
+                     "HDG, active IGR, one rank, and Backward Euler";
+          else
+            requested_trace_policy =
+                CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+        }
+        if (reason.empty())
+        {
+          trace_policy = ResolveCudaTracePolicy(
+              cuda_engine, igr_active, ranks, request.options.order,
+              requested_trace_policy);
+          if (!CudaTracePolicyDescriptorIsExact(trace_policy))
+            reason = "CUDA HDG trace policy resolution failed";
+        }
       }
     }
   }
@@ -1802,7 +1824,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(request.communicator, local_ok))
     return Reject(request, "generic CUDA session allocation failed");
   auto& session = *allocated_session;
-  if (session.Initialize(resolved_plan.request).status !=
+  if (session.Initialize(resolved_plan.request,
+                         trace_policy.requested_selection).status !=
       HdgEulerSessionStatus::initialized)
     return Reject(request, "generic CUDA session initialization failed");
   const bool rodas3 = time_treatment == EulerHdgTimeTreatment::rodas3;
@@ -2060,7 +2083,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       if (!adaptive_rodas3)
       {
         time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-        return Reject(request, "generic CUDA prepared step failed");
+        const auto reported_failure_class =
+            prepare_failure_class ==
+                GenericEulerCudaPrepareFailureClass::not_failed
+            ? GenericEulerCudaPrepareFailureClass::unavailable
+            : prepare_failure_class;
+        return Reject(request,
+            std::string("generic CUDA prepared step failed: ") +
+                PrepareFailureClassName(reported_failure_class));
       }
       local_ok = session.RejectFailedPrepare().status ==
           HdgEulerSessionStatus::aborted;

@@ -1753,8 +1753,10 @@ private:
   {
     const bool borrowed_generic_shape = config_.use_borrowed_topology &&
         config_.use_borrowed_host_inputs && config_.mesh_n >= 0 &&
-        config_.order >= generic::minimum_polynomial_order &&
-        config_.order <= generic::maximum_polynomial_order;
+        generic::PlanPolynomialShape(config_.order,
+            config_.use_generic_numerical_policy &&
+            config_.numerical_policy.stabilization.kind ==
+                generic::RegularizationKind::igr).valid;
     const bool smoke_shape = config_.order == smoke_polynomial_order &&
         config_.mesh_n == smoke_elements_per_direction;
     const bool functional_shape =

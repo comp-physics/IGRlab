@@ -20,6 +20,8 @@
 #include "test_dgsem_reference_fixtures.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -85,6 +87,106 @@ std::vector<double> OffDiagonalRowSum(const mfem::DenseMatrix& mat)
     sums[i] = s;
   }
   return sums;
+}
+
+// Keep the pre-optimization directional composition as an independent oracle.
+// The production normal-flux helper must not be used to form the expected value.
+void LegacyEntropyNormalFlux(const mfem::Vector& ul,
+                             const mfem::Vector& ur,
+                             const mfem::Vector& normal,
+                             double gamma,
+                             mfem::dgsem::EntropyFluxType type,
+                             double sigma_l,
+                             double sigma_r,
+                             mfem::Vector& expected)
+{
+  expected.SetSize(ul.Size());
+  expected = 0.0;
+  mfem::real_t directional_data[4];
+  mfem::Vector directional(directional_data, ul.Size());
+  for (int d = 0; d < normal.Size(); ++d)
+  {
+    mfem::dgsem::EntropyConservativeFlux(
+      ul, ur, d, gamma, type, directional, sigma_l, sigma_r);
+    for (int eq = 0; eq < ul.Size(); ++eq)
+    {
+      expected(eq) += normal(d) * directional(eq);
+    }
+  }
+}
+
+void CheckEntropyNormalFluxBitwiseOracle(TestContext& ctx)
+{
+  // rho, vx, vy, thermal pressure for the left and right states. Include
+  // identical states, both logarithmic-mean branches, and unequal states.
+  const std::array<double, 8> states[] = {
+    {1.2, 0.3, -0.2, 1.1, 0.9, -0.1, 0.4, 0.7},
+    {1.2, 0.3, -0.2, 1.1, 1.2, 0.3, -0.2, 1.1},
+    {1.0, 0.0, -0.0, 1.0, 1.0, -0.0, 0.0, 1.0},
+    {1.0, 0.3, -0.2, 1.0, 1.0 + 1.0e-14, 0.3, -0.2, 1.0 + 1.0e-14},
+    {1.0, 0.3, -0.2, 1.0, 1.0 + 1.0e-8, 0.3, -0.2, 1.0 + 2.0e-8},
+    {0.08, 2.1, -1.7, 0.6, 3.1, -1.4, 0.9, 2.6},
+    {2.3, -0.4, 0.0, 1.7, 0.4, 0.0, -0.8, 0.8}};
+  const std::array<double, 2> normals[] = {
+    {1.0, 0.0}, {-1.0, -0.0}, {0.0, 1.0}, {-0.0, -2.5},
+    {0.0, 0.0}, {0.6, -1.3}, {-0.8, 0.4}};
+  const std::array<double, 2> sigmas[] = {
+    {0.0, 0.0}, {0.25, -0.1}, {-0.2, 0.4}};
+  bool exact = true;
+  bool finite = true;
+  int comparisons = 0;
+  for (const int dim : {1, 2})
+  {
+    for (const double gamma : {1.4, 1.67})
+    {
+      for (const auto type : {mfem::dgsem::EntropyFluxType::Ranocha,
+                              mfem::dgsem::EntropyFluxType::Chandrashekar})
+      {
+        for (const auto& q : states)
+        {
+          const mfem::Vector left = dim == 1
+            ? EulerConsFromPrim1D(q[0], q[1], q[3], gamma)
+            : EulerConsFromPrim2D(q[0], q[1], q[2], q[3], gamma);
+          const mfem::Vector right = dim == 1
+            ? EulerConsFromPrim1D(q[4], q[5], q[7], gamma)
+            : EulerConsFromPrim2D(q[4], q[5], q[6], q[7], gamma);
+          for (const auto& n : normals)
+          {
+            mfem::Vector normal(dim);
+            for (int d = 0; d < dim; ++d) { normal(d) = n[d]; }
+            for (const auto& sigma : sigmas)
+            {
+              for (const bool swap : {false, true})
+              {
+                const auto& ul = swap ? right : left;
+                const auto& ur = swap ? left : right;
+                const double sigma_l = sigma[swap ? 1 : 0];
+                const double sigma_r = sigma[swap ? 0 : 1];
+                mfem::Vector actual, expected;
+                LegacyEntropyNormalFlux(
+                  ul, ur, normal, gamma, type, sigma_l, sigma_r, expected);
+                mfem::dgsem::EntropyConservativeFluxDotN(
+                  ul, ur, normal, gamma, type, actual, sigma_l, sigma_r);
+                for (int eq = 0; eq < actual.Size(); ++eq)
+                {
+                  finite = finite && std::isfinite(actual(eq)) &&
+                           std::isfinite(expected(eq));
+                }
+                exact = exact && actual.Size() == expected.Size() &&
+                  std::memcmp(actual.GetData(), expected.GetData(),
+                              actual.Size() * sizeof(mfem::real_t)) == 0;
+                ++comparisons;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ctx.Check(comparisons == 2352 && finite,
+            "EC normal-flux oracle covers finite 1D/2D, sigma and normal cases");
+  ctx.Check(exact,
+            "EC normal flux matches original directional composition bitwise");
 }
 
 } // namespace
@@ -903,6 +1005,8 @@ int RunDGSEMFluxTests(TestContext& ctx)
     ctx.Check(resid_sigma > 1.0e-8,
               "DGSEM IGR residual responds to varying sigma");
   }
+
+  CheckEntropyNormalFluxBitwiseOracle(ctx);
 
   // Entropy-conservative flux helpers (Chandrashekar/Ranocha) symmetry + consistency.
   {

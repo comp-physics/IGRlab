@@ -5267,35 +5267,33 @@ private:
         ? trace.GetFaceElement(faces[0]) : nullptr;
     if (fe == nullptr || face_fe == nullptr) { return false; }
 
+    const auto order_shape = generic::PlanPolynomialShape(
+        config.order, IgrActive(config));
+    if (!order_shape.valid) return false;
     const int scalar_interior_dofs = fe->GetDof();
     const int scalar_face_dofs = face_fe->GetDof();
-    const int interior_dofs =
-        InteriorComponents(config) * scalar_interior_dofs;
-    const int trace_dofs =
-        faces_per_element * TraceComponents(config) * scalar_face_dofs;
+    if (scalar_interior_dofs != order_shape.scalar_interior_dofs ||
+        scalar_face_dofs != order_shape.scalar_face_dofs) return false;
+    const int interior_dofs = order_shape.interior_dofs;
+    const int trace_dofs = order_shape.trace_dofs;
     const auto assembly_orders = AssemblyOrders(config);
+    if (!generic::ValidAssemblyQuadratureOrder(assembly_orders.volume_order) ||
+        !generic::ValidAssemblyQuadratureOrder(assembly_orders.face_order))
+      return false;
     const int volume_points = mfem::IntRules.Get(
         fe->GetGeomType(), assembly_orders.volume_order).GetNPoints();
     const int face_points = mfem::IntRules.Get(
         face_fe->GetGeomType(), assembly_orders.face_order).GetNPoints();
     const bool common_shape = trace.GetVSize() > 0 && trace.GetTrueVSize() > 0 &&
         exchange.map.dofs.global_true_dof_count > 0 &&
-        scalar_interior_dofs > 0 &&
-        scalar_interior_dofs <= (generic
-            ? generic_maximum_scalar_dofs_per_element
-            : maximum_scalar_dofs_per_element) &&
-        scalar_face_dofs > 0 &&
-        scalar_face_dofs <= (generic
-            ? generic_maximum_scalar_dofs_per_face
-            : maximum_scalar_dofs_per_face) &&
-        interior_dofs <= (generic
-            ? generic_maximum_interior_dofs_per_element
-            : maximum_interior_dofs_per_element) &&
-        trace_dofs <= (generic
-            ? generic_maximum_trace_dofs_per_element
-            : maximum_trace_dofs_per_element) &&
-        volume_points <= maximum_volume_points &&
-        face_points <= maximum_face_points;
+        (generic ||
+         (scalar_interior_dofs <= maximum_scalar_dofs_per_element &&
+          scalar_face_dofs <= maximum_scalar_dofs_per_face &&
+          interior_dofs <= maximum_interior_dofs_per_element &&
+          trace_dofs <= maximum_trace_dofs_per_element)) &&
+        volume_points > 0 && face_points > 0 &&
+        (generic || (volume_points <= maximum_volume_points &&
+                     face_points <= maximum_face_points));
     if (generic) return common_shape;
     return common_shape && trace.GetVSize() <= maximum_local_trace_dofs &&
         trace.GetTrueVSize() <= maximum_true_trace_dofs &&
@@ -5306,6 +5304,17 @@ private:
   bool ValidateBorrowedTopologyCapacity(const CudaConfig& config) const
       noexcept
   {
+    const auto order_shape = generic::PlanPolynomialShape(
+        config.order, IgrActive(config));
+    const auto orders = AssemblyOrders(config);
+    const bool indices_fit = config.borrowed_mesh != nullptr &&
+        generic::PolynomialRankIndicesFitInt(order_shape,
+            config.borrowed_mesh->GetNE(),
+            config.borrowed_mesh->GetNumFaces()) &&
+        generic::PolynomialRankWorkspaceSlicesFitInt(order_shape,
+            config.borrowed_mesh->GetNE(), orders.volume_order,
+            orders.face_order);
+    if (!CollectiveContinue(indices_fit)) return false;
     bool local_valid = false;
     try
     {
@@ -5346,8 +5355,7 @@ private:
         config.expected_rank_count == 2;
     const bool supported_order = config.use_borrowed_topology &&
             config.use_borrowed_host_inputs
-        ? config.order >= generic::minimum_polynomial_order &&
-            config.order <= generic::maximum_polynomial_order
+        ? generic::PlanPolynomialShape(config.order, IgrActive(config)).valid
         : config.order == smoke_polynomial_order ||
             config.order == functional_polynomial_order;
     int collective_ranks = 0;
@@ -5719,6 +5727,15 @@ private:
         owned_mesh_.emplace(communicator_, serial_mesh_, partition.data());
         mesh_ = &*owned_mesh_;
       }
+      const auto order_shape = generic::PlanPolynomialShape(
+          config.order, IgrActive(config));
+      const auto orders = AssemblyOrders(config);
+      if (mesh_ == nullptr ||
+          !generic::PolynomialRankIndicesFitInt(order_shape,
+              mesh_->GetNE(), mesh_->GetNumFaces()) ||
+          !generic::PolynomialRankWorkspaceSlicesFitInt(order_shape,
+              mesh_->GetNE(), orders.volume_order, orders.face_order))
+        return false;
       interior_collection_.emplace(
           config.order, dimension, mfem::BasisType::GaussLegendre,
           mfem::FiniteElement::VALUE);
@@ -5753,10 +5770,13 @@ private:
     shape_.scalar_face_dofs = face_fe == nullptr ? 0 : face_fe->GetDof();
     shape_.interior_components = InteriorComponents(config);
     shape_.trace_components = TraceComponents(config);
-    shape_.interior_dofs =
-        shape_.interior_components * shape_.scalar_interior_dofs;
-    shape_.trace_dofs = faces_per_element * shape_.trace_components *
-        shape_.scalar_face_dofs;
+    const auto order_shape = generic::PlanPolynomialShape(
+        config.order, IgrActive(config));
+    if (!order_shape.valid ||
+        shape_.scalar_interior_dofs != order_shape.scalar_interior_dofs ||
+        shape_.scalar_face_dofs != order_shape.scalar_face_dofs) return false;
+    shape_.interior_dofs = order_shape.interior_dofs;
+    shape_.trace_dofs = order_shape.trace_dofs;
     const auto assembly_orders = AssemblyOrders(config);
     shape_.volume_assembly_order = assembly_orders.volume_order;
     shape_.face_assembly_order = assembly_orders.face_order;
@@ -5791,8 +5811,10 @@ private:
         fe->GetGeomType(), shape_.volume_assembly_order).GetNPoints();
     shape_.face_points = mfem::IntRules.Get(
         face_fe->GetGeomType(), shape_.face_assembly_order).GetNPoints();
-    if (shape_.volume_points > maximum_volume_points ||
-        shape_.face_points > maximum_face_points)
+    const bool generic = borrowed_topology_ && shape_.borrowed_host_inputs;
+    if (shape_.volume_points <= 0 || shape_.face_points <= 0 ||
+        (!generic && (shape_.volume_points > maximum_volume_points ||
+                      shape_.face_points > maximum_face_points)))
       return false;
     return true;
   }
@@ -5923,6 +5945,83 @@ private:
               trace_policy_descriptor_.trace_preconditioner)
           ? true_trace : 0;
       if (!valid) return false;
+      if (generic)
+      {
+        std::size_t doubles = 0;
+        std::size_t nine_interior = 0, four_true = 0, three_element_trace = 0;
+        std::size_t two_coupling = 0, two_local_matrix = 0;
+        std::size_t two_element_trace = 0, three_local_matrix = 0;
+        std::size_t four_element_trace = 0;
+        valid = checked_product(interior, 9, nine_interior) &&
+            checked_product(true_trace, 4, four_true) &&
+            checked_product(layout.element_trace, 3, three_element_trace) &&
+            checked_product(layout.element_coupling, 2, two_coupling) &&
+            checked_product(layout.local_matrix, 2, two_local_matrix) &&
+            checked_product(layout.element_trace, 2, two_element_trace) &&
+            checked_product(layout.local_matrix, 3, three_local_matrix) &&
+            checked_product(layout.element_trace, 4, four_element_trace) &&
+            checked_add(doubles, nine_interior) &&
+            checked_add(doubles, four_true) && checked_add(doubles, local_trace) &&
+            checked_add(doubles, three_element_trace) && checked_add(doubles, interior) &&
+            checked_add(doubles, layout.element_trace) &&
+            checked_add(doubles, layout.element_interior2) &&
+            checked_add(doubles, two_coupling) && checked_add(doubles, layout.local_matrix) &&
+            checked_add(doubles, interior) && checked_add(doubles, layout.element_trace) &&
+            checked_add(doubles, layout.element_interior2) && checked_add(doubles, interior) &&
+            checked_add(doubles, layout.solve_workspace) && checked_add(doubles, layout.local_matrix) &&
+            checked_add(doubles, layout.element_trace) && checked_add(doubles, true_trace) &&
+            checked_add(doubles, two_local_matrix) && checked_add(doubles, two_element_trace) &&
+            checked_add(doubles, layout.volume_shape) && checked_add(doubles, layout.volume_derivative) &&
+            checked_add(doubles, layout.volume_weight) && checked_add(doubles, layout.volume_position) &&
+            checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
+            checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
+            (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
+            checked_add(doubles, elements) &&
+            checked_add(doubles, euler_conservation_result_scalars) &&
+            checked_add(doubles, layout.face_weight) &&
+            (!shape_.borrowed_static_boundary_policies ||
+             (checked_add(doubles, layout.boundary_reference) &&
+              checked_add(doubles, layout.boundary_pressure))) &&
+            (!positivity_limiter_enabled_ ||
+             (checked_add(doubles, layout.positivity_diagnostics) &&
+              checked_add(doubles, layout.limiter_vertex_shape))) &&
+            (!partitioned_backward_euler_ ||
+             checked_add(doubles, layout.partitioned_base_interior)) &&
+            (!rodas3_ ||
+             (checked_add(doubles, layout.rodas_interior_vectors) &&
+              checked_add(doubles, layout.rodas_true_trace_vectors) &&
+              checked_add(doubles, layout.rodas_local_trace_vectors) &&
+              checked_add(doubles, layout.rodas_element_trace_vectors) &&
+              checked_add(doubles, layout.rodas_coupling_matrices))) &&
+            (!native_trace ||
+             (checked_add(doubles, layout.native_ilu_inverse_diagonal) &&
+              checked_add(doubles,
+                          native_trace_requirements_.basis_doubles) &&
+              checked_add(doubles,
+                          native_trace_requirements_.vector_doubles) &&
+              checked_add(doubles,
+                          native_trace_requirements_.reduction_doubles) &&
+              checked_add(doubles,
+                          native_trace_requirements_.small_doubles) &&
+              checked_add(doubles,
+                          native_trace_requirements_.control_double_slots)));
+        std::size_t integers = 17;
+        valid = valid && checked_add(integers, layout.element_trace) &&
+            checked_add(integers, three_local_matrix) &&
+            checked_add(integers, three_local_matrix) &&
+            checked_add(integers, four_element_trace) &&
+            (!shape_.borrowed_static_boundary_policies ||
+             checked_add(integers, layout.element_faces)) &&
+            (!native_trace || checked_add(
+                integers,
+                native_trace_requirements_.permutation_integers));
+        if (!valid || doubles > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            integers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+          return false;
+        double_arena_capacity_ = doubles;
+        integer_arena_capacity_ = integers;
+        generic_arena_layout_ = layout;
+      }
       const std::size_t host_elements = generic ? layout.elements : maximum_rank_elements;
       const std::size_t host_interior = generic ? interior :
           static_cast<std::size_t>(maximum_rank_elements) * maximum_interior_dofs_per_element;
@@ -6009,81 +6108,6 @@ private:
       vector_send_host_.assign(host_element_trace, 0.0);
       vector_receive_host_.assign(host_element_trace, 0.0);
 
-      if (!generic) return true;
-      std::size_t doubles = 0;
-      std::size_t nine_interior = 0, four_true = 0, three_element_trace = 0;
-      std::size_t two_coupling = 0, two_local_matrix = 0;
-      std::size_t two_element_trace = 0, three_local_matrix = 0;
-      std::size_t four_element_trace = 0;
-      valid = checked_product(interior, 9, nine_interior) &&
-          checked_product(true_trace, 4, four_true) &&
-          checked_product(layout.element_trace, 3, three_element_trace) &&
-          checked_product(layout.element_coupling, 2, two_coupling) &&
-          checked_product(layout.local_matrix, 2, two_local_matrix) &&
-          checked_product(layout.element_trace, 2, two_element_trace) &&
-          checked_product(layout.local_matrix, 3, three_local_matrix) &&
-          checked_product(layout.element_trace, 4, four_element_trace) &&
-          checked_add(doubles, nine_interior) &&
-          checked_add(doubles, four_true) && checked_add(doubles, local_trace) &&
-          checked_add(doubles, three_element_trace) && checked_add(doubles, interior) &&
-          checked_add(doubles, layout.element_trace) &&
-          checked_add(doubles, layout.element_interior2) &&
-          checked_add(doubles, two_coupling) && checked_add(doubles, layout.local_matrix) &&
-          checked_add(doubles, interior) && checked_add(doubles, layout.element_trace) &&
-          checked_add(doubles, layout.element_interior2) && checked_add(doubles, interior) &&
-          checked_add(doubles, layout.solve_workspace) && checked_add(doubles, layout.local_matrix) &&
-          checked_add(doubles, layout.element_trace) && checked_add(doubles, true_trace) &&
-          checked_add(doubles, two_local_matrix) && checked_add(doubles, two_element_trace) &&
-          checked_add(doubles, layout.volume_shape) && checked_add(doubles, layout.volume_derivative) &&
-          checked_add(doubles, layout.volume_weight) && checked_add(doubles, layout.volume_position) &&
-          checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
-          checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
-          (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
-          checked_add(doubles, elements) &&
-          checked_add(doubles, euler_conservation_result_scalars) &&
-          checked_add(doubles, layout.face_weight) &&
-          (!shape_.borrowed_static_boundary_policies ||
-           (checked_add(doubles, layout.boundary_reference) &&
-            checked_add(doubles, layout.boundary_pressure))) &&
-          (!positivity_limiter_enabled_ ||
-           (checked_add(doubles, layout.positivity_diagnostics) &&
-            checked_add(doubles, layout.limiter_vertex_shape))) &&
-          (!partitioned_backward_euler_ ||
-           checked_add(doubles, layout.partitioned_base_interior)) &&
-          (!rodas3_ ||
-           (checked_add(doubles, layout.rodas_interior_vectors) &&
-            checked_add(doubles, layout.rodas_true_trace_vectors) &&
-            checked_add(doubles, layout.rodas_local_trace_vectors) &&
-            checked_add(doubles, layout.rodas_element_trace_vectors) &&
-            checked_add(doubles, layout.rodas_coupling_matrices))) &&
-          (!native_trace ||
-           (checked_add(doubles, layout.native_ilu_inverse_diagonal) &&
-            checked_add(doubles,
-                        native_trace_requirements_.basis_doubles) &&
-            checked_add(doubles,
-                        native_trace_requirements_.vector_doubles) &&
-            checked_add(doubles,
-                        native_trace_requirements_.reduction_doubles) &&
-            checked_add(doubles,
-                        native_trace_requirements_.small_doubles) &&
-            checked_add(doubles,
-                        native_trace_requirements_.control_double_slots)));
-      std::size_t integers = 17;
-      valid = valid && checked_add(integers, layout.element_trace) &&
-          checked_add(integers, three_local_matrix) &&
-          checked_add(integers, three_local_matrix) &&
-          checked_add(integers, four_element_trace) &&
-          (!shape_.borrowed_static_boundary_policies ||
-           checked_add(integers, layout.element_faces)) &&
-          (!native_trace || checked_add(
-              integers,
-              native_trace_requirements_.permutation_integers));
-      if (!valid || doubles > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-          integers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-        return false;
-      double_arena_capacity_ = doubles;
-      integer_arena_capacity_ = integers;
-      generic_arena_layout_ = layout;
       return true;
     }
     catch (...) { return false; }

@@ -1,5 +1,6 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 
 #include <mfem.hpp>
 
@@ -790,17 +791,18 @@ bool NativeWorkspaceRequirementsPolicy() noexcept
 bool NativeElementSchwarzPatchRowsPolicy() noexcept
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
-  constexpr std::array<int, 3> conventional{{32, 48, 64}};
-  constexpr std::array<int, 3> igr{{40, 60, 80}};
-  for (const int rows : conventional)
-    if (!NativeTraceElementSchwarzPatchRowsSupported(rows)) return false;
-  for (const int rows : igr)
-    if (!NativeTraceElementSchwarzPatchRowsSupported(rows)) return false;
+  // Shape-policy checks extend beyond the bounded numerical p10 fixtures.
+  for (int order = 1; order <= 12; ++order)
+    if (!NativeTraceElementSchwarzPatchRowsSupported(16 * (order + 1)) ||
+        !NativeTraceElementSchwarzPatchRowsSupported(20 * (order + 1)))
+      return false;
   return !NativeTraceElementSchwarzPatchRowsSupported(0) &&
       !NativeTraceElementSchwarzPatchRowsSupported(24) &&
       !NativeTraceElementSchwarzPatchRowsSupported(36) &&
       !NativeTraceElementSchwarzPatchRowsSupported(72) &&
-      !NativeTraceElementSchwarzPatchRowsSupported(96);
+      !NativeTraceElementSchwarzPatchRowsSupported(
+          std::numeric_limits<int>::max()) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(219);
 }
 
 template <typename T>
@@ -854,6 +856,141 @@ class NativeDeviceAllocation
   T* pointer_ = nullptr;
   std::size_t count_ = 0;
 };
+
+bool TensorVolumeFailedChunkFixture()
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  // Poison retained storage before every launch. A first-chunk rejection
+  // must leave zero volume outputs; a later rejection must retain exactly
+  // the previously completed chunk. This exercises both four- and seven-
+  // component volume slabs without relying on a successful trace solve.
+  for (const bool igr_active : {false, true})
+  {
+    CudaMeshShape shape{};
+    shape.elements = 1;
+    shape.order = 2;
+    shape.scalar_interior_dofs = 9;
+    shape.scalar_face_dofs = 3;
+    shape.interior_components = igr_active ? 7 : 4;
+    shape.trace_components = igr_active ? 5 : 4;
+    shape.interior_dofs = shape.interior_components * 9;
+    shape.trace_dofs = 4 * shape.trace_components * 3;
+    shape.interior_count = shape.interior_dofs;
+    shape.local_trace_count = shape.trace_dofs;
+    shape.borrowed_host_inputs = true;
+    shape.igr_active = igr_active;
+    shape.igr_alpha = 0.01;
+    shape.igr_beta = 1.0;
+    shape.face_points = 1;
+    const int ni = shape.interior_dofs, nt = shape.trace_dofs;
+    const auto capacity = PlanTensorVolumeScratch(ni, nt, 1, igr_active);
+    if (!capacity.valid) return false;
+    shape.volume_points = capacity.capacity_points + 1;
+    const auto scratch = PlanTensorVolumeScratch(
+        ni, nt, shape.volume_points, igr_active);
+    if (!scratch.valid || scratch.chunk_points >= shape.volume_points)
+      return false;
+    const int full_points = shape.volume_points;
+    std::vector<double> host;
+    const auto reserve = [&](const std::size_t count, const double value)
+    {
+      const std::size_t offset = host.size();
+      host.resize(offset + count, value);
+      return offset;
+    };
+    const auto state = reserve(ni, 0.0);
+    const auto old = reserve(ni, 0.0);
+    const auto trace = reserve(nt, 0.0);
+    for (int row = 0; row < 9; ++row)
+    {
+      host[state + row] = host[old + row] = 1.0;
+      host[state + 3 * 9 + row] = 2.5;
+      host[old + 3 * 9 + row] = 2.0;
+    }
+    for (int face = 0; face < 4; ++face)
+      for (int row = 0; row < 3; ++row)
+      {
+        const int offset = face * shape.trace_components * 3 + row;
+        host[trace + offset] = 1.0;
+        host[trace + offset + 9] = 2.5;
+      }
+    const auto volume_shape = reserve(full_points * 9, 1.0 / 9.0);
+    const auto volume_derivative = reserve(full_points * 9 * 2, 0.0);
+    const auto volume_weight = reserve(full_points, 1.0);
+    const auto face_shape = reserve(4 * 9, 1.0 / 9.0);
+    const auto trace_shape = reserve(4 * 3, 1.0 / 3.0);
+    // Reject before any face contribution, leaving volume entries available
+    // for comparison with the deliberately rejected coefficient chunk.
+    const auto face_weight = reserve(4, -1.0);
+    const auto face_normal = reserve(4 * 2, 1.0);
+    const auto face_h = reserve(4, 1.0);
+    const auto a = reserve(ni * ni, -123.0);
+    const auto r = reserve(ni, -123.0);
+    const auto b = reserve(ni * nt, -123.0);
+    const auto c = reserve(nt * ni, -123.0);
+    const auto d = reserve(nt * nt, -123.0);
+    const auto f = reserve(ni, -123.0);
+    const auto g = reserve(nt, -123.0);
+    const auto residual_g = reserve(nt, -123.0);
+    const auto status = reserve(1, -123.0);
+    const auto workspace = reserve(scratch.workspace_doubles, -123.0);
+    NativeDeviceAllocation<double> device;
+    if (!device.CopyFrom(host)) return false;
+    CudaDeviceView view{};
+    double* const base = device.data();
+    view.work_interior = base + state;
+    view.old_interior = base + old;
+    view.current_local_trace = base + trace;
+    view.volume_shape = base + volume_shape;
+    view.volume_derivative = base + volume_derivative;
+    view.volume_weight = base + volume_weight;
+    view.face_interior_shape = base + face_shape;
+    view.face_trace_shape = base + trace_shape;
+    view.face_weight = base + face_weight;
+    view.face_normal = base + face_normal;
+    view.face_h = base + face_h;
+    view.a = base + a; view.b = base + b;
+    view.c = base + c; view.d = base + d;
+    view.f = base + f; view.g = base + g;
+    view.residual_r = base + r; view.residual_g = base + residual_g;
+    view.status = base + status;
+    view.solve_workspace = base + workspace;
+    const auto run = [&](const int points, std::vector<double>& result)
+    {
+      shape.volume_points = points;
+      std::uint64_t tiles = 0;
+      return cudaMemcpy(base, host.data(), host.size() * sizeof(double),
+                        cudaMemcpyHostToDevice) == cudaSuccess &&
+          CudaLaunchBorrowedAssembly(
+              view, shape, 0.1, CudaBorrowedAssemblyKind::tensor_volume,
+              tiles) && cudaDeviceSynchronize() == cudaSuccess &&
+          device.CopyTo(result);
+    };
+    std::vector<double> expected(host.size()), actual(host.size());
+    if (!run(scratch.chunk_points, expected) || expected[status] >= 0.0 ||
+        std::none_of(expected.begin() + a, expected.begin() + a + ni * ni,
+                     [](const double value) { return value != 0.0; }) ||
+        std::none_of(expected.begin() + r, expected.begin() + r + ni,
+                     [](const double value) { return value != 0.0; }))
+      return false;
+    host[volume_weight + scratch.chunk_points] = -1.0;
+    if (!run(full_points, actual) || actual[status] != -1.0 ||
+        !std::equal(expected.begin() + a, expected.begin() + a + ni * ni,
+                    actual.begin() + a) ||
+        !std::equal(expected.begin() + r, expected.begin() + r + ni,
+                    actual.begin() + r))
+      return false;
+    host[volume_weight + scratch.chunk_points] = 1.0;
+    host[volume_weight] = -1.0;
+    if (!run(full_points, actual) || actual[status] != -1.0 ||
+        !std::all_of(actual.begin() + a, actual.begin() + a + ni * ni,
+                     [](const double value) { return value == 0.0; }) ||
+        !std::all_of(actual.begin() + r, actual.begin() + r + ni,
+                     [](const double value) { return value == 0.0; }))
+      return false;
+  }
+  return true;
+}
 
 struct NativeCsrFixture
 {
@@ -1596,7 +1733,8 @@ bool RankOneEquilibratedMgrFixture()
 }
 
 bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
-                           NativeSolveFixtureResult& result)
+                           NativeSolveFixtureResult& result,
+                           const double initial_solution = 0.0)
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
   result = {};
@@ -1642,7 +1780,8 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
       !matrix_columns.CopyFrom(fixture.matrix.columns) ||
       !matrix_values.CopyFrom(fixture.matrix.values) ||
       !right_hand_side.CopyFrom(fixture.right_hand_side) ||
-      !solution.Allocate(static_cast<std::size_t>(rows)) ||
+      !solution.CopyFrom(std::vector<double>(
+          static_cast<std::size_t>(rows), initial_solution)) ||
       !basis.Allocate(requirements.basis_doubles) ||
       !vectors.Allocate(requirements.vector_doubles) ||
       !reduction.Allocate(requirements.reduction_doubles) ||
@@ -3323,22 +3462,32 @@ bool NativeFixedSigmaJacobiOrderFixture(
 
 bool NativeFixedSigmaJacobiDeviceFixtures()
 {
+  const auto run = [](const int order, const NativeFixedSigmaPatchKind kind,
+                      const int sweeps)
+  {
+    const bool pass = NativeFixedSigmaJacobiOrderFixture(order, kind, sweeps);
+    if (!pass)
+      std::cerr << "native trace fixed-sigma fixture failed order=" << order
+                << " patch_kind=" << static_cast<int>(kind)
+                << " sweeps=" << sweeps << '\n';
+    return pass;
+  };
   for (int order = 1; order <= 3; ++order)
     for (int sweeps = 1;
          sweeps <= dg::hdg::runtime::cuda_w8a::detail::
              native_trace_sigma_jacobi_maximum_sweeps;
          ++sweeps)
-      if (!NativeFixedSigmaJacobiOrderFixture(
+      if (!run(
               order, NativeFixedSigmaPatchKind::scalar_field_split,
               sweeps) ||
-          !NativeFixedSigmaJacobiOrderFixture(
+          !run(
               order, NativeFixedSigmaPatchKind::warp_field_split,
               sweeps))
         return false;
   for (int order = 1; order <= 3; ++order)
-    if (!NativeFixedSigmaJacobiOrderFixture(
+    if (!run(
             order, NativeFixedSigmaPatchKind::warp_coupled, 2) ||
-        !NativeFixedSigmaJacobiOrderFixture(
+        !run(
             order, NativeFixedSigmaPatchKind::warp_coupled,
             dg::hdg::runtime::cuda_w8a::detail::
                 native_trace_sigma_jacobi_maximum_sweeps))
@@ -3625,10 +3774,85 @@ bool NativeBreakdownFixtureExact()
           result.control, fixture.policy);
 }
 
+bool NativeInitialResidualFixturesExact()
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  struct Case
+  {
+    const char* name;
+    double rhs_entry;
+    NativeTraceSolveStatus status;
+    int actual_residual_checks;
+  };
+  const std::array<Case, 3> cases{{
+      {"zero", 0.0, NativeTraceSolveStatus::converged, 1},
+      {"nonfinite", std::numeric_limits<double>::quiet_NaN(),
+       NativeTraceSolveStatus::nonfinite_input, 0},
+      {"overflow", std::numeric_limits<double>::max(),
+       NativeTraceSolveStatus::numerical_breakdown, 1}}};
+  for (const bool igr : {false, true})
+  {
+    NativeSolveFixture fixture{};
+    fixture.matrix = DenseToDiagonalFirstCsr(
+        {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, 3);
+    fixture.ilu.factor = fixture.matrix;
+    fixture.ilu.permutation = {2, 0, 1};
+    fixture.ilu.inverse_diagonal = {1.0, 1.0, 1.0};
+    fixture.policy.rank_count = 1;
+    fixture.policy.krylov_dimension = 2;
+    fixture.policy.maximum_iterations = 4;
+    fixture.policy.relative_tolerance = 1.0e-12;
+    fixture.igr = igr;
+    for (const Case& test : cases)
+    {
+      fixture.right_hand_side = {0.0, test.rhs_entry, -0.0};
+      NativeSolveFixtureResult result{};
+      constexpr double initial_solution = 13.0;
+      const bool launched = RunNativeSolveFixture(
+          fixture, result, initial_solution);
+      const auto& control = result.control;
+      const bool converged = test.status == NativeTraceSolveStatus::converged;
+      // Nonfinite input leaves the supplied solution untouched; admitted input
+      // must replace it with the solver's zero initial guess before the norm.
+      const double expected_solution = test.actual_residual_checks == 0
+          ? initial_solution : 0.0;
+      const bool solution_exact = result.solution.size() == 3 &&
+          std::all_of(result.solution.begin(), result.solution.end(),
+                      [expected_solution](const double value)
+                      { return value == expected_solution; });
+      if (!launched || control.schema != native_trace_control_schema ||
+          control.status != test.status ||
+          (control.failure_mask == 0) != converged ||
+          control.iterations != 0 || control.restart_cycles != 0 ||
+          control.preconditioner_applications != 0 ||
+          control.operator_applications != 0 ||
+          control.actual_residual_checks != test.actual_residual_checks ||
+          control.rhs_norm != 0.0 || control.initial_residual_norm != 0.0 ||
+          control.estimated_residual_norm != 0.0 ||
+          control.actual_residual_norm != 0.0 ||
+          control.relative_residual_norm != 0.0 || !solution_exact ||
+          NativeTraceResultIsReadyForTrueResidual(control, fixture.policy) !=
+              converged)
+      {
+        std::cerr << "native trace initial residual fixture failed case="
+                  << test.name << " igr=" << igr << " status="
+                  << NativeTraceSolveStatusName(control.status)
+                  << " failure_mask=" << control.failure_mask
+                  << " residual_checks=" << control.actual_residual_checks
+                  << '\n';
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool NativeTraceDeviceFixtures() noexcept
 {
   try
   {
+    if (!NativeInitialResidualFixturesExact()) return false;
+
     // A generic five-row system cannot finish within one GMRES(2) cycle;
     // compare its restarted native result with an independent pivoted solve.
     const NativeSolveFixture conventional =
@@ -3820,6 +4044,74 @@ constexpr bool OrdinaryRankOneRefreshRoutingPolicy() noexcept
 static_assert(OrdinaryRankOneRefreshRoutingPolicy(),
               "only exact ordinary refresh-each policies use the lean solve");
 
+constexpr bool OrdinaryJacobiRefreshDescriptorPolicy() noexcept
+{
+  using dg::hdg::generic::CudaEngineKind;
+  using dg::hdg::generic::EulerHdgTimeTreatment;
+  constexpr auto selection =
+      CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+  const auto candidate = dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true, 1, 3, selection);
+  auto expected = dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true, 1, 3,
+      CudaTracePolicyKind::engine_default);
+  expected.requested_selection = selection;
+  expected.resolved_selection = selection;
+  expected.ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKind::iterative_jacobi;
+  expected.ilu_lower_jacobi_iterations = 5;
+  expected.ilu_upper_jacobi_iterations = 5;
+  if (!CudaTracePolicyDescriptorIsExact(candidate) ||
+      !CudaTracePolicyDescriptorExact(candidate, expected) ||
+      candidate.ilu_factor_reuse_policy !=
+          CudaIluFactorReusePolicy::refresh_each_trace_solve ||
+      CudaOrdinaryRankOneRefreshPolicyIsExact(candidate) ||
+      std::string_view(CudaTracePolicyKindName(selection)) !=
+          "ordinary-ilu-jacobi5-refresh" ||
+      ResolveCudaTracePolicy(CudaEngineKind::ordinary, false, selection).valid ||
+      ResolveCudaTracePolicy(CudaEngineKind::tensor_core, true, selection).valid ||
+      dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+          CudaEngineKind::ordinary, true, 2, 3, selection).valid)
+    return false;
+  auto stale = candidate;
+  stale.ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+  auto fewer_sweeps = candidate;
+  fewer_sweeps.ilu_lower_jacobi_iterations = 4;
+  for (const int order : {0, 1, 2, 4, 10})
+    if (DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+            EulerHdgTimeTreatment::backward_euler, order) !=
+        CudaTracePolicyKind::engine_default)
+      return false;
+  return !CudaTracePolicyDescriptorIsExact(stale) &&
+      !CudaTracePolicyDescriptorIsExact(fewer_sweeps) &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::backward_euler, 3) == selection &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::backward_euler) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::rodas3, 3) == CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 1,
+          EulerHdgTimeTreatment::partitioned_backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, true, 2,
+          EulerHdgTimeTreatment::backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::ordinary, false, 1,
+          EulerHdgTimeTreatment::backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      DefaultCudaTracePolicyRequest(CudaEngineKind::tensor_core, true, 1,
+          EulerHdgTimeTreatment::backward_euler, 3) ==
+          CudaTracePolicyKind::engine_default &&
+      CudaTracePolicyDescriptorIsExact(
+          dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::ordinary, true, 1, 4, selection));
+}
+
+static_assert(OrdinaryJacobiRefreshDescriptorPolicy(),
+              "ordinary Jacobi defaults only to p3 fresh BE factors; explicit policy stays available");
+
 constexpr bool DiagScaleSetupOrderPolicy() noexcept
 {
   using dg::hdg::generic::CudaEngineKind;
@@ -3962,8 +4254,7 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
   using dg::hdg::generic::CudaEngineKind;
   using dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind;
   using dg::hdg::runtime::cuda_w8a::detail::ResolveCudaTraceSolverKind;
-  for (int order = dg::hdg::generic::minimum_polynomial_order;
-       order <= dg::hdg::generic::maximum_polynomial_order; ++order)
+  for (int order = 1; order <= 12; ++order)
   {
     constexpr CudaTracePolicyKind expected_policy =
         CudaTracePolicyKind::
@@ -4060,7 +4351,11 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
               CudaEngineKind::tensor_core, true, 0, 1,
               CudaTracePolicyKind::engine_default).valid &&
       !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
-              CudaEngineKind::tensor_core, true, 1, 4,
+              CudaEngineKind::tensor_core, true, 1, 0,
+              CudaTracePolicyKind::engine_default).valid &&
+      !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, true, 1,
+              std::numeric_limits<int>::max(),
               CudaTracePolicyKind::engine_default).valid;
 }
 
@@ -4846,6 +5141,46 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
       !ordinary_evidence.ilu_accounting_complete)
     return false;
 
+  CudaTensorCoreEvidence jacobi_refresh_evidence{};
+  jacobi_refresh_evidence.selected_engine = CudaEngineKind::ordinary;
+  jacobi_refresh_evidence.requested_trace_policy =
+      CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+  jacobi_refresh_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
+  jacobi_refresh_evidence.trace_policy_rank_count = 1;
+  jacobi_refresh_evidence.trace_policy_order = 3;
+  auto jacobi_refresh = IluDiagnostics(
+      true, CudaEngineKind::ordinary,
+      CudaIluFactorReusePolicy::refresh_each_trace_solve, 1, 0, 0, 9);
+  jacobi_refresh.ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKind::iterative_jacobi;
+  jacobi_refresh.ilu_lower_jacobi_iterations = 5;
+  jacobi_refresh.ilu_upper_jacobi_iterations = 5;
+  jacobi_refresh.ilu_jacobi_factor_spmv_updates_lower_bound =
+      8 * jacobi_refresh.ilu_inner_iterations_lower_bound;
+  jacobi_refresh.ilu_jacobi_factor_spmv_updates_upper_bound =
+      8 * jacobi_refresh.ilu_inner_iterations_upper_bound;
+  if (!CudaInitializeIluEvidence(jacobi_refresh_evidence,
+          CudaTracePreconditionerKind::hypre_ilu0, true) ||
+      !CudaAccumulateIluSolveEvidence(jacobi_refresh_evidence, jacobi_refresh) ||
+      !CudaAccumulateIluSolveEvidence(jacobi_refresh_evidence, jacobi_refresh) ||
+      jacobi_refresh_evidence.ilu_factor_setups != 2 ||
+      jacobi_refresh_evidence.ilu_factor_reuses != 0 ||
+      jacobi_refresh_evidence.ilu_factor_age_generations != 0 ||
+      jacobi_refresh_evidence.ilu_jacobi_factor_spmv_updates_lower_bound !=
+          8 * jacobi_refresh_evidence.ilu_inner_iterations_lower_bound ||
+      jacobi_refresh_evidence.ilu_jacobi_factor_spmv_updates_upper_bound !=
+          8 * jacobi_refresh_evidence.ilu_inner_iterations_upper_bound ||
+      !jacobi_refresh_evidence.ilu_accounting_complete)
+    return false;
+  auto stale_jacobi = jacobi_refresh;
+  stale_jacobi.ilu_factor_setups = 0;
+  stale_jacobi.ilu_factor_reuses = 1;
+  stale_jacobi.ilu_factor_age_generations = 1;
+  auto stale_jacobi_evidence = jacobi_refresh_evidence;
+  if (CudaAccumulateIluSolveEvidence(stale_jacobi_evidence, stale_jacobi))
+    return false;
+
   CudaTensorCoreEvidence tensor_igr_evidence{};
   tensor_igr_evidence.selected_engine = CudaEngineKind::tensor_core;
   tensor_igr_evidence.requested_trace_policy =
@@ -5593,6 +5928,13 @@ int main(int argc, char** argv)
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   const std::string_view mode = argc == 2 ? argv[1] : "";
+  if (mode == "--tensor-volume-chunks")
+  {
+    const bool pass = ranks == 1 && TensorVolumeFailedChunkFixture();
+    if (!pass && rank == 0)
+      std::cerr << "tensor volume rejected-chunk initialization failed\n";
+    return pass ? 0 : 1;
+  }
   const bool known_mode = mode.empty() || mode == "--token-negatives" ||
       mode == "--functional";
   const bool policies = NativeBoundedResultPolicy() &&
@@ -5610,7 +5952,8 @@ int main(int argc, char** argv)
          : LifecycleAndRecovery<RankTwoTag>(ranks))
       : false);
   const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
-      (lifecycle && RetainedLuStageLeafFixture() &&
+      (lifecycle && TensorVolumeFailedChunkFixture() &&
+       RetainedLuStageLeafFixture() &&
        NativeTraceDeviceFixtures() &&
        NativeElementSchwarzDeviceFixture() &&
        NativeFixedSigmaJacobiDeviceFixtures());

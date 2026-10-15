@@ -1324,9 +1324,11 @@ __device__ void SparseMatrixVector(
   grid.sync();
 }
 
+// Keep these immutable views in the kernel's grid-constant parameter storage
+// through the residual helper chain instead of copying them into local frames.
 __device__ void ApplyTraceOperator(
-    const NativeTraceSystemView system,
-    const NativeTracePreconditionerView preconditioner,
+    const NativeTraceSystemView& system,
+    const NativeTracePreconditionerView& preconditioner,
     const double* input, double* output,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
@@ -1343,7 +1345,7 @@ __device__ void ApplyTraceOperator(
     return;
   }
 
-  const NativeTraceElementSchwarzView schwarz =
+  const NativeTraceElementSchwarzView& schwarz =
       preconditioner.element_schwarz;
   const int patch_rows = schwarz.patch_rows;
   const int element_slots = schwarz.elements * patch_rows;
@@ -1464,8 +1466,8 @@ __device__ void ApplyTraceOperator(
 }
 
 __device__ void ComputeActualResidual(
-    const NativeTraceSystemView system,
-    const NativeTracePreconditionerView preconditioner, double* residual,
+    const NativeTraceSystemView& system,
+    const NativeTracePreconditionerView& preconditioner, double* residual,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
@@ -2271,8 +2273,8 @@ __global__ void NativeRankOneTraceSolveKernel(
 
   double rhs_norm = GridNorm(system.rhs, rows, workspace, control,
                              grid, block_scratch);
-  double residual_norm = GridNorm(first_basis, rows, workspace, control,
-                                  grid, block_scratch);
+  // The zero initial guess leaves the residual equal to the copied RHS.
+  double residual_norm = rhs_norm;
   if (grid.thread_rank() == 0)
   {
     control->rhs_norm = rhs_norm;
@@ -3099,7 +3101,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
          !NativeTraceIgrElementSchwarzPatchRowsSupported(
              schwarz.patch_rows)) ||
         (field_split &&
-         (scalar_face_rows < 2 || scalar_face_rows > 4 ||
+         (scalar_face_rows < generic::minimum_polynomial_order + 1 ||
+          !generic::PlanPolynomialShape(scalar_face_rows - 1, true).valid ||
           euler_rows != 4 * schwarz.patch_rows / 5 ||
           selected_field_split_required > patch_capacity)) ||
         schwarz.true_rows != system.matrix.rows ||

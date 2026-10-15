@@ -2,6 +2,7 @@
 #include "numerics/riemann/side_scope_utils.hpp"
 
 #include <algorithm>
+#include <typeinfo>
 
 namespace mfem
 {
@@ -63,18 +64,42 @@ real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
     sigma_r = flux_igr->GetSigmaAtSide(Tr, FaceSide::Right);
   }
 
-  Vector flux_tmp(state1.Size());
+  // Euler scratch is at most four entries. Keep it local to each call so
+  // these vectors do not allocate at each face quadrature point, including
+  // in thread-safe builds.
+  // SetSize retains the original heap-backed behavior for larger states.
+  const int num_eq = state1.Size();
+  real_t flux_tmp_data[4];
+  Vector flux_tmp(flux_tmp_data, std::min(num_eq, 4));
+  flux_tmp.SetSize(num_eq);
+  const FluxFunction* speed_flux = &flux_fn_;
+  const FaceSideExplicitFlux* speed_side_flux = side_explicit_flux_;
+  // The sigma values above already supply the entropy flux and dissipation.
+  // With the concrete Euler/IGR pair and no sigma-speed policy, the wrapped
+  // normal flux returns exactly the base speed. Avoid interpolating sigma
+  // again just to add it to this discarded scratch flux. Retain virtual side
+  // dispatch for derived fluxes and check mutable policies on every call.
+  if (flux_igr && typeid(*flux_igr) == typeid(FluxWithIGR) &&
+      typeid(flux_igr->GetBaseFlux()) == typeid(EulerFlux) &&
+      !flux_igr->GetSigmaAwareCFL() &&
+      !flux_igr->GetSigmaAwareRusanov() &&
+      !flux_igr->GetFrozenSigmaSpectralSpeed() &&
+      !flux_igr->GetInvariantDomainFlux())
+  {
+    speed_flux = &flux_igr->GetBaseFlux();
+    speed_side_flux = nullptr;
+  }
   const real_t speed1 =
-    riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
-                                           flux_fn_,
+    riemann_detail::ComputeFluxDotNForSide(speed_side_flux,
+                                           *speed_flux,
                                            FaceSide::Left,
                                            state1,
                                            nor,
                                            Tr,
                                            flux_tmp);
   const real_t speed2 =
-    riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
-                                           flux_fn_,
+    riemann_detail::ComputeFluxDotNForSide(speed_side_flux,
+                                           *speed_flux,
                                            FaceSide::Right,
                                            state2,
                                            nor,
@@ -83,7 +108,9 @@ real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
 
   const real_t max_speed = std::max(speed1, speed2);
 
-  Vector flux_ec(state1.Size());
+  real_t flux_ec_data[4];
+  Vector flux_ec(flux_ec_data, std::min(num_eq, 4));
+  flux_ec.SetSize(num_eq);
   dgsem::EntropyConservativeFluxDotN(state1,
                                      state2,
                                      nor,
@@ -96,7 +123,9 @@ real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
 
   if (type_ == DGSEMSurfaceFluxType::EntropyStableWinters)
   {
-    Vector diss(state1.Size());
+    real_t diss_data[4];
+    Vector diss(diss_data, std::min(num_eq, 4));
+    diss.SetSize(num_eq);
     dgsem::WintersDissipation(state1,
                               state2,
                               nor,
@@ -109,7 +138,9 @@ real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
   else
   {
     const double scaled = max_speed * nor.Norml2();
-    Vector diss(state1.Size());
+    real_t diss_data[4];
+    Vector diss(diss_data, std::min(num_eq, 4));
+    diss.SetSize(num_eq);
     dgsem::EntropyVariableLFDissipation(state1,
                                         state2,
                                         gamma_,

@@ -35,6 +35,7 @@ public:
   void SetSurfaceFluxType(DGSEMSurfaceFluxType type) { type_ = type; }
   void SetEntropyFluxType(dgsem::EntropyFluxType type) { entropy_type_ = type; }
   void SetGamma(double gamma) { gamma_ = gamma; }
+  double GetGamma() const { return gamma_; }
   void SetEntropyJacobianMode(dgsem::EntropyJacobianMode mode)
   {
     entropy_jacobian_mode_ = mode;

@@ -300,7 +300,7 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      bool frozen_sigma_spectral_speed = false,
                                      bool assemble_weak_surface = true);
 
-/** Fused FP64 CUDA residual for admitted 2D p1--p4 LGL element batches.
+/** Fused FP64 CUDA residual for admitted 2D p1--p10 LGL element batches.
  *
  * Consumes the unique unweighted face fluxes above. Central transport,
  * optional LLF volume dissipation, signed face incidence, and diagonal inverse
@@ -310,7 +310,7 @@ void AssembleEulerRusanovFacesDevice(int dim,
  * numerical method to a blend with an adjacent-LGL-subcell LLF residual and
  * requires affine metrics and coefficients in [0,1].
  * The packed output remains private until the caller's normal final scatter.
- * tensor_contraction selects an on-chip FP64 8x8x4 WMMA central contraction;
+ * tensor_contraction selects a padded, tiled FP64 8x8x4 WMMA central contraction;
  * the default uses the same precombined operator with ordinary FP64 arithmetic.
  */
 /** Density/pressure modal sensor for an element-constant conservative

@@ -406,6 +406,59 @@ bool CheckZeroOwnedMapContract()
       map.GhostCount() == 1;
 }
 
+bool CheckMapCoverageValidation()
+{
+  DGInterfaceTraceMap map;
+  map.vector_dimension = 2;
+  map.dofs.rank = 0;
+  map.dofs.rank_count = 1;
+  map.dofs.local_true_dof_count = 8;
+  map.dofs.global_true_dof_count = 8;
+  for (int i = 0; i < 8; ++i)
+  {
+    map.dofs.entries.push_back({i, i, 7 - i, 0, Ownership::owned});
+  }
+  // Each face has two scalar nodes and two components.  Permuted scalar
+  // nodes and negative MFEM orientations still cover every local VDof once.
+  map.faces = {{0, mfem::Geometry::SEGMENT, {2, -1, 6, -5}},
+               {1, mfem::Geometry::SEGMENT, {-4, 1, -8, 5}}};
+  if (!map.IsConsistent()) { return false; }
+  std::swap(map.faces[0].signed_local_vdofs,
+            map.faces[1].signed_local_vdofs);
+  if (!map.IsConsistent()) { return false; }
+
+  DGInterfaceTraceMap invalid = map;
+  invalid.faces[1].signed_local_vdofs = invalid.faces[0].signed_local_vdofs;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs = {2, 2, 6, 6};
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces.pop_back();
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs[0] = std::numeric_limits<int>::min();
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs[0] = 4;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs[2] = 8;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs[2] = -9;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs[2] = 7;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs[2] = -7;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.faces[0].signed_local_vdofs.pop_back();
+  return !invalid.IsConsistent();
+}
+
 bool CheckUnsupported3D()
 {
   mfem::Mesh valid_serial = mfem::Mesh::MakeCartesian2D(
@@ -1102,6 +1155,8 @@ int main(int argc, char* argv[])
               CheckAnalyticSegmentOrientations(), failures, rank);
   RecordCheck("zero_owned_true_dof_map_contract",
               CheckZeroOwnedMapContract(), failures, rank);
+  RecordCheck("signed_face_coverage_validation",
+              CheckMapCoverageValidation(), failures, rank);
   RecordCheck("zero_local_dg_trace_map_plan_exchange",
               CheckZeroLocalMapPlanAndExchange(MPI_COMM_WORLD), failures,
               rank);

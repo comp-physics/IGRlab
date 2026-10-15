@@ -6,9 +6,11 @@
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_quadrature.hpp"
 #include "numerics/dgsem/dgsem_tensor.hpp"
+#include "numerics/riemann/dgsem_surface_flux.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "physics/bc/boundary_state.hpp"
+#include "sim/wiring/dg_operator.hpp"
 #include "utils/math/constants.hpp"
 
 #include "mfem.hpp"
@@ -19,6 +21,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -339,6 +342,117 @@ void RunLegacy3DGuardProbeIfRequested()
   MFEM_ABORT("DGSEM legacy 3D probe unexpectedly passed its dimension guard.");
 }
 
+void RunDGSEMUnusedWeakDivergenceTests(TestContext& ctx)
+{
+  // Exercise both the application factory and its host-oracle fallback with
+  // the same nonconstant state, including the empty-storage Update lifecycle.
+  dgsem_production_test::ScopedEnvironment strict(
+    "IGRLAB_DGSEM_PRODUCTION_STRICT", "0");
+  dg_sim::RunConfig config;
+  config.dg_backend = dg_sim::DGBackend::DGSEM;
+  config.opts.order = 2;
+  config.opts.preassemble_weak_div = true;
+  config.case_config.gamma = 1.4;
+  config.case_config.int_order_offset = 2;
+  config.dgsem_volume_flux = dg_sim::DGSEMVolumeFlux::Central;
+  config.dgsem_volume_dissipation = dg_sim::DGSEMVolumeDissipation::None;
+  config.dgsem_stab = dg_sim::DGSEMStabilization::None;
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+    2, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  dg_sim::ExampleContext example(
+    config, std::make_unique<mfem::ParMesh>(MPI_COMM_SELF, serial),
+    "L2", true, false);
+  auto& vfes = example.spaces.vfes;
+  mfem::ParGridFunction state(&vfes);
+  mfem::VectorFunctionCoefficient state_coefficient(
+    4, [](const mfem::Vector& point, mfem::Vector& value)
+    {
+      value = EulerConsFromPrim2D(
+        1.0 + 0.03 * point(0), 0.2 + 0.02 * point(1),
+        -0.1 + 0.01 * point(0), 1.0 + 0.04 * point(1), 1.4);
+    });
+  state.ProjectCoefficient(state_coefficient);
+  mfem::ParGridFunction sigma(example.spaces.sigma_fes.get());
+  mfem::FunctionCoefficient sigma_coefficient(
+    [](const mfem::Vector& point)
+    { return 0.02 + 0.01 * point(0) + 0.005 * point(1); });
+  sigma.ProjectCoefficient(sigma_coefficient);
+  mfem::EulerFlux euler(2, 1.4);
+  mfem::FluxWithIGR igr(euler);
+  igr.SetSigmaField(&sigma);
+  mfem::Vector input;
+  state.GetTrueDofs(input);
+  mfem::Array<int> marker(example.Mesh().bdr_attributes.Max());
+  marker = 1;
+  const auto same_values = [](const mfem::Vector& a, const mfem::Vector& b)
+  {
+    if (a.Size() != b.Size()) { return false; }
+    const auto* left = a.HostRead();
+    const auto* right = b.HostRead();
+    for (int i = 0; i < a.Size(); ++i)
+    {
+      if (!std::isfinite(left[i]) || !std::isfinite(right[i])) { return false; }
+    }
+    return std::memcmp(left, right, a.Size() * sizeof(mfem::real_t)) == 0;
+  };
+
+  for (const auto type : {mfem::DGSEMSurfaceFluxType::Rusanov,
+                          mfem::DGSEMSurfaceFluxType::EntropyStableWinters})
+  {
+    mfem::DGSEMSurfaceFlux numerical_flux(igr);
+    numerical_flux.SetSurfaceFluxType(type);
+    auto actual = dg_sim::MakeDGOperator(example, numerical_flux);
+    auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+      numerical_flux, 2);
+    mfem::DGHyperbolicConservationLaws reference(vfes, std::move(form), true);
+    reference.SetNumericalFlux(&numerical_flux);
+    reference.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+    reference.SetDGSEMGamma(1.4);
+    reference.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+    reference.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::None);
+    reference.SetFaceQuadratureOrderOffset(2);
+    reference.SetFaceIntegrationRule(mfem::dgsem::GetLGLFaceRule(2));
+    for (auto* op : {&actual, &reference})
+    {
+      op->AddBdrFaceIntegrator(
+        std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+          numerical_flux, std::make_unique<mfem::SupersonicOutletState>(), 2),
+        marker);
+    }
+    const bool packed = type == mfem::DGSEMSurfaceFluxType::Rusanov;
+    const std::string route = packed ? "packed" : "fallback";
+    for (int update = 0; update < 2; ++update)
+    {
+      if (update) { actual.Update(); reference.Update(); }
+      mfem::Vector output(vfes.GetTrueVSize());
+      mfem::Vector expected(vfes.GetTrueVSize());
+      actual.Mult(input, output);
+      reference.Mult(input, expected);
+      const auto selection = actual.GetDGSEMProductionSelection();
+      const auto speed = actual.GetMaxCharSpeed();
+      const auto expected_speed = reference.GetMaxCharSpeed();
+      ctx.Check(selection.supported == packed && !selection.strict &&
+                  (packed || selection.reason ==
+                    mfem::dgsem::DGSEMProductionReason::UnsupportedSurfaceFlux),
+                "DGSEM no weak-div setup selects " + route);
+      ctx.Check(same_values(output, expected) && std::isfinite(speed) &&
+                  std::memcmp(&speed, &expected_speed, sizeof(speed)) == 0,
+                "DGSEM no weak-div setup preserves " + route +
+                  " residual and speed exactly, update=" + std::to_string(update));
+
+      mfem::dgsem::DGSEMOperator actual_oracle(actual);
+      mfem::dgsem::DGSEMOperator reference_oracle(reference);
+      const auto oracle_speed = actual_oracle.AssembleResidual(input, output);
+      const auto reference_speed = reference_oracle.AssembleResidual(input, expected);
+      ctx.Check(same_values(output, expected) && std::isfinite(oracle_speed) &&
+                  std::memcmp(&oracle_speed, &reference_speed,
+                              sizeof(oracle_speed)) == 0,
+                "DGSEM no weak-div setup preserves direct host oracle for " +
+                  route + ", update=" + std::to_string(update));
+    }
+  }
+}
+
 } // namespace
 
 int RunDGSEMOperatorTests(TestContext& ctx)
@@ -351,6 +465,7 @@ int RunDGSEMOperatorTests(TestContext& ctx)
   RunLegacy3DGuardProbeIfRequested();
   RunDGSEMDeviceParityTests(ctx);
   dgsem_production_test::RunDGSEMProductionOperatorTests(ctx);
+  RunDGSEMUnusedWeakDivergenceTests(ctx);
 
   const double tol = 1.0e-10;
 

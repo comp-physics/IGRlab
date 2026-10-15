@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "target": "x86_64_v3",
+  "compiler": {"version": "14.2.1"},
+  "cmake": {"version": "3.31.8", "target": "x86_64_v2"},
+  "cuda_version": "12.9.20260507",
+  "cuda_compiler_version": "12.9.86",
+  "metis_version": "5.1.0",
+  "openblas": {
+    "version": "0.3.29", "target": "x86_64_v2",
+    "parameters": {"threads": "none", "shared": true, "ilp64": false}
+  },
+  "hypre_version": "3.1.0",
+  "umpire_version": "2025.12.0",
+  "zlib_version": "1.3.1",
+  "profiles": {
+    "cpu": {
+      "modules": ["gcc-native/14", "cmake/3.31.8", "openblas/0.3.29-gcc13.3.1", "nvhpc-hpcx-cuda12-openmpi4/26.5", "cuda/12.9"],
+      "mpi_version": "4.1.9a1",
+      "mpi_parameters": {"cuda": true}
+    },
+    "cuda-sm80": {
+      "modules": ["gcc-native/14", "cmake/3.31.8", "openblas/0.3.29-gcc13.3.1", "nvhpc-hpcx-cuda12-openmpi4/26.5", "cuda/12.9"],
+      "mpi_version": "4.1.9a1",
+      "mpi_parameters": {"cuda": true}
+    }
+  }
+}

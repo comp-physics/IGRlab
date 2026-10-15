@@ -282,6 +282,10 @@ foreach(_regularization IN ITEMS conventional igr)
         RESOURCE_LOCK hdg_generic_euler_cpu
         LABELS "hdg;generic;cpu;convergence;spatial;backward-euler;${_regularization};p${_order}"
         TIMEOUT 3600)
+    if(_order EQUAL 1 OR _order EQUAL 3)
+      set_property(TEST hdg_generic_euler_cpu_convergence_${_regularization}_p${_order}
+        APPEND PROPERTY LABELS "numerical-acceptance;numerical-convergence")
+    endif()
   endforeach()
 endforeach()
 
@@ -356,6 +360,10 @@ foreach(_order IN ITEMS 1 2 3)
       RESOURCE_LOCK hdg_generic_euler_cpu
       LABELS "hdg;generic;cpu;igr;quadrature-equivalence;p${_order}"
       TIMEOUT 3600)
+  if(_order EQUAL 3)
+    set_property(TEST hdg_generic_euler_cpu_igr_quadrature_equivalence_p${_order}
+      APPEND PROPERTY LABELS "numerical-acceptance;numerical-conservation;conservation")
+  endif()
 endforeach()
 
 add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test
