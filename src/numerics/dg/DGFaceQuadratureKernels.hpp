@@ -1718,7 +1718,6 @@ struct InteriorFaceDGDiffusionRecord2D
 // Each side/q projection retains the original ascending-d sum, the side-pair
 // terms retain their operation order, and each output retains its ascending-q
 // sum.  The subsequent deterministic element incidence gather is unchanged.
-template <bool PairedSides>
 struct InteriorFaceDGDiffusionRecord2DWarp
 {
   InteriorFaceDGDiffusionRecord2D record;
@@ -1775,111 +1774,63 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       projected_penalty_jump = P(lane, face) * projected_jump;
     }
 
-    if constexpr (PairedSides)
+    // Keep two independent output sums per lane.  The side-pair terms are
+    // broadcast once for both rows, exposing independent table loads without
+    // growing the register working set with polynomial order.  Each output
+    // still accumulates in ascending q, including the final incomplete group.
+    constexpr int rows_per_lane = 2;
+    for (int row_base = 0; row_base < 2 * record.dof;
+         row_base += 32 * rows_per_lane)
     {
-      // Once an element has at least a warp of dofs, let each lane own the
-      // same dof on both sides.  This removes row-to-side division and the
-      // divergent side branches from every quadrature iteration.  The two
-      // independent sums retain exactly the original expressions and q order.
-      // Tiling by dof keeps storage bounded at arbitrary polynomial order.
-      for (int dof_base = 0; dof_base < record.dof; dof_base += 32)
+      mfem::real_t sums[rows_per_lane] = {0.0, 0.0};
+      int sides[rows_per_lane];
+      int dofs[rows_per_lane];
+      bool owns_row[rows_per_lane];
+#pragma unroll
+      for (int i = 0; i < rows_per_lane; ++i)
       {
-        const int d = dof_base + lane;
-        const bool owns_dof = d < record.dof;
-        mfem::real_t sum0 = 0.0;
-        mfem::real_t sum1 = 0.0;
-        for (int q = 0; q < record.nq; ++q)
-        {
-          // Tail lanes still execute every full-mask broadcast.
-          const mfem::real_t jump =
-            __shfl_sync(0xffffffffu, projected_jump, q);
-          const mfem::real_t avg_flux =
-            __shfl_sync(0xffffffffu, projected_avg_flux, q);
-          const mfem::real_t penalty_jump =
-            __shfl_sync(0xffffffffu, projected_penalty_jump, q);
-          if (owns_dof)
-          {
-            const mfem::real_t shape0 = S(0, q, d, shape_face);
-            const mfem::real_t shape1 = S(1, q, d, shape_face);
-            const mfem::real_t y0 =
-              -shape0 * avg_flux +
-              record.ip_sigma * N(0, q, d, face) * jump +
-              shape0 * penalty_jump;
-            const mfem::real_t y1 =
-              shape1 * avg_flux +
-              record.ip_sigma * N(1, q, d, face) * jump -
-              shape1 * penalty_jump;
-            sum0 += y0;
-            sum1 += y1;
-          }
-        }
-        if (owns_dof)
-        {
-          C(d, 0, face) = sum0;
-          C(d, 1, face) = sum1;
-        }
+        const int row = row_base + lane + 32 * i;
+        owns_row[i] = row < 2 * record.dof;
+        sides[i] = row / record.dof;
+        dofs[i] = row - sides[i] * record.dof;
       }
-    }
-    else
-    {
-      // Keep two independent output sums per lane.  The side-pair terms are
-      // broadcast once for both rows, exposing independent table loads without
-      // growing the register working set with polynomial order.  Each output
-      // still accumulates in ascending q, including the final incomplete group.
-      constexpr int rows_per_lane = 2;
-      for (int row_base = 0; row_base < 2 * record.dof;
-           row_base += 32 * rows_per_lane)
+      for (int q = 0; q < record.nq; ++q)
       {
-        mfem::real_t sums[rows_per_lane] = {0.0, 0.0};
-        int sides[rows_per_lane];
-        int dofs[rows_per_lane];
-        bool owns_row[rows_per_lane];
+        const mfem::real_t jump =
+          __shfl_sync(0xffffffffu, projected_jump, q);
+        const mfem::real_t avg_flux =
+          __shfl_sync(0xffffffffu, projected_avg_flux, q);
+        const mfem::real_t penalty_jump =
+          __shfl_sync(0xffffffffu, projected_penalty_jump, q);
 #pragma unroll
         for (int i = 0; i < rows_per_lane; ++i)
         {
-          const int row = row_base + lane + 32 * i;
-          owns_row[i] = row < 2 * record.dof;
-          sides[i] = row / record.dof;
-          dofs[i] = row - sides[i] * record.dof;
-        }
-        for (int q = 0; q < record.nq; ++q)
-        {
-          const mfem::real_t jump =
-            __shfl_sync(0xffffffffu, projected_jump, q);
-          const mfem::real_t avg_flux =
-            __shfl_sync(0xffffffffu, projected_avg_flux, q);
-          const mfem::real_t penalty_jump =
-            __shfl_sync(0xffffffffu, projected_penalty_jump, q);
-#pragma unroll
-          for (int i = 0; i < rows_per_lane; ++i)
+          if (owns_row[i])
           {
-            if (owns_row[i])
+            const int d = dofs[i];
+            if (sides[i] == 0)
             {
-              const int d = dofs[i];
-              if (sides[i] == 0)
-              {
-                const mfem::real_t y0 =
-                  -S(0, q, d, shape_face) * avg_flux +
-                  record.ip_sigma * N(0, q, d, face) * jump +
-                  S(0, q, d, shape_face) * penalty_jump;
-                sums[i] += y0;
-              }
-              else
-              {
-                const mfem::real_t y1 =
-                  S(1, q, d, shape_face) * avg_flux +
-                  record.ip_sigma * N(1, q, d, face) * jump -
-                  S(1, q, d, shape_face) * penalty_jump;
-                sums[i] += y1;
-              }
+              const mfem::real_t y0 =
+                -S(0, q, d, shape_face) * avg_flux +
+                record.ip_sigma * N(0, q, d, face) * jump +
+                S(0, q, d, shape_face) * penalty_jump;
+              sums[i] += y0;
+            }
+            else
+            {
+              const mfem::real_t y1 =
+                S(1, q, d, shape_face) * avg_flux +
+                record.ip_sigma * N(1, q, d, face) * jump -
+                S(1, q, d, shape_face) * penalty_jump;
+              sums[i] += y1;
             }
           }
         }
+      }
 #pragma unroll
-        for (int i = 0; i < rows_per_lane; ++i)
-        {
-          if (owns_row[i]) { C(dofs[i], sides[i], face) = sums[i]; }
-        }
+      for (int i = 0; i < rows_per_lane; ++i)
+      {
+        if (owns_row[i]) { C(dofs[i], sides[i], face) = sums[i]; }
       }
     }
 #else
@@ -2056,24 +2007,11 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
     const bool compact_shape = work.shape_dictionary.Matches(info);
     record.shape = compact_shape ? work.shape_dictionary.values.Read()
                                  : work.shape.Read();
-    const int* shape_slots = compact_shape ?
-      work.shape_dictionary.face_slots.Read() : nullptr;
-    const int shape_count = compact_shape ?
-      work.shape_dictionary.slot_count : info.nf;
-    if (info.dof >= 32)
-    {
-      mfem::forall_2D_batch(
-        info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<true>{
-          record, shape_slots, shape_count});
-    }
-    else
-    {
-      // Keep the original combined-row mapping below one warp of dofs so
-      // low orders retain their output-lane utilization and original kernel body.
-      mfem::forall_2D_batch(
-        info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<false>{
-          record, shape_slots, shape_count});
-    }
+    mfem::forall_2D_batch(
+      info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp{
+        record,
+        compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr,
+        compact_shape ? work.shape_dictionary.slot_count : info.nf});
   }
   else
 #endif
