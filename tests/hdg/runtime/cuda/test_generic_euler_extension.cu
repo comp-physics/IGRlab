@@ -383,6 +383,109 @@ struct CudaDirectZhangShuAudit
 struct CudaQualificationTestAccess
 {
   template <typename Engine>
+  static bool VerifyInitialStateHashesAndReferenceShapes(Engine& engine)
+  {
+    auto& numerics = engine.numerics_;
+    const auto& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        numerics.initialized_ && shape.borrowed_host_inputs &&
+        shape.elements > 0 && shape.interior_count > 0 &&
+        shape.true_trace_count > 0 && numerics.ranks_ >= 1 &&
+        numerics.ranks_ <= 2;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    // Independently rebuild each reference basis. Reused reference values
+    // must have exactly the original bits, including signed zeros.
+    mfem::Vector expected(shape.scalar_interior_dofs);
+    for (int element = 0; element < shape.elements; ++element)
+    {
+      const auto* fe = numerics.interior_space_->GetFE(element);
+      const auto& rule = mfem::IntRules.Get(
+          fe->GetGeomType(), shape.volume_assembly_order);
+      for (int q = 0; q < shape.volume_points; ++q)
+      {
+        fe->CalcShape(rule.IntPoint(q), expected);
+        const std::size_t offset =
+            (static_cast<std::size_t>(element) * shape.volume_points + q) *
+            shape.scalar_interior_dofs;
+        local_valid = local_valid && std::memcmp(
+            expected.HostRead(), numerics.host_volume_shape_.data() + offset,
+            static_cast<std::size_t>(shape.scalar_interior_dofs) *
+                sizeof(double)) == 0;
+      }
+    }
+
+    // Read both actual device slots and hash their bytes on the host. Merely
+    // comparing copied metadata would miss a stale or incorrectly seeded slot.
+    const auto& committed = numerics.committed_slot_;
+    const auto& candidate = numerics.candidate_slot_;
+    for (int trace = 0; trace < 2; ++trace)
+    {
+      const std::size_t count = trace ? committed.trace.count
+                                      : committed.interior.count;
+      std::array<std::vector<double>, 2> values{{
+          std::vector<double>(count), std::vector<double>(count)}};
+      for (int slot_index = 0; slot_index < 2; ++slot_index)
+      {
+        const auto& slot = slot_index ? candidate : committed;
+        const double* coefficients = trace ? slot.trace.coefficients
+                                            : slot.interior.coefficients;
+        const std::size_t actual_count = trace ? slot.trace.count
+                                               : slot.interior.count;
+        const StateHash& local_hash = trace ? slot.trace.local_hash
+                                            : slot.interior.local_hash;
+        const StateHash& aggregate_hash = trace ? slot.trace.hash
+                                                : slot.interior.hash;
+        const bool copied = actual_count == count && coefficients &&
+            CudaTransportPolicy::DeviceToHost(
+                values[slot_index].data(), coefficients,
+                count * sizeof(double),
+                CudaTransferCategory::generic_host_bridge,
+                CudaTransferSite::generic_host_export) &&
+            CudaTransportPolicy::Synchronize(
+                CudaTransferSite::generic_host_export);
+        if (!numerics.CollectiveContinue(copied)) return false;
+        const StateHash observed = HashHostBytes(
+            values[slot_index].data(), count * sizeof(double));
+        std::array<unsigned char, 64> rank_hashes{};
+        const bool gathered = MPI_Allgather(
+            observed.bytes.data(), 32, MPI_UNSIGNED_CHAR,
+            rank_hashes.data(), 32, MPI_UNSIGNED_CHAR,
+            numerics.communicator_) == MPI_SUCCESS;
+        local_valid = local_valid && gathered && observed == local_hash &&
+            HashHostBytes(rank_hashes.data(),
+                static_cast<std::size_t>(numerics.ranks_) * 32) ==
+                aggregate_hash;
+      }
+      local_valid = local_valid && std::memcmp(
+          values[0].data(), values[1].data(), count * sizeof(double)) == 0;
+    }
+    return numerics.CollectiveContinue(local_valid);
+  }
+
+  static bool VerifyInitialStateHashesAndReferenceShapes(
+      cuda::GenericEulerHdgCudaSession& session)
+  {
+    if (session.borrowed_rank1_)
+      return VerifyInitialStateHashesAndReferenceShapes(*session.borrowed_rank1_);
+    if (session.borrowed_rank2_)
+      return VerifyInitialStateHashesAndReferenceShapes(*session.borrowed_rank2_);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.partitioned_backward_euler_borrowed_rank1_);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.partitioned_backward_euler_borrowed_rank2_);
+    if (session.rodas3_borrowed_rank1_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.rodas3_borrowed_rank1_);
+    if (session.rodas3_borrowed_rank2_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.rodas3_borrowed_rank2_);
+    return false;
+  }
+
+  template <typename Engine>
   static bool ApplyDirectZhangShu(
       Engine& engine, const std::vector<double>& input,
       CudaDirectZhangShuAudit& audit) noexcept
@@ -6193,6 +6296,13 @@ bool CheckLifecycle(const int order, const bool physical,
       initialized.status == HdgEulerSessionStatus::initialized,
       request.communicator);
   if (!initialized_everywhere) return false;
+  if (!CudaQualificationTestAccess::VerifyInitialStateHashesAndReferenceShapes(
+          session))
+  {
+    std::cerr << "CUDA initial state hash/reference shape mismatch order="
+              << order << '\n';
+    return false;
+  }
   bool initial_transfer = false;
   const bool initial_export = export_committed(
       committed_initial, sigma_initial, initial_transfer);

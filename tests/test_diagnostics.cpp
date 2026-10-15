@@ -4,6 +4,7 @@
 #include "sim/state/euler_state_bundle.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #include "test_utils.hpp"
@@ -147,6 +148,125 @@ int RunDiagnosticsTests(TestContext& ctx)
     pressure_reference.ProjectCoefficient(pressure_coeff);
     ctx.Check(same_values(bundle.pressure_view.pressure, pressure_reference),
               "ProjectIC retains its immediate pressure refresh.");
+
+    const bool cuda = mfem::Device::Allows(mfem::Backend::CUDA) &&
+                      sizeof(mfem::real_t) == sizeof(double);
+    const auto check_current_projection = [&](bool expect_device,
+                                               const char* message)
+    {
+      pressure_reference.ProjectCoefficient(pressure_coeff);
+      velocity_reference.ProjectCoefficient(velocity_coeff);
+      if (cuda)
+      {
+        bundle.sol.UseDevice(true);
+        (void)bundle.sol.ReadWrite(); // make the current device copy authoritative
+      }
+      dg_sim::UpdateEulerOutputFields(bundle.field_list);
+      if (cuda)
+      {
+        ctx.Check(bundle.sol.GetMemory().HostIsValid() != expect_device,
+                  "Derived projection uses the admitted device route or host fallback.");
+      }
+      const auto same_bits = [](const mfem::Vector& a, const mfem::Vector& b)
+      {
+        return a.Size() == b.Size() &&
+          std::memcmp(a.HostRead(), b.HostRead(),
+                      a.Size() * sizeof(mfem::real_t)) == 0;
+      };
+      ctx.Check(same_bits(bundle.pressure_view.pressure, pressure_reference) &&
+                  same_bits(bundle.velocity_view.velocity, velocity_reference),
+                message);
+    };
+    check_current_projection(true,
+      "Collocated p5 GL/LGL CUDA projections exactly match generic coefficients.");
+    check_current_projection(true,
+      "Warm collocation plans still read the current device state exactly.");
+
+    auto* edge_state = bundle.sol.HostReadWrite();
+    for (int i = 0; i < ndofs; ++i)
+    {
+      edge_state[i] = i % 2 ? 1.0e-18 : -0.0;
+      edge_state[ndofs + i] = i % 3 ? 1.0e-18 : -0.0;
+      edge_state[2 * ndofs + i] = i % 2 ? -1.0e-18 : -0.0;
+      edge_state[3 * ndofs + i] = 1.0;
+    }
+    check_current_projection(true,
+      "Pressure and velocity retain their distinct density floors and signed zeros.");
+    bundle.sol.HostReadWrite()[ndofs] =
+      std::numeric_limits<mfem::real_t>::quiet_NaN();
+    check_current_projection(false,
+      "Nonfinite collocated input preserves the full generic NaN projection.");
+
+    example_ctx.Mesh().UniformRefinement();
+    example_ctx.spaces.fes.Update();
+    example_ctx.spaces.dfes.Update();
+    example_ctx.spaces.vfes.Update();
+    bundle.sol.Update();
+    bundle.pressure_view.pressure.Update();
+    bundle.velocity_view.velocity.Update();
+    pressure_reference.Update();
+    velocity_reference.Update();
+    bundle.sol.ProjectCoefficient(ic);
+    check_current_projection(true,
+      "Mesh/space updates invalidate collocation plans before the next projection.");
+  }
+
+  // Mixed geometry and different input/output nodes retain coefficient
+  // interpolation, rather than treating nearby or unrelated DOFs as collocated.
+  for (const bool mixed_geometry : {false, true})
+  {
+    mfem::Mesh mesh = mixed_geometry
+      ? mfem::Mesh(2, 6, 3, 0, 2)
+      : mfem::Mesh::MakeCartesian2D(2, 1, mfem::Element::QUADRILATERAL,
+                                    true, 1.0, 1.0);
+    if (mixed_geometry)
+    {
+      const mfem::real_t vertices[6][2] = {{0,0},{0.5,0},{1,0},{0,1},{0.5,1},{1,1}};
+      for (const auto& vertex : vertices) { mesh.AddVertex(vertex); }
+      mesh.AddQuad(0, 1, 4, 3);
+      mesh.AddTriangle(1, 2, 5);
+      mesh.AddTriangle(1, 5, 4);
+      mesh.FinalizeTopology();
+      mesh.Finalize();
+    }
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    mfem::L2_FECollection input_fec(5, 2, mfem::BasisType::GaussLegendre);
+    mfem::L2_FECollection output_fec(5, 2, mixed_geometry
+      ? mfem::BasisType::GaussLegendre : mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace input_fes(&pmesh, &input_fec, 4,
+                                          mfem::Ordering::byNODES);
+    mfem::ParFiniteElementSpace scalar_fes(&pmesh, &output_fec);
+    mfem::ParFiniteElementSpace vector_fes(&pmesh, &output_fec, 2,
+                                           mfem::Ordering::byNODES);
+    mfem::ParGridFunction state(&input_fes);
+    FillConstantState(EulerConsFromPrim2D(1.0, 0.25, -0.05, 1.0, gamma), state);
+    // Nonconstant values make a mistaken GL-to-LGL direct gather observable.
+    auto* values = state.HostReadWrite();
+    for (int i = 0; i < input_fes.GetNDofs(); ++i)
+    {
+      values[i] += 0.001 * (i % 7);
+      values[3 * input_fes.GetNDofs() + i] += 0.002 * (i % 5);
+    }
+    mfem::PressureCoefficient pressure_coeff(state, 2, gamma);
+    mfem::VelocityFromConsCoefficient velocity_coeff(2, &state, rho_floor);
+    mfem::ParGridFunction pressure_reference(&scalar_fes), velocity_reference(&vector_fes);
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    velocity_reference.ProjectCoefficient(velocity_coeff);
+    dg_sim::EulerPressureView pressure(scalar_fes, state, 2, gamma, false);
+    dg_sim::EulerVelocityView velocity(vector_fes, state, 2, rho_floor, false);
+    if (mfem::Device::Allows(mfem::Backend::CUDA))
+    {
+      state.UseDevice(true);
+      (void)state.ReadWrite();
+    }
+    pressure.Update(); velocity.Update();
+    ctx.Check(state.GetMemory().HostIsValid(),
+              "Mixed or noncollocated spaces retain the host coefficient path.");
+    ctx.Check(std::memcmp(pressure.pressure.HostRead(), pressure_reference.HostRead(),
+                         pressure_reference.Size() * sizeof(mfem::real_t)) == 0 &&
+                std::memcmp(velocity.velocity.HostRead(), velocity_reference.HostRead(),
+                            velocity_reference.Size() * sizeof(mfem::real_t)) == 0,
+              "Unsupported layouts exactly match generic pressure/velocity projection.");
   }
 
   // H1 diagnostics scalar outputs must live on scalar spaces (vdim=1).

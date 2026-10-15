@@ -913,6 +913,7 @@ public:
 
 private:
   friend struct cuda_w8a::detail::CudaQualificationTestAccess;
+  friend class GenericEulerHdgCudaAppSession;
 
   enum class operation_tag : int
   {

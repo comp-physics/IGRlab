@@ -71,6 +71,8 @@ public:
   }
 
   void SetState(const mfem::ParGridFunction* U) { U_ = U; }
+  int GetStateDimension() const { return dim_; }
+  double GetDensityFloor() const { return rho_floor_; }
 
   void Eval(mfem::Vector& V,
             mfem::ElementTransformation& T,

@@ -28,7 +28,7 @@ class HostFaceDensityPreparationCache
 {
 public:
   explicit HostFaceDensityPreparationCache(
-    std::size_t memory_budget = 64u * 1024u * 1024u)
+    std::size_t memory_budget = 128u * 1024u * 1024u)
     : memory_budget_(memory_budget) {}
 
   const mfem::FaceQuadratureSpace* Prepare(

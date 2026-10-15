@@ -94,7 +94,8 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/hdg/scalar_hdg_oracle.cpp"
          "src/numerics/limiters/zhang_shu.cpp"
          "src/physics/igr/IGR_chebyshev.cpp"
-         "src/physics/igr/IGR_device_coefficients.cpp")
+         "src/physics/igr/IGR_device_coefficients.cpp"
+         "src/sim/state/euler_derived_fields.cpp")
     # CUDA-enabled MFEM conditionally extends mfem::SparseMatrix under NVCC.
     # Keep every enabled HDG owner of that type ABI-compatible with MFEM.
     if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT OR

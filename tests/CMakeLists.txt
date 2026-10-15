@@ -242,6 +242,28 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "dgsem;maximum;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_dg_device_faces_test test_dg_device_faces.cpp)
+target_link_libraries(dg_igr_dg_device_faces_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dg_device_faces_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+set_source_files_properties(test_dg_device_faces.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_dg_device_faces_command dg_igr_dg_device_faces_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_dg_device_faces_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dg_device_faces_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dg_device_faces_cpu
+  COMMAND ${_igrlab_dg_device_faces_command} cpu)
+set_tests_properties(dg_igr_dg_device_faces_cpu PROPERTIES
+  LABELS "dg;face;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dg_device_faces_cuda
+    COMMAND ${_igrlab_dg_device_faces_command} cuda)
+  set_tests_properties(dg_igr_dg_device_faces_cuda PROPERTIES
+    LABELS "dg;face;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_face_density_host_cache_test
   test_igr_face_density_host_cache.cpp)
 target_link_libraries(dg_igr_face_density_host_cache_test PRIVATE igr_mfem mfem)
@@ -795,6 +817,12 @@ add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_diagnostics_cuda COMMAND dg_igr_unit_tests --diagnostics)
+  set_tests_properties(dg_igr_diagnostics_cuda PROPERTIES
+    ENVIRONMENT "DG_IGR_TEST_DEVICE=cuda"
+    LABELS "cuda;diagnostics;parity" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
 
 if(TARGET dgsem_smooth_advection_periodic)
   add_test(NAME dg_igr_hdg_static_source_legacy_ignored_by_dgsem

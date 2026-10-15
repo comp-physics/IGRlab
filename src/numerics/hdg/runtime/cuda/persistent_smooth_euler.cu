@@ -4979,7 +4979,7 @@ __device__ bool BorrowedEulerFaceElement(
   return true;
 }
 
-// Tensor assembly and the ordinary p3 specialization assign a warp to an
+// Tensor assembly and the ordinary p3/p5 specializations assign a warp to an
 // element so independent dense rows do not queue behind four owners.  Every
 // entry still visits faces and quadrature points in the same order; all
 // interpolants and coupled flux work retain their original owners.
@@ -6615,18 +6615,21 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     }
     __syncthreads();
   }
+  // A thread owns the same RHS columns for every pivot. Swaps therefore
+  // depend only on earlier work by that thread; synchronize once before
+  // the forward solve redistributes entries across the block.
+  for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
   for(int row=0;row<ni;++row)
   {
     const int pivot=static_cast<int>(pivots[row]);
     if(pivot!=row)
-      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
-      {
-        const double value=w[row*cols+rhs];
-        w[row*cols+rhs]=w[pivot*cols+rhs];
-        w[pivot*cols+rhs]=value;
-      }
-    __syncthreads();
+    {
+      const double value=w[row*cols+rhs];
+      w[row*cols+rhs]=w[pivot*cols+rhs];
+      w[pivot*cols+rhs]=value;
+    }
   }
+  __syncthreads();
   for(int column=0;column<ni;++column)
   {
     const int remaining=ni-column-1;
@@ -6637,17 +6640,17 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     }
     __syncthreads();
   }
+  // Back substitution also has independent RHS columns. Keep each scalar
+  // recurrence intact, with one barrier before the cross-column Schur work.
+  for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
   for(int row=ni-1;row>=0;--row)
   {
-    for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
-    {
-      double value=w[row*cols+rhs];
-      for(int column=row+1;column<ni;++column)
-        value-=lu[row*ni+column]*w[column*cols+rhs];
-      w[row*cols+rhs]=value/lu[row*ni+row];
-    }
-    __syncthreads();
+    double value=w[row*cols+rhs];
+    for(int column=row+1;column<ni;++column)
+      value-=lu[row*ni+column]*w[column*cols+rhs];
+    w[row*cols+rhs]=value/lu[row*ni+row];
   }
+  __syncthreads();
   for(int item=threadIdx.x;item<nt*(nt+1);item+=blockDim.x)
   {
     const int row=item/(nt+1),column=item-row*(nt+1);
@@ -6988,17 +6991,16 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
         }
       __syncthreads();
     }
+    // Each trailing column stays with one thread throughout this panel.
+    for(int entry=panel_end+threadIdx.x;entry<ni;entry+=blockDim.x)
     for(int row=panel_start;row<panel_end;++row)
     {
-      for(int entry=panel_end+threadIdx.x;entry<ni;entry+=blockDim.x)
-      {
-        double value=lu[row*ni+entry];
-        for(int column=panel_start;column<row;++column)
-          value-=lu[row*ni+column]*lu[column*ni+entry];
-        lu[row*ni+entry]=value;
-      }
-      __syncthreads();
+      double value=lu[row*ni+entry];
+      for(int column=panel_start;column<row;++column)
+        value-=lu[row*ni+column]*lu[column*ni+entry];
+      lu[row*ni+entry]=value;
     }
+    __syncthreads();
     const int panel_width=panel_end-panel_start;
     const int trailing=ni-panel_end;
     TensorSubtractBlockedProduct<UseTensor>(
@@ -7009,33 +7011,34 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
         &tensor_a[0][0],&tensor_b[0][0][0],&tensor_product[0][0]);
     __syncthreads();
   }
+  // Pivot application has no cross-RHS dependency.
+  for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
   for(int row=0;row<ni;++row)
   {
     const int pivot=static_cast<int>(pivots[row]);
     if(pivot!=row)
-      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
-      {
-        const double value=w[row*cols+rhs];
-        w[row*cols+rhs]=w[pivot*cols+rhs];
-        w[pivot*cols+rhs]=value;
-      }
-    __syncthreads();
+    {
+      const double value=w[row*cols+rhs];
+      w[row*cols+rhs]=w[pivot*cols+rhs];
+      w[pivot*cols+rhs]=value;
+    }
   }
+  __syncthreads();
   for(int panel_start=0;panel_start<ni;panel_start+=lu_panel_columns)
   {
     const int panel_limit=panel_start+lu_panel_columns;
     const int panel_end=panel_limit<ni?panel_limit:ni;
+    // Preserve the scalar row recurrence within each independently owned
+    // RHS, then publish the panel once to the tensor update below.
+    for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
     for(int row=panel_start;row<panel_end;++row)
     {
-      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
-      {
-        double value=w[row*cols+rhs];
-        for(int column=panel_start;column<row;++column)
-          value-=lu[row*ni+column]*w[column*cols+rhs];
-        w[row*cols+rhs]=value;
-      }
-      __syncthreads();
+      double value=w[row*cols+rhs];
+      for(int column=panel_start;column<row;++column)
+        value-=lu[row*ni+column]*w[column*cols+rhs];
+      w[row*cols+rhs]=value;
     }
+    __syncthreads();
     const int panel_width=panel_end-panel_start;
     const int trailing=ni-panel_end;
     TensorSubtractBlockedProduct<UseTensor>(
@@ -7051,17 +7054,15 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
   {
     const int panel_limit=panel_start+lu_panel_columns;
     const int panel_end=panel_limit<ni?panel_limit:ni;
+    for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
     for(int row=panel_end-1;row>=panel_start;--row)
     {
-      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
-      {
-        double value=w[row*cols+rhs];
-        for(int column=row+1;column<panel_end;++column)
-          value-=lu[row*ni+column]*w[column*cols+rhs];
-        w[row*cols+rhs]=value/lu[row*ni+row];
-      }
-      __syncthreads();
+      double value=w[row*cols+rhs];
+      for(int column=row+1;column<panel_end;++column)
+        value-=lu[row*ni+column]*w[column*cols+rhs];
+      w[row*cols+rhs]=value/lu[row*ni+row];
     }
+    __syncthreads();
     const int panel_width=panel_end-panel_start;
     TensorSubtractBlockedProduct<UseTensor>(
         w,cols,lu+panel_start,ni,w+panel_start*cols,cols,
@@ -9232,9 +9233,13 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
   BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
   if(!LaunchOk())return false;
-  // Qualify only the measured quadrilateral p3 layout.  Other ordinary
-  // orders retain four lanes per element until separately measured.
-  if(s.order==3&&s.scalar_interior_dofs==16&&s.scalar_face_dofs==4)
+  // Distribute independent dense rows over a warp for the measured p3/p5
+  // quadrilateral layouts. Other orders retain the four-lane path. The
+  // interpolant owners and per-entry accumulation order remain unchanged.
+  const bool warp_rows=
+      (s.order==3&&s.scalar_interior_dofs==16&&s.scalar_face_dofs==4)||
+      (s.order==5&&s.scalar_interior_dofs==36&&s.scalar_face_dofs==6);
+  if(warp_rows)
   {
     constexpr int elements_per_block=borrowed_euler_block_threads/
         borrowed_euler_warp_threads;

@@ -400,6 +400,37 @@ void CheckFallback(int& failures, int& cases)
     }
   }
 }
+void CheckLargeAdmission(int& failures, int& cases)
+{
+  if (mfem::Mpi::WorldSize() != 1) { return; }
+  auto box = mfem::Mesh::MakeCartesian2D(
+    128, 128, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  const std::vector<mfem::Vector> shifts = {
+    mfem::Vector({1.0, 0.0}), mfem::Vector({0.0, 1.0})};
+  auto periodic = mfem::Mesh::MakePeriodic(
+    box, box.CreatePeriodicVertexMapping(shifts));
+  mfem::ParMesh mesh(MPI_COMM_WORLD, periodic);
+  mfem::L2_FECollection fec(5, 2, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(&mesh, &fec, 4);
+  mfem::ParFiniteElementSpace sfes(&mesh, &fec);
+  mfem::ParGridFunction state(&vfes);
+  mfem::Vector alpha;
+  FillState(vfes, state, alpha);
+  const auto& rule = mfem::IntRules.Get(mfem::Geometry::SEGMENT, 11);
+  // This production-size case exceeds the former cap through geometry alone.
+  Cache old_budget(64u * 1024u * 1024u);
+  Check(old_budget.Prepare(vfes, sfes, rule) == nullptr,
+        "p5/n128 exceeds the former face geometry budget", failures);
+  Cache cache;
+  auto before = Compare(cache, vfes, sfes, rule, state, 0.0, &alpha,
+                        0.1, false, failures, cases);
+  state *= 1.07;
+  alpha *= 0.93;
+  auto after = Compare(cache, vfes, sfes, rule, state, 0.0, &alpha,
+                       0.08, false, failures, cases);
+  Check(!SameBits(before, after),
+        "large warm cache consumes fresh state and alpha", failures);
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -413,6 +444,7 @@ int main(int argc, char** argv)
   CheckSpaces(failures, cases);
   CheckFloorBoundaries(failures, cases);
   CheckFallback(failures, cases);
+  CheckLargeAdmission(failures, cases);
   if (mfem::Mpi::WorldRank() == 0)
   {
     std::cout << "Host face-density cache parity: backend=" << backend

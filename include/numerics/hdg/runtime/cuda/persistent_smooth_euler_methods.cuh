@@ -201,8 +201,11 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
 {
-  const bool explicit_initial_true_trace = shape_.borrowed_host_inputs &&
-      config.borrowed_initial_true_trace.coefficients != nullptr;
+  // Borrowed input initialization below replaces every interior and owned
+  // true-trace coefficient before either state slot is uploaded. Its trace
+  // restriction depends on the supplied interior, never the manufactured
+  // seed. Keep the topology/map checks here without evaluating unused data.
+  const bool manufactured_initial_state = !shape_.borrowed_host_inputs;
   std::vector<double> local_exact_trace(
       static_cast<std::size_t>(shape_.local_trace_count), 0.0);
   std::vector<double> local_perturbed_trace(
@@ -255,6 +258,10 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       }
     }
   }
+  const mfem::FiniteElement* reference_shape_element = nullptr;
+  std::vector<double> reference_volume_shape(
+      static_cast<std::size_t>(shape_.volume_points) *
+          shape_.scalar_interior_dofs);
   for (int element = 0; element < shape_.elements; ++element)
   {
     const mfem::FiniteElement* fe = interior_space_->GetFE(element);
@@ -287,24 +294,28 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
     }
     const mfem::IntegrationRule& nodes = fe->GetNodes();
     if (nodes.GetNPoints() != shape_.scalar_interior_dofs) { return false; }
-    for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+    if (manufactured_initial_state)
     {
-      mfem::Vector physical(dimension);
-      transformation->Transform(nodes.IntPoint(scalar), physical);
-      double exact[conserved_components], perturbed[conserved_components];
-      CudaManufacturedState(physical[0], physical[1], exact);
-      CudaPerturbedState(physical[0], physical[1], perturbed);
-      for (int component = 0; component < conserved_components; ++component)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
       {
-        const int local = scalar + shape_.scalar_interior_dofs * component;
-        const std::size_t index = static_cast<std::size_t>(element) *
-                                      shape_.interior_dofs + local;
-        host_exact_interior_[index] = exact[component];
-        host_perturbed_interior_[index] = perturbed[component];
+        mfem::Vector physical(dimension);
+        transformation->Transform(nodes.IntPoint(scalar), physical);
+        double exact[conserved_components], perturbed[conserved_components];
+        CudaManufacturedState(physical[0], physical[1], exact);
+        CudaPerturbedState(physical[0], physical[1], perturbed);
+        for (int component = 0; component < conserved_components; ++component)
+        {
+          const int local = scalar + shape_.scalar_interior_dofs * component;
+          const std::size_t index = static_cast<std::size_t>(element) *
+                                        shape_.interior_dofs + local;
+          host_exact_interior_[index] = exact[component];
+          host_perturbed_interior_[index] = perturbed[component];
+        }
       }
     }
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
         fe->GetGeomType(), shape_.volume_assembly_order);
+    const bool rebuild_reference_shape = reference_shape_element != fe;
     mfem::Vector shape(shape_.scalar_interior_dofs), physical(dimension);
     mfem::DenseMatrix derivative(shape_.scalar_interior_dofs, dimension);
     for (int q = 0; q < shape_.volume_points; ++q)
@@ -312,7 +323,14 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
       transformation->SetIntPoint(&point);
       transformation->Transform(point, physical);
-      fe->CalcShape(point, shape);
+      if (rebuild_reference_shape)
+      {
+        fe->CalcShape(point, shape);
+        for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+          reference_volume_shape[
+              static_cast<std::size_t>(q) * shape_.scalar_interior_dofs +
+              scalar] = shape[scalar];
+      }
       fe->CalcPhysDShape(*transformation, derivative);
       const std::size_t quadrature =
           static_cast<std::size_t>(element) * shape_.volume_points + q;
@@ -324,13 +342,16 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
       {
         host_volume_shape_[quadrature * shape_.scalar_interior_dofs + scalar] =
-            shape[scalar];
+            reference_volume_shape[
+                static_cast<std::size_t>(q) * shape_.scalar_interior_dofs +
+                scalar];
         for (int direction = 0; direction < dimension; ++direction)
           host_volume_derivative_[
               (quadrature * shape_.scalar_interior_dofs + scalar) * dimension +
               direction] = derivative(scalar, direction);
       }
     }
+    reference_shape_element = fe;
 
     mfem::Array<int> faces, orientations;
     mesh_->GetElementEdges(element, faces, orientations);
@@ -377,11 +398,11 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       const mfem::IntegrationRule& face_nodes = trace_fe->GetNodes();
       for (int scalar = 0; scalar < shape_.scalar_face_dofs; ++scalar)
       {
-        mfem::Vector face_physical(dimension);
-        ft->Face->Transform(face_nodes.IntPoint(scalar), face_physical);
         double exact[conserved_components]{}, perturbed[conserved_components]{};
-        if (!explicit_initial_true_trace)
+        if (manufactured_initial_state)
         {
+          mfem::Vector face_physical(dimension);
+          ft->Face->Transform(face_nodes.IntPoint(scalar), face_physical);
           CudaManufacturedState(face_physical[0], face_physical[1], exact);
           CudaPerturbedState(face_physical[0], face_physical[1], perturbed);
         }
@@ -494,7 +515,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
         return false;
       owned_global_true_[static_cast<std::size_t>(entry.local_true_dof)] =
           static_cast<std::int64_t>(entry.global_true_dof);
-      if (!explicit_initial_true_trace)
+      if (manufactured_initial_state)
       {
         host_exact_true_trace_[static_cast<std::size_t>(entry.local_true_dof)] =
             local_exact_trace[static_cast<std::size_t>(entry.local_dof)];
@@ -2542,8 +2563,16 @@ BindStateSlots() noexcept
       view_.work_true_trace,
       static_cast<std::size_t>(shape_.true_trace_count), {}, {}, 0,
       reinterpret_cast<std::uintptr_t>(view_.work_true_trace), 0, false, true};
-  return UpdateStateHashes(committed_slot_) &&
-      UpdateStateHashes(candidate_slot_);
+  if (!UpdateStateHashes(committed_slot_)) { return false; }
+  // UploadTopologyAndState and BuildPersistentTrueSystem have completed and
+  // synchronized successful uploads of the same host interior/trace bytes to
+  // both slots. Only their storage identities differ. As with a checked state
+  // copy, transfer the hash metadata; all later mutable-state audits remain.
+  candidate_slot_.interior.local_hash = committed_slot_.interior.local_hash;
+  candidate_slot_.interior.hash = committed_slot_.interior.hash;
+  candidate_slot_.trace.local_hash = committed_slot_.trace.local_hash;
+  candidate_slot_.trace.hash = committed_slot_.trace.hash;
+  return true;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>

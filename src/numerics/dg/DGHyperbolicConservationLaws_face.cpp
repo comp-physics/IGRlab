@@ -1,5 +1,7 @@
 #include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
+#include "DGEntropyFaceKernels.hpp"
+#include <typeinfo>
 
 namespace mfem
 {
@@ -307,6 +309,11 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
 
 void DGHyperbolicConservationLaws::BuildFaceApplyData_()
 {
+  face_entropy_ready_ = false;
+  face_built_entropy_policy_ = SupportsPackedEntropyFacePolicy_();
+  face_entropy_element_offsets_.SetSize(0);
+  face_entropy_element_sides_.SetSize(0);
+  face_entropy_flux_.SetSize(0);
   face_apply_ready_ = false;
   face_data_dirty_ = false;
   face_elem_dof_ = 0;
@@ -385,6 +392,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
     flux_supported =
       (dgsem_flux && dgsem_flux->GetSurfaceFluxType() == DGSEMSurfaceFluxType::Rusanov);
   }
+  flux_supported = flux_supported || face_built_entropy_policy_;
   if (!flux_supported)
   {
     return;
@@ -887,6 +895,61 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
     return;
   }
 
+  if (face_built_entropy_policy_)
+  {
+    // Initial qualification: rank-one periodic p5 affine quadrilateral DG.
+    // All sampled face quadrature/normal data are still those of the integrator.
+    int ranks = 0;
+#ifdef MFEM_USE_MPI
+    if (pfes) { MPI_Comm_size(pfes->GetComm(), &ranks); }
+#endif
+    if (!pfes || ranks != 1 || !pmesh || pmesh->GetNSharedFaces() != 0 ||
+        face_bdr_e1_.Size() != 0 || face_shared_e1_.Size() != 0 ||
+        face_int_e1_.Size() == 0 ||
+        !dynamic_cast<const L2_FECollection*>(vfes.FEColl())) { return; }
+    for (int e = 0; e < vfes.GetNE(); ++e)
+    {
+      const auto& fe = *vfes.GetFE(e);
+      const auto* tensor = dynamic_cast<const TensorBasisElement*>(&fe);
+      if (fe.GetOrder() != 5 || fe.GetGeomType() != Geometry::SQUARE ||
+          fe.GetMapType() != FiniteElement::VALUE || !tensor ||
+          (tensor->GetBasisType() != BasisType::GaussLegendre &&
+           tensor->GetBasisType() != BasisType::GaussLobatto)) { return; }
+      auto* tr = vfes.GetElementTransformation(e);
+      const auto& nodes = fe.GetNodes();
+      tr->SetIntPoint(&nodes.IntPoint(0));
+      DenseMatrix first(tr->Jacobian());
+      for (int q = 1; q < nodes.GetNPoints(); ++q)
+      {
+        tr->SetIntPoint(&nodes.IntPoint(q));
+        const auto& jac = tr->Jacobian();
+        for (int j = 0; j < 2; ++j)
+          for (int i = 0; i < 2; ++i)
+            if (std::abs(jac(i, j) - first(i, j)) >
+                64 * std::numeric_limits<real_t>::epsilon() *
+                  std::max(real_t(1.0), std::abs(first(i, j)))) { return; }
+      }
+    }
+    const int ne = vfes.GetNE();
+    face_entropy_element_offsets_.SetSize(ne + 1);
+    face_entropy_element_offsets_ = 0;
+    for (int f = 0; f < face_int_e1_.Size(); ++f)
+    {
+      ++face_entropy_element_offsets_[face_int_e1_[f] + 1];
+      ++face_entropy_element_offsets_[face_int_e2_[f] + 1];
+    }
+    for (int e = 0; e < ne; ++e)
+      face_entropy_element_offsets_[e + 1] += face_entropy_element_offsets_[e];
+    face_entropy_element_sides_.SetSize(2 * face_int_e1_.Size());
+    Array<int> next(face_entropy_element_offsets_);
+    for (int f = 0; f < face_int_e1_.Size(); ++f)
+    {
+      face_entropy_element_sides_[next[face_int_e1_[f]]++] = 2 * f;
+      face_entropy_element_sides_[next[face_int_e2_[f]]++] = 2 * f + 1;
+    }
+    face_entropy_flux_.SetSize(4 * face_int_e1_.Size() * face_int_nq_);
+    face_entropy_ready_ = true;
+  }
   face_apply_ready_ = true;
 }
 
@@ -926,9 +989,10 @@ bool DGHyperbolicConservationLaws::BuildFaceSigmaData_(
   {
     return false;
   }
-  for (int e = 1; e < ne; ++e)
+  for (int e = 0; e < ne; ++e)
   {
-    if (sfes->GetFE(e)->GetDof() != sigma_ldof)
+    if (sfes->GetFE(e)->GetDof() != sigma_ldof ||
+        (face_entropy_ready_ && sfes->GetFE(e)->GetMapType() != FiniteElement::VALUE))
     {
       return false;
     }
@@ -1165,22 +1229,108 @@ real_t DGHyperbolicConservationLaws::ReduceFaceMaxSpeed_(
   return max_speed;
 }
 
+bool DGHyperbolicConservationLaws::SupportsPackedEntropyFacePolicy_() const
+{
+  if (!standard_face_integrator_ || dim != 2 || num_equations != 4 ||
+      num_flux_ != standard_face_flux_ ||
+      face_int_order_offset_ != standard_face_int_order_offset_ || !num_flux_ || typeid(*num_flux_) != typeid(DGSEMSurfaceFlux)) { return false; }
+  const auto& surface = static_cast<const DGSEMSurfaceFlux&>(*num_flux_);
+  if (surface.GetSurfaceFluxType() != DGSEMSurfaceFluxType::EntropyStableWinters ||
+      surface.GetEntropyFluxType() != dgsem::EntropyFluxType::Ranocha ||
+      surface.GetGamma() != dgsem_gamma_ || !(dgsem_gamma_ > 1.0 && dgsem_gamma_ <= 2.0))
+    { return false; }
+  const FluxFunction& physical = formIntegrator->GetFluxFunction();
+  if (&physical != &num_flux_->GetFluxFunction()) { return false; }
+  const FluxFunction* base = &physical;
+  if (typeid(physical) == typeid(FluxWithIGR))
+  {
+    const auto& igr = static_cast<const FluxWithIGR&>(physical);
+    if (!igr.HasEulerBase() || igr.GetGamma() != dgsem_gamma_ ||
+        igr.GetSigmaAwareCFL() || igr.GetSigmaAwareRusanov() ||
+        igr.GetFrozenSigmaSpectralSpeed() || igr.GetInvariantDomainFlux()) { return false; }
+    base = &igr.GetBaseFlux();
+    const auto* sigma = igr.GetSigmaField();
+    if (sigma && (!sigma->ParFESpace() || sigma->ParFESpace()->GetVDim() != 1 ||
+                  sigma->ParFESpace()->GetMesh() != vfes.GetMesh())) { return false; }
+  }
+  if (typeid(*base) != typeid(EulerFlux) || base->dim != 2) { return false; }
+  // MFEM keeps Euler's gamma private. For this exact type, the stationary
+  // unit-density/unit-energy flux is gamma-1. On (1,2], subtraction is exact.
+  real_t state_data[4] = {1.0, 0.0, 0.0, 1.0}, normal_data[2] = {1.0, 0.0};
+  real_t flux_data[4];
+  Vector state(state_data, 4), normal(normal_data, 2), flux(flux_data, 4);
+  FaceElementTransformations tr;
+  base->ComputeFluxDotN(state, normal, tr, flux);
+  return flux(1) == dgsem_gamma_ - 1.0;
+}
+
 bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
 {
-  if (!Device::Allows(Backend::DEVICE_MASK))
-  {
-    return false;
-  }
-  if (vol_mode_ != VolumeMode::WeakDivergence || weakdiv.empty() ||
-      !invmass_apply_ready_)
-  {
-    return false;
-  }
-  if (face_data_dirty_)
-  {
+  if (!Device::Allows(Backend::DEVICE_MASK) ||
+      vol_mode_ != VolumeMode::WeakDivergence || weakdiv.empty() ||
+      !invmass_apply_ready_) { return false; }
+  const bool entropy = SupportsPackedEntropyFacePolicy_();
+  const unsigned long native = static_cast<unsigned long>(Backend::CPU) |
+                               static_cast<unsigned long>(Backend::CUDA);
+  if (entropy && (!Device::Allows(Backend::CUDA) || Device::Allows(~native)))
+    { return false; }
+  const auto* surface = dynamic_cast<const DGSEMSurfaceFlux*>(num_flux_);
+  const bool rusanov = dynamic_cast<const RusanovFluxWithSides*>(num_flux_) ||
+    (surface && surface->GetSurfaceFluxType() == DGSEMSurfaceFluxType::Rusanov);
+  if (!entropy && !rusanov) { return false; }
+  if (face_data_dirty_ || (entropy && !face_built_entropy_policy_))
     const_cast<DGHyperbolicConservationLaws*>(this)->BuildFaceApplyData_();
+  if (entropy)
+  {
+    if (!Device::Allows(Backend::CUDA_MASK) || !face_apply_ready_ || !face_entropy_ready_)
+      { return false; }
+    const auto* igr = dynamic_cast<const FluxWithIGR*>(&formIntegrator->GetFluxFunction());
+    const auto* sigma = igr ? igr->GetSigmaField() : nullptr;
+    return !sigma || BuildFaceSigmaData_(*sigma);
   }
-  return face_apply_ready_;
+  // A mutable flux policy can safely return to the independent host route.
+  return face_apply_ready_ && !face_entropy_ready_;
+}
+
+bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEntropyStable_(
+  const Vector& x_in, Vector& z_out, real_t& max_face_speed) const
+{
+#ifndef DG_IGR_HAS_ACCEL_FORALL
+  (void)x_in; (void)z_out; max_face_speed = 0.0;
+  return false;
+#else
+  if (!face_entropy_ready_ || !SupportsPackedEntropyFacePolicy_()) { return false; }
+  const auto* igr = dynamic_cast<const FluxWithIGR*>(&formIntegrator->GetFluxFunction());
+  const auto* sigma = igr ? igr->GetSigmaField() : nullptr;
+  if (sigma && !BuildFaceSigmaData_(*sigma)) { return false; }
+  dg_igr_detail::packed_entropy::FaceKernel face;
+  face.dof = face_elem_dof_; face.nq = face_int_nq_;
+  face.sigma_dof = sigma ? face_sigma_ldof_ : 0;
+  face.gamma = dgsem_gamma_;
+  face.e1 = face_int_e1_.Read(); face.e2 = face_int_e2_.Read();
+  face.state_map = invmass_elem_vdof_map_.Read();
+  face.sigma_map = sigma ? face_sigma_elem_dof_map_.Read() : nullptr;
+  face.x = x_in.Read(); face.sigma = sigma ? sigma->Read() : nullptr;
+  face.shape1 = face_int_shape1_.Read(); face.shape2 = face_int_shape2_.Read();
+  face.sigma_shape1 = sigma ? face_int_sigma_shape1_.Read() : nullptr;
+  face.sigma_shape2 = sigma ? face_int_sigma_shape2_.Read() : nullptr;
+  face.normal = face_int_normals_.Read();
+  face.flux = face_entropy_flux_.Write(); face.speed = face_int_speed_q_.Write();
+  mfem::forall(face_int_e1_.Size() * face_int_nq_, face);
+  dg_igr_detail::packed_entropy::GatherKernel gather;
+  gather.dof = face_elem_dof_; gather.nq = face_int_nq_;
+  gather.offsets = face_entropy_element_offsets_.Read();
+  gather.sides = face_entropy_element_sides_.Read();
+  gather.state_map = invmass_elem_vdof_map_.Read();
+  gather.shape1 = face_int_shape1_.Read(); gather.shape2 = face_int_shape2_.Read();
+  gather.weights = face_int_weights_.Read(); gather.flux = face_entropy_flux_.Read();
+  gather.z = z_out.Write();
+  mfem::forall(vfes.GetNE() * face_elem_dof_ * num_equations, gather);
+  max_face_speed = ReduceFaceMaxSpeed_(face_int_speed_q_, face_int_speed_reduce_workspace_);
+  MFEM_VERIFY(std::isfinite(max_face_speed),
+              "Packed ES-Winters face flux encountered an inadmissible/nonfinite state.");
+  return true;
+#endif
 }
 
 bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(

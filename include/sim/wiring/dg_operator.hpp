@@ -105,10 +105,8 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
   }
   mfem::DGHyperbolicConservationLaws op(
     ctx.spaces.vfes,
-    std::unique_ptr<mfem::HyperbolicFormIntegrator>(
-      new mfem::HyperbolicFormIntegrator(
-        numerical_flux,
-        ctx.run_cfg.case_config.int_order_offset)),
+    numerical_flux,
+    ctx.run_cfg.case_config.int_order_offset,
     preassemble_weak_div);
   op.SetDGSEMGamma(ctx.run_cfg.case_config.gamma);
   op.SetFaceQuadratureOrderOffset(ctx.run_cfg.case_config.int_order_offset);
