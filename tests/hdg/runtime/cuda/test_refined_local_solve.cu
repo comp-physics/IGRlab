@@ -12,14 +12,14 @@ using namespace dg::hdg::runtime::cuda_w8a;
 using namespace dg::hdg::runtime::cuda_w8a::detail;
 struct Arena
 {
-  std::vector<double*> buffers;
-  ~Arena(){for(double* p:buffers)cudaFree(p);}
-  double* Get(std::size_t n)
+  std::vector<void*> buffers;
+  ~Arena(){for(void* p:buffers)cudaFree(p);}
+  template <typename T=double> T* Get(std::size_t n)
   {
-    double* p=nullptr;
-    if(cudaMallocManaged(reinterpret_cast<void**>(&p),n*sizeof(double))!=cudaSuccess)
+    T* p=nullptr;
+    if(cudaMallocManaged(reinterpret_cast<void**>(&p),n*sizeof(T))!=cudaSuccess)
       throw "allocation failed";
-    buffers.push_back(p);std::fill(p,p+n,0.0);return p;
+    buffers.push_back(p);std::fill(p,p+n,T{});return p;
   }
 };
 
@@ -31,6 +31,13 @@ bool Run(const int n,const CudaLocalSolveKind kind)
   CudaMeshShape s{};
   s.elements=ne;s.interior_dofs=n;s.trace_dofs=nt;
   s.interior_count=ne*n;s.borrowed_host_inputs=true;s.local_solve=kind;
+  s.true_trace_count=ne*nt;s.global_true_trace_count=ne*nt;
+  s.vector_owned_count=ne*nt;
+  v.signed_element_trace=arena.Get<int>(ne*nt);
+  v.vector_owned_source=arena.Get<int>(ne*nt);
+  v.vector_owned_target=arena.Get<int>(ne*nt);
+  for(int i=0;i<ne*nt;++i)
+    v.signed_element_trace[i]=v.vector_owned_source[i]=v.vector_owned_target[i]=i;
   v.a=arena.Get(ne*n*n);v.lu=arena.Get(ne*n*n);v.pivots=arena.Get(ne*n);
   v.b=arena.Get(ne*n*nt);v.c=arena.Get(ne*nt*n);v.d=arena.Get(ne*nt*nt);
   v.f=arena.Get(ne*n);v.g=arena.Get(ne*nt);v.schur=arena.Get(ne*nt*nt);
@@ -107,6 +114,7 @@ bool Run(const int n,const CudaLocalSolveKind kind)
   if(maximum_backward_error>1.e-13 ||
      (kind==CudaLocalSolveKind::fp32_refine&&v.local_solve_work[0]<1.0))return false;
   if(!CudaLaunchRecover(v,s,dg::hdg::generic::CudaEngineKind::ordinary)||
+     !CudaLaunchRefinedOriginalCoupledSquaredNorms(v,s)||
      cudaDeviceSynchronize()!=cudaSuccess)return false;
   for(int e=0;e<ne;++e)
     for(int row=0;row<n;++row)
@@ -118,13 +126,14 @@ bool Run(const int n,const CudaLocalSolveKind kind)
   for(int i=0;i<ne*n;++i)if(v.residual_r[i]!=17.0)return false;
   for(int i=0;i<ne*nt;++i)if(v.residual_g[i]!=19.0)return false;
   // Residual checking must use A/B/C/D, not reconstruct the rounded Schur.
+  // This fixture has independent trace rows, so true assembly is identity.
   for(int e=0;e<ne;++e)
     for(int row=0;row<nt;++row)
     {
       double expected=v.g[e*nt+row];
       for(int j=0;j<n;++j)expected-=v.c[(e*nt+row)*n+j]*v.recovered_interior[e*n+j];
       for(int j=0;j<nt;++j)expected-=v.d[(e*nt+row)*nt+j]*v.trace_increment_local[e*nt+j];
-      if(std::abs(v.local_solve_workspace[ne*n+e*nt+row]-expected)>1.e-12)return false;
+      if(std::abs(v.local_solve_workspace[ne*n+ne*nt+e*nt+row]-expected)>1.e-12)return false;
     }
   // Nonfinite original A must fail even after the bounded FP64 fallback.
   v.a[0]=std::numeric_limits<double>::quiet_NaN();
@@ -134,13 +143,88 @@ bool Run(const int n,const CudaLocalSolveKind kind)
            <<" max_backward_error="<<maximum_backward_error<<" passed\n";
   return true;
 }
+
+// Exercise the production rank-one RHS assembly and recovered coupled gate.
+// Shared trace rows have large cancelling g contributions near convergence;
+// local subtraction loses ~1e-16 although the assembled RHS is only 2^-40.
+bool SharedTraceCancellation(const CudaLocalSolveKind kind,
+                             const dg::hdg::generic::CudaEngineKind engine)
+{
+  constexpr int ne=2,n=3,nt=1,cols=2;
+  const double delta=std::ldexp(1.0,-40),third=delta/3.0;
+  Arena arena;
+  CudaDeviceView v{};CudaMeshShape s{};
+  s.elements=ne;s.interior_dofs=n;s.trace_dofs=nt;s.interior_count=ne*n;
+  s.borrowed_host_inputs=true;s.local_solve=kind;
+  s.true_trace_count=1;s.global_true_trace_count=1;s.vector_owned_count=ne;
+  v.a=arena.Get(ne*n*n);v.lu=arena.Get(ne*n*n);v.pivots=arena.Get(ne*n);
+  v.b=arena.Get(ne*n*nt);v.c=arena.Get(ne*nt*n);v.d=arena.Get(ne*nt*nt);
+  v.f=arena.Get(ne*n);v.g=arena.Get(ne*nt);v.schur=arena.Get(ne*nt*nt);
+  v.condensed_rhs=arena.Get(ne*nt);v.solve_workspace=arena.Get(ne*n*cols);
+  v.local_solve_workspace=arena.Get(ne*n*cols);v.local_solve_work=arena.Get(ne*3);
+  v.status=arena.Get(ne);v.scalar=arena.Get(3);v.true_rhs_scratch=arena.Get(1);
+  v.recovered_interior=arena.Get(ne*n);v.trace_increment_local=arena.Get(ne*nt);
+  v.signed_element_trace=arena.Get<int>(ne);
+  v.vector_owned_source=arena.Get<int>(ne);v.vector_owned_target=arena.Get<int>(ne);
+  v.signed_element_trace[0]=0;v.signed_element_trace[1]=-1;
+  v.vector_owned_source[0]=0;v.vector_owned_source[1]=1;
+  for(int e=0;e<ne;++e)
+  {
+    for(int row=0;row<n;++row)v.a[(e*n+row)*n+row]=1.0;
+    v.d[e]=1.0;
+  }
+  v.f[0]=third;v.f[1]=third;v.f[n]=third;
+  v.c[0]=1.0;v.c[1]=1.0;v.c[n]=-1.0;
+  v.g[0]=1.0;v.g[1]=1.0-delta;
+  std::uint64_t tiles=0;
+  if(!CudaLaunchCondensation(v,s,engine,tiles)||
+     !CudaLaunchRefinedTrueRhs(v,s)||cudaDeviceSynchronize()!=cudaSuccess)
+    return false;
+  for(int e=0;e<ne;++e)if(v.status[e]!=1.0)return false;
+  const double legacy_rhs=v.condensed_rhs[0]-v.condensed_rhs[1];
+  const double corrected_rhs=v.true_rhs_scratch[0];
+  const double true_schur=v.schur[0]+v.schur[1];
+  if(!(std::abs(legacy_rhs)>1.e-6*delta)||
+     std::abs(corrected_rhs)>1.e-10*delta||true_schur!=2.0)return false;
+  const auto recover_and_measure=[&](const double rhs,double& relative)
+  {
+    v.trace_increment_local[0]=rhs/true_schur;
+    v.trace_increment_local[1]=-rhs/true_schur;
+    if(!CudaLaunchRecover(v,s,engine)||
+       !CudaLaunchRefinedOriginalCoupledSquaredNorms(v,s)||
+       cudaDeviceSynchronize()!=cudaSuccess||!(v.scalar[1]>0.0))return false;
+    relative=std::sqrt(v.scalar[0])/std::sqrt(v.scalar[1]);
+    return std::isfinite(relative)&&v.true_rhs_scratch[0]==corrected_rhs;
+  };
+  double correct_relative=0.0,legacy_relative=0.0;
+  if(!recover_and_measure(corrected_rhs,correct_relative)||correct_relative>1.e-10||
+     !recover_and_measure(legacy_rhs,legacy_relative)||legacy_relative<=1.e-10)
+    return false;
+  // Reject an erroneous interior recovery as well as the inaccurate trace RHS.
+  if(!recover_and_measure(corrected_rhs,correct_relative))return false;
+  v.recovered_interior[0]+=delta*1.e-3;
+  if(!CudaLaunchRefinedOriginalCoupledSquaredNorms(v,s)||
+     cudaDeviceSynchronize()!=cudaSuccess)return false;
+  const double perturbed_relative=std::sqrt(v.scalar[0])/std::sqrt(v.scalar[1]);
+  if(!std::isfinite(perturbed_relative)||perturbed_relative<=1.e-10)return false;
+  std::cout<<"shared-trace-cancellation mixed="<<(kind==CudaLocalSolveKind::fp32_refine)
+           <<" tensor="<<(engine==dg::hdg::generic::CudaEngineKind::tensor_core)
+           <<" corrected_relative="<<correct_relative
+           <<" legacy_relative="<<legacy_relative<<" passed\n";
+  return true;
+}
 }
 int main()
 {
   try
   {
-    return Run(5,CudaLocalSolveKind::fp64_refine)&&Run(5,CudaLocalSolveKind::fp32_refine)&&
-           Run(17,CudaLocalSolveKind::fp64_refine)&&Run(17,CudaLocalSolveKind::fp32_refine)?0:1;
+    if(!Run(5,CudaLocalSolveKind::fp64_refine)||!Run(5,CudaLocalSolveKind::fp32_refine)||
+       !Run(17,CudaLocalSolveKind::fp64_refine)||!Run(17,CudaLocalSolveKind::fp32_refine))return 1;
+    for(const auto kind:{CudaLocalSolveKind::fp64_refine,CudaLocalSolveKind::fp32_refine})
+      for(const auto engine:{dg::hdg::generic::CudaEngineKind::ordinary,
+                             dg::hdg::generic::CudaEngineKind::tensor_core})
+        if(!SharedTraceCancellation(kind,engine))return 1;
+    return 0;
   }
   catch(const char* error){std::cerr<<error<<'\n';return 2;}
 }

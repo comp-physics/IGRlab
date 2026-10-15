@@ -2323,6 +2323,12 @@ bool CudaLaunchGatherRemoteVector(const CudaDeviceView& view,
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& view,
                                    const CudaMeshShape& shape,
                                    double* true_vector) noexcept;
+// Rank-one opt-in assembly retains small globally assembled RHS values when
+// opposing element face contributions are much larger than the correction.
+bool CudaLaunchRefinedTrueRhs(const CudaDeviceView& view,
+                              const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRefinedOriginalCoupledSquaredNorms(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchRecover(const CudaDeviceView& view,
                        const CudaMeshShape& shape,
                        generic::CudaEngineKind engine) noexcept;

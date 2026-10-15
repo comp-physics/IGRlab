@@ -2757,23 +2757,10 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 OriginalCoupledResidualPassed() noexcept
 {
   if (shape_.local_solve == CudaLocalSolveKind::current) return true;
-  // Rank-one-only admission makes these reductions local. Preserve the same
-  // original-equation relative tolerance used by the existing true trace gate.
-  double* residual_r = view_.local_solve_workspace;
-  double* residual_g = residual_r + shape_.interior_count;
-  double* assembled = residual_g + shape_.elements * shape_.trace_dofs;
-  // For the admitted local dimensions n >= 2, n*(nt+1) can hold n+2*nt
-  // doubles per element; true-trace count is bounded by element-trace count.
-  // Reuse this dead solve scratch and preserve the coherent condensed RHS,
-  // original nonlinear residuals, and true-residual product for their callers.
-  if (!AssembleTrueVector(residual_g, assembled, false) ||
-      !CudaLaunchLocalSquaredNorm(residual_r, shape_.interior_count,
-          assembled, shape_.true_trace_count, view_.status,
-          shape_.elements, view_.scalar) ||
-      !AssembleTrueVector(view_.g, assembled, false) ||
-      !CudaLaunchLocalSquaredNorm(view_.f, shape_.interior_count,
-          assembled, shape_.true_trace_count, view_.status,
-          shape_.elements, view_.scalar + 1)) return false;
+  // Assemble original trace RHS and action separately. Subtracting the tiny
+  // coherent correction from each large, cancelling face RHS first loses the
+  // very digits this relative residual is intended to certify.
+  if (!CudaLaunchRefinedOriginalCoupledSquaredNorms(view_, shape_)) return false;
   double norms[2]{};
   if (!TransportPolicy::DeviceToHost(norms, view_.scalar, sizeof(norms),
           CudaTransferCategory::scalar_diagnostic, CudaTransferSite::scalar_status) ||
@@ -3032,7 +3019,17 @@ AssembleTrueSystem() noexcept
   const bool matrix_free_operator =
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
           trace_policy_descriptor_.resolved_selection);
-  if (matrix_free_operator)
+  if (shape_.local_solve != CudaLocalSolveKind::current)
+  {
+    // Local g-C*A^{-1}f can lose a near-converged RHS before opposing
+    // element contributions are assembled. Preserve the original global
+    // equation by assembling its two terms independently in the opt-in path.
+    if (!CollectiveContinue(ranks_ == 1 &&
+            CudaLaunchRefinedTrueRhs(view_, shape_)) ||
+        !CollectiveContinue(TransportPolicy::Synchronize(
+            CudaTransferSite::rhs_remote_scatter))) return false;
+  }
+  else if (matrix_free_operator)
   {
     const bool exact_rank_one_rhs = ranks_ == 1 &&
         element_schwarz_plan_.valid &&

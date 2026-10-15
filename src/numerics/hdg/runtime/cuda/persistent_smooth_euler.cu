@@ -8043,8 +8043,31 @@ __global__ void TensorBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
   __syncthreads();
   if(threadIdx.x==0)v.status[e]=1;
 }
+// Keep the trace action separate from g until both have been assembled.
+// Near convergence, element g contributions can be large and cancelling;
+// local subtraction would round away a tiny but meaningful global RHS.
+__global__ void RefinedCondensedTraceActionKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int n=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const double* w=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
+  for(int row=threadIdx.x;row<nt;row+=blockDim.x)
+  {
+    double value=0.0;
+    for(int j=0;j<n;++j)
+      value+=v.c[(static_cast<std::size_t>(e)*nt+row)*n+j]*w[j*cols+nt];
+    v.local_solve_workspace[e*nt+row]=value;
+  }
+}
+__global__ void RefinedTraceDifferenceKernel(const double* rhs,
+    const double* action,double* residual,const int count)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row<count)residual[row]=rhs[row]-action[row];
+}
+
 // Verify the original coupled system after trace distribution and recovery.
-// Trace rows are assembled globally by the owner before evaluating their norm.
+// The trace portion stores C*x+D*lambda, assembled separately from g below.
 __global__ void RefinedOriginalCoupledResidualKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x;if(e>=s.elements)return;
@@ -8064,9 +8087,9 @@ __global__ void RefinedOriginalCoupledResidualKernel(CudaDeviceView v,CudaMeshSh
   }
   for(int row=threadIdx.x;row<nt;row+=blockDim.x)
   {
-    double value=v.g[e*nt+row];
-    for(int j=0;j<n;++j)value-=v.c[(static_cast<std::size_t>(e)*nt+row)*n+j]*x[j];
-    for(int j=0;j<nt;++j)value-=v.d[(static_cast<std::size_t>(e)*nt+row)*nt+j]*t[j];
+    double value=0.0;
+    for(int j=0;j<n;++j)value+=v.c[(static_cast<std::size_t>(e)*nt+row)*n+j]*x[j];
+    for(int j=0;j<nt;++j)value+=v.d[(static_cast<std::size_t>(e)*nt+row)*nt+j]*t[j];
     residual_g[e*nt+row]=value;
   }
 }
@@ -10369,6 +10392,59 @@ bool CudaLaunchGatherRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s
 {if(s.vector_send_count)GatherRemoteVectorKernel<<<Blocks(s.vector_send_count),128>>>(v,s,values,s.vector_send_count);return LaunchOk();}
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s,double* truth) noexcept
 {if(s.vector_receive_count)ScatterRemoteVectorKernel<<<Blocks(s.vector_receive_count),128>>>(v,truth,s.vector_receive_count);return LaunchOk();}
+bool CudaLaunchRefinedTrueRhs(const CudaDeviceView& v,
+                              const CudaMeshShape& s) noexcept
+{
+  if(s.local_solve==CudaLocalSolveKind::current||s.elements<=0||
+     s.interior_dofs<2||s.trace_dofs<=0||s.true_trace_count<=0||
+     s.global_true_trace_count!=s.true_trace_count||
+     s.true_trace_count>s.elements*s.trace_dofs||
+     s.vector_send_count!=0||s.vector_receive_count!=0||
+     v.local_solve_workspace==nullptr||v.true_rhs_scratch==nullptr)
+    return false;
+  double* action=v.local_solve_workspace+s.elements*s.trace_dofs;
+  RefinedCondensedTraceActionKernel<<<s.elements,128>>>(v,s);
+  if(!LaunchOk()||!CudaLaunchAssembleOwnedVector(
+          v,s,v.local_solve_workspace,action)||
+     !CudaLaunchAssembleOwnedVector(v,s,v.g,v.true_rhs_scratch))return false;
+  RefinedTraceDifferenceKernel<<<Blocks(s.true_trace_count),128>>>(
+      v.true_rhs_scratch,action,v.true_rhs_scratch,s.true_trace_count);
+  return LaunchOk();
+}
+bool CudaLaunchRefinedOriginalCoupledSquaredNorms(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(s.local_solve==CudaLocalSolveKind::current||s.elements<=0||
+     s.interior_dofs<2||s.trace_dofs<=0||s.true_trace_count<=0||
+     s.global_true_trace_count!=s.true_trace_count||
+     s.interior_count!=s.elements*s.interior_dofs||
+     s.true_trace_count>s.elements*s.trace_dofs||
+     s.vector_send_count!=0||s.vector_receive_count!=0||
+     v.local_solve_workspace==nullptr)return false;
+  // Corrected W is retained elsewhere. Reuse dead triangular-solve scratch.
+  // Production n>=3 fits even ntrue=E*nt; check the exact bound for smaller
+  // private fixtures as well, without adding another persistent allocation.
+  const std::size_t local_trace=static_cast<std::size_t>(s.elements)*s.trace_dofs;
+  const std::size_t required=s.interior_count+local_trace+
+      2*static_cast<std::size_t>(s.true_trace_count);
+  const std::size_t capacity=static_cast<std::size_t>(s.interior_count)*
+      (static_cast<std::size_t>(s.trace_dofs)+1);
+  if(required>capacity)return false;
+  double* residual_r=v.local_solve_workspace;
+  double* local_action=residual_r+s.interior_count;
+  double* residual_g=local_action+s.elements*s.trace_dofs;
+  double* rhs=residual_g+s.true_trace_count;
+  RefinedOriginalCoupledResidualKernel<<<s.elements,128>>>(v,s);
+  if(!LaunchOk()||!CudaLaunchAssembleOwnedVector(v,s,local_action,residual_g)||
+     !CudaLaunchAssembleOwnedVector(v,s,v.g,rhs))return false;
+  RefinedTraceDifferenceKernel<<<Blocks(s.true_trace_count),128>>>(
+      rhs,residual_g,residual_g,s.true_trace_count);
+  return LaunchOk()&&CudaLaunchLocalSquaredNorm(
+      residual_r,s.interior_count,residual_g,s.true_trace_count,
+      v.status,s.elements,v.scalar)&&CudaLaunchLocalSquaredNorm(
+      v.f,s.interior_count,rhs,s.true_trace_count,
+      v.status,s.elements,v.scalar+1);
+}
 bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
                        const generic::CudaEngineKind engine) noexcept
 {
@@ -10384,7 +10460,6 @@ bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
          (s.local_solve!=CudaLocalSolveKind::fp32_refine&&
           s.local_solve!=CudaLocalSolveKind::fp64_refine))return false;
       TensorBorrowedRecoverKernel<<<s.elements,128>>>(v,s);
-      RefinedOriginalCoupledResidualKernel<<<s.elements,128>>>(v,s);
       return LaunchOk();
     }
     const auto recovery=CudaBorrowedRecoveryForEngine(engine);
