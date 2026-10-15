@@ -4455,14 +4455,16 @@ __global__ void BorrowedEulerZeroKernel(CudaDeviceView v,CudaMeshShape s)
   BorrowedEulerZeroElement(v,s,e,lane);
 }
 
-// Each four-lane group owns one element.  Independent cache fields have one
-// lane writer and retain their scalar accumulation order; complete matrix rows
-// likewise remain lane-owned with their original q and column order.  Exact
-// masks and per-group caches isolate the eight groups within each warp.
+// The first four lanes retain the original interpolant ownership and scalar
+// accumulation order.  A wider group only distributes complete matrix rows;
+// each entry keeps its original quadrature and column order.
+template <int GroupThreads>
 __device__ bool BorrowedEulerVolumeElement(
     CudaDeviceView v,CudaMeshShape s,double dt,const int e,const int lane,
     const unsigned group_mask,BorrowedVolumeCache& cache)
 {
+  static_assert(GroupThreads==borrowed_euler_group_threads||
+                GroupThreads==borrowed_euler_warp_threads);
   const int ni=s.interior_dofs;
   const int si=s.scalar_interior_dofs;
   const int e_i=e*ni;
@@ -4474,48 +4476,51 @@ __device__ bool BorrowedEulerVolumeElement(
     {
       cache.weight=v.volume_weight[qp];cache.q_value=0.0;cache.valid=1;
     }
-    // Lane c owns conserved field c and its two flux/Jacobian staging rows.
-    cache.state[lane]=0.0;cache.old[lane]=0.0;
-    cache.source[lane]=0.0;cache.flux_x[lane]=0.0;
-    cache.flux_y[lane]=0.0;
-    for(int entry=0;entry<igr_trace_components;++entry)
+    if(lane<conserved_components)
     {
-      cache.jacobian_x[lane*igr_trace_components+entry]=0.0;
-      cache.jacobian_y[lane*igr_trace_components+entry]=0.0;
-    }
-    for(int a=0;a<si;++a)
-    {
-      const double phi=v.volume_shape[qp*si+a];
-      cache.state[lane]+=phi*v.work_interior[
-          e_i+ByNodes(a,si,lane)];
-      cache.old[lane]+=phi*v.old_interior[e_i+ByNodes(a,si,lane)];
-      if(s.borrowed_static_source)
-        cache.source[lane]+=phi*v.static_source[
-            e_i+ByNodes(a,si,lane)];
-    }
-    if(s.igr_active)
-    {
-      // Lanes 0--2 own their conservative-gradient component; lane 3 owns
-      // sigma and both auxiliary z components.
-      if(lane<3)
+      // Lane c owns conserved field c and its two flux/Jacobian staging rows.
+      cache.state[lane]=0.0;cache.old[lane]=0.0;
+      cache.source[lane]=0.0;cache.flux_x[lane]=0.0;
+      cache.flux_y[lane]=0.0;
+      for(int entry=0;entry<igr_trace_components;++entry)
       {
-        for(int direction=0;direction<dimension;++direction)
-          cache.conservative_gradient[lane][direction]=0.0;
-        for(int a=0;a<si;++a)
-          for(int direction=0;direction<dimension;++direction)
-            cache.conservative_gradient[lane][direction]+=
-                v.volume_derivative[(qp*si+a)*dimension+direction]*
-                v.work_interior[e_i+ByNodes(a,si,lane)];
+        cache.jacobian_x[lane*igr_trace_components+entry]=0.0;
+        cache.jacobian_y[lane*igr_trace_components+entry]=0.0;
       }
-      else
+      for(int a=0;a<si;++a)
       {
-        cache.sigma=0.0;cache.z[0]=0.0;cache.z[1]=0.0;
-        for(int a=0;a<si;++a)
+        const double phi=v.volume_shape[qp*si+a];
+        cache.state[lane]+=phi*v.work_interior[
+            e_i+ByNodes(a,si,lane)];
+        cache.old[lane]+=phi*v.old_interior[e_i+ByNodes(a,si,lane)];
+        if(s.borrowed_static_source)
+          cache.source[lane]+=phi*v.static_source[
+              e_i+ByNodes(a,si,lane)];
+      }
+      if(s.igr_active)
+      {
+        // Lanes 0--2 own their conservative-gradient component; lane 3 owns
+        // sigma and both auxiliary z components.
+        if(lane<3)
         {
-          const double phi=v.volume_shape[qp*si+a];
-          cache.sigma+=phi*v.work_interior[e_i+ByNodes(a,si,4)];
-          cache.z[0]+=phi*v.work_interior[e_i+ByNodes(a,si,5)];
-          cache.z[1]+=phi*v.work_interior[e_i+ByNodes(a,si,6)];
+          for(int direction=0;direction<dimension;++direction)
+            cache.conservative_gradient[lane][direction]=0.0;
+          for(int a=0;a<si;++a)
+            for(int direction=0;direction<dimension;++direction)
+              cache.conservative_gradient[lane][direction]+=
+                  v.volume_derivative[(qp*si+a)*dimension+direction]*
+                  v.work_interior[e_i+ByNodes(a,si,lane)];
+        }
+        else
+        {
+          cache.sigma=0.0;cache.z[0]=0.0;cache.z[1]=0.0;
+          for(int a=0;a<si;++a)
+          {
+            const double phi=v.volume_shape[qp*si+a];
+            cache.sigma+=phi*v.work_interior[e_i+ByNodes(a,si,4)];
+            cache.z[0]+=phi*v.work_interior[e_i+ByNodes(a,si,5)];
+            cache.z[1]+=phi*v.work_interior[e_i+ByNodes(a,si,6)];
+          }
         }
       }
     }
@@ -4561,7 +4566,7 @@ __device__ bool BorrowedEulerVolumeElement(
     }
     __syncwarp(group_mask);
     if(!cache.valid){if(lane==0)v.status[e]=-1.0;return false;}
-    for(int lr=lane;lr<ni;lr+=borrowed_euler_group_threads)
+    for(int lr=lane;lr<ni;lr+=GroupThreads)
     {
       const int component=lr/si,row=lr-component*si;
       const double phi=v.volume_shape[qp*si+row];
@@ -4662,18 +4667,24 @@ __device__ bool BorrowedEulerVolumeElement(
   return true;
 }
 
+template <int GroupThreads>
 __global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
                                           double dt)
 {
-  const int group=threadIdx.x/borrowed_euler_group_threads;
-  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  static_assert(GroupThreads==borrowed_euler_group_threads||
+                GroupThreads==borrowed_euler_warp_threads);
+  constexpr int elements_per_block=borrowed_euler_block_threads/GroupThreads;
+  static_assert(sizeof(BorrowedVolumeCache)*elements_per_block<=48*1024);
+  const int group=threadIdx.x/GroupThreads;
+  const int lane=threadIdx.x%GroupThreads;
   const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
-  const unsigned group_mask=borrowed_euler_group_mask<<
-      (warp_lane-lane);
-  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  constexpr unsigned lane_mask=0xffffffffu>>(borrowed_euler_warp_threads-
+                                            GroupThreads);
+  const unsigned group_mask=lane_mask<<(warp_lane-lane);
+  const int e=blockIdx.x*elements_per_block+group;
   if(e>=s.elements)return;
-  __shared__ BorrowedVolumeCache caches[borrowed_euler_elements_per_block];
-  (void)BorrowedEulerVolumeElement(
+  __shared__ BorrowedVolumeCache caches[elements_per_block];
+  (void)BorrowedEulerVolumeElement<GroupThreads>(
       v,s,dt,e,lane,group_mask,caches[group]);
 }
 
@@ -4968,10 +4979,10 @@ __device__ bool BorrowedEulerFaceElement(
   return true;
 }
 
-// Ordinary assembly retains four lanes per element.  Tensor assembly assigns
-// a warp to an element so independent dense rows do not queue behind four
-// owners.  Every entry still visits faces and quadrature points in the same
-// order; all interpolants and coupled flux work retain their original owners.
+// Tensor assembly and the ordinary p3 specialization assign a warp to an
+// element so independent dense rows do not queue behind four owners.  Every
+// entry still visits faces and quadrature points in the same order; all
+// interpolants and coupled flux work retain their original owners.
 template <int BlockThreads,int GroupThreads>
 __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
                                         bool frozen_llf,
@@ -9221,7 +9232,21 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
   BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
   if(!LaunchOk())return false;
-  BorrowedEulerVolumeKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,dt);
+  // Qualify only the measured quadrilateral p3 layout.  Other ordinary
+  // orders retain four lanes per element until separately measured.
+  if(s.order==3&&s.scalar_interior_dofs==16&&s.scalar_face_dofs==4)
+  {
+    constexpr int elements_per_block=borrowed_euler_block_threads/
+        borrowed_euler_warp_threads;
+    const int row_blocks=(s.elements-1)/elements_per_block+1;
+    BorrowedEulerVolumeKernel<borrowed_euler_warp_threads>
+        <<<row_blocks,borrowed_euler_block_threads>>>(v,s,dt);
+    if(!LaunchOk())return false;
+    return LaunchSelectedBorrowedEulerFace<borrowed_euler_warp_threads>(
+        v,s,face_block_threads,frozen_llf,differentiate_nonlinearities);
+  }
+  BorrowedEulerVolumeKernel<borrowed_euler_group_threads>
+      <<<blocks,borrowed_euler_block_threads>>>(v,s,dt);
   if(!LaunchOk())return false;
   return LaunchSelectedBorrowedEulerFace(
       v,s,face_block_threads,frozen_llf,differentiate_nonlinearities);

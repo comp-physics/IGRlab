@@ -1103,7 +1103,11 @@ struct CudaQualificationTestAccess
       const auto& right = *fused_products[product];
       audit.maximum_absolute_errors[product] = 0.0;
       audit.maximum_scaled_errors[product] = 0.0;
-      audit.bitwise_equal[product] = left == right;
+      // Face-only blocks retain an exact gate, including signed zero.
+      // Volume products still use the existing FP64 roundoff bound below.
+      audit.bitwise_equal[product] = left.size() == right.size() &&
+          (left.empty() || std::memcmp(left.data(), right.data(),
+                                      left.size() * sizeof(double)) == 0);
       bool finite = left.size() == right.size();
       for (std::size_t index = 0; finite && index < left.size(); ++index)
       {
@@ -1135,7 +1139,10 @@ struct CudaQualificationTestAccess
                ? audit.maximum_scaled_errors[product] <= tensor_tolerance
                : audit.bitwise_equal[product]);
     }
-    audit.status_bitwise_equal = split.status == fused.status;
+    audit.status_bitwise_equal = split.status.size() == fused.status.size() &&
+        (split.status.empty() || std::memcmp(
+            split.status.data(), fused.status.data(),
+            split.status.size() * sizeof(double)) == 0);
     audit.status_all_passed = std::all_of(
         fused.status.begin(), fused.status.end(),
         [](const double value) { return value == 1.0; });
