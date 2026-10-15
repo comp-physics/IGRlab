@@ -897,8 +897,10 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
 
   if (face_built_entropy_policy_)
   {
-    // Initial qualification: rank-one periodic p5 affine quadrilateral DG.
-    // All sampled face quadrature/normal data are still those of the integrator.
+    // The packed kernels use the actual DOF and quadrature counts, so all
+    // positive uniform orders share this path. Retain the qualified rank-one,
+    // periodic affine quadrilateral topology and the integrator's sampled
+    // quadrature/normal data; unsupported layouts keep the host fallback.
     int ranks = 0;
 #ifdef MFEM_USE_MPI
     if (pfes) { MPI_Comm_size(pfes->GetComm(), &ranks); }
@@ -907,11 +909,14 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
         face_bdr_e1_.Size() != 0 || face_shared_e1_.Size() != 0 ||
         face_int_e1_.Size() == 0 ||
         !dynamic_cast<const L2_FECollection*>(vfes.FEColl())) { return; }
+    const int order = vfes.GetFE(0)->GetOrder();
+    if (order < 1) { return; }
     for (int e = 0; e < vfes.GetNE(); ++e)
     {
       const auto& fe = *vfes.GetFE(e);
       const auto* tensor = dynamic_cast<const TensorBasisElement*>(&fe);
-      if (fe.GetOrder() != 5 || fe.GetGeomType() != Geometry::SQUARE ||
+      if (fe.GetOrder() != order || fe.GetDof() != dof ||
+          fe.GetGeomType() != Geometry::SQUARE ||
           fe.GetMapType() != FiniteElement::VALUE || !tensor ||
           (tensor->GetBasisType() != BasisType::GaussLegendre &&
            tensor->GetBasisType() != BasisType::GaussLobatto)) { return; }

@@ -135,23 +135,28 @@ void OperatorOracle(TestContext& ctx, int basis, int ordering, int order,
   if (mutation == 5) { candidate.SetNumericalFlux(&replacement); }
   const std::string log = Apply(candidate, state, actual);
   Apply(oracle, state, expected);
-  const bool admitted = order == 5 && (mutation == 0 || mutation == 4);
+  const bool admitted = order >= 1 && (mutation == 0 || mutation == 4);
+  const std::string cohort = "p" + std::to_string(order) +
+      " basis=" + std::to_string(basis) +
+      " ordering=" + std::to_string(ordering);
   if (mfem::Device::Allows(mfem::Backend::CUDA_MASK))
   {
     ctx.Check(log.find(admitted ? "selected=packed-mfem-forall-euler-es-winters"
                                : "selected=nonlinearForm->Mult") != std::string::npos,
-              "p5 qualification and policy fallback select the expected face route");
+              cohort + " order admission and policy fallback select the expected face route");
   }
-  NearVector(ctx, actual, expected, 2.e-11, "full DG RHS versus MFEM face oracle");
+  NearVector(ctx, actual, expected, 2.e-11,
+             cohort + " full DG RHS versus MFEM face oracle");
   ctx.CheckNear(candidate.GetMaxCharSpeed(), oracle.GetMaxCharSpeed(), 2.e-12,
-                "full DG maximum speed versus MFEM oracle");
+                cohort + " full DG maximum speed versus MFEM oracle");
   Apply(candidate, state, repeat);
   NearVector(ctx, repeat, actual, admitted ? 0.0 : 2.e-13,
-             "owned face gather repeats deterministically");
+             cohort + " owned face gather repeats deterministically");
   // Current sigma values must be read every application, not cached with shape.
   Fill(fes, state, sigma, 1.7);
   Apply(candidate, state, actual); Apply(oracle, state, expected);
-  NearVector(ctx, actual, expected, 2.e-11, "changed sigma values versus oracle");
+  NearVector(ctx, actual, expected, 2.e-11,
+             cohort + " changed sigma values versus oracle");
   if (admitted)
   {
     // Mutable speed policy must return to the host route even after packing.
@@ -175,7 +180,18 @@ int main(int argc, char** argv)
   for (int basis : {mfem::BasisType::GaussLegendre, mfem::BasisType::GaussLobatto})
     for (int ordering : {mfem::Ordering::byNODES, mfem::Ordering::byVDIM})
       OperatorOracle(ctx, basis, ordering, 5);
-  OperatorOracle(ctx, mfem::BasisType::GaussLobatto, mfem::Ordering::byNODES, 3);
+  // Lower, even, and higher orders use the same runtime-sized kernels. Cover
+  // both nodal bases and vector orderings without repeating the p5 Cartesian
+  // cohort above; each oracle retains MFEM's independent face assembly.
+  for (const int order : {1, 2, 3, 4, 7})
+  {
+    OperatorOracle(ctx, mfem::BasisType::GaussLegendre,
+                   mfem::Ordering::byNODES, order);
+    OperatorOracle(ctx, mfem::BasisType::GaussLobatto,
+                   mfem::Ordering::byVDIM, order);
+  }
+  OperatorOracle(ctx, mfem::BasisType::GaussLobatto,
+                 mfem::Ordering::byNODES, 0);
   for (int mutation = 1; mutation <= 5; ++mutation)
     OperatorOracle(ctx, mfem::BasisType::GaussLobatto, mfem::Ordering::byNODES, 5, mutation);
   return ctx.failures == 0 ? 0 : 1;
