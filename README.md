@@ -1,173 +1,78 @@
-# IGRlab
+<p align="center">
+  <img src="docs/assets/igrlab-logo-adaptive.svg" alt="IGRlab" width="500">
+</p>
 
-IGRlab develops Euler and information-geometric regularization methods with
-MFEM, retaining DG, DGSEM, and HDG implementations on CPU and GPU.
+<p align="center"><strong>Information-geometric regularization for Euler flows</strong></p>
 
-| Backend | CPU / ordinary GPU | Specialized tensor implementation |
-|---|---|---|
-| DG | Shared application and MFEM device kernels | TF32 WMMA in the shared IGR screened-patch solve |
-| DGSEM | Reference and packed CPU/CUDA operators | Explicit FP64 WMMA fused CUDA residual |
-| HDG | Generic CPU and ordinary CUDA engines | FP64 WMMA volume/condensation, with optional arithmetic variants |
+<p align="center">
+  <a href="docs/getting-started.md">Get started</a> ·
+  <a href="docs/methods.md">Methods</a> ·
+  <a href="#examples">Examples</a> ·
+  <a href="#validation-and-performance">Validation</a>
+</p>
 
-Support depends on dimension, element geometry, polynomial order, numerical
-policy, and device architecture. Existing admission checks enforce these
-limits. The HDG generic application currently admits conforming two-dimensional
-quadrilateral meshes with orders p1-p3. See [A100 support](docs/a100.md) for the
-SM80 build requirements and the scope of recorded hardware validation.
+IGRlab explores how **information-geometric regularization (IGR)** shapes
+compressible Euler flows, from smooth transport to strong shocks. Built on
+[MFEM](https://mfem.org/), it brings DG, DGSEM, and HDG into a shared research
+codebase for studying numerical behavior and computational cost on CPUs and GPUs.
 
-The C++ application namespace is `igrlab`; `dg_igr` remains a source alias.
-`IGRlab::core` names the existing library target. Canonical configuration and
-runtime environment names use `IGRLAB_*`; legacy `DG_IGR_*` names, existing
-executable/CTest names, and checkpoint formats remain supported during this
-migration. Canonical runtime environment values take precedence, including an explicitly
-empty value. [Consolidation records](docs/consolidation/README.md) describe the
-recovery archive, retained features, validation, and proposed final cleanup.
+**Experimental research software.** Capabilities and validation vary by method,
+polynomial order, and hardware; see the [method guide](docs/methods.md) for scope.
 
-## Building
+## Three approaches to Euler flows
 
-MFEM is pinned as the `tpl/mfem` submodule and built locally so this project can
-consume its installed CMake target. Spack supplies MFEM's dependencies.
+| Method | Implementation |
+| --- | --- |
+| **DG** — discontinuous Galerkin | Euler and IGR operators |
+| **DGSEM** — DG spectral element method | Reference and packed operators |
+| **HDG** — hybridizable discontinuous Galerkin | Euler and IGR solvers with local elimination |
 
-Initialize the submodule and load Spack's shell support once:
+CPU and CUDA implementations support comparisons across polynomial orders.
+Specialized tensor-core kernels are available for selected configurations.
+[Explore the methods and their supported configurations →](docs/methods.md)
+
+## Get started
+
+From a source checkout, with a C++20 compiler, MPI, and [Spack](https://spack.io/):
 
 ```bash
 git submodule update --init
 source /path/to/spack/share/spack/setup-env.sh
+./build.sh --cpu-only --hdg-runtime -j 4
 ```
 
-Then use the unified build driver:
+Then run a short DG Sedov blast with IGR, using the `app_build` path printed
+by the build:
 
 ```bash
-./build.sh --cpu-only -j 16
-./build.sh --gpu --cuda-arch 120 -j 16
-./build.sh --a100 --hdg-runtime -j 16
+APP_BUILD=/path/printed/as/app_build
+"$APP_BUILD/examples/sedov_taylor_blast/sedov_taylor_blast" \
+  --device cpu --t-final 0.001 -rs 0 -rp 0 -o 1 -c 0.25
 ```
 
-On PACE, use the checked-in site profile to submit compilation and validation to
-the free background queue. CPU and A100 builds use separate Spack environments,
-dependency stores, and build caches. See [the PACE build](docs/pace.md) for the
-scratch output path and Spack setup:
+[Full setup and CUDA builds](docs/getting-started.md) ·
+[PACE](docs/pace.md) · [Delta](docs/delta.md) ·
+[Fast application-only rebuilds](docs/iteration.md)
 
-```bash
-./build.sh --site pace --cpu-only --hdg-runtime --submit \
-  --output-root /absolute/scratch/igrlab-build
-./build.sh --site pace --a100 --hdg-runtime --submit \
-  --output-root /absolute/scratch/igrlab-build
-```
+## Examples
 
-| Target | Selected Spack environment |
-|---|---|
-| PACE CPU | `SITE_ROOT/site/pace/spack-envs/cpu` |
-| PACE A100 | `SITE_ROOT/site/pace/spack-envs/cuda-sm80` |
-| Other systems | A site environment selected with `IGRLAB_SPACK_ENV` |
+| Flow problem | Example |
+| --- | --- |
+| Strong blast wave | [Sedov–Taylor blast](examples/sedov_taylor_blast/) |
+| Shock structure and interaction | [Stationary shock](examples/dgsem_stationary_shock/) · [Shock–vortex interaction](examples/dgsem_shock_vortex_interaction/) |
+| Supersonic flow around a body | [Cylinder](examples/dgsem_supersonic_cylinder/) |
+| Smooth transport and method comparisons | [Periodic advection](examples/dgsem_smooth_advection_periodic/) |
 
-`SITE_ROOT` defaults to `OUTPUT_ROOT`; `--site-root` selects a separate dependency
-root when needed.
-Each environment retains its own `spack.yaml` and `spack.lock`. Keep dependency
-roots separate across machines; select compilers, MPI and CUDA through the
-machine's Spack configuration. The PACE profile discovers installation paths
-through Spack rather than embedding them in the repository.
-Ordinary builds retain the selected lock; intentional dependency upgrades use
-Spack's explicit environment re-concretization workflow.
+Browse [all examples](examples/); each executable provides its options with `--help`.
 
-Application and locally built MFEM outputs live outside the checkout. By default they are scoped under
-`${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build` by canonical worktree and
-profile; choose another external location with `--output-root DIR` or
-`IGRLAB_OUTPUT_ROOT`. A selected output root must be outside every detected Git
-checkout.
+## Validation and performance
 
-```bash
-./build.sh --cpu-only --output-root /scratch/$USER/dg-igr -j 16
-./build.sh --gpu --cuda-arch 120 --print-plan
-```
+Accuracy, conservation, stability, and cost per degree of freedom guide
+development. The [current A100 results](docs/a100.md#current-architecture-multiorder-follow-up-2026-10-15)
+report field comparisons across orders, targeted CUDA/MPI checks, and
+DOF-normalized end-to-end timings for the recorded source and configurations.
 
-`--print-plan` reports the output root, deterministic worktree/profile scope,
-and resolved app/MFEM paths without creating output-root content or acquiring
-the output lock. `build_mfem_tpl.sh` is an internal helper; invoke `build.sh`
-for all builds.
-
-The generic Spack environment templates live under `spack-envs/`. Their CUDA profiles are
-`cuda-sm120` (Blackwell, CUDA 13 and HYPRE `develop`) and `cuda-sm80`
-(A100, CUDA 12.9.1, HYPRE 2.32.0 and Umpire 2024.07.0). The A100 manifest
-uses static HYPRE with CUDA/Umpire, as supported by older site Spack recipes. It is a portable template: configure site compilers and
-CUDA/MPI externals in a site environment selected with `IGRLAB_SPACK_ENV`,
-then concretize/install through the driver. For a shared x86 CPU build and
-A100 GPU allocation, constrain the site environment to a CPU target supported
-by both nodes (for example `target=x86_64_v3`), rather than the build node
-architecture.
-The PACE site profile generates its own environments with HYPRE 3.1.0 and
-Umpire 2025.12.0; its settings are recorded in [the site definition](cmake/sites/pace.json).
-
-GPU architecture selection has three deliberately separate roles. For the
-checked-in Blackwell profile, `--cuda-arch 120` selects Spack dependencies and
-isolated build directories with `cuda_arch=120`; MFEM is compiled with
-`MFEM_CUDA_ARCHS=80-virtual` PTX to avoid CUDA 13's expensive native `sm_120`
-compilation; and this project's CUDA sources are compiled natively with
-`APP_CUDA_ARCHS=120`. The driver enforces that split before dependency or cache
-actions and rejects the ambiguous legacy `CUDA_ARCHS` variable. These values
-normally do not need to be set explicitly.
-
-`--a100` is equivalent to `--gpu --cuda-arch 80`: dependencies, MFEM, and
-application CUDA sources all use native architecture 80, with separate
-`cuda-sm80` output directories. It rejects an explicit CPU mode or any
-conflicting `--cuda-arch` option. `--hdg-runtime` supports native 80 and 120,
-and tensor/native runtime paths require a device matching the configured
-architecture. The SM80 route still requires compilation and device validation on the target
-system; a successful `--print-plan` only validates the build policy. Existing
-SM120 disassembly qualification checks remain specific to that profile.
-
-For repeatable A100 optimization studies, use [the GPU study workflow](docs/gpu-studies.md).
-Its `perf.sh` command freezes sources, reuses canonical builds, schedules paired
-timings and profiling in PACE's free queue, and exports compact results.
-
-The application and MFEM builds both use `-j 16` in the example above. Use
-`--mfem-jobs N` only when MFEM needs different concurrency, such as:
-
-```bash
-./build.sh --gpu --cuda-arch 120 -j 16 --mfem-jobs 8
-```
-
-`./build.sh --gpu --cuda-arch 120 --print-plan` validates and prints the
-resolved architecture and job policy without invoking Spack, CMake, cache
-cleanup, or a build.
-
-Both commands install dependencies, rebuild MFEM, build and install the app,
-and run CTest. Useful controls include `--no-deps`, `--no-clean`, `--no-tests`,
-and `--smoke`. Run `./build.sh --help` for the full interface.
-
-Standalone numerical campaign probes are excluded from ordinary builds.
-Enable them explicitly with `IGRLAB_BUILD_RESEARCH_TESTS=ON ./build.sh ...`.
-Direct operator, conservation, damping, source-oracle, and tensor-parity checks
-remain available in ordinary correctness-test builds. Existing caches can be
-selected with `--output-root`; the default cache root is now `igrlab-build`.
-
-## Modal damping (M16)
-
-Add these options to a DG Euler/IGR example to enable the original M16
-conservative modal damping:
-
-```bash
---modal-damping-rate 80000 --igr-sigma-cadence every-stage
-```
-
-The default rate is zero (disabled). The rate is in inverse model time. At
-each Runge–Kutta stage the solver transforms each conservative component to
-Legendre coefficients and adds the source
-`dU_k/dt = -rate * max((39*k - 29*p)/(10*p), 0)^4 * U_k`.
-For degree `p=39`, modes 0–29 are untouched, mode 30 decays at rate 8,
-and mode 39 at rate 80000. Other degrees use the same fractional cutoff.
-When IGR is enabled, its stress must be recomputed every stage.
-
-This implementation supports affine, nodal L2 DG segments, quadrilaterals,
-and hexahedra with uniform polynomial order. In two or three dimensions,
-the weight uses the largest modal index across the reference directions;
-this is a tensor extension of the original one-dimensional treatment.
-Physical cell averages are preserved. Curved and non-affine elements and
-HDG are rejected when damping is enabled.
-
-The timestep is capped at `1/rate` (0.0000125 for M16). This guards the
-isolated damping term; the coupled Euler/IGR system can require a smaller
-step. The handoff's original fine-step M16 comparison used
-`dt = 1.953125e-7`. Damping is a mitigation whose effect on gradients and
-pressure should be measured in each case; it does not guarantee positivity
-or removal of ringing. Run metadata records the selected rate and profile.
+- [Numerical validation](docs/numerical-validation.md) — how changes are assessed.
+- [GPU studies](docs/gpu-studies.md) — reproducible comparisons and Nsight profiling.
+- [Validation records](docs/consolidation/validation.md) — selected CPU and SM120 checks.
+- [Method scope and limitations](docs/methods.md#validation-scope) — what the evidence covers.
