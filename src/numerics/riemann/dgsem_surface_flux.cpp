@@ -2,6 +2,7 @@
 #include "numerics/riemann/side_scope_utils.hpp"
 
 #include <algorithm>
+#include <typeinfo>
 
 namespace mfem
 {
@@ -71,17 +72,34 @@ real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
   real_t flux_tmp_data[4];
   Vector flux_tmp(flux_tmp_data, std::min(num_eq, 4));
   flux_tmp.SetSize(num_eq);
+  const FluxFunction* speed_flux = &flux_fn_;
+  const FaceSideExplicitFlux* speed_side_flux = side_explicit_flux_;
+  // The sigma values above already supply the entropy flux and dissipation.
+  // With the concrete Euler/IGR pair and no sigma-speed policy, the wrapped
+  // normal flux returns exactly the base speed. Avoid interpolating sigma
+  // again just to add it to this discarded scratch flux. Retain virtual side
+  // dispatch for derived fluxes and check mutable policies on every call.
+  if (flux_igr && typeid(*flux_igr) == typeid(FluxWithIGR) &&
+      typeid(flux_igr->GetBaseFlux()) == typeid(EulerFlux) &&
+      !flux_igr->GetSigmaAwareCFL() &&
+      !flux_igr->GetSigmaAwareRusanov() &&
+      !flux_igr->GetFrozenSigmaSpectralSpeed() &&
+      !flux_igr->GetInvariantDomainFlux())
+  {
+    speed_flux = &flux_igr->GetBaseFlux();
+    speed_side_flux = nullptr;
+  }
   const real_t speed1 =
-    riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
-                                           flux_fn_,
+    riemann_detail::ComputeFluxDotNForSide(speed_side_flux,
+                                           *speed_flux,
                                            FaceSide::Left,
                                            state1,
                                            nor,
                                            Tr,
                                            flux_tmp);
   const real_t speed2 =
-    riemann_detail::ComputeFluxDotNForSide(side_explicit_flux_,
-                                           flux_fn_,
+    riemann_detail::ComputeFluxDotNForSide(speed_side_flux,
+                                           *speed_flux,
                                            FaceSide::Right,
                                            state2,
                                            nor,
