@@ -51,6 +51,37 @@ private:
   mutable int calls_ = 0;
 };
 
+class PositiveDiagonal final : public mfem::Solver
+{
+public:
+  explicit PositiveDiagonal(int n) : mfem::Solver(n) { }
+  void SetOperator(const mfem::Operator&) override { }
+  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
+  {
+    y.SetSize(height);
+    y.UseDevice(true);
+    const double* input = x.Read();
+    double* output = y.Write();
+    mfem::forall(height, [=] MFEM_HOST_DEVICE(int i)
+    { output[i] = input[i] / (4.0 + 0.2 * (i % 7)); });
+  }
+};
+
+double PreconditionedResidual(const mfem::Operator& op, mfem::Solver& prec,
+                                const mfem::Vector& b, const mfem::Vector& x)
+{
+  mfem::Vector residual(b.Size()), z(b.Size());
+  op.Mult(x, residual);
+  residual -= b;
+  prec.Mult(residual, z);
+  const double* r = residual.HostRead();
+  const double* zr = z.HostRead();
+  long double product = 0.0L;
+  for (int i = 0; i < b.Size(); ++i) { product += static_cast<long double>(r[i]) * zr[i]; }
+  MFEM_VERIFY(product >= 0.0L && std::isfinite(product), "Invalid test residual product.");
+  return std::sqrt(static_cast<double>(product));
+}
+
 double Norm(const mfem::Vector& x)
 {
   const double* data = x.HostRead();
@@ -162,6 +193,24 @@ int main(int argc, char** argv)
   reference -= x;
   MFEM_VERIFY(mfem_cg.GetConverged() && Norm(reference) / Norm(exact) < 3.0e-11,
               "Device CG disagrees with MFEM.");
+  PositiveDiagonal jacobi(n);
+  Configure(*cg, spd);
+  cg->SetPreconditioner(jacobi);
+  x = guess;
+  const double preconditioned_initial = PreconditionedResidual(spd, jacobi, rhs, x);
+  cg->Mult(rhs, x);
+  const double preconditioned_final = PreconditionedResidual(spd, jacobi, rhs, x);
+  MFEM_VERIFY(cg->GetConverged() && preconditioned_final <= 1.0e-11 * preconditioned_initial &&
+                std::abs(cg->GetInitialNorm() - preconditioned_initial) < 1.0e-13 * preconditioned_initial &&
+                std::abs(cg->GetFinalNorm() - preconditioned_final) < 1.0e-13 * preconditioned_initial,
+              "Preconditioned device CG violated its original-operator r.Br norm gate.");
+  Configure(mfem_cg, spd);
+  mfem_cg.SetPreconditioner(jacobi);
+  reference = guess;
+  mfem_cg.Mult(rhs, reference);
+  reference -= x;
+  MFEM_VERIFY(mfem_cg.GetConverged() && Norm(reference) / Norm(exact) < 3.0e-11,
+              "Preconditioned device CG disagrees with MFEM.");
   Configure(*cg, spd, false);
   rhs = 0.0;
   cg->Mult(rhs, x);
@@ -179,6 +228,6 @@ int main(int argc, char** argv)
               "Device CG accepted nonfinite curvature.");
   std::cout << "device_krylov_test passed restarted_flexible_mgs=true"
                " true_residual=true cached_reconfigure=true happy_breakdown=true"
-               " zero_rhs=true iteration_cap=true cg_mfem_parity=true nonpositive_curvature=true nonfinite_curvature=true\n";
+               " zero_rhs=true iteration_cap=true cg_mfem_parity=true preconditioned_cg=true nonpositive_curvature=true nonfinite_curvature=true\n";
   return 0;
 }

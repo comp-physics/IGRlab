@@ -365,7 +365,13 @@ public:
         final_norm = true_squared >= 0.0 ? std::sqrt(true_squared) : true_squared;
         converged = std::isfinite(true_squared) && true_squared >= 0.0 &&
                       true_squared <= tolerance_squared;
-        return;
+        if (converged || !std::isfinite(true_squared) || true_squared < 0.0)
+        { return; }
+        // Recurrence drift does not enlarge the solve budget or tolerance.
+        // Restart from the certified residual, retaining its device scalar.
+        direction_ = z_;
+        old_slot = 1 - old_slot;
+        continue;
       }
       PrepareCGBeta<<<1, 1>>>(old_slot, c);
       CGDirection<<<blocks, threads>>>(height, z_.Read(), c, direction_.ReadWrite());
