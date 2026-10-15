@@ -66,9 +66,10 @@ OwnedScratchChebyshev::OwnedScratchChebyshev(
   MFEM_VERIFY(!mfem::Device::Allows(mfem::Backend::CUDA_MASK),
               "Private Chebyshev CUDA arithmetic requires local CUDA compilation.");
 #endif
-  // Retain the Setup/Mult expressions and separate kernels from MFEM
-  // d9d6526 linalg/solvers.cpp. Neither coefficients nor state are reused
-  // across the application's changing closure operators.
+  // Retain the Setup/Mult arithmetic from MFEM d9d6526 linalg/solvers.cpp.
+  // The fused scale/accumulate below preserves the rounded residual between
+  // those operations. Neither coefficients nor state are reused across the
+  // application's changing closure operators.
   residual_.UseDevice(true);
   helper_.UseDevice(true);
   SetupInverseDiagonal(size_, diagonal, essential_tdofs, inverse_diagonal_);
@@ -169,10 +170,22 @@ void OwnedScratchChebyshev::Mult(const mfem::Vector& x, mfem::Vector& y) const
 
     const auto Dinv = inverse_diagonal_.Read();
     const auto R = residual_.ReadWrite();
-    mfem::forall(size_, [=] MFEM_HOST_DEVICE (int i) { R[i] *= Dinv[i]; });
     const auto Y = y.ReadWrite();
     const auto C = coefficients_.Read();
-    mfem::forall(size_, [=] MFEM_HOST_DEVICE (int i) { Y[i] += C[k] * R[i]; });
+    mfem::forall(size_, [=] MFEM_HOST_DEVICE (int i)
+    {
+      // The original first kernel stored this product before accumulation.
+      // Preserve that rounding boundary while avoiding a second launch/read.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      const mfem::real_t scaled = __dmul_rn(R[i], Dinv[i]);
+#elif defined(__CUDA_ARCH__) && defined(MFEM_USE_SINGLE)
+      const mfem::real_t scaled = __fmul_rn(R[i], Dinv[i]);
+#else
+      const volatile mfem::real_t scaled = R[i] * Dinv[i];
+#endif
+      R[i] = scaled;
+      Y[i] += C[k] * scaled;
+    });
   }
 }
 

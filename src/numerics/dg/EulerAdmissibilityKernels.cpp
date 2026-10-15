@@ -84,10 +84,11 @@ __device__ DeviceSummary EmptySummary()
   return s;
 }
 
+template <bool AcrossElements = false>
 __device__ void MergeSummary(DeviceSummary& a, const DeviceSummary& b)
 {
-  // Occurrence index is a tie breaker, not a changed FP reduction. It retains
-  // the original first value on equality, including the sign of zero.
+  // The index breaks ties by occurrence locally, or by source element in the
+  // final fold. It retains the first equal value, including the sign of zero.
   if (b.min_rho < a.min_rho ||
       (b.min_rho == a.min_rho && b.min_rho_at < a.min_rho_at))
   { a.min_rho = b.min_rho; a.min_rho_at = b.min_rho_at; }
@@ -97,7 +98,11 @@ __device__ void MergeSummary(DeviceSummary& a, const DeviceSummary& b)
   a.bad_rho += b.bad_rho;
   a.bad_pressure += b.bad_pressure;
   a.declined |= b.declined;
-  if (b.first_at < a.first_at)
+  bool earlier_issue = b.first_at < a.first_at;
+  if (AcrossElements && a.first_at != INT_MAX && b.first_at != INT_MAX &&
+      a.element != b.element)
+  { earlier_issue = b.element < a.element; }
+  if (earlier_issue)
   {
     a.first_at = b.first_at; a.element = b.element; a.face = b.face;
     a.point = b.point; a.scalar_dof = b.scalar_dof;
@@ -221,15 +226,18 @@ __global__ void EulerAdmissibilityElementKernel(
 __global__ void EulerAdmissibilityFoldKernel(
   const DeviceSummary* elements, int count, DeviceSummary* output)
 {
+  __shared__ DeviceSummary partial[scan_threads];
   DeviceSummary result = EmptySummary();
-  // This compact NE fold retains the original ascending-element min ties and
-  // first diagnostic; all expensive sample interpolation is already parallel.
-  for (int e = 0; e < count; ++e)
+  // Each lane visits ascending elements. The minimum occurrence fields now
+  // identify source elements, so equal minima retain their original bit
+  // patterns even when the reduction tree visits elements out of order.
+  for (int e = threadIdx.x; e < count;)
   {
     const DeviceSummary value = elements[e];
-    if (value.min_rho < result.min_rho) { result.min_rho = value.min_rho; }
+    if (value.min_rho < result.min_rho)
+    { result.min_rho = value.min_rho; result.min_rho_at = e; }
     if (value.min_pressure < result.min_pressure)
-    { result.min_pressure = value.min_pressure; }
+    { result.min_pressure = value.min_pressure; result.min_pressure_at = e; }
     result.bad_rho += value.bad_rho;
     result.bad_pressure += value.bad_pressure;
     result.declined |= value.declined;
@@ -241,8 +249,22 @@ __global__ void EulerAdmissibilityFoldKernel(
       result.pressure_bad = value.pressure_bad;
       result.first_rho = value.first_rho; result.first_pressure = value.first_pressure;
     }
+    if (count - e <= scan_threads) { break; }
+    e += scan_threads;
   }
-  *output = result;
+  partial[threadIdx.x] = result;
+  __syncthreads();
+  for (int stride = scan_threads / 2; stride > 0; stride /= 2)
+  {
+    if (threadIdx.x < stride)
+    {
+      // MergeSummary compares occurrence indices within one element. Across
+      // elements the first failing element wins, regardless of its occurrence.
+      MergeSummary<true>(partial[threadIdx.x], partial[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { *output = partial[0]; }
 }
 } // namespace
 
@@ -450,7 +472,7 @@ bool EvaluateAdmissibilityDevice(const AdmissibilityDevicePlan& plan,
       plan.elements.Read(true), plan.rules.Size() ? plan.rules.Read(true) : nullptr,
       gamma, rho_min, p_min, plan.per_element.Write(true));
     MFEM_GPU_CHECK(cudaGetLastError());
-    EulerAdmissibilityFoldKernel<<<1, 1>>>(
+    EulerAdmissibilityFoldKernel<<<1, scan_threads>>>(
       plan.per_element.Read(true), plan.per_element.Size(), plan.final.Write(true));
     MFEM_GPU_CHECK(cudaGetLastError());
     const DeviceSummary result = plan.final.HostRead()[0];

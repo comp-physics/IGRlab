@@ -1007,6 +1007,69 @@ void CheckProductionCudaBudget(int& failures)
   }
 }
 
+void CheckProductionCudaElementFold(int& failures)
+{
+  // Cross both a warp boundary and the final fold block's strided tail. An
+  // earlier element's last node must beat a later element's first node, and
+  // equal minima must retain the earlier element's sign of zero.
+  auto mesh = mfem::Mesh::MakeCartesian2D(
+    257, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+  mfem::DG_FECollection fec(1, 2, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
+  mfem::Vector state(fes.GetVSize()); state.UseDevice(true);
+  Cache cache;
+  const int n = fes.GetNDofs();
+  for (int component : {0, 3})
+  {
+    std::vector<double> input(state.Size(), 0.0);
+    for (int j = 0; j < n; ++j)
+    { input[j] = 1.0; input[j + 3 * n] = 2.5; }
+    mfem::Array<int> dofs;
+    for (int e : {127, 128, 256})
+    {
+      fes.GetElementDofs(e, dofs);
+      const int local = e == 127 ? dofs.Size() - 1 : 0;
+      const int encoded = dofs[local];
+      const int decoded = encoded >= 0 ? encoded : -1 - encoded;
+      const double value = e == 128 ? 0.0 : -0.0;
+      input[decoded + component * n] = encoded >= 0 ? value : -value;
+    }
+    probe::WriteDeviceState(state, input);
+    const auto actual = cache.Scan(
+      fes, state, 2, 1.5, 0.1, 0.1, 0, {}, PointSet::Dof);
+    Check(!state.GetMemory().HostIsValid(),
+          "strided cross-element fold stays device resident",
+          fes.GetComm(), failures);
+    const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+      fes, state, 2, 1.5, 0.1, 0.1, 0, {}, PointSet::Dof);
+    Check(SameSummary(actual, expected) &&
+          actual.first_local_issue.element == 127 &&
+          actual.first_local_issue.scalar_dof == fes.GetFE(127)->GetDof() - 1 &&
+          SameDouble(component == 0 ? actual.global_min_rho :
+                     actual.global_min_pressure, -0.0),
+          "strided fold preserves element-first issues, signed minima and counts",
+          fes.GetComm(), failures);
+    // A declined value in the final partial stride must invalidate the whole
+    // device result, even when an earlier element already supplies an issue.
+    fes.GetElementDofs(256, dofs);
+    const int encoded = dofs[dofs.Size() - 1];
+    const int decoded = encoded >= 0 ? encoded : -1 - encoded;
+    input[decoded + n] = std::numeric_limits<double>::denorm_min();
+    probe::WriteDeviceState(state, input);
+    const auto declined = cache.Scan(
+      fes, state, 2, 1.5, 0.1, 0.1, 0, {}, PointSet::Dof);
+    Check(state.GetMemory().HostIsValid(),
+          "declined arithmetic in final fold stride triggers complete host fallback",
+          fes.GetComm(), failures);
+    const auto original = mfem::igrlab::ScanEulerAdmissibility(
+      fes, state, 2, 1.5, 0.1, 0.1, 0, {}, PointSet::Dof);
+    Check(SameSummary(declined, original),
+          "strided declined fold retains original summary",
+          fes.GetComm(), failures);
+  }
+}
+
 void CheckProductionCudaScan(int& failures)
 {
   if (!mfem::igrlab::detail::AdmissibilityOrdinaryCuda() ||
@@ -1016,6 +1079,7 @@ void CheckProductionCudaScan(int& failures)
   if (failures != 0 || !ProbeEnvironmentSupported()) { return; }
   ScopedProductionCudaFlag enabled("1");
   CheckProductionCudaBudget(failures);
+  CheckProductionCudaElementFold(failures);
   int native_calls = 0;
   Cache cache;
   for (const int basis : {mfem::BasisType::GaussLegendre,
