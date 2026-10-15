@@ -425,7 +425,7 @@ DG/DGSEM solver elapsed time, HDG accepted-step timing, or DGSEM kernel timing.
 
 | Adapter | Primary timing | Numerical/work gate | Diagnostic scope |
 |---|---|---|---|
-| DG/DGSEM application | Fixed-horizon full-solver time | Accepted steps/RHS work, zero rejects, NaN scan, geometry and five physical fields | CPU, ordinary CUDA, and selected DGSEM fused arithmetic |
+| DG/DGSEM application | Fixed-horizon solver elapsed or whole-process wall time, as selected by the suite | Accepted steps/RHS work, zero rejects, NaN scan, geometry and five physical fields | CPU, ordinary CUDA, and selected DGSEM fused arithmetic |
 | Generic HDG application | Whole-process wall time | Production success, fixed accepted horizon, field comparison; same-work CPU reference when selected | CPU, ordinary CUDA, tensor CUDA; whole-run timeline |
 | HDG | Accepted-step median per process | Schema-2 policies/gates, zero retries/fallback, same work, separate exported checksums | Measured step zero; volume, condensation, face, recovery and trace-solve families |
 | DGSEM, optional | Selected volume method time | Complete method/error observations against the existing long-double reference | Prescribed-sigma central-volume probe only |

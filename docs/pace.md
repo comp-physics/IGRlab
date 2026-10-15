@@ -251,10 +251,12 @@ build. The HDG source preflight also requires MFEM's pinned `v4.9` tag. Include
 `refs/tags/v4.9` in MFEM Git bundles; a commit-only bundle loses the release
 description used by the face oracle.
 
-PACE CPU/A100 runs are the performance authority for this work. Local builds
-may verify compilation and correctness, but local RTX 5080 timings do not guide
-these optimizations. The site profile uses ordinary batch children and the
-validated MPI installation without overriding MPI transport components.
+PACE CPU/A100 results apply to their recorded source and site configuration.
+[Delta results](a100.md#current-architecture-multiorder-follow-up-2026-10-15)
+are qualified separately. Local compilation and correctness checks do not
+establish performance on either cluster. The site profile uses ordinary batch
+children and the validated MPI installation without overriding MPI transport
+components.
 
 Use the maintained [GPU study workflow](gpu-studies.md) to compare source
 versions with one command, retained source/build caches, separate timing and
