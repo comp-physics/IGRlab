@@ -1867,7 +1867,12 @@ struct Solver
       }
     }
 
-    EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor);
+    // Custom initialization hooks can inspect derived fields. Preserve their
+    // eager initialization; otherwise the first consumer is RunEulerCase's
+    // mandatory refresh after initial-state admission and before any output.
+    const bool project_initial_views = spec.make_callbacks || spec.after_init;
+    EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor,
+                                   project_initial_views);
     if (igr)
     {
       state_bundle.AttachIGR(*igr);
@@ -1878,9 +1883,19 @@ struct Solver
       if (subcell_recovery)
       {
         subcell_recovery->InitializeMeans(*ic,state_bundle.sol);
-        state_bundle.pressure_view.Update();
+        if (project_initial_views)
+        {
+          state_bundle.pressure_view.Update();
+        }
       }
-      else state_bundle.ProjectIC(*ic);
+      else if (project_initial_views)
+      {
+        state_bundle.ProjectIC(*ic);
+      }
+      else
+      {
+        state_bundle.sol.ProjectCoefficient(*ic);
+      }
     }
     else
     {

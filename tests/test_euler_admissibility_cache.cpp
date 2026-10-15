@@ -1070,6 +1070,50 @@ void CheckProductionCudaElementFold(int& failures)
   }
 }
 
+void CheckProductionCudaLargeMesh(int& failures)
+{
+  // At this size the former shared 64 MiB cache admitted the Dof device plan
+  // but exhausted its budget before Limiter/Output. Exercise all three plans
+  // in one generation, including warmed calls after the oracle reads state.
+  auto mesh = mfem::Mesh::MakeCartesian2D(
+    128, 128, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+  mfem::DG_FECollection fec(5, 2, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
+  mfem::Vector state(fes.GetVSize()); state.UseDevice(true);
+  const int n = fes.GetNDofs();
+  std::vector<double> input(state.Size(), 0.0);
+  for (int j = 0; j < n; ++j)
+  { input[j] = 1.0; input[j + 3 * n] = 2.5; }
+  mfem::Array<int> dofs;
+  fes.GetElementDofs(1, dofs);
+  input[dofs[dofs.Size() - 1]] = -0.125;
+  fes.GetElementDofs(fes.GetNE() - 1, dofs);
+  input[dofs[0] + 3 * n] = -0.125;
+  Cache cache;
+  for (const auto points : {PointSet::Dof, PointSet::Limiter, PointSet::Output})
+  {
+    probe::WriteDeviceState(state, input);
+    const auto cold = cache.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                                 12, {11}, points);
+    Check(!state.GetMemory().HostIsValid(),
+          "p5 n128 cold Dof/Limiter/Output scan stays device resident",
+          fes.GetComm(), failures);
+    const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+      fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 12, {11}, points);
+    probe::WriteDeviceState(state, input);
+    const auto warm = cache.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                                 12, {11}, points);
+    Check(!state.GetMemory().HostIsValid(),
+          "p5 n128 warm Dof/Limiter/Output scan stays device resident",
+          fes.GetComm(), failures);
+    Check(expected.global_bad_rho > 0 && expected.global_bad_pressure > 0 &&
+          SameSummary(cold, expected) && SameSummary(warm, expected),
+          "p5 n128 CUDA summaries preserve host bits, counts and first issue",
+          fes.GetComm(), failures);
+  }
+}
+
 void CheckProductionCudaScan(int& failures)
 {
   if (!mfem::igrlab::detail::AdmissibilityOrdinaryCuda() ||
@@ -1080,6 +1124,7 @@ void CheckProductionCudaScan(int& failures)
   ScopedProductionCudaFlag enabled("1");
   CheckProductionCudaBudget(failures);
   CheckProductionCudaElementFold(failures);
+  CheckProductionCudaLargeMesh(failures);
   int native_calls = 0;
   Cache cache;
   for (const int basis : {mfem::BasisType::GaussLegendre,

@@ -1,5 +1,6 @@
 #include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace mfem
 {
@@ -8,6 +9,64 @@ namespace mfem
 
 namespace
 {
+
+bool AssembleCollocatedInverseMass(const FiniteElement& fe,
+                                  ElementTransformation& transformation,
+                                  const IntegrationRule& rule,
+                                  Vector& shape,
+                                  DenseMatrix& inverse)
+{
+  const int dof = fe.GetDof();
+  if (rule.GetNPoints() != dof)
+  {
+    return false;
+  }
+
+  // Admit only exact nodal collocation under the same physical shapes and
+  // quadrature as MassIntegrator. No near-zero tolerance or lumping is used.
+  inverse.SetSize(dof);
+  inverse = 0.0;
+  shape.SetSize(dof);
+  for (int q = 0; q < rule.GetNPoints(); ++q)
+  {
+    const IntegrationPoint& point = rule.IntPoint(q);
+    transformation.SetIntPoint(&point);
+    fe.CalcPhysShape(transformation, shape);
+    int node = -1;
+    for (int i = 0; i < dof; ++i)
+    {
+      if (shape(i) == 0.0)
+      {
+        continue;
+      }
+      if (shape(i) != 1.0 || node >= 0)
+      {
+        return false;
+      }
+      node = i;
+    }
+    if (node < 0 || inverse(node, node) != 0.0)
+    {
+      return false;
+    }
+    const real_t weight = transformation.Weight() * point.weight;
+    if (!std::isfinite(weight) || weight <= 0.0)
+    {
+      return false;
+    }
+    inverse(node, node) = weight;
+  }
+  for (int i = 0; i < dof; ++i)
+  {
+    const real_t reciprocal = 1.0 / inverse(i, i);
+    if (!std::isfinite(reciprocal))
+    {
+      return false;
+    }
+    inverse(i, i) = reciprocal;
+  }
+  return true;
+}
 
 struct PackedDiagonalInverseMassKernel
 {
@@ -30,31 +89,40 @@ struct PackedDiagonalInverseMassKernel
 // Compute inverse mass matrices
 // -----------------------------------------------------------------------------
 //
-// For each element T, assemble M_T^{-1} by applying InverseIntegrator(MassIntegrator).
-// We store the dense inverse per element, so we can do:
+// Assemble exact nodally collocated masses directly; otherwise retain
+// InverseIntegrator(MassIntegrator). Store the dense inverse per element for:
 //     y_T = M_T^{-1} z_T
 // cheaply in Mult().
 //
 void DGHyperbolicConservationLaws::ComputeInvMass()
 {
+  ::igrlab::NVTXRange range("DG/setup-inverse-mass");
   InverseIntegrator inv_mass(new MassIntegrator());
   invmass.resize(vfes.GetNE());
   static IntegrationRules lgl_rules(0, Quadrature1D::GaussLobatto);
+  Vector shape;
 
   for (int i = 0; i < vfes.GetNE(); i++)
   {
     const FiniteElement& fe = *vfes.GetFE(i);
     const int dof = fe.GetDof();
+    ElementTransformation& transformation = *vfes.GetElementTransformation(i);
+    const IntegrationRule* collocated_rule = nullptr;
     if (const auto* tbe = dynamic_cast<const TensorBasisElement*>(&fe))
     {
       if (tbe->GetBasisType() == BasisType::GaussLobatto)
       {
         const int order = std::max(1, 2 * fe.GetOrder() - 1);
-        inv_mass.SetIntRule(&lgl_rules.Get(fe.GetGeomType(), order));
+        collocated_rule = &lgl_rules.Get(fe.GetGeomType(), order);
+        inv_mass.SetIntRule(collocated_rule);
       }
       else
       {
         inv_mass.SetIntRule(nullptr);
+        if (tbe->GetBasisType() == BasisType::GaussLegendre)
+        {
+          collocated_rule = &MassIntegrator::GetRule(fe, fe, transformation);
+        }
       }
     }
     else
@@ -62,9 +130,12 @@ void DGHyperbolicConservationLaws::ComputeInvMass()
       inv_mass.SetIntRule(nullptr);
     }
     invmass[i].SetSize(dof);
-    inv_mass.AssembleElementMatrix(fe,
-                                   *vfes.GetElementTransformation(i),
-                                   invmass[i]);
+    if (!collocated_rule ||
+        !AssembleCollocatedInverseMass(fe, transformation, *collocated_rule,
+                                      shape, invmass[i]))
+    {
+      inv_mass.AssembleElementMatrix(fe, transformation, invmass[i]);
+    }
   }
 }
 

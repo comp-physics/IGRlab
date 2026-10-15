@@ -75,7 +75,10 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
     return !(value.empty() || value == "0" || value == "false" ||
              value == "FALSE" || value == "off" || value == "OFF");
   };
-  bool preassemble_weak_div = ctx.run_cfg.opts.preassemble_weak_div;
+  // DGSEM computes its own flux-difference volume contribution in both the
+  // packed path and host oracle; ordinary-DG weak-divergence blocks are unused.
+  bool preassemble_weak_div = ctx.run_cfg.dg_backend != DGBackend::DGSEM &&
+                              ctx.run_cfg.opts.preassemble_weak_div;
   const bool force_device_matrix_free =
     env_flag("DG_IGR_DG_FORCE_MATRIX_FREE", false);
   if (ctx.run_cfg.dg_backend == DGBackend::DG && preassemble_weak_div &&

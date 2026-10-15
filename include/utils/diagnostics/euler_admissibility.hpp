@@ -225,8 +225,12 @@ public:
 
 private:
   // An optional acceleration budget, not a restriction on supported orders.
-  // Larger or unusual spaces keep the original scanner without a cache.
-  static constexpr std::size_t byte_budget = 64u * 1024u * 1024u;
+  // The three p5, 128x128 scan plans charge about 121 MiB together, including
+  // packing temporaries and both host/device mirrors. Keep all three within
+  // this bounded allowance; otherwise the later scans silently fall back to
+  // the host even though their device payloads fit. Larger or unusual spaces
+  // retain the original scanner, and device-memory admission is unchanged.
+  static constexpr std::size_t byte_budget = 128u * 1024u * 1024u;
   struct BudgetExceeded {};
 
   void Charge(std::size_t bytes)

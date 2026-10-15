@@ -31,6 +31,60 @@ bool SameValues(const mfem::Vector& left, const mfem::Vector& right)
   return true;
 }
 
+bool CheckMapValidation()
+{
+  TraceMap map;
+  map.rank = 0;
+  map.rank_count = 2;
+  map.local_true_dof_count = 3;
+  map.global_true_dof_count = 8;
+  // Local true IDs may be permuted, ghosts have no local true ID, and this
+  // validator does not require unique global IDs.
+  map.entries = {{0, 7, 2, 0, Ownership::owned},
+                 {1, 2, -1, 1, Ownership::ghost},
+                 {2, 5, 0, 0, Ownership::owned},
+                 {3, 7, 1, 0, Ownership::owned}};
+  if (!map.IsConsistent()) { return false; }
+
+  TraceMap invalid = map;
+  invalid.entries[3].local_true_dof = 2;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[3].local_true_dof = -1;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[3].local_true_dof = map.local_true_dof_count;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[1].local_true_dof = 0;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[3] = {3, 7, -1, 1, Ownership::ghost};
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.local_true_dof_count = 4;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.local_true_dof_count = std::numeric_limits<LocalIndex>::max();
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[2].local_dof = 1;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[2].global_true_dof = map.global_true_dof_count;
+  if (invalid.IsConsistent()) { return false; }
+  invalid = map;
+  invalid.entries[2].owner_rank = 1;
+  if (invalid.IsConsistent()) { return false; }
+
+  map.local_true_dof_count = 0;
+  map.entries = {{0, 7, -1, 1, Ownership::ghost},
+                 {1, 7, -1, 1, Ownership::ghost}};
+  if (!map.IsConsistent()) { return false; }
+  map.entries.clear();
+  return map.IsConsistent();
+}
+
 bool CheckActions()
 {
   AssembledTraceAction assembled;
@@ -388,7 +442,7 @@ bool CheckMapAndExchange(MPI_Comm comm)
 int main(int argc, char* argv[])
 {
   MPI_Init(&argc, &argv);
-  const bool passed = CheckActions() && CheckOrientation() &&
+  const bool passed = CheckMapValidation() && CheckActions() && CheckOrientation() &&
                       CheckMapAndExchange(MPI_COMM_WORLD);
   int local = passed ? 1 : 0;
   int global = 0;

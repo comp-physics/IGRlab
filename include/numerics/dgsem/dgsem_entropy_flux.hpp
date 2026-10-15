@@ -549,6 +549,58 @@ inline void EntropyConservativeFluxDotN(const Vector& ul,
   real_t f_dir_data[4];
   Vector f_dir(f_dir_data, std::min(num_eq, 4));
   f_dir.SetSize(num_eq);
+  if (num_eq == 4 && type == EntropyFluxType::Ranocha)
+  {
+    // Both directions use the same states and logarithmic means. Retain each
+    // directional expression and the original +0, x, y accumulation order,
+    // including work for zero normal components.
+    double rho_l, v1_l, v2_l, p_l, rhoe_l;
+    double rho_r, v1_r, v2_r, p_r, rhoe_r;
+    EulerPrimitive(ul, /*dim=*/2, gamma, sigma_l, rho_l, v1_l, v2_l, p_l, rhoe_l);
+    EulerPrimitive(ur, /*dim=*/2, gamma, sigma_r, rho_r, v1_r, v2_r, p_r, rhoe_r);
+
+    const double rho_mean = LogMean(rho_l, rho_r);
+    const double inv_rho_p_mean =
+      p_l * p_r * InvLogMean(rho_l * p_r, rho_r * p_l);
+    const double v1_avg = 0.5 * (v1_l + v1_r);
+    const double v2_avg = 0.5 * (v2_l + v2_r);
+    const double p_avg = 0.5 * (p_l + p_r);
+    const double v_sq_avg = 0.5 * (v1_l * v1_r + v2_l * v2_r);
+
+    for (int d = 0; d < dim; ++d)
+    {
+      if (d == 0)
+      {
+        const double f1 = rho_mean * v1_avg;
+        const double f2 = f1 * v1_avg + p_avg;
+        const double f3 = f1 * v2_avg;
+        const double f4 = f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
+                          0.5 * (p_l * v1_r + p_r * v1_l);
+        f_dir(0) = f1;
+        f_dir(1) = f2;
+        f_dir(2) = f3;
+        f_dir(3) = f4;
+      }
+      else
+      {
+        const double f1 = rho_mean * v2_avg;
+        const double f2 = f1 * v1_avg;
+        const double f3 = f1 * v2_avg + p_avg;
+        const double f4 = f1 * (v_sq_avg + inv_rho_p_mean / (gamma - 1.0)) +
+                          0.5 * (p_l * v2_r + p_r * v2_l);
+        f_dir(0) = f1;
+        f_dir(1) = f2;
+        f_dir(2) = f3;
+        f_dir(3) = f4;
+      }
+      for (int eq = 0; eq < num_eq; ++eq)
+      {
+        flux(eq) += normal(d) * f_dir(eq);
+      }
+    }
+    return;
+  }
+
   for (int d = 0; d < dim; ++d)
   {
     EntropyConservativeFlux(ul, ur, d, gamma, type, f_dir, sigma_l, sigma_r);

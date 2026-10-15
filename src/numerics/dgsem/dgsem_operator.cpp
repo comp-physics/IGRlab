@@ -404,9 +404,8 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
 {
   MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_->dim),
               "DGSEM legacy volume oracle supports only 1D/2D.");
-  MFEM_VERIFY(!op_->weakdiv.empty(),
-              "DGSEM volume mode requires preassembled weak divergence "
-              "(face-only form).");
+  // Surface and volume are assembled directly by this oracle, independently
+  // of the ordinary-DG nonlinear form and its weak-divergence storage.
 
   Vector state;
   DenseMatrix flux;      // contravariant flux (num_eq × (dim*dof))

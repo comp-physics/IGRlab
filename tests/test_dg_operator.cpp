@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
@@ -126,7 +127,7 @@ int RunDGOperatorTests(TestContext& ctx)
   for (int basis : {mfem::BasisType::GaussLegendre,
                     mfem::BasisType::GaussLobatto})
   {
-    for (int mass_order : {1, 3})
+    for (int mass_order : {1, 3, 5})
     {
       mfem::Mesh mass_mesh = mfem::Mesh::MakeCartesian2D(
         2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
@@ -166,6 +167,7 @@ int RunDGOperatorTests(TestContext& ctx)
         // off-diagonals rather than assuming a geometry implies that branch.
         mfem::InverseIntegrator inverse(new mfem::MassIntegrator());
         mfem::IntegrationRules lgl_rules(0, mfem::Quadrature1D::GaussLobatto);
+        std::vector<mfem::DenseMatrix> inverse_blocks(mass_fes.GetNE());
         bool all_diagonal = true;
         for (int element = 0; element < mass_fes.GetNE(); ++element)
         {
@@ -175,7 +177,7 @@ int RunDGOperatorTests(TestContext& ctx)
               ? &lgl_rules.Get(fe.GetGeomType(),
                                std::max(1, 2 * fe.GetOrder() - 1))
               : nullptr);
-          mfem::DenseMatrix inverse_block;
+          mfem::DenseMatrix& inverse_block = inverse_blocks[element];
           inverse.AssembleElementMatrix(
             fe, *mass_fes.GetElementTransformation(element), inverse_block);
           for (int column = 0; column < fe.GetDof(); ++column)
@@ -200,8 +202,35 @@ int RunDGOperatorTests(TestContext& ctx)
         mfem::Vector weak_rhs(mass_fes.GetTrueVSize());
         reference_form.Mult(mass_x, weak_rhs);
         mfem::Vector expected(mass_fes.GetTrueVSize());
+        // Keep the construction oracle independent of mass_oper: its blocks
+        // use the original dense quadrature assembly and matrix inversion.
+        mfem::Array<int> element_vdofs;
+        mfem::Vector element_rhs;
+        mfem::DenseMatrix element_input, element_output;
+        for (int element = 0; element < mass_fes.GetNE(); ++element)
+        {
+          const int dof = mass_fes.GetFE(element)->GetDof();
+          mass_fes.GetElementVDofs(element, element_vdofs);
+          weak_rhs.GetSubVector(element_vdofs, element_rhs);
+          element_input.UseExternalData(element_rhs.GetData(), dof, num_eq);
+          element_output.SetSize(dof, num_eq);
+          mfem::Mult(inverse_blocks[element], element_input, element_output);
+          expected.SetSubVector(element_vdofs, element_output.GetData());
+        }
+        mfem::Vector constructed(mass_fes.GetTrueVSize());
         mfem::dgsem::DGSEMOperator dense_oracle(mass_oper);
-        dense_oracle.ApplyInverseMass(weak_rhs, expected);
+        dense_oracle.ApplyInverseMass(weak_rhs, constructed);
+        const mfem::real_t* expected_values = expected.HostRead();
+        const mfem::real_t* constructed_values = constructed.HostRead();
+        bool same_mass_action = true;
+        for (int i = 0; i < expected.Size(); ++i)
+        {
+          same_mass_action = same_mass_action &&
+                             std::isfinite(expected_values[i]) &&
+                             expected_values[i] == constructed_values[i];
+        }
+        ctx.Check(same_mass_action,
+                  label + " construction exactly matches the legacy dense mass action");
         mfem::Vector actual(mass_fes.GetTrueVSize());
         mass_oper.Mult(mass_x, actual);
         ctx.Check(expected.Normlinf() > 1.0e-3,

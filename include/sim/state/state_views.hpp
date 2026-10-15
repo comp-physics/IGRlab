@@ -7,6 +7,7 @@
 
 #include "mfem.hpp"
 #include "physics/euler/diagnostics.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace dg_sim
 {
@@ -57,16 +58,21 @@ struct EulerPressureView
   EulerPressureView(mfem::ParFiniteElementSpace& fes,
                     mfem::ParGridFunction& sol,
                     int dim,
-                    double gamma)
+                    double gamma,
+                    bool project_initial_state = true)
     : coeff(sol, dim, gamma),
       pressure(&fes),
       state(&sol)
   {
-    Update();
+    if (project_initial_state)
+    {
+      Update();
+    }
   }
 
   void Update()
   {
+    ::igrlab::NVTXRange range("Solver/pressure-projection");
     coeff.SetState(*state);
     pressure.ProjectCoefficient(coeff);
   }
@@ -84,16 +90,21 @@ struct EulerVelocityView
   EulerVelocityView(mfem::ParFiniteElementSpace& dfes,
                     mfem::ParGridFunction& sol,
                     int dim,
-                    double rho_floor)
+                    double rho_floor,
+                    bool project_initial_state = true)
     : coeff(dim, &sol, rho_floor),
       velocity(&dfes),
       state(&sol)
   {
-    Update();
+    if (project_initial_state)
+    {
+      Update();
+    }
   }
 
   void Update()
   {
+    ::igrlab::NVTXRange range("Solver/velocity-projection");
     coeff.SetState(state);
     velocity.ProjectCoefficient(coeff);
   }

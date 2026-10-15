@@ -3,6 +3,7 @@
 #include "sim/io/vis_helpers.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 
+#include <cmath>
 #include <limits>
 
 #include "test_utils.hpp"
@@ -76,6 +77,77 @@ int RunDiagnosticsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
   constexpr double rho_floor = 1.0e-12;
+
+  // Startup may defer unobserved projections, but the first output refresh
+  // must use the fully initialized state, including subsequent state changes.
+  for (const auto backend : {dg_sim::DGBackend::DG, dg_sim::DGBackend::DGSEM})
+  {
+    mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+      2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    auto pmesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, serial_mesh);
+    dg_sim::RunConfig run_cfg = MakeRunConfig(/*order=*/5);
+    run_cfg.dg_backend = backend;
+    dg_sim::ExampleContext example_ctx(run_cfg, std::move(pmesh), "L2",
+                                       /*need_sigma=*/false,
+                                       /*need_h1=*/false);
+    dg_sim::EulerStateBundle bundle(example_ctx, gamma, rho_floor,
+                                     /*project_initial_state=*/false);
+    mfem::VectorFunctionCoefficient ic(
+      4, [](const mfem::Vector& x, mfem::Vector& y)
+      {
+        y.SetSize(4);
+        const double rho = 1.0 + 0.2 * x(0);
+        const double u = 0.25 + 0.1 * x(1);
+        const double v = -0.05 + 0.1 * x(0);
+        y(0) = rho;
+        y(1) = rho * u;
+        y(2) = rho * v;
+        y(3) = (1.0 + 0.1 * x(1)) / 0.4 +
+               0.5 * rho * (u * u + v * v);
+      });
+    bundle.sol.ProjectCoefficient(ic);
+    mfem::PressureCoefficient pressure_coeff(bundle.sol, 2, gamma);
+    mfem::VelocityFromConsCoefficient velocity_coeff(2, &bundle.sol, rho_floor);
+    mfem::ParGridFunction pressure_reference(&example_ctx.spaces.fes);
+    mfem::ParGridFunction velocity_reference(&example_ctx.spaces.dfes);
+    const auto same_values = [](const mfem::Vector& a, const mfem::Vector& b)
+    {
+      if (a.Size() != b.Size()) { return false; }
+      const auto* av = a.HostRead();
+      const auto* bv = b.HostRead();
+      for (int i = 0; i < a.Size(); ++i)
+      {
+        if (!std::isfinite(av[i]) || av[i] != bv[i]) { return false; }
+      }
+      return true;
+    };
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    velocity_reference.ProjectCoefficient(velocity_coeff);
+    dg_sim::EulerPressureView eager_pressure(example_ctx.spaces.fes, bundle.sol,
+                                             2, gamma);
+    dg_sim::EulerVelocityView eager_velocity(example_ctx.spaces.dfes, bundle.sol,
+                                             2, rho_floor);
+    ctx.Check(same_values(eager_pressure.pressure, pressure_reference) &&
+                same_values(eager_velocity.velocity, velocity_reference),
+              "Default Euler view constructors retain eager exact projections.");
+
+    // Model an initialization/admission change before the first consumer.
+    const int ndofs = example_ctx.spaces.fes.GetNDofs();
+    auto* state = bundle.sol.HostReadWrite();
+    for (int i = 0; i < ndofs; ++i) { state[3 * ndofs + i] += 0.375; }
+    bundle.pressure_view.pressure = std::numeric_limits<double>::quiet_NaN();
+    bundle.velocity_view.velocity = std::numeric_limits<double>::quiet_NaN();
+    dg_sim::UpdateEulerOutputFields(bundle.field_list);
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    velocity_reference.ProjectCoefficient(velocity_coeff);
+    ctx.Check(same_values(bundle.pressure_view.pressure, pressure_reference) &&
+                same_values(bundle.velocity_view.velocity, velocity_reference),
+              "Deferred Euler views exactly refresh the final initialized state.");
+    bundle.ProjectIC(ic);
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    ctx.Check(same_values(bundle.pressure_view.pressure, pressure_reference),
+              "ProjectIC retains its immediate pressure refresh.");
+  }
 
   // H1 diagnostics scalar outputs must live on scalar spaces (vdim=1).
   {
