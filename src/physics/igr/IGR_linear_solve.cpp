@@ -12,6 +12,7 @@
 #include "IGR_face_density_cuda.hpp"
 #include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
+#include "IGR_device_krylov.hpp"
 #include "IGR_chebyshev.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
@@ -2414,7 +2415,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     two_level_coarse_env ? two_level_coarse_env : "dense";
   const int two_level_order = using_two_level_inverse
     ? ReadEnvInt("DG_IGR_IGR_TWO_LEVEL_ORDER", 1) : 1;
-  const std::string two_level_key = two_level_coarse + ":" + std::to_string(two_level_order);
+  const bool device_coarse_requested = DeviceKrylovRequested(
+    "DG_IGR_IGR_COARSE_CG_BACKEND", DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"));
+  const std::string two_level_key = two_level_coarse + ":" + std::to_string(two_level_order)
+    + (device_coarse_requested ? ":cuda-fp64" : ":mfem");
   MFEM_VERIFY(!using_two_level_inverse ||
                 (std::string(two_level_env) == "fp64" && using_cuda &&
                  !using_dense_inverse),
@@ -3067,6 +3071,38 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 #endif
   }
 
+  const bool device_krylov_requested =
+    DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND");
+  int krylov_ranks = 1;
+  if (device_krylov_requested) { MPI_Comm_size(comm, &krylov_ranks); }
+  const bool device_krylov_admitted = using_cuda && krylov_ranks == 1 &&
+    !mfem::Device::Allows(mfem::Backend::CEED_MASK | mfem::Backend::OCCA_MASK);
+  const bool use_device_krylov = device_krylov_requested && device_krylov_admitted;
+  MFEM_VERIFY(!use_device_krylov || solver_choice == LinearSolverType::FGMRES,
+              "CUDA FP64 Krylov currently requires explicit FGMRES.");
+  if (use_device_krylov)
+  {
+#ifdef DG_IGR_HAS_DEVICE_KRYLOV_CUDA
+    if (!device_fgmres_)
+    {
+      device_fgmres_ = MakeDeviceFGMRESSolver(comm);
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-device-krylov] backend=cuda-fp64 method=fgmres restart=50"
+                  << " orthogonalization=ordered-mgs final-gate=fp64-true-residual"
+                  << " convergence-read=each-iteration workspace=cached" << std::endl;
+      }
+    }
+#else
+    MFEM_ABORT("CUDA FP64 Krylov requires local CUDA compilation.");
+#endif
+  }
+  else if (device_krylov_requested && solve_call == 1 && mfem::Mpi::Root())
+  {
+    std::cout << "[igr-device-krylov] backend=mfem fallback=requires-ordinary-rank-one-cuda"
+              << std::endl;
+  }
+
   const auto solve_start = std::chrono::steady_clock::now();
 
   auto run_krylov = [&](double relative_tolerance, bool iterative_mode)
@@ -3108,7 +3144,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     }
     else if (solver_choice == LinearSolverType::FGMRES)
     {
-      mfem::FGMRESSolver solver(comm);
+      mfem::FGMRESSolver reference_solver(comm);
+      mfem::IterativeSolver& solver = use_device_krylov
+        ? *device_fgmres_ : static_cast<mfem::IterativeSolver&>(reference_solver);
       configure_solver(solver, relative_tolerance, iterative_mode);
       solver.Mult(B_, X_);
       last_linear_iters_ = solver.GetNumIterations();
@@ -3320,7 +3358,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     ++total_linear_converged_calls_;
   }
 
-  last_linear_solver_name_ = LinearSolverTypeName(solver_choice);
+  last_linear_solver_name_ = use_device_krylov ? "fgmres-cuda-fp64"
+    : LinearSolverTypeName(solver_choice);
   last_precond_name_ = using_operator_chebyshev
                          ? (using_operator_chebyshev_base
                               ? "operatorchebyshev-base"

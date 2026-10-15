@@ -1916,3 +1916,17 @@ if(IGRLAB_BUILD_RESEARCH_TESTS AND TARGET dg_igr_hdg_generic_cpu AND MFEM_USE_MP
     LABELS "cpu-reference;igr;research;hdg" TIMEOUT 120)
 endif()
 add_subdirectory(regularization)
+
+# Private shared IGR Krylov algebra fixture, independent of the HDG runtime.
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MPI)
+  add_executable(dg_igr_device_krylov_test test_igr_device_krylov_cuda.cu)
+  target_link_libraries(dg_igr_device_krylov_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_device_krylov_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_device_krylov_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_device_krylov_cuda COMMAND dg_igr_device_krylov_test)
+  set_tests_properties(dg_igr_device_krylov_cuda PROPERTIES
+    LABELS "cuda;igr;krylov" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
