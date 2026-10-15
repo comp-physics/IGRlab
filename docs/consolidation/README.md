@@ -46,7 +46,7 @@ reviewed MFEM identity records retain their recorded paths and hashes.
 
 M16 conservative modal damping is retained in the shared DG/DGSEM operator at
 each Runge–Kutta stage. It remains opt-in, with the affine tensor-cell and
-every-stage IGR admission rules described in the [main README](../../README.md).
+every-stage IGR admission rules described in the [method guide](../methods.md#conservative-modal-damping).
 The original one-dimensional study showed a useful mitigation; it does not
 establish elimination of ringing in every application or geometry.
 

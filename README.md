@@ -4,31 +4,36 @@
 
 <p align="center"><strong>Information-geometric regularization for Euler flows</strong></p>
 
-IGRlab is a research code for studying information-geometric regularization
-(IGR) in compressible Euler flows, including shocks and smooth transport.
-It uses [MFEM](https://mfem.org/) for finite-element meshes, spaces, and
-operators, and provides three spatial discretizations:
+<p align="center">
+  <a href="docs/getting-started.md">Get started</a> ·
+  <a href="docs/methods.md">Methods</a> ·
+  <a href="#examples">Examples</a> ·
+  <a href="#validation-and-performance">Validation</a>
+</p>
 
-| Method | CPU and CUDA implementations | Manual tensor-core kernels |
-| --- | --- | --- |
-| Discontinuous Galerkin (DG) | Euler and IGR operators | TF32 IGR patch preconditioner |
-| DG spectral element method (DGSEM) | Reference and packed operators | FP64 fused residual |
-| Hybridizable DG (HDG) | Euler and IGR solvers | FP64 volume and condensation |
+IGRlab explores how **information-geometric regularization (IGR)** shapes
+compressible Euler flows, from smooth transport to strong shocks. Built on
+[MFEM](https://mfem.org/), it brings DG, DGSEM, and HDG into a shared research
+codebase for studying numerical behavior and computational cost on CPUs and GPUs.
 
-The specialized CUDA kernels use explicit warp-level matrix
-multiply-accumulate (WMMA) instructions. Their support depends on element
-geometry, polynomial order, arithmetic policy, and GPU architecture.
-The generic HDG application supports conforming 2D quadrilateral meshes with
-runtime-selected polynomial order, subject to dimension and workspace limits.
-Its CUDA path admits one or two MPI ranks. See [A100 support](docs/a100.md)
-for device architecture, build requirements, and qualified configurations.
+**Experimental research software.** Capabilities and validation vary by method,
+polynomial order, and hardware; see the [method guide](docs/methods.md) for scope.
 
-## Build
+## Three approaches to Euler flows
 
-You will need a C++20 compiler, [Spack](https://spack.io/), and MPI. CUDA
-builds also need the matching NVIDIA toolchain. The initial build installs
-dependencies, builds the pinned MFEM submodule and IGRlab, and runs CTest.
-From a source checkout:
+| Method | Implementation |
+| --- | --- |
+| **DG** — discontinuous Galerkin | Euler and IGR operators |
+| **DGSEM** — DG spectral element method | Reference and packed operators |
+| **HDG** — hybridizable discontinuous Galerkin | Euler and IGR solvers with local elimination |
+
+CPU and CUDA implementations support comparisons across polynomial orders.
+Specialized tensor-core kernels are available for selected configurations.
+[Explore the methods and their supported configurations →](docs/methods.md)
+
+## Get started
+
+From a source checkout, with a C++20 compiler, MPI, and [Spack](https://spack.io/):
 
 ```bash
 git submodule update --init
@@ -36,36 +41,8 @@ source /path/to/spack/share/spack/setup-env.sh
 ./build.sh --cpu-only --hdg-runtime -j 4
 ```
 
-DG and DGSEM are built by default. `--hdg-runtime` enables the HDG application.
-For CUDA, choose the profile for your GPU:
-
-```bash
-./build.sh --gpu --cuda-arch 120 --hdg-runtime -j 4  # SM120
-./build.sh --a100 --hdg-runtime -j 2                # A100
-```
-
-Build outputs live outside the checkout under
-`${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build` by default. The printed build
-plan gives the exact `app_build` directory; `--print-plan` shows it without
-building. Run `./build.sh --help` for cache and research-test options.
-[A100 setup](docs/a100.md#practical-setup) covers site environments and GPU
-build settings.
-
-On PACE and Delta, use the checked-in site profiles to submit builds and
-validation on compute nodes. The [PACE guide](docs/pace.md) and
-[Delta guide](docs/delta.md) cover each site's setup, queues, and runtime.
-Keep dependency and build roots separate between sites.
-
-After configuring once, [IGRlab-only iteration](docs/iteration.md) uses
-`--iterate --target NAME` to rebuild selected application targets while
-reusing dependencies. Polynomial order is selected at runtime and needs no
-rebuild. The [GPU study workflow](docs/gpu-studies.md) provides DOF-normalized
-comparisons and selective Nsight profiling on both sites.
-
-## First run
-
-Run a short DG Sedov blast with IGR. Set `APP_BUILD` to the `app_build` path
-printed by your CPU build:
+Then run a short DG Sedov blast with IGR, using the `app_build` path printed
+by the build:
 
 ```bash
 APP_BUILD=/path/printed/as/app_build
@@ -73,35 +50,29 @@ APP_BUILD=/path/printed/as/app_build
   --device cpu --t-final 0.001 -rs 0 -rp 0 -o 1 -c 0.25
 ```
 
-Executables remain in the build tree under `examples/<case>/`. Use `--help`
-for an example's options. The [examples](examples/) include stationary
-shocks, shock–vortex interaction, supersonic flow, and smooth periodic
-advection. Add `--smoke` to a build command for the driver's short two-rank
-Sedov check.
+[Full setup and CUDA builds](docs/getting-started.md) ·
+[PACE](docs/pace.md) · [Delta](docs/delta.md) ·
+[Fast application-only rebuilds](docs/iteration.md)
 
-## Numerical notes
+## Examples
 
-This is experimental research software.
-[Consolidation validation](docs/consolidation/validation.md) records selected
-CPU and SM120 correctness checks.
-[Current A100 results](docs/a100.md#current-architecture-multiorder-follow-up-2026-10-15)
-include multiorder field comparisons, targeted CUDA/MPI checks, and
-DOF-normalized end-to-end timings. Results apply to the recorded source and
-configurations; they do not establish arbitrary mixed-hp support, multi-node
-performance, or long-time suppression of ringing. Dense HDG storage remains
-a scaling limit.
+| Flow problem | Example |
+| --- | --- |
+| Strong blast wave | [Sedov–Taylor blast](examples/sedov_taylor_blast/) |
+| Shock structure and interaction | [Stationary shock](examples/dgsem_stationary_shock/) · [Shock–vortex interaction](examples/dgsem_shock_vortex_interaction/) |
+| Supersonic flow around a body | [Cylinder](examples/dgsem_supersonic_cylinder/) |
+| Smooth transport and method comparisons | [Periodic advection](examples/dgsem_smooth_advection_periodic/) |
 
-Conservative modal damping (M16) is opt-in for affine, uniform-order nodal
-L2 DG/DGSEM tensor cells. It preserves physical cell averages, but does not
-guarantee positivity or elimination of ringing. Enable it with
-`--modal-damping-rate 80000 --igr-sigma-cadence every-stage`; zero rate
-disables damping. When damping is enabled, active IGR requires a closure
-solve at every stage. For a positive rate, the timestep is capped at
-`1/rate`; the coupled system may need a smaller step. See [bounded damping validation](docs/consolidation/validation.md#bounded-application-damping-comparison).
+Browse [all examples](examples/); each executable provides its options with `--help`.
 
-Further documentation:
+## Validation and performance
 
-- [Numerical validation](docs/numerical-validation.md): accuracy and stability checks for optimization.
-- [Validation notes](docs/consolidation/validation.md): tested source and configurations.
-- [Scalar HDG oracle](tests/hdg/README.md): independent CPU checks of the scalar formulation.
-- [Consolidation notes](docs/consolidation/README.md): compatibility, retained research, and recovery records.
+Accuracy, conservation, stability, and cost per degree of freedom guide
+development. The [current A100 results](docs/a100.md#current-architecture-multiorder-follow-up-2026-10-15)
+report field comparisons across orders, targeted CUDA/MPI checks, and
+DOF-normalized end-to-end timings for the recorded source and configurations.
+
+- [Numerical validation](docs/numerical-validation.md) — how changes are assessed.
+- [GPU studies](docs/gpu-studies.md) — reproducible comparisons and Nsight profiling.
+- [Validation records](docs/consolidation/validation.md) — selected CPU and SM120 checks.
+- [Method scope and limitations](docs/methods.md#validation-scope) — what the evidence covers.
