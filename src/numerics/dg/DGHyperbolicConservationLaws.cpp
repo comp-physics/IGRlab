@@ -67,6 +67,21 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
 }
 
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
+  FiniteElementSpace& vfes_, const NumericalFlux& numerical_flux,
+  int int_order_offset, bool preassembleWeakDivergence)
+  : DGHyperbolicConservationLaws(
+      vfes_, std::make_unique<HyperbolicFormIntegrator>(numerical_flux,
+                                                     int_order_offset),
+      preassembleWeakDivergence)
+{
+  standard_face_integrator_ = true;
+  standard_face_flux_ = &numerical_flux;
+  standard_face_int_order_offset_ = int_order_offset;
+  face_int_order_offset_ = int_order_offset;
+  num_flux_ = &numerical_flux;
+}
+
+DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   DGHyperbolicConservationLaws&&) = default;
 
 void DGHyperbolicConservationLaws::SetModalDampingRate(real_t rate)
@@ -829,22 +844,27 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     }
     else
     {
-      ::igrlab::NVTXRange range("DG/face-packed-euler-rusanov");
+      const bool entropy_face = face_entropy_ready_ && SupportsPackedEntropyFacePolicy_();
+      ::igrlab::NVTXRange range(entropy_face ? "DG/face-packed-euler-es-winters"
+                                            : "DG/face-packed-euler-rusanov");
       MFEM_VERIFY(UseDeviceFaceResidual_(),
                   "DG device-closure requires packed device face residual path "
                   "(no host fallback).");
-      used_device_face =
-        AddDeviceFaceContributionsEulerRusanov_(*x_eval,
+      used_device_face = entropy_face
+        ? AddDeviceFaceContributionsEntropyStable_(*x_eval, z_eval, device_face_speed)
+        : AddDeviceFaceContributionsEulerRusanov_(*x_eval,
                                                 z_eval,
                                                 device_face_speed,
                                                 capture_boundary_flux);
       MFEM_VERIFY(used_device_face,
-                  "DG device-closure requires packed Euler/Rusanov face kernels "
+                  "DG device-closure requires admitted packed Euler face kernels "
                   "and supported boundary/sigma metadata (no fallback).");
       if (!dg_face_path_logged_ && mfem::Mpi::Root())
       {
         std::cout << "[dg-device] event=face-domain-path"
-                  << " selected=packed-mfem-forall-euler-rusanov"
+                  << " selected=" << (entropy_face ? "packed-mfem-forall-euler-es-winters"
+                                                     : "packed-mfem-forall-euler-rusanov")
+                  << (entropy_face ? " qualification=p5-rank1-periodic-affine-quads sigma-speed=thermal" : "")
                   << " backend=device"
                   << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
                   << " x_size=" << x.Size()

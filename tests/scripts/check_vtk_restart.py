@@ -287,6 +287,7 @@ def base_command(
     time_integrator: str,
     invariant_domain_flux: bool,
     zhang_shu_vtk_points: bool,
+    mpi_single_rank: bool = False,
 ) -> list[str]:
     linear_rtol = "1.0e-5" if device == "cuda" else "1.0e-8"
     app = [
@@ -309,7 +310,7 @@ def base_command(
             app.append("--igr-invariant-domain-flux")
     if zhang_shu_vtk_points:
         app.append("--zhang-shu-vtk-points")
-    return [mpiexec, np_flag, str(ranks), *app] if ranks > 1 else app
+    return [mpiexec, np_flag, str(ranks), *app] if ranks > 1 or mpi_single_rank else app
 
 
 def with_output(env: dict[str, str], root: Path) -> dict[str, str]:
@@ -758,6 +759,8 @@ def main() -> int:
     parser.add_argument("--order", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--mpiexec", default="mpirun")
     parser.add_argument("--mpi-numproc-flag", default="-np")
+    parser.add_argument("--mpi-single-rank", action="store_true",
+                        help="Use the selected MPI launcher even for one rank")
     parser.add_argument("--format-controls", action="store_true")
     parser.add_argument("--negative-controls", action="store_true")
     parser.add_argument("--no-igr", action="store_true")
@@ -799,6 +802,7 @@ def main() -> int:
         args.time_integrator,
         args.invariant_domain_flux,
         args.zhang_shu_vtk_points,
+        args.mpi_single_rank,
     )
 
     control_root = output / "control" / "vtk"

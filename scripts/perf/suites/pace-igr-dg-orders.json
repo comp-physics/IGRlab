@@ -1,0 +1,530 @@
+{
+  "schema_version": 1,
+  "name": "pace-igr-dg-orders",
+  "repetitions": 3,
+  "warmups": 1,
+  "correctness_regex": "^(dg_igr_dg_operator_tests|dg_igr_dgsem_operator_cuda|dg_igr_hdg_runtime_cuda_generic_euler_session_rank1|dg_igr_hdg_runtime_cuda_generic_euler_session_tensor_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_p3_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_tensor_p3_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p1_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p3_rank1|dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face)$",
+  "timings_budget_seconds": 3600,
+  "profiles_budget_seconds": 3600,
+  "command_timeout_seconds": 3600,
+  "cases": [
+    {
+      "id": "dg-igr-cuda-p1-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 1,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p2-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 2,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p3-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 3,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": true,
+      "optional": false
+    },
+    {
+      "id": "dg-igr-cuda-p4-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 4,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p5-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 5,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p6-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 6,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p7-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 7,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p8-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 8,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p9-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 9,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p10-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 10,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p1-n128",
+      "adapter": "dg",
+      "parameters": {
+        "order": 1,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 2,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p3-n64",
+      "adapter": "dg",
+      "parameters": {
+        "order": 3,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 1,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cuda-p10-n24",
+      "adapter": "dg",
+      "parameters": {
+        "order": 10,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cuda",
+        "serial_refine": 2,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
+        "kernel_groups": {
+          "volume": "PackedWeakDivEulerKernel",
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
+        },
+        "timeout": 3600
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cpu-p1-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 1,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cpu",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "timeout": 3600,
+        "kernel_regex": "not-applicable-cpu",
+        "launch_skip": 0,
+        "launch_count": 1
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "dg-igr-cpu-p10-n32",
+      "adapter": "dg",
+      "parameters": {
+        "order": 10,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "dg",
+        "device": "cpu",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "local"
+      },
+      "profile": {
+        "timeout": 3600,
+        "kernel_regex": "not-applicable-cpu",
+        "launch_skip": 0,
+        "launch_count": 1
+      },
+      "enabled": false,
+      "optional": true
+    }
+  ]
+}

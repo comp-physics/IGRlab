@@ -28,6 +28,9 @@ public:
       delete;
 
   result_type Initialize(const generic::EulerHdgRequest& request) noexcept;
+  result_type Initialize(
+      const generic::EulerHdgRequest& request,
+      cuda_w8a::CudaTracePolicyKind trace_policy) noexcept;
   std::uint32_t capabilities() const noexcept;
   coordinates_type coordinates() const noexcept;
   generic::HdgEulerCommittedDiagnostics diagnostics() const noexcept;

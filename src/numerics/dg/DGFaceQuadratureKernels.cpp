@@ -109,6 +109,31 @@ void LaunchInteriorFaceDGDiffusionApply2D(
   AddInteriorFaceDGDiffusionApply2D(info, work, scalar, ip_sigma, y);
 }
 
+bool TryLaunchInteriorFaceDGDiffusionAddToBase2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  mfem::Vector& y)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  const unsigned long alternative_backends =
+    mfem::Backend::OMP_MASK | mfem::Backend::RAJA_MASK |
+    mfem::Backend::OCCA_MASK | mfem::Backend::CEED_MASK |
+    mfem::Backend::HIP_MASK | mfem::Backend::DEBUG_DEVICE;
+  if (mfem::Device::Allows(mfem::Backend::CUDA) &&
+      !mfem::Device::Allows(alternative_backends))
+  {
+    AddInteriorFaceDGDiffusionApplyDevice2D(
+      info, work, scalar, ip_sigma, y, true);
+    return true;
+  }
+#else
+  (void)info; (void)work; (void)scalar; (void)ip_sigma; (void)y;
+#endif
+  return false;
+}
+
 void LaunchSharedFaceDGDiffusionApply2D(
   const SharedFaceDGDiffusionApplyInfo& info,
   const SharedFaceDGDiffusionApplyScratch& work,

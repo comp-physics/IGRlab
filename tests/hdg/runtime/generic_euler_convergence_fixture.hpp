@@ -77,8 +77,7 @@ inline bool ParseOrder(const std::string_view text, int& order) noexcept
   const char* const end = begin + text.size();
   const auto parsed = std::from_chars(begin, end, order);
   return parsed.ec == std::errc{} && parsed.ptr == end &&
-      order >= generic::minimum_polynomial_order &&
-      order <= generic::maximum_polynomial_order;
+      generic::PlanPolynomialShape(order).valid;
 }
 
 inline bool ParseQuadratureOrder(
@@ -89,7 +88,7 @@ inline bool ParseQuadratureOrder(
   const char* const end = begin + text.size();
   const auto parsed = std::from_chars(begin, end, order);
   return parsed.ec == std::errc{} && parsed.ptr == end &&
-      order >= 1 && order <= 14;
+      generic::ValidAssemblyQuadratureOrder(order);
 }
 
 inline bool ParsePositiveDouble(
@@ -204,6 +203,8 @@ inline bool ParseCaseSelection(const int argc, char* argv[],
     }
   }
   if (!have_order || !have_regularization ||
+      !generic::PlanPolynomialShape(selection.order,
+          selection.regularization == RegularizationKind::igr).valid ||
       have_igr_volume_order != have_igr_face_order ||
       (have_igr_volume_order &&
        selection.regularization != RegularizationKind::igr) ||

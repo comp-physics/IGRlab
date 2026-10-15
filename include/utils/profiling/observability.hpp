@@ -1,6 +1,7 @@
 #pragma once
 
 #include "igrlab/compat.hpp"
+#include "utils/config/env_flags.hpp"
 
 /**
  * @file utils/profiling/observability.hpp
@@ -11,6 +12,8 @@
  * is called during serial program setup. The runtime gate is deliberately
  * non-atomic: configure it before worker threads are launched and do not
  * change it while instrumented work is running.
+ * Full solvers opt in during startup with IGRLAB_PROFILE_NVTX=1 (legacy
+ * DG_IGR_PROFILE_NVTX). This cannot enable a compiled-out NVTX backend.
  */
 
 #include <array>
@@ -325,6 +328,14 @@ inline bool runtime_enabled() noexcept
 inline constexpr void set_runtime_enabled(bool) noexcept {}
 inline constexpr bool runtime_enabled() noexcept { return false; }
 #endif
+
+/** Configure the existing gate once during serial startup; return the request. */
+inline bool configure_nvtx_from_environment()
+{
+  const bool requested = ::igrlab::EnvFlagEnabled("DG_IGR_PROFILE_NVTX");
+  set_runtime_enabled(requested && nvtx_backend_enabled);
+  return requested;
+}
 
 enum class RecordedEventKind : std::uint8_t
 {

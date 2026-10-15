@@ -930,14 +930,57 @@ StateHash HashPair(const StateHash& left, const StateHash& right) noexcept
   return HashBytes(bytes.data(), bytes.size());
 }
 
+template <typename Record>
+const Record* GatherWorldRecords(
+    const Record& local, std::array<Record, 2>& small_records,
+    std::vector<Record>& large_records, int& ranks) noexcept
+{
+  static_assert(std::is_trivially_copyable<Record>::value,
+                "collective records must be trivially copyable");
+  static_assert(sizeof(Record) <=
+                    static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                "collective records must fit an MPI byte count");
+  ranks = 0;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
+      ranks < 1)
+  {
+    return nullptr;
+  }
+
+  Record* records = small_records.data();
+  if (ranks > 2)
+  {
+    int local_ready = 0;
+    try
+    {
+      large_records.resize(static_cast<std::size_t>(ranks));
+      local_ready = 1;
+    }
+    catch (...)
+    {
+      local_ready = 0;
+    }
+    // No rank may enter the gather if another rank could not allocate its
+    // destination. Keep the original allocation-free path for ranks 1/2.
+    int all_ready = 0;
+    if (MPI_Allreduce(&local_ready, &all_ready, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD) != MPI_SUCCESS || all_ready != 1)
+    {
+      return nullptr;
+    }
+    records = large_records.data();
+  }
+  if (MPI_Allgather(&local, static_cast<int>(sizeof(Record)), MPI_BYTE,
+                    records, static_cast<int>(sizeof(Record)), MPI_BYTE,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return nullptr;
+  }
+  return records;
+}
+
 StateHash RankCommonHash(const std::vector<double>& values) noexcept
 {
-  int ranks = 0;
-  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
-      (ranks != 1 && ranks != 2))
-  {
-    return {};
-  }
   std::array<std::uint8_t, 40> local{};
   const std::uint64_t size = static_cast<std::uint64_t>(values.size());
   for (unsigned int byte = 0; byte < 8; ++byte)
@@ -947,14 +990,16 @@ StateHash RankCommonHash(const std::vector<double>& values) noexcept
   const StateHash local_hash = HashDoubles(values);
   std::copy(local_hash.bytes.begin(), local_hash.bytes.end(),
             local.begin() + 8);
-  std::array<std::array<std::uint8_t, 40>, 2> rank_ordered{};
-  if (MPI_Allgather(local.data(), static_cast<int>(local.size()), MPI_BYTE,
-                    rank_ordered.data(), static_cast<int>(local.size()),
-                    MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS)
+  std::array<std::array<std::uint8_t, 40>, 2> small_records{};
+  std::vector<std::array<std::uint8_t, 40>> large_records;
+  int ranks = 0;
+  const auto* rank_ordered = GatherWorldRecords(
+      local, small_records, large_records, ranks);
+  if (!rank_ordered)
   {
     return {};
   }
-  return HashBytes(rank_ordered.data(),
+  return HashBytes(rank_ordered,
                    static_cast<std::size_t>(ranks) * local.size());
 }
 
@@ -1004,18 +1049,11 @@ template <typename Context, typename Same>
 bool ContextsEqual(const Context& context, Same&& same,
                    int& ranks) noexcept
 {
-  static_assert(std::is_trivially_copyable<Context>::value,
-                "collective contexts must be trivially copyable");
-  ranks = 0;
-  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
-      (ranks != 1 && ranks != 2))
-  {
-    return false;
-  }
-  std::array<Context, 2> gathered{};
-  if (MPI_Allgather(&context, static_cast<int>(sizeof(Context)), MPI_BYTE,
-                    gathered.data(), static_cast<int>(sizeof(Context)),
-                    MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS)
+  std::array<Context, 2> small_records{};
+  std::vector<Context> large_records;
+  const Context* gathered = GatherWorldRecords(
+      context, small_records, large_records, ranks);
+  if (!gathered)
   {
     return false;
   }
@@ -1537,6 +1575,8 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
   const StateHash imported_interior_hash = RankCommonHash(storage->interior);
   const StateHash imported_trace_hash = RankCommonHash(storage->trace);
   const bool local_hashes_match =
+      imported_interior_hash != StateHash{} &&
+      imported_trace_hash != StateHash{} &&
       imported_interior_hash == descriptor.interior_hash &&
       imported_trace_hash == descriptor.trace_hash;
   // Phase 6 follows the ordered interior/trace hash collectives (phases 4/5).
@@ -1685,12 +1725,20 @@ struct LocalSystem
   bool Allocate(const int batch_count, const int ni, const int nt,
                 CpuOwnedAllocationLedger& ledger)
   {
+    if (batch_count < 0 || !generic::DenseLocalDimensionsFitInt(ni, nt))
+      return false;
+    const std::size_t batches = static_cast<std::size_t>(batch_count);
+    const std::size_t interior = static_cast<std::size_t>(ni);
+    const std::size_t trace = static_cast<std::size_t>(nt);
+    const std::size_t maximum = std::min({a.max_size(), b.max_size(),
+        c.max_size(), d.max_size(), residual_interior.max_size(),
+        residual_trace.max_size(), f.max_size(), g.max_size()});
+    if (batches > maximum / (interior * interior) ||
+        batches > maximum / (interior * trace) ||
+        batches > maximum / (trace * trace)) return false;
     elements = batch_count;
     interior_dofs = ni;
     trace_dofs = nt;
-    const std::size_t batches = static_cast<std::size_t>(elements);
-    const std::size_t interior = static_cast<std::size_t>(ni);
-    const std::size_t trace = static_cast<std::size_t>(nt);
     return ResizeOwned(residual_interior, batches * interior,
                        CpuOwnedAllocationSite::local_system_vector, ledger) &&
         ResizeOwned(residual_trace, batches * trace,
@@ -3101,13 +3149,15 @@ struct detail::CpuNumericsCore::Implementation
   {
     try
     {
-      const int expected_interior_dofs =
-          (config.polynomial_order + 1) * (config.polynomial_order + 1);
+      const auto order_shape = generic::PlanPolynomialShape(
+          config.polynomial_order, igr_active);
+      if (!generic::PolynomialRankIndicesFitInt(
+              order_shape, mesh->GetNE(), mesh->GetNumFaces())) return false;
+      const int expected_interior_dofs = order_shape.scalar_interior_dofs;
       scalar_interior_dofs = expected_interior_dofs;
-      local_interior = scalar_interior_dofs * interior_components;
-      scalar_trace_dofs = config.polynomial_order + 1;
-      local_trace = 4 * scalar_trace_dofs *
-          trace_components;
+      local_interior = order_shape.interior_dofs;
+      scalar_trace_dofs = order_shape.scalar_face_dofs;
+      local_trace = order_shape.trace_dofs;
       if (mesh->GetNE() > 0)
       {
         const mfem::FiniteElement* interior = interior_space->GetFE(0);
@@ -11390,9 +11440,15 @@ bool detail::CpuNumericsCore::InitializeInternal(
       ? igr_interior_components : cpu_conserved_components;
   state.trace_components = state.igr_active
       ? igr_trace_components : cpu_conserved_components;
+  const auto order_shape = generic::PlanPolynomialShape(
+      config.polynomial_order, state.igr_active);
+  const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
   const bool config_consensus = !generic && mpi_initialized != 0 && mpi_finalized == 0
       ? ExactConfigConsensus(config) : false;
-  bool local_ok = mpi_initialized != 0 && mpi_finalized == 0 &&
+  bool local_ok = order_shape.valid &&
+      generic::ValidAssemblyQuadratureOrder(assembly_orders.volume_order) &&
+      generic::ValidAssemblyQuadratureOrder(assembly_orders.face_order) &&
+      mpi_initialized != 0 && mpi_finalized == 0 &&
       MPI_Comm_rank(state.communicator, &state.rank) == MPI_SUCCESS &&
       MPI_Comm_size(state.communicator, &state.ranks) == MPI_SUCCESS &&
       (!generic || borrowed_request->time_treatment ==
@@ -11463,6 +11519,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
   if (!state.CollectiveAll(local_ok)) { return false; }
 
   local_ok = generic || state.ObserveParentCellIds();
+  if (!state.CollectiveAll(local_ok)) { return false; }
+
+  local_ok = generic::PolynomialRankIndicesFitInt(
+      order_shape, state.mesh->GetNE(), state.mesh->GetNumFaces());
   if (!state.CollectiveAll(local_ok)) { return false; }
 
   try

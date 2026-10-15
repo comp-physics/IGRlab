@@ -4,8 +4,10 @@ set -euo pipefail
 # Exercise the real MFEM artifact validator without a compiler, Spack install,
 # or GPU. Only source-checkout admission is replaced; its separate source/Git
 # fixtures remain in check_cuda_build_policy.sh.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="${1:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
+TEST_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${1:-$(cd -- "${TEST_SCRIPT_DIR}/../.." && pwd)}"
+# Extracted production functions resolve repository helpers through SCRIPT_DIR.
+SCRIPT_DIR="$(cd -- "${REPO_ROOT}" && pwd)"
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/dg_igr_external_artifacts.XXXXXX")"
 trap 'rm -rf -- "${fixture_root}"' EXIT
 
@@ -27,7 +29,7 @@ validate_mfem_source_checkout() { MFEM_SOURCE_ROOT="$1"; }
 declare -A package_hash package_prefix artifacts
 packages=(openmpi hypre metis cuda umpire caliper)
 artifacts[openmpi]='bin/mpicc bin/mpicxx'
-artifacts[hypre]='include/HYPRE.h lib/libHYPRE.so'
+artifacts[hypre]='include/HYPRE.h include/HYPRE_config.h lib/libHYPRE.so'
 artifacts[metis]='include/metis.h lib/libmetis.a'
 artifacts[cuda]='bin/nvcc'
 artifacts[umpire]='lib/cmake/umpire/umpire-config.cmake'
@@ -93,13 +95,15 @@ prepare_fixture() {
   CMAKE_BUILD_TYPE=Release
   SPACK_CUDA_ARCH=80; MFEM_CUDA_ARCHS=80; DEPENDENCY_CUDA_ARCH=80
   local package artifact view="${SPACK_ENV}/.spack-env/view" cuda_on=ON caliper_on=OFF
+  local hypre_library="" hypre_includes="${package_prefix[hypre]}/include"
   local fixture_cmake_version="${4:-3.31.11}" fixture_cmake_minor
   fixture_cmake_minor="${fixture_cmake_version#*.}"
   [[ "${MODE}" == gpu ]] || cuda_on=OFF
   ((CALIPER == 0)) || caliper_on=ON
   rm -rf -- "${fixture_root}/prefix" "${SPACK_ENV}" "${MFEM_BUILD}" "${MFEM_INSTALL}"
   mkdir -p "${view}" "${fixture_root}/source" \
-    "${MFEM_BUILD}/CMakeFiles/${fixture_cmake_version}" "${MFEM_INSTALL}/lib/cmake/mfem"
+    "${MFEM_BUILD}/CMakeFiles/${fixture_cmake_version}" "${MFEM_INSTALL}/lib/cmake/mfem" \
+    "${MFEM_INSTALL}/include"
   touch "${SPACK_ENV}/spack.yaml" "${SPACK_ENV}/spack.lock" \
     "${MFEM_BUILD}/cmake_install.cmake" "${MFEM_BUILD}/CMakeFiles/cmake.check_cache" \
     "${MFEM_BUILD}/install_manifest.txt" "${MFEM_BUILD}/CMakeFiles/${fixture_cmake_version}/CMakeCXXCompiler.cmake" \
@@ -115,6 +119,14 @@ prepare_fixture() {
       fi
     done
   done
+  for artifact in ${artifacts[hypre]}; do
+    [[ "${artifact}" != */libHYPRE.* ]] || hypre_library="${package_prefix[hypre]}/${artifact}"
+  done
+  [[ -n "${hypre_library}" ]] || fail "fixture lacks a HYPRE library"
+  if [[ "${MODE}" == gpu ]]; then
+    mkdir -p "${package_prefix[umpire]}/include" "${package_prefix[cuda]}/include"
+    hypre_includes+=";${package_prefix[umpire]}/include;${package_prefix[cuda]}/include"
+  fi
   printf '#!/bin/sh\nprintf "13.3.0\\n"\n' >"${fixture_root}/compiler"
   chmod +x "${fixture_root}/compiler"
   for artifact in mpicc mpicxx; do
@@ -138,6 +150,10 @@ MFEM_USE_CUDA:BOOL=${cuda_on}
 MFEM_USE_UMPIRE:BOOL=${cuda_on}
 CMAKE_PREFIX_PATH:PATH=${view}
 HYPRE_DIR:PATH=${package_prefix[hypre]}
+HYPRE_INCLUDE_DIR:PATH=${package_prefix[hypre]}/include
+HYPRE_INCLUDE_DIRS:STRING=${hypre_includes}
+HYPRE_LIBRARY:FILEPATH=${hypre_library}
+HYPRE_LIBRARIES:STRING=${hypre_library}
 METIS_DIR:PATH=${package_prefix[metis]}
 CMAKE_CXX_COMPILER:FILEPATH=${package_prefix[openmpi]}/bin/mpicxx
 MPI_CXX_COMPILER:FILEPATH=${package_prefix[openmpi]}/bin/mpicxx
@@ -155,7 +171,14 @@ set(MFEM_USE_CALIPER ${caliper_on})
 set(MFEM_USE_CUDA ${cuda_on})
 set(MFEM_USE_UMPIRE ${cuda_on})
 set(MFEM_CXX_COMPILER "${package_prefix[openmpi]}/bin/mpicxx")
+set(MFEM_INCLUDE_DIRS "\${PACKAGE_PREFIX_DIR}/include;${hypre_includes}")
 CONFIG
+  cat >"${MFEM_INSTALL}/lib/cmake/mfem/MFEMTargets.cmake" <<TARGETS
+set_target_properties(mfem PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES "\${_IMPORT_PREFIX}/include;${hypre_includes}"
+  INTERFACE_LINK_LIBRARIES "${hypre_library};MPI::MPI_CXX"
+)
+TARGETS
   cat >"${MFEM_BUILD}/CMakeFiles/${fixture_cmake_version}/CMakeCXXCompiler.cmake" <<CONFIG
 set(CMAKE_CXX_COMPILER "${package_prefix[openmpi]}/bin/mpicxx")
 set(CMAKE_CXX_COMPILER_ID "GNU")
@@ -231,7 +254,7 @@ check_validation 3 modern-cuda-host-metadata-missing
 # CUDA/Umpire HYPRE may be static. Both supported library directories retain
 # the same concrete-prefix containment check for installed and external specs.
 for library_dir in lib lib64; do
-  artifacts[hypre]="include/HYPRE.h ${library_dir}/libHYPRE.a"
+  artifacts[hypre]="include/HYPRE.h include/HYPRE_config.h ${library_dir}/libHYPRE.a"
   for hypre_external in '' hypre; do
     prepare_fixture "${hypre_external}"
     check_validation 0 "static-hypre-${library_dir}-${hypre_external:-installed}"
@@ -241,7 +264,7 @@ for library_dir in lib lib64; do
     check_validation 3 "redirected-static-hypre-${library_dir}-${hypre_external:-installed}"
   done
 done
-artifacts[hypre]='include/HYPRE.h lib/libHYPRE.so'
+artifacts[hypre]='include/HYPRE.h include/HYPRE_config.h lib/libHYPRE.so'
 
 # Umpire may install its config under lib or lib64. Both the validator and
 # application configuration use this resolver and require exact-prefix binding.
@@ -288,6 +311,32 @@ for bad in missing malformed wrong-hash duplicate failure; do
 done
 
 # Canonical prefix containment and compiler/cache identity remain enforced.
+# A correct HYPRE_DIR cannot admit stale singular/plural discovery values or
+# stale installed interfaces left over from an earlier dependency graph.
+for binding in HYPRE_INCLUDE_DIR HYPRE_INCLUDE_DIRS HYPRE_LIBRARY HYPRE_LIBRARIES; do
+  prepare_fixture "${packages[*]}"
+  mkdir -p "${fixture_root}/stale-hypre/include" "${fixture_root}/stale-hypre/lib"
+  touch "${fixture_root}/stale-hypre/include/HYPRE.h" \
+    "${fixture_root}/stale-hypre/include/HYPRE_config.h" \
+    "${fixture_root}/stale-hypre/lib/libHYPRE.so"
+  if [[ "${binding}" == *INCLUDE* ]]; then
+    stale_value="${fixture_root}/stale-hypre/include"
+  else
+    stale_value="${fixture_root}/stale-hypre/lib/libHYPRE.so"
+  fi
+  printf '%s:STRING=%s\n' "${binding}" "${stale_value}" >>"${MFEM_BUILD}/CMakeCache.txt"
+  check_validation 3 "stale-hypre-discovery-${binding}"
+done
+for export_file in MFEMConfig.cmake MFEMTargets.cmake; do
+  prepare_fixture "${packages[*]}"
+  mkdir -p "${fixture_root}/stale-hypre/include" "${fixture_root}/stale-hypre/lib"
+  touch "${fixture_root}/stale-hypre/include/HYPRE.h" \
+    "${fixture_root}/stale-hypre/include/HYPRE_config.h" \
+    "${fixture_root}/stale-hypre/lib/libHYPRE.so"
+  sed -i "s|${package_prefix[hypre]}|${fixture_root}/stale-hypre|g" \
+    "${MFEM_INSTALL}/lib/cmake/mfem/${export_file}"
+  check_validation 3 "stale-installed-hypre-${export_file}"
+done
 prepare_fixture "${packages[*]}"
 rm -- "${package_prefix[metis]}/include/metis.h"
 ln -s "${fixture_root}/compiler" "${package_prefix[metis]}/include/metis.h"

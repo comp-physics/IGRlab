@@ -7,6 +7,8 @@
 
 #include "mfem.hpp"
 #include "physics/euler/diagnostics.hpp"
+#include "sim/state/detail/euler_derived_fields.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace dg_sim
 {
@@ -57,19 +59,32 @@ struct EulerPressureView
   EulerPressureView(mfem::ParFiniteElementSpace& fes,
                     mfem::ParGridFunction& sol,
                     int dim,
-                    double gamma)
+                    double gamma,
+                    bool project_initial_state = true)
     : coeff(sol, dim, gamma),
       pressure(&fes),
       state(&sol)
   {
-    Update();
+    if (project_initial_state)
+    {
+      Update();
+    }
   }
 
   void Update()
   {
+    ::igrlab::NVTXRange range("Solver/pressure-projection");
     coeff.SetState(*state);
-    pressure.ProjectCoefficient(coeff);
+    if (!detail::TryProjectEulerDerivedField(
+          *state, pressure, coeff.dim, coeff.gamma, 1.0e-16,
+          detail::EulerDerivedField::Pressure, device_plan_))
+    {
+      pressure.ProjectCoefficient(coeff);
+    }
   }
+
+private:
+  std::shared_ptr<detail::EulerDerivedFieldPlan> device_plan_;
 };
 
 /**
@@ -84,19 +99,33 @@ struct EulerVelocityView
   EulerVelocityView(mfem::ParFiniteElementSpace& dfes,
                     mfem::ParGridFunction& sol,
                     int dim,
-                    double rho_floor)
+                    double rho_floor,
+                    bool project_initial_state = true)
     : coeff(dim, &sol, rho_floor),
       velocity(&dfes),
       state(&sol)
   {
-    Update();
+    if (project_initial_state)
+    {
+      Update();
+    }
   }
 
   void Update()
   {
+    ::igrlab::NVTXRange range("Solver/velocity-projection");
     coeff.SetState(state);
-    velocity.ProjectCoefficient(coeff);
+    if (!detail::TryProjectEulerDerivedField(
+          *state, velocity, coeff.GetStateDimension(), 0.0,
+          coeff.GetDensityFloor(), detail::EulerDerivedField::Velocity,
+          device_plan_))
+    {
+      velocity.ProjectCoefficient(coeff);
+    }
   }
+
+private:
+  std::shared_ptr<detail::EulerDerivedFieldPlan> device_plan_;
 };
 
 } // namespace dg_sim

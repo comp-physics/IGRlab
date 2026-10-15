@@ -42,6 +42,8 @@
 #include "sim/wiring/dg_operator.hpp"
 #include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
+#include "utils/profiling/observability.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace dg_sim
 {
@@ -784,6 +786,7 @@ RunEulerCase(ExampleContext& ctx,
       }
       if (is_final)
       {
+        ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
         const mfem::igrlab::NonFiniteSummary final_nonfinite =
           mfem::igrlab::ScanNonFinite(bundle.sol);
         if (final_nonfinite.global_non_finite != 0)
@@ -793,6 +796,8 @@ RunEulerCase(ExampleContext& ctx,
         }
       }
       const auto prepare_start = std::chrono::steady_clock::now();
+      ::igrlab::NVTXRange range(is_final ? "Solver/final-sigma-preparation"
+                                       : "Solver/sigma-output-preparation");
       const mfem::IGRSigmaPreparationResult preparation =
         sigma_provider->PrepareSigmaForOutput(
           bundle.sol,
@@ -928,6 +933,7 @@ RunEulerCase(ExampleContext& ctx,
   if (sigma_provider && !final_sigma_prepared &&
       !final_sigma_certification_skipped_nonfinite)
   {
+    ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
     const mfem::igrlab::NonFiniteSummary final_nonfinite =
       mfem::igrlab::ScanNonFinite(bundle.sol);
     final_state_finite = final_nonfinite.global_non_finite == 0;
@@ -939,6 +945,7 @@ RunEulerCase(ExampleContext& ctx,
   if (sigma_provider && !final_sigma_prepared && final_state_finite &&
       !final_sigma_certification_skipped_nonfinite)
   {
+    ::igrlab::NVTXRange range("Solver/final-sigma-preparation");
     final_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
       bundle.sol,
       rk3.GetStateGeneration(),
@@ -1309,6 +1316,13 @@ struct Solver
   solve(const CaseSpec<CaseOptions, NumericalFlux>& spec, int argc, char** argv)
   {
     mfem::Mpi::Init(argc, argv);
+    if (::igrlab::observability::configure_nvtx_from_environment() &&
+        mfem::Mpi::Root())
+    {
+      std::cout << "[profiling] nvtx_requested=1 nvtx_enabled="
+                << (::igrlab::observability::nvtx_backend_enabled ? 1 : 0)
+                << " scope=full-solver" << std::endl;
+    }
     mfem::Hypre::Init();
 
     CaseConfig case_cfg = MakeCaseConfig(spec.case_name,
@@ -1853,7 +1867,12 @@ struct Solver
       }
     }
 
-    EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor);
+    // Custom initialization hooks can inspect derived fields. Preserve their
+    // eager initialization; otherwise the first consumer is RunEulerCase's
+    // mandatory refresh after initial-state admission and before any output.
+    const bool project_initial_views = spec.make_callbacks || spec.after_init;
+    EulerStateBundle state_bundle(ctx, case_cfg.gamma, rho_floor,
+                                   project_initial_views);
     if (igr)
     {
       state_bundle.AttachIGR(*igr);
@@ -1864,9 +1883,19 @@ struct Solver
       if (subcell_recovery)
       {
         subcell_recovery->InitializeMeans(*ic,state_bundle.sol);
-        state_bundle.pressure_view.Update();
+        if (project_initial_views)
+        {
+          state_bundle.pressure_view.Update();
+        }
       }
-      else state_bundle.ProjectIC(*ic);
+      else if (project_initial_views)
+      {
+        state_bundle.ProjectIC(*ic);
+      }
+      else
+      {
+        state_bundle.sol.ProjectCoefficient(*ic);
+      }
     }
     else
     {

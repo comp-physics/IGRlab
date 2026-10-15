@@ -3,6 +3,10 @@
 
 #include <array>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -12,7 +16,13 @@ static_assert(NativeElementSchwarzIgrPatchRows(1) == 40);
 static_assert(NativeElementSchwarzIgrPatchRows(2) == 60);
 static_assert(NativeElementSchwarzIgrPatchRows(3) == 80);
 static_assert(NativeElementSchwarzIgrPatchRows(0) == 0);
-static_assert(NativeElementSchwarzIgrPatchRows(4) == 0);
+static_assert(NativeElementSchwarzIgrPatchRows(10) == 220);
+static_assert(NativeElementSchwarzPatchRows(10, false) == 176);
+static_assert(NativeElementSchwarzIgrPatchRows(11) == 240);
+static_assert(NativeElementSchwarzPatchRows(11, false) == 192);
+static_assert(NativeElementSchwarzIgrPatchRows(12) == 260);
+static_assert(NativeElementSchwarzIgrPatchRows(
+    std::numeric_limits<int>::max()) == 0);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).valid);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).euler_rows == 32);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).sigma_rows == 8);
@@ -36,13 +46,34 @@ static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).warp_valid);
 static_assert(
     NativeElementSchwarzIgrFieldSplitLayout(3).warp_required_doubles == 5696);
 static_assert(!NativeElementSchwarzIgrFieldSplitLayout(0).valid);
-static_assert(!NativeElementSchwarzIgrFieldSplitLayout(4).valid);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).euler_rows == 176);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).sigma_rows == 44);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).required_doubles ==
+              41096);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).warp_required_doubles ==
+              41536);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).euler_rows == 192);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).sigma_rows == 48);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).required_doubles ==
+              48864);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).warp_required_doubles ==
+              49344);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).valid);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).euler_rows == 208);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).sigma_rows == 52);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).required_doubles ==
+              57304);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).warp_required_doubles ==
+              57824);
+static_assert(!NativeElementSchwarzIgrFieldSplitLayout(
+    std::numeric_limits<int>::max()).valid);
 static_assert(NativeElementSchwarzEncodeDof(7, -1) == -8);
 static_assert(NativeElementSchwarzDecodedDof(-8) == 7);
 
 bool CheckFieldSplitLayout()
 {
-  for (int order = 1; order <= 3; ++order)
+  // A bounded metadata cohort exercises padding and permutations beyond p10.
+  for (int order = 1; order <= 12; ++order)
   {
     const NativeElementSchwarzFieldSplitLayout layout =
         NativeElementSchwarzIgrFieldSplitLayout(order);
@@ -73,7 +104,7 @@ bool CheckFieldSplitLayout()
 
     int euler_rows = 0;
     int sigma_rows = 0;
-    std::array<bool, 80> visited{};
+    std::vector<bool> visited(static_cast<std::size_t>(layout.patch_rows));
     for (int row = 0; row < layout.patch_rows; ++row)
     {
       const int packed = NativeElementSchwarzIgrFieldSplitPackedRow(
@@ -95,6 +126,13 @@ bool CheckFieldSplitLayout()
       }
     }
     if (euler_rows != layout.euler_rows || sigma_rows != layout.sigma_rows)
+      return false;
+    if (NativeElementSchwarzIgrFieldSplitPackedRow(order, -1) != -1 ||
+        NativeElementSchwarzIgrFieldSplitPackedRow(order, layout.patch_rows) !=
+            -1 ||
+        NativeElementSchwarzIgrFieldSplitPatchRow(order, -1) != -1 ||
+        NativeElementSchwarzIgrFieldSplitPatchRow(order, layout.patch_rows) !=
+            -1)
       return false;
   }
   return true;
@@ -127,6 +165,55 @@ bool CheckExactTwoElementPlan()
       plan.second_element_sources[3] == 4 &&
       plan.first_element_sources[4] == 3 &&
       plan.second_element_sources[4] == 4;
+}
+
+bool CheckP10OrientedFaceOverlap()
+{
+  // Two p10 IGR elements share one complete 5-component, 11-node face.
+  // Reverse its ordering and orientation on the second element. This probes
+  // the high row indices and two-contributor entries without a CUDA runtime.
+  constexpr int rows = 220;
+  constexpr int face_rows = 55;
+  constexpr int unique_rows = rows - face_rows;
+  constexpr int true_rows = 2 * rows - face_rows;
+  std::vector<int> signed_local(2 * rows);
+  std::vector<int> local_true(true_rows);
+  for (int row = 0; row < true_rows; ++row) local_true[row] = row;
+  for (int row = 0; row < rows; ++row) signed_local[row] = row;
+  for (int row = 0; row < rows; ++row)
+    signed_local[rows + row] = row < face_rows
+        ? NativeElementSchwarzEncodeDof(rows - 1 - row, -1)
+        : rows + row - face_rows;
+  const NativeElementSchwarzPlan plan =
+      BuildDirectNativeElementSchwarzPlan({
+          2, rows, true_rows, true_rows,
+          signed_local.data(), signed_local.size(),
+          local_true.data(), local_true.size()});
+  if (!plan.valid || plan.patch_rows != rows ||
+      plan.minimum_multiplicity != 1 || plan.maximum_multiplicity != 2 ||
+      plan.maximum_contributors != 2 ||
+      plan.signed_element_true_dofs != signed_local)
+    return false;
+  for (int truth = 0; truth < true_rows; ++truth)
+    if (plan.true_multiplicity[truth] !=
+        (truth >= unique_rows && truth < rows ? 2 : 1))
+      return false;
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+    {
+      const std::size_t entry = static_cast<std::size_t>(row) * rows + column;
+      const bool shared_entry = row >= unique_rows && column >= unique_rows;
+      const int second_source = rows * rows +
+          (rows - 1 - row) * rows + (rows - 1 - column);
+      if (plan.first_element_sources[entry] != static_cast<int>(entry) ||
+          plan.second_element_sources[entry] !=
+              (shared_entry ? second_source : -1))
+        return false;
+    }
+  // The second element's reversed shared corner must reference the same
+  // assembled principal-patch entry, including its first-element source.
+  return plan.first_element_sources[rows * rows] == rows * rows - 1 &&
+      plan.second_element_sources[rows * rows] == rows * rows;
 }
 
 bool SamePlan(const NativeElementSchwarzPlan& left,
@@ -208,6 +295,100 @@ bool CheckDirectPlanMatchesCsrDerivedPlan()
       permuted_direct.maximum_multiplicity == 2;
 }
 
+bool CheckDirectPlanOrderAndTopologyCohort()
+{
+  // Face IDs define boundary patches, a chain, two elements sharing two
+  // faces, a four-element cycle, and a fully shared three-element topology.
+  // The latter two distinguish rows sharing different neighboring elements;
+  // the two-face case prevents assuming that each neighbor shares one face.
+  const std::vector<std::vector<std::array<int, 4>>> topologies{
+      {{{0, 1, 2, 3}}},
+      {{{0, 1, 2, 3}}, {{4, 5, 6, 1}}, {{7, 8, 9, 5}}},
+      {{{0, 1, 2, 3}}, {{2, 4, 0, 5}}},
+      {{{0, 1, 2, 3}}, {{4, 5, 6, 1}}, {{7, 8, 9, 5}}, {{10, 3, 11, 8}}},
+      {{{0, 1, 2, 3}}, {{0, 1, 4, 5}}, {{2, 3, 4, 5}}}};
+
+  for (const int order : {1, 2, 5, 7})
+    for (const bool igr_active : {false, true})
+      for (std::size_t topology = 0; topology < topologies.size(); ++topology)
+      {
+        const auto& faces = topologies[topology];
+        const int elements = static_cast<int>(faces.size());
+        const int rows = NativeElementSchwarzPatchRows(order, igr_active);
+        const int face_rows = rows / 4;
+        const int element_rows = elements * rows;
+        const int element_entries = element_rows * rows;
+        int face_count = 0;
+        for (const auto& element_faces : faces)
+          for (const int face : element_faces)
+            face_count = std::max(face_count, face + 1);
+        const int true_rows = face_count * face_rows;
+        std::vector<int> signed_local(element_rows);
+        std::vector<int> local_true(element_rows);
+        std::vector<int> element_true(element_rows);
+        std::vector<int> face_visits(face_count, 0);
+        for (int element = 0; element < elements; ++element)
+          for (int face = 0; face < 4; ++face)
+          {
+            const int face_id = faces[element][face];
+            const bool reverse = face_visits[face_id]++ > 0;
+            for (int row = 0; row < face_rows; ++row)
+            {
+              const int slot = element * rows + face * face_rows + row;
+              // Distinct local aliases map to the same shared true row.
+              // Reverse local numbering and the second face incidence, and
+              // mix signs independently of both permutations.
+              const int local = element_rows - 1 - slot;
+              const int truth = face_id * face_rows +
+                  (reverse ? face_rows - 1 - row : row);
+              signed_local[slot] = NativeElementSchwarzEncodeDof(
+                  local, (slot + element) % 3 == 0 ? -1 : 1);
+              local_true[local] = truth;
+              element_true[slot] = truth;
+            }
+          }
+
+        // Independent oracle: assemble the true (row,column) graph in a map
+        // by enumerating all dense element entries, then use the retained
+        // CSR-derived builder to recover the exact ordered source lists.
+        std::map<std::pair<int, int>, int> true_entries;
+        std::vector<int> sources(element_entries);
+        std::vector<int> sections(element_entries, 0);
+        std::vector<int> targets(element_entries);
+        for (int element = 0; element < elements; ++element)
+          for (int row = 0; row < rows; ++row)
+            for (int column = 0; column < rows; ++column)
+            {
+              const int source = (element * rows + row) * rows + column;
+              const auto insertion = true_entries.emplace(
+                  std::make_pair(element_true[element * rows + row],
+                                 element_true[element * rows + column]),
+                  static_cast<int>(true_entries.size()));
+              sources[source] = source;
+              targets[source] = insertion.first->second;
+            }
+        const NativeElementSchwarzPlan csr = BuildNativeElementSchwarzPlan({
+            elements, rows, element_rows, true_rows,
+            static_cast<int>(true_entries.size()),
+            signed_local.data(), signed_local.size(),
+            local_true.data(), local_true.size(), sources.data(),
+            sections.data(), targets.data(), targets.size()});
+        const NativeElementSchwarzPlan direct =
+            BuildDirectNativeElementSchwarzPlan({
+                elements, rows, element_rows, true_rows,
+                signed_local.data(), signed_local.size(),
+                local_true.data(), local_true.size()});
+        if (!csr.valid || !direct.valid || !SamePlan(csr, direct))
+        {
+          std::cerr << "Schwarz plan oracle mismatch: p=" << order
+                    << ", IGR=" << igr_active
+                    << ", topology=" << topology << '\n';
+          return false;
+        }
+      }
+  return true;
+}
+
 bool CheckDirectPlanFailsClosed()
 {
   const std::array<int, 3> three_incidence{{0, 0, 0}};
@@ -240,8 +421,24 @@ bool CheckDirectPlanFailsClosed()
       BuildDirectNativeElementSchwarzPlan({
           1, 1, 1, 1, valid_local.data(), 0,
           one_truth.data(), one_truth.size()});
+  const std::array<int, 2> aliased_local{{0, -2}};
+  const std::array<int, 2> aliased_true{{0, 0}};
+  const NativeElementSchwarzPlan duplicate_alias =
+      BuildDirectNativeElementSchwarzPlan({
+          1, 2, 2, 1, aliased_local.data(), aliased_local.size(),
+          aliased_true.data(), aliased_true.size()});
+  const NativeElementSchwarzPlan unreferenced_true =
+      BuildDirectNativeElementSchwarzPlan({
+          1, 1, 1, 2, valid_local.data(), valid_local.size(),
+          one_truth.data(), one_truth.size()});
+  const NativeElementSchwarzPlan oversized_entries =
+      BuildDirectNativeElementSchwarzPlan({
+          std::numeric_limits<int>::max(), 2, 1, 1,
+          valid_local.data(), valid_local.size(),
+          one_truth.data(), one_truth.size()});
   return !too_many.valid && !duplicate.valid && !bad_local.valid &&
-      !bad_truth.valid && !bad_count.valid;
+      !bad_truth.valid && !bad_count.valid && !duplicate_alias.valid &&
+      !unreferenced_true.valid && !oversized_entries.valid;
 }
 
 bool CheckDirectTraceCsrGraph()
@@ -485,7 +682,9 @@ bool CheckMatrixFreeActionAndRhsModel()
 int main()
 {
   if (!CheckFieldSplitLayout() || !CheckExactTwoElementPlan() ||
+      !CheckP10OrientedFaceOverlap() ||
       !CheckDirectPlanMatchesCsrDerivedPlan() ||
+      !CheckDirectPlanOrderAndTopologyCohort() ||
       !CheckDirectPlanFailsClosed() ||
       !CheckDirectTraceCsrGraph() ||
       !CheckSignedWeightedApplyModel() ||

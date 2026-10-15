@@ -152,8 +152,8 @@ if [[ "${MODE}" == "gpu" ]]; then
     exit 2
   fi
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
-  if [[ "${SPACK_CUDA_ARCH}" == "80" ]]; then
-    # The SM80 manifest pins a compatible release; identity still binds its DAG hash.
+  if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]]; then
+    # The SM70/SM80 manifests pin compatible releases; identity still binds the DAG hash.
     HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
   fi
   MPI_SPEC="openmpi+cuda"
@@ -167,6 +167,12 @@ else
   MPI_SPEC="openmpi~cuda"
   DEPENDENCY_CUDA_ARCH="none"
   CUDA_CODEGEN="none"
+fi
+
+# Delta uses the installed CUDA-aware MPI for CPU and GPU applications.
+# This changes MPI selection only; CPU MFEM and HYPRE keep CUDA disabled.
+if [[ "${IGRLAB_BUILD_SITE:-}" == "delta" ]]; then
+  MPI_SPEC="openmpi+cuda"
 fi
 
 echo "[mfem-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} cuda_codegen_archs=${CUDA_CODEGEN} jobs=${JOBS}"
@@ -201,8 +207,8 @@ spack_location() {
   spack -e "${SPACK_ENV}" location -i "$1"
 }
 
-configure_sm80_hypre_linalg() {
-  [[ "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
+configure_cuda_hypre_linalg() {
+  [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
   local prefix hash dependencies library="" candidate
   prefix="$(spack_location openblas)"
   prefix="$(realpath -e -- "${prefix}")" || exit 3
@@ -210,7 +216,7 @@ configure_sm80_hypre_linalg() {
   dependencies="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
     --format '{^blas.hash}|{^lapack.hash}' "${HYPRE_SPEC}")"
   [[ "${hash}" =~ ^[a-z0-9]{32}$ && "${dependencies}" == "${hash}|${hash}" ]] || {
-    echo "ERROR: SM80 HYPRE BLAS/LAPACK must match the selected Spack OpenBLAS identity." >&2
+    echo "ERROR: SM${SPACK_CUDA_ARCH} HYPRE BLAS/LAPACK must match the selected Spack OpenBLAS identity." >&2
     exit 3
   }
   for candidate in "${prefix}/lib/libopenblas.so" "${prefix}/lib64/libopenblas.so"; do
@@ -222,7 +228,7 @@ configure_sm80_hypre_linalg() {
   case "${library}" in
     "${prefix}"/*) ;;
     *)
-      echo "ERROR: SM80 requires a shared OpenBLAS library inside its concrete prefix: ${prefix}" >&2
+      echo "ERROR: SM${SPACK_CUDA_ARCH} requires a shared OpenBLAS library inside its concrete prefix: ${prefix}" >&2
       exit 3
       ;;
   esac
@@ -230,10 +236,7 @@ configure_sm80_hypre_linalg() {
   # actual find_library cache entries while retaining their symbol checks.
   # MFEM must export Umpire's concrete imported archive after static HYPRE;
   # the bare umpire target can otherwise be emitted before HYPRE by consumers.
-  # Clear only HYPRE's discovery results so an iterative configure rebuilds
-  # that dependency list instead of taking FindHYPRE's cached early return.
   cmake_args+=(
-    -UHYPRE_FOUND -UHYPRE_LIBRARIES -UHYPRE_INCLUDE_DIRS
     '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE'
     -DUMPIRE_TARGET_NAMES:STRING=umpire
     -DUMPIRE_TARGET_FORCE:BOOL=OFF
@@ -248,8 +251,34 @@ MPI_PREFIX="$(spack_location "${MPI_SPEC}")"
 HYPRE_PREFIX="$(spack_location "${HYPRE_SPEC}")"
 METIS_PREFIX="$(spack_location metis)"
 CMAKE_BIN="${CMAKE_PREFIX}/bin/cmake"
+HYPRE_PREFIX="$(realpath -e -- "${HYPRE_PREFIX}")" || exit 3
+HYPRE_HEADER="$(realpath -e -- "${HYPRE_PREFIX}/include/HYPRE.h")" || exit 3
+case "${HYPRE_HEADER}" in
+  "${HYPRE_PREFIX}"/*) ;;
+  *) echo "ERROR: active HYPRE header escapes its concrete prefix." >&2; exit 3 ;;
+esac
+HYPRE_LIBRARY=""
+for hypre_library_candidate in \
+    "${HYPRE_PREFIX}/lib/libHYPRE.so" "${HYPRE_PREFIX}/lib64/libHYPRE.so" \
+    "${HYPRE_PREFIX}/lib/libHYPRE.a" "${HYPRE_PREFIX}/lib64/libHYPRE.a"; do
+  if [[ -f "${hypre_library_candidate}" ]]; then
+    HYPRE_LIBRARY="$(realpath -e -- "${hypre_library_candidate}")" || exit 3
+    break
+  fi
+done
+case "${HYPRE_LIBRARY}" in
+  "${HYPRE_PREFIX}"/*) ;;
+  *) echo "ERROR: active HYPRE library is missing or escapes its concrete prefix." >&2; exit 3 ;;
+esac
 
 cmake_args=(
+  # FindHYPRE returns early on cached plural values, and find_path/find_library
+  # retain singular paths even when HYPRE_DIR changes. Refresh only HYPRE's
+  # discovery results; all other cache entries and compiled objects survive.
+  -UHYPRE_FOUND -UHYPRE_INCLUDE_DIR -UHYPRE_INCLUDE_DIRS
+  -UHYPRE_LIBRARY -UHYPRE_LIBRARIES -UHYPRE_VERSION '-UHYPRE_VERSION_*'
+  -UHYPRE_USING_CUDA -UHYPRE_USING_HIP
+  -UTPL_HYPRE_INCLUDE_DIRS -UTPL_HYPRE_LIBRARIES
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_INSTALL_PREFIX="${MFEM_INSTALL}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
@@ -261,6 +290,8 @@ cmake_args=(
   -DMFEM_ENABLE_MINIAPPS=OFF
   -DMFEM_ENABLE_TESTING=OFF
   -DHYPRE_DIR="${HYPRE_PREFIX}"
+  -DHYPRE_INCLUDE_DIR:PATH="$(dirname -- "${HYPRE_HEADER}")"
+  -DHYPRE_LIBRARY:FILEPATH="${HYPRE_LIBRARY}"
   -DMETIS_DIR="${METIS_PREFIX}"
 )
 
@@ -275,7 +306,7 @@ if [[ "${MODE}" == "gpu" ]]; then
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
     -DUMPIRE_DIR="${UMPIRE_PREFIX}"
   )
-  configure_sm80_hypre_linalg
+  configure_cuda_hypre_linalg
 else
   cmake_args+=(
     -DMFEM_USE_CUDA=OFF
@@ -296,6 +327,14 @@ if ((CLEAN)); then
 fi
 "${CMAKE_BIN}" "${configure_args[@]}" \
   -S "${MFEM_SRC}" -B "${MFEM_BUILD}" "${cmake_args[@]}"
+dependency_binding_checker="${SCRIPT_DIR}/scripts/build/check_dependency_bindings.py"
+[[ -f "${dependency_binding_checker}" ]] || {
+  echo "ERROR: canonical dependency binding checker is missing." >&2
+  exit 3
+}
+python3 "${dependency_binding_checker}" \
+  --hypre-prefix "${HYPRE_PREFIX}" --mpi-prefix "${MPI_PREFIX}" \
+  --mfem-cache "${MFEM_BUILD}/CMakeCache.txt"
 if [[ "${MODE}" == "gpu" ]]; then
   mfem_cache="${MFEM_BUILD}/CMakeCache.txt"
   [[ -f "${mfem_cache}" ]] || {
@@ -319,6 +358,11 @@ MFEM_CONFIG="${MFEM_INSTALL}/lib/cmake/mfem/MFEMConfig.cmake"
   echo "ERROR: MFEMConfig.cmake was not installed at ${MFEM_CONFIG}" >&2
   exit 3
 }
+python3 "${dependency_binding_checker}" \
+  --hypre-prefix "${HYPRE_PREFIX}" --mpi-prefix "${MPI_PREFIX}" \
+  --mfem-cache "${MFEM_BUILD}/CMakeCache.txt" \
+  --mfem-config "${MFEM_CONFIG}" \
+  --mfem-targets "${MFEM_INSTALL}/lib/cmake/mfem/MFEMTargets.cmake"
 
 if [[ "${MODE}" == "gpu" ]]; then
   grep -Fq 'set(MFEM_USE_CUDA ON)' "${MFEM_CONFIG}" || {

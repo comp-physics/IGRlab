@@ -82,7 +82,7 @@ assert_stamped_reuse_scope_policy() {
     capture && /^CMAKE_BIN=/ { exit }
   ' "${driver}")"
   [[ "${init_body}" == *'application build scope'* &&
-     "${init_body}" == *'if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then'* &&
+     "${init_body}" == *'if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" && -z "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then'* &&
      "${init_body}" == *'MFEM build scope'* ]] || {
     fail "stamped reuse scope policy no longer separates app and MFEM paths"
   }
@@ -229,7 +229,9 @@ assert_reuse_identity_policy() {
 [[ -f "${BUILD_DRIVER}" ]] || fail "missing build driver: ${BUILD_DRIVER}"
 [[ -f "${MFEM_DRIVER}" ]] || fail "missing MFEM driver: ${MFEM_DRIVER}"
 
-if [[ -n "${DG_IGR_TEST_REUSE_MFEM_ROOT:-}" ]]; then
+if [[ -n "${IGRLAB_TEST_MFEM_SOURCE_ROOT:-}" ]]; then
+  mfem_source="${IGRLAB_TEST_MFEM_SOURCE_ROOT}"
+elif [[ -n "${DG_IGR_TEST_REUSE_MFEM_ROOT:-}" ]]; then
   mfem_source="${DG_IGR_TEST_REUSE_MFEM_ROOT}"
 else
   mfem_source="${REPO_ROOT}/tpl/mfem"
@@ -299,6 +301,9 @@ fixture_mfem_entry="$(git -C "${fixture_root}" ls-tree HEAD -- tpl/mfem)"
 }
 
 cp "${BUILD_DRIVER}" "${fixture_root}/build.sh"
+mkdir -p "${fixture_root}/scripts/build"
+cp "${REPO_ROOT}/scripts/build/prebuilt_validation.py" \
+  "${REPO_ROOT}/scripts/build/mfem_cache.sh" "${fixture_root}/scripts/build/"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -306,6 +311,10 @@ printf '%s\n' \
   '  printf "MFEM_SRC=%s\\n" "${MFEM_SRC:?}"' \
   '  printf "MFEM_BUILD=%s\\n" "${MFEM_BUILD:?}"' \
   '  printf "MFEM_INSTALL=%s\\n" "${MFEM_INSTALL:?}"' \
+  '  printf "IGRLAB_TEST_MFEM_SOURCE_ROOT=%s\\n" "${IGRLAB_TEST_MFEM_SOURCE_ROOT:-}"' \
+  '  for name in DG_IGR_TEST_REUSE_MFEM_ROOT DG_IGR_TEST_REUSE_SPACK_ENV DG_IGR_TEST_REUSE_MODE DG_IGR_TEST_REUSE_PROFILE DG_IGR_TEST_REUSE_CALIPER DG_IGR_TEST_REUSE_CUDA_ARCH; do' \
+  '    printf "%s=%s\\n" "$name" "${!name-}"' \
+  '  done' \
   '  printf "%s\\n" "$@"' \
   '} >"${FAKE_HELPER_LOG:?}"' \
   'exit 77' >"${fixture_root}/build_mfem_tpl.sh"
@@ -333,6 +342,7 @@ clean_env=(
   -u IGRLAB_CUDA_ARCH
   -u IGRLAB_MFEM_CUDA_ARCHS
   -u IGRLAB_APP_CUDA_ARCHS
+  -u IGRLAB_VALIDATION_MODE
 )
 
 # The synthetic exact-source composition exercises normal-mode source
@@ -350,6 +360,40 @@ assert_contains "${plan}" "app_cuda_archs=120"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=16"
 assert_contains "${plan}" "output_root=${default_output_root}"
+assert_not_exists "${default_output_root}"
+
+# Iteration preserves the application build scope and skips dependency setup.
+iteration_plan="$("${clean_env[@]}" XDG_CACHE_HOME="${default_cache_root}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 --iterate --print-plan)"
+assert_contains "${iteration_plan}" "route=app-only dependency_work=none artifact_hashes=none run_tests=0"
+[[ "$(plan_field "${iteration_plan}" scope)" == "$(plan_field "${plan}" scope)" ]] || \
+  fail "iteration changes the persistent build scope"
+ambient_plan="$("${clean_env[@]}" IGRLAB_VALIDATION_MODE=iteration \
+  bash "${fixture_root}/build.sh" --cpu-only --print-plan)"
+assert_contains "${ambient_plan}" 'clean=1 install_deps=1'
+for filter in regex label no-tests; do
+  case "${filter}" in
+    regex) iteration_args=(--tests-only --test-regex '^focused$') ;;
+    label) iteration_args=(--tests-only --test-label '^special$') ;;
+    no-tests) iteration_args=(--no-tests) ;;
+  esac
+  filtered_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+    --cpu-only --iterate "${iteration_args[@]}" --print-plan)"
+  [[ "${filtered_plan}" != *'test_label=^numerical-smoke$'* ]] || \
+    fail "iteration overrides an explicit filter or adds tests to a build-only plan"
+done
+for clean_order in first last overwritten; do
+  case "${clean_order}" in
+    first) iteration_args=(--clean --iterate) ;;
+    last) iteration_args=(--iterate --clean) ;;
+    overwritten) iteration_args=(--clean --no-clean --iterate) ;;
+  esac
+  if conflict_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+    --cpu-only "${iteration_args[@]}" --print-plan 2>&1)"; then
+    fail "iteration accepts explicit --clean (${clean_order})"
+  fi
+  assert_contains "${conflict_plan}" '--iterate conflicts with --clean'
+done
 assert_not_exists "${default_output_root}"
 
 # Canonical build names preserve legacy scripts and select explicit overrides.
@@ -389,7 +433,13 @@ assert_not_exists "${a100_output_root}"
 plan="$("${clean_env[@]}" SPACK_CUDA_ARCH=120 bash "${fixture_root}/build.sh" \
   --a100 --gpu --cuda-arch 80 --print-plan)"
 assert_contains "${plan}" "profile=cuda-sm80"
-for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-unsupported; do
+v100_output_root="${tmp_root}/v100-output"
+v100_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 70 --output-root "${v100_output_root}" --print-plan)"
+assert_contains "${v100_plan}" "mode=gpu profile=cuda-sm70 dependency_cuda_arch=70 mfem_cuda_archs=70 app_cuda_archs=70"
+assert_contains "${v100_plan}" "hdg_runtime=OFF"
+assert_not_exists "${v100_output_root}"
+for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-unsupported hdg-v100; do
   case "${conflict}" in
     cpu-first) conflict_args=(--cpu-only --a100) ;;
     cpu-last) conflict_args=(--a100 --cpu) ;;
@@ -397,6 +447,7 @@ for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-uns
     arch-last) conflict_args=(--a100 --cuda-arch 120) ;;
     overwritten-arch) conflict_args=(--cuda-arch 120 --cuda-arch 80 --a100) ;;
     hdg-unsupported) conflict_args=(--gpu --cuda-arch 90 --hdg-runtime) ;;
+    hdg-v100) conflict_args=(--gpu --cuda-arch 70 --hdg-runtime) ;;
   esac
   set +e
   reject_output="$("${clean_env[@]}" PATH="${fake_bin}:/usr/bin:/bin" \
@@ -406,7 +457,7 @@ for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-uns
   reject_rc=$?
   set -e
   [[ ${reject_rc} -eq 2 ]] || fail "A100 conflict ${conflict} exited ${reject_rc}, expected 2"
-  if [[ "${conflict}" == hdg-unsupported ]]; then
+  if [[ "${conflict}" == hdg-* ]]; then
     assert_contains "${reject_output}" "--hdg-runtime requires native CUDA architecture 80 or 120"
   else
     assert_contains "${reject_output}" "--a100 conflicts"
@@ -691,6 +742,58 @@ assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-codegen" "80-virtu
 assert_not_exists "${tmp_root}/forwarded-spack.log"
 assert_not_exists "${fixture_root}/build-deps"
 
+# Fresh external MFEM sources must reach the policy fixture without admitting
+# the unrelated full build/install reuse fixtures.
+external_app="${tmp_root}/external-app"
+external_mfem="${tmp_root}/external-mfem"
+git clone --quiet --shared "${fixture_root}" "${external_app}"
+git -c advice.detachedHead=false clone --quiet --shared --no-checkout \
+  "${mfem_source}" "${external_mfem}"
+git -c advice.detachedHead=false -C "${external_mfem}" checkout --quiet \
+  --detach "${real_mfem_gitlink}"
+git -C "${external_mfem}" remote set-url origin \
+  https://github.com/mfem/mfem.git
+cp "${fixture_root}/build.sh" "${fixture_root}/build_mfem_tpl.sh" \
+  "${external_app}/"
+mkdir -p "${external_app}/scripts/build"
+cp "${fixture_root}/scripts/build/prebuilt_validation.py" \
+  "${fixture_root}/scripts/build/mfem_cache.sh" "${external_app}/scripts/build/"
+mkdir -p "${external_app}/spack-envs/cpu/.spack-env/view"
+cp "${REPO_ROOT}/spack-envs/cpu/spack.yaml" \
+  "${external_app}/spack-envs/cpu/spack.yaml"
+[[ ! -e "${external_app}/tpl/mfem/.git" ]] || \
+  fail "external-source fixture initialized its local submodule"
+set +e
+env -u IGRLAB_TEST_MFEM_SOURCE_ROOT \
+  -u DG_IGR_RUN_REUSE_FIXTURES \
+  -u DG_IGR_TEST_REUSE_MFEM_ROOT -u DG_IGR_TEST_REUSE_SPACK_ENV \
+  -u DG_IGR_TEST_REUSE_MODE -u DG_IGR_TEST_REUSE_PROFILE \
+  -u DG_IGR_TEST_REUSE_CALIPER -u DG_IGR_TEST_REUSE_CUDA_ARCH \
+  -u IGRLAB_SPACK_ENV -u DG_IGR_SPACK_ENV \
+  PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/external-source.log" \
+  FAKE_SPACK_LOG="${tmp_root}/external-spack.log" \
+  bash "${external_app}/build.sh" --cpu-only \
+  --reuse-mfem-root "${external_mfem}" \
+  --output-root "${tmp_root}/external-output" \
+  --no-clean --no-deps --no-tests \
+  >"${tmp_root}/external-source-output.log" 2>&1
+external_rc=$?
+set -e
+[[ ${external_rc} -eq 77 ]] || \
+  fail "external source forwarding exited ${external_rc}, expected 77"
+external_log="$(<"${tmp_root}/external-source.log")"
+assert_contains "${external_log}" "MFEM_SRC=${external_mfem}"
+assert_contains "${external_log}" \
+  "IGRLAB_TEST_MFEM_SOURCE_ROOT=${external_mfem}"
+for name in DG_IGR_TEST_REUSE_MFEM_ROOT DG_IGR_TEST_REUSE_SPACK_ENV \
+  DG_IGR_TEST_REUSE_MODE DG_IGR_TEST_REUSE_PROFILE \
+  DG_IGR_TEST_REUSE_CALIPER DG_IGR_TEST_REUSE_CUDA_ARCH; do
+  grep -Fxq "${name}=" "${tmp_root}/external-source.log" || \
+    fail "external source forwarding enabled full reuse metadata: ${name}"
+done
+assert_not_exists "${tmp_root}/external-spack.log"
+
 # Distinct profiles may race to create a fresh shared output root; each owns a
 # separate scope and reaches the fake helper without a spurious mkdir failure.
 concurrent_output_root="${tmp_root}/concurrent-output"
@@ -744,7 +847,7 @@ assert_contains "${reject_output}" "output lock is already held"
 assert_not_exists "${tmp_root}/locked-helper.log"
 assert_not_exists "${tmp_root}/locked-spack.log"
 
-# SM80's manifest owns the release pin; both dependency lookup sites must
+# SM70/SM80 manifests own their release pins; both dependency lookup sites must
 # accept that release while leaving the reviewed SM120 develop query unchanged.
 for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SPEC"; do
   query_driver="${driver_and_variable%:*}"
@@ -755,12 +858,12 @@ for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SP
     capture && /^[ ]*fi$/ { exit }
   ' "${query_driver}")"
   [[ -n "${query_selection}" ]] || fail "missing HYPRE query in ${query_driver}"
-  for query_arch in 80 120; do
+  for query_arch in 70 80 120; do
     selected_query="$(SPACK_CUDA_ARCH="${query_arch}" bash -c \
       "${query_selection}"$'\n''printf "%s" "${!1}"' -- "${query_variable}")"
-    if [[ "${query_arch}" == 80 ]]; then
-      [[ "${selected_query}" == "hypre+mpi+cuda cuda_arch=80" ]] || \
-        fail "SM80 HYPRE query does not admit its release pin: ${selected_query}"
+    if [[ "${query_arch}" == 70 || "${query_arch}" == 80 ]]; then
+      [[ "${selected_query}" == "hypre+mpi+cuda cuda_arch=${query_arch}" ]] || \
+        fail "SM${query_arch} HYPRE query does not admit its release pin: ${selected_query}"
     else
       [[ "${selected_query}" == "hypre@develop+mpi+cuda cuda_arch=120" ]] || \
         fail "SM120 HYPRE query changed: ${selected_query}"
@@ -768,20 +871,57 @@ for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SP
   done
 done
 
-# Exercise the production SM80 static-HYPRE linkage selector without invoking
+# CPU and GPU configure share the full FindHYPRE refresh. Check the production
+# argument array without invoking CMake; changing HYPRE_DIR must also replace
+# its singular discovery paths and rerun version/backend probes.
+(
+  base_arguments="$(awk '
+    /^cmake_args=\(/ { capture = 1 }
+    capture { print }
+    capture && /^\)$/ { exit }
+  ' "${MFEM_DRIVER}")"
+  [[ -n "${base_arguments}" ]] || fail "missing shared MFEM configure arguments"
+  CMAKE_BUILD_TYPE=Release
+  MFEM_INSTALL="${tmp_root}/mfem-install"
+  MPI_PREFIX="${tmp_root}/mpi"
+  METIS_PREFIX="${tmp_root}/metis"
+  for hypre_revision in old current; do
+    HYPRE_PREFIX="${tmp_root}/${hypre_revision}-hypre"
+    HYPRE_HEADER="${HYPRE_PREFIX}/include/HYPRE.h"
+    HYPRE_LIBRARY="${HYPRE_PREFIX}/lib/libHYPRE.so"
+    eval "${base_arguments}"
+    for expected_arg in \
+        -UHYPRE_FOUND -UHYPRE_INCLUDE_DIR -UHYPRE_INCLUDE_DIRS \
+        -UHYPRE_LIBRARY -UHYPRE_LIBRARIES -UHYPRE_VERSION '-UHYPRE_VERSION_*' \
+        -UHYPRE_USING_CUDA -UHYPRE_USING_HIP \
+        -UTPL_HYPRE_INCLUDE_DIRS -UTPL_HYPRE_LIBRARIES; do
+      [[ " ${cmake_args[*]} " == *" ${expected_arg} "* ]] || \
+        fail "shared HYPRE refresh omits ${expected_arg}"
+    done
+    for actual_arg in "${cmake_args[@]}"; do
+      case "${actual_arg}" in
+        -UHYPRE_*|-UTPL_HYPRE_*) ;;
+        -U*) fail "shared HYPRE refresh clears an unrelated cache entry: ${actual_arg}" ;;
+      esac
+    done
+    assert_contains " ${cmake_args[*]} " " -DHYPRE_DIR=${HYPRE_PREFIX} "
+    assert_contains " ${cmake_args[*]} " " -DHYPRE_INCLUDE_DIR:PATH=${HYPRE_PREFIX}/include "
+    assert_contains " ${cmake_args[*]} " " -DHYPRE_LIBRARY:FILEPATH=${HYPRE_LIBRARY} "
+  done
+)
+
+# Exercise the production SM70/SM80 static-HYPRE linkage selector without invoking
 # a compiler. SM120 must not query OpenBLAS or gain host LAPACK dependencies.
 (
   eval "$(awk '
-    /^configure_sm80_hypre_linalg\(\)/ { capture = 1 }
+    /^configure_cuda_hypre_linalg\(\)/ { capture = 1 }
     capture { print }
     capture && /^}/ { exit }
   ' "${MFEM_DRIVER}")"
   openblas_fixture="${tmp_root}/openblas"
   mkdir -p "${openblas_fixture}/lib64"
-  touch "${openblas_fixture}/lib64/libopenblas.so"
   openblas_hash=0123456789abcdef0123456789abcdef
   SPACK_ENV="${tmp_root}/linalg-env"
-  HYPRE_SPEC='hypre+mpi+cuda cuda_arch=80'
   spack_location() { [[ "$1" == openblas ]] || return 1; printf '%s' "${openblas_fixture}"; }
   spack() {
     [[ "$1" == -e && "$2" == "${SPACK_ENV}" && "$3" == find && "$4" == --format ]] || return 1
@@ -792,41 +932,42 @@ done
       *) return 1 ;;
     esac
   }
-  SPACK_CUDA_ARCH=80
-  cmake_args=()
-  configure_sm80_hypre_linalg
-  for expected_arg in \
-      '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE' \
-      -DUMPIRE_TARGET_NAMES:STRING=umpire -DUMPIRE_TARGET_FORCE:BOOL=OFF \
-      -UHYPRE_FOUND -UHYPRE_LIBRARIES -UHYPRE_INCLUDE_DIRS; do
-    [[ " ${cmake_args[*]} " == *" ${expected_arg} "* ]] || \
-      fail "SM80 static-HYPRE dependency arguments omit ${expected_arg}"
+  for SPACK_CUDA_ARCH in 70 80; do
+    HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+    touch "${openblas_fixture}/lib64/libopenblas.so"
+    cmake_args=()
+    configure_cuda_hypre_linalg
+    for expected_arg in \
+        '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE' \
+        -DUMPIRE_TARGET_NAMES:STRING=umpire -DUMPIRE_TARGET_FORCE:BOOL=OFF; do
+      [[ " ${cmake_args[*]} " == *" ${expected_arg} "* ]] || \
+        fail "SM${SPACK_CUDA_ARCH} static-HYPRE dependency arguments omit ${expected_arg}"
+    done
+    for actual_arg in "${cmake_args[@]}"; do
+      case "${actual_arg}" in
+        -U*) fail "SM${SPACK_CUDA_ARCH} linkage selector duplicates the shared HYPRE cache refresh: ${actual_arg}" ;;
+      esac
+    done
+    assert_contains "${cmake_args[*]}" '-DBLA_VENDOR:STRING=OpenBLAS'
+    assert_contains "${cmake_args[*]}" "-DBLAS_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
+    assert_contains "${cmake_args[*]}" "-DLAPACK_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
+    [[ "${cmake_args[*]}" != *MFEM_USE_LAPACK* ]] || fail "SM${SPACK_CUDA_ARCH} changed MFEM's own LAPACK policy"
+    mv "${openblas_fixture}/lib64/libopenblas.so" "${tmp_root}/outside-openblas-${SPACK_CUDA_ARCH}.so"
+    ln -s "${tmp_root}/outside-openblas-${SPACK_CUDA_ARCH}.so" "${openblas_fixture}/lib64/libopenblas.so"
+    set +e
+    output="$(configure_cuda_hypre_linalg 2>&1)"
+    status=$?
+    set -e
+    [[ "${status}" == 3 ]] || fail "SM${SPACK_CUDA_ARCH} redirected OpenBLAS library was admitted"
+    assert_contains "${output}" "SM${SPACK_CUDA_ARCH} requires a shared OpenBLAS library inside its concrete prefix"
+    rm "${openblas_fixture}/lib64/libopenblas.so"
   done
-  unset_count=0
-  for actual_arg in "${cmake_args[@]}"; do
-    case "${actual_arg}" in
-      -UHYPRE_FOUND|-UHYPRE_LIBRARIES|-UHYPRE_INCLUDE_DIRS) unset_count=$((unset_count + 1)) ;;
-      -U*) fail "SM80 clears an unrelated or broad CMake cache entry: ${actual_arg}" ;;
-    esac
-  done
-  [[ ${unset_count} -eq 3 ]] || fail "SM80 HYPRE rediscovery must clear exactly three cache entries"
-  assert_contains "${cmake_args[*]}" '-DBLA_VENDOR:STRING=OpenBLAS'
-  assert_contains "${cmake_args[*]}" "-DBLAS_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
-  assert_contains "${cmake_args[*]}" "-DLAPACK_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
-  [[ "${cmake_args[*]}" != *MFEM_USE_LAPACK* ]] || fail "SM80 changed MFEM's own LAPACK policy"
-  mv "${openblas_fixture}/lib64/libopenblas.so" "${tmp_root}/outside-openblas.so"
-  ln -s "${tmp_root}/outside-openblas.so" "${openblas_fixture}/lib64/libopenblas.so"
-  set +e
-  output="$(configure_sm80_hypre_linalg 2>&1)"
-  status=$?
-  set -e
-  [[ "${status}" == 3 ]] || fail "redirected OpenBLAS library was admitted"
   SPACK_CUDA_ARCH=120
   cmake_args=()
   spack_location() { fail "SM120 queried an OpenBLAS prefix"; }
   spack() { fail "SM120 queried OpenBLAS metadata"; }
-  configure_sm80_hypre_linalg
-  [[ ${#cmake_args[@]} == 0 ]] || fail "SM120 gained SM80-only linalg arguments"
+  configure_cuda_hypre_linalg
+  [[ ${#cmake_args[@]} == 0 ]] || fail "SM120 gained SM70/SM80-only linalg arguments"
 )
 
 # The reuse tuple is revalidated only after a real dependency install and

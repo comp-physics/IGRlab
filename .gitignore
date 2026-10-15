@@ -74,6 +74,17 @@ tests/scripts/*
 !tests/scripts/check_igrlab_cmake_aliases.cmake
 !tests/scripts/check_sigma_vtk_lifecycle.py
 !tests/scripts/check_vtk_restart.py
+!tests/scripts/test_pace_submission.py
+!tests/scripts/test_pace_manifest.py
+!tests/scripts/test_pace_discovery.py
+!tests/scripts/test_delta_site.py
+!tests/scripts/test_dependency_bindings.py
+!tests/scripts/test_mpi_test_launcher.py
+!tests/scripts/test_prebuilt_validation.py
+!tests/scripts/test_mfem_cache.py
+!tests/scripts/test_app_iteration.py
+!scripts/build/
+!scripts/build/**
 out/
 __pycache__
 # supersonic_example/backup

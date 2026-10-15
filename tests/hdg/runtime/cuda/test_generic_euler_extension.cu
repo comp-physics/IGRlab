@@ -383,6 +383,212 @@ struct CudaDirectZhangShuAudit
 struct CudaQualificationTestAccess
 {
   template <typename Engine>
+  static bool VerifySparseStagingMaps(Engine& engine)
+  {
+    const auto& numerics = engine.numerics_;
+    const auto& shape = numerics.shape_;
+    const auto& structure = numerics.true_structure_;
+    // Successful initialization releases duplicate host maps after upload.
+    // Inspect the retained device copies, so this oracle also catches an
+    // upload-lifetime error instead of validating only the discarded source.
+    const auto released = [](const std::vector<int>& values)
+    { return values.empty() && values.capacity() == 0; };
+    const auto& schwarz = numerics.element_schwarz_plan_;
+    if (!released(numerics.host_matrix_owned_source_) ||
+        !released(numerics.host_matrix_owned_section_) ||
+        !released(numerics.host_matrix_owned_target_) ||
+        !released(schwarz.signed_element_true_dofs) ||
+        !released(schwarz.first_element_sources) ||
+        !released(schwarz.second_element_sources) ||
+        !released(schwarz.true_multiplicity) ||
+        !released(schwarz.true_incidence_slots))
+      return false;
+    std::vector<int> owned_sources(shape.matrix_owned_count);
+    std::vector<int> owned_sections(shape.matrix_owned_count);
+    std::vector<int> owned_targets(shape.matrix_owned_count);
+    const auto copy = [](const int* source, std::vector<int>& values)
+    {
+      return values.empty() || cudaMemcpy(
+          values.data(), source, values.size() * sizeof(int),
+          cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    if (!copy(numerics.view_.matrix_owned_source, owned_sources) ||
+        !copy(numerics.view_.matrix_owned_section, owned_sections) ||
+        !copy(numerics.view_.matrix_owned_target, owned_targets))
+      return false;
+    int owned_entry = 0;
+    int sent_entry = 0;
+    bool valid = true;
+    for (int element = 0; element < shape.elements; ++element)
+      for (int row = 0; row < shape.trace_dofs; ++row)
+      {
+        const int encoded_row = numerics.signed_element_trace_[
+            static_cast<std::size_t>(element) * shape.trace_dofs + row];
+        const int local_row = encoded_row < 0 ? -1 - encoded_row : encoded_row;
+        const int owner = numerics.local_owner_[local_row];
+        const int true_row = numerics.local_true_index_[local_row];
+        for (int column = 0; column < shape.trace_dofs; ++column)
+        {
+          const int encoded_column = numerics.signed_element_trace_[
+              static_cast<std::size_t>(element) * shape.trace_dofs + column];
+          const int local_column = encoded_column < 0
+              ? -1 - encoded_column : encoded_column;
+          const int source = (element * shape.trace_dofs + row) *
+              shape.trace_dofs + column;
+          if (owner != numerics.rank_)
+          {
+            valid = valid && sent_entry < shape.matrix_send_count &&
+                numerics.host_matrix_send_source_[sent_entry] == source &&
+                numerics.matrix_send_keys_[2 * sent_entry] ==
+                    numerics.local_global_true_[local_row] &&
+                numerics.matrix_send_keys_[2 * sent_entry + 1] ==
+                    numerics.local_global_true_[local_column];
+            ++sent_entry;
+            continue;
+          }
+
+          // Independent linear scan: do not use production lookup/search
+          // helpers, and require the first matching CSR slot in its order.
+          const int section = numerics.local_owner_[local_column] ==
+                  numerics.rank_ ? 0 : 1;
+          int target = -1;
+          if (true_row >= 0 && true_row < shape.true_trace_count)
+          {
+            const auto& offsets = section == 0
+                ? structure.diag_offsets : structure.offd_offsets;
+            for (int entry = offsets[true_row];
+                 entry < offsets[true_row + 1]; ++entry)
+            {
+              const bool matches = section == 0
+                  ? structure.diag_columns[entry] ==
+                        numerics.local_true_index_[local_column]
+                  : structure.offd_columns[entry] ==
+                        numerics.local_global_true_[local_column];
+              if (matches)
+              {
+                target = entry;
+                break;
+              }
+            }
+          }
+          valid = valid && target >= 0 &&
+              owned_entry < shape.matrix_owned_count &&
+              owned_sources[owned_entry] == source &&
+              owned_sections[owned_entry] == section &&
+              owned_targets[owned_entry] == target;
+          ++owned_entry;
+        }
+      }
+    return valid && owned_entry == shape.matrix_owned_count &&
+        sent_entry == shape.matrix_send_count;
+  }
+
+  template <typename Engine>
+  static bool VerifyInitialStateHashesAndReferenceShapes(Engine& engine)
+  {
+    auto& numerics = engine.numerics_;
+    const auto& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        numerics.initialized_ && shape.borrowed_host_inputs &&
+        shape.elements > 0 && shape.interior_count > 0 &&
+        shape.true_trace_count > 0 && numerics.ranks_ >= 1 &&
+        numerics.ranks_ <= 2;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    local_valid = VerifySparseStagingMaps(engine);
+
+    // Independently rebuild each reference basis. Reused reference values
+    // must have exactly the original bits, including signed zeros.
+    mfem::Vector expected(shape.scalar_interior_dofs);
+    for (int element = 0; element < shape.elements; ++element)
+    {
+      const auto* fe = numerics.interior_space_->GetFE(element);
+      const auto& rule = mfem::IntRules.Get(
+          fe->GetGeomType(), shape.volume_assembly_order);
+      for (int q = 0; q < shape.volume_points; ++q)
+      {
+        fe->CalcShape(rule.IntPoint(q), expected);
+        const std::size_t offset =
+            (static_cast<std::size_t>(element) * shape.volume_points + q) *
+            shape.scalar_interior_dofs;
+        local_valid = local_valid && std::memcmp(
+            expected.HostRead(), numerics.host_volume_shape_.data() + offset,
+            static_cast<std::size_t>(shape.scalar_interior_dofs) *
+                sizeof(double)) == 0;
+      }
+    }
+
+    // Read both actual device slots and hash their bytes on the host. Merely
+    // comparing copied metadata would miss a stale or incorrectly seeded slot.
+    const auto& committed = numerics.committed_slot_;
+    const auto& candidate = numerics.candidate_slot_;
+    for (int trace = 0; trace < 2; ++trace)
+    {
+      const std::size_t count = trace ? committed.trace.count
+                                      : committed.interior.count;
+      std::array<std::vector<double>, 2> values{{
+          std::vector<double>(count), std::vector<double>(count)}};
+      for (int slot_index = 0; slot_index < 2; ++slot_index)
+      {
+        const auto& slot = slot_index ? candidate : committed;
+        const double* coefficients = trace ? slot.trace.coefficients
+                                            : slot.interior.coefficients;
+        const std::size_t actual_count = trace ? slot.trace.count
+                                               : slot.interior.count;
+        const StateHash& local_hash = trace ? slot.trace.local_hash
+                                            : slot.interior.local_hash;
+        const StateHash& aggregate_hash = trace ? slot.trace.hash
+                                                : slot.interior.hash;
+        const bool copied = actual_count == count && coefficients &&
+            CudaTransportPolicy::DeviceToHost(
+                values[slot_index].data(), coefficients,
+                count * sizeof(double),
+                CudaTransferCategory::generic_host_bridge,
+                CudaTransferSite::generic_host_export) &&
+            CudaTransportPolicy::Synchronize(
+                CudaTransferSite::generic_host_export);
+        if (!numerics.CollectiveContinue(copied)) return false;
+        const StateHash observed = HashHostBytes(
+            values[slot_index].data(), count * sizeof(double));
+        std::array<unsigned char, 64> rank_hashes{};
+        const bool gathered = MPI_Allgather(
+            observed.bytes.data(), 32, MPI_UNSIGNED_CHAR,
+            rank_hashes.data(), 32, MPI_UNSIGNED_CHAR,
+            numerics.communicator_) == MPI_SUCCESS;
+        local_valid = local_valid && gathered && observed == local_hash &&
+            HashHostBytes(rank_hashes.data(),
+                static_cast<std::size_t>(numerics.ranks_) * 32) ==
+                aggregate_hash;
+      }
+      local_valid = local_valid && std::memcmp(
+          values[0].data(), values[1].data(), count * sizeof(double)) == 0;
+    }
+    return numerics.CollectiveContinue(local_valid);
+  }
+
+  static bool VerifyInitialStateHashesAndReferenceShapes(
+      cuda::GenericEulerHdgCudaSession& session)
+  {
+    if (session.borrowed_rank1_)
+      return VerifyInitialStateHashesAndReferenceShapes(*session.borrowed_rank1_);
+    if (session.borrowed_rank2_)
+      return VerifyInitialStateHashesAndReferenceShapes(*session.borrowed_rank2_);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.partitioned_backward_euler_borrowed_rank1_);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.partitioned_backward_euler_borrowed_rank2_);
+    if (session.rodas3_borrowed_rank1_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.rodas3_borrowed_rank1_);
+    if (session.rodas3_borrowed_rank2_)
+      return VerifyInitialStateHashesAndReferenceShapes(
+          *session.rodas3_borrowed_rank2_);
+    return false;
+  }
+
+  template <typename Engine>
   static bool ApplyDirectZhangShu(
       Engine& engine, const std::vector<double>& input,
       CudaDirectZhangShuAudit& audit) noexcept
@@ -1103,7 +1309,11 @@ struct CudaQualificationTestAccess
       const auto& right = *fused_products[product];
       audit.maximum_absolute_errors[product] = 0.0;
       audit.maximum_scaled_errors[product] = 0.0;
-      audit.bitwise_equal[product] = left == right;
+      // Face-only blocks retain an exact gate, including signed zero.
+      // Volume products still use the existing FP64 roundoff bound below.
+      audit.bitwise_equal[product] = left.size() == right.size() &&
+          (left.empty() || std::memcmp(left.data(), right.data(),
+                                      left.size() * sizeof(double)) == 0);
       bool finite = left.size() == right.size();
       for (std::size_t index = 0; finite && index < left.size(); ++index)
       {
@@ -1135,7 +1345,10 @@ struct CudaQualificationTestAccess
                ? audit.maximum_scaled_errors[product] <= tensor_tolerance
                : audit.bitwise_equal[product]);
     }
-    audit.status_bitwise_equal = split.status == fused.status;
+    audit.status_bitwise_equal = split.status.size() == fused.status.size() &&
+        (split.status.empty() || std::memcmp(
+            split.status.data(), fused.status.data(),
+            split.status.size() * sizeof(double)) == 0);
     audit.status_all_passed = std::all_of(
         fused.status.begin(), fused.status.end(),
         [](const double value) { return value == 1.0; });
@@ -6108,9 +6321,11 @@ bool CheckLifecycle(const int order, const bool physical,
                     const SourceMode source_mode,
                     const InitialMode initial_mode,
                     std::vector<double>& committed_result,
-                    long double* source_only_response = nullptr)
+                    long double* source_only_response = nullptr,
+                    const int physical_elements_per_direction = 3)
 {
-  mfem::ParMesh mesh = physical ? MakePhysicalMesh() : MakePeriodicMesh();
+  mfem::ParMesh mesh = physical
+      ? MakePhysicalMesh(physical_elements_per_direction) : MakePeriodicMesh();
   BorrowedFields fields = MakeBorrowedFields(
       mesh, order, source_mode, initial_mode);
   const std::vector<double> expected_initial = fields.initial;
@@ -6184,6 +6399,13 @@ bool CheckLifecycle(const int order, const bool physical,
       initialized.status == HdgEulerSessionStatus::initialized,
       request.communicator);
   if (!initialized_everywhere) return false;
+  if (!CudaQualificationTestAccess::VerifyInitialStateHashesAndReferenceShapes(
+          session))
+  {
+    std::cerr << "CUDA initial state hash/reference shape/staging map mismatch order="
+              << order << '\n';
+    return false;
+  }
   bool initial_transfer = false;
   const bool initial_export = export_committed(
       committed_initial, sigma_initial, initial_transfer);
@@ -8588,6 +8810,7 @@ struct Options
       EulerHdgTimeTreatment::backward_euler;
   bool assembly_arithmetic_only = false;
   bool partitioned_smoke = false;
+  bool high_order_smoke = false;
   bool rodas3_screen = false;
   bool rodas3_rank2_screen = false;
 };
@@ -8641,6 +8864,12 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       options.partitioned_smoke = true;
       continue;
     }
+    if (argument == "--high-order-smoke")
+    {
+      if (options.high_order_smoke) return false;
+      options.high_order_smoke = true;
+      continue;
+    }
     if (argument == "--rodas3-screen")
     {
       options.rodas3_screen = true;
@@ -8659,14 +8888,48 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       EulerHdgTimeTreatment::rodas3;
   const bool any_rodas3_screen = options.rodas3_screen ||
       options.rodas3_rank2_screen;
-  return options.order >= dg::hdg::generic::minimum_polynomial_order &&
-      options.order <= dg::hdg::generic::maximum_polynomial_order &&
+  return dg::hdg::generic::PlanPolynomialShape(options.order, true).valid &&
       options.partitioned_smoke == partitioned_selected &&
       any_rodas3_screen == rodas3_selected &&
       !(options.rodas3_screen && options.rodas3_rank2_screen) &&
+      (!options.high_order_smoke ||
+       (options.order > 3 && !options.partitioned_smoke &&
+        !any_rodas3_screen && !options.assembly_arithmetic_only)) &&
       (!options.assembly_arithmetic_only ||
        (options.engine == CudaEngineKind::tensor_core &&
         !options.partitioned_smoke && !any_rodas3_screen));
+}
+
+bool CheckSparseOwnedRowLookup()
+{
+  using dg::hdg::runtime::cuda_w8a::detail::CudaSparseOwnedRowLookup;
+  CudaSparseOwnedRowLookup lookup;
+  if (!lookup.Initialize(8)) return false;
+  // Diagonal-first/sorted tail, unsorted duplicates, disjoint and empty rows.
+  // Revisit earlier rows to catch stale targets from a more recent row.
+  const std::vector<int> columns{5, 0, 2, 5, 7, 3, 7, 1, 3, 6, 0, 2};
+  const std::array<int, 5> offsets{{0, 5, 9, 9, 12}};
+  const std::array<int, 7> visits{{0, 1, 2, 3, 0, 1, 3}};
+  for (const int row : visits)
+    for (int column = 0; column < 8; ++column)
+    {
+      int expected = -1;
+      for (int entry = offsets[row]; entry < offsets[row + 1]; ++entry)
+        if (columns[entry] == column)
+        {
+          expected = entry;
+          break;
+        }
+      if (lookup.Find(columns, offsets[row], offsets[row + 1], column) !=
+          expected)
+        return false;
+    }
+  const int beyond_cap = static_cast<int>(
+      CudaSparseOwnedRowLookup::maximum_bytes / sizeof(int)) + 1;
+  return !lookup.Admits(-1) && !lookup.Admits(8) &&
+      !lookup.Initialize(beyond_cap) && !lookup.Admits(0) &&
+      lookup.Initialize(8) &&
+      lookup.Find(columns, offsets[0], offsets[1], 5) == 0;
 }
 
 bool CheckRecoveryDispatchAdmission() noexcept
@@ -8704,24 +8967,52 @@ int main(int argc, char* argv[])
   {
     if (rank == 0)
       std::cerr << "Usage: " << argv[0]
-                << " --order 1|2|3 [--engine ordinary|tensor]"
+                << " --order P [--engine ordinary|tensor]"
                    " [--time-treatment backward-euler|"
                    "partitioned-backward-euler|rodas3]"
-                   " [--partitioned-smoke|--rodas3-screen|"
+                   " [--high-order-smoke|--partitioned-smoke|--rodas3-screen|"
                    "--rodas3-rank2-screen|--assembly-arithmetic-only]\n";
     return 2;
   }
   const int order = options.order;
+  if (options.high_order_smoke && ranks != 1)
+  {
+    if (rank == 0)
+      std::cerr << "--high-order-smoke requires exactly one MPI rank\n";
+    return 2;
+  }
   selected_cuda_engine = options.engine;
   selected_time_treatment = options.time_treatment;
-  const bool admission = options.rodas3_screen ||
-      options.rodas3_rank2_screen ||
-      (order > 0 && CheckContractAdmission(order));
+  const bool admission = CheckSparseOwnedRowLookup() &&
+      (options.rodas3_screen || options.rodas3_rank2_screen ||
+       (order > 0 && CheckContractAdmission(order)));
   mfem::Device device("cuda");
   (void)device;
   if (options.assembly_arithmetic_only)
     return ranks == 1 && admission && MeasureAssemblyArithmetic(order,rank)
         ? EXIT_SUCCESS : EXIT_FAILURE;
+  if (options.high_order_smoke)
+  {
+    std::vector<double> conventional;
+    std::vector<double> igr;
+    const bool conventional_passed = CheckLifecycle(
+        order, true, RegularizationKind::none, SourceMode::nonzero,
+        InitialMode::smooth_periodic, conventional, nullptr, 1);
+    const bool igr_passed = CheckLifecycle(
+        order, false, RegularizationKind::igr, SourceMode::empty,
+        InitialMode::smooth_periodic, igr);
+    const bool passed = All(ranks == 1 && admission &&
+        conventional_passed && igr_passed);
+    if (rank == 0)
+      std::cout << "HDG high-order CUDA lifecycle smoke order=" << order
+                << " engine="
+                << (options.engine == CudaEngineKind::tensor_core
+                        ? "tensor" : "ordinary")
+                << " physical_elements=1 periodic_igr_elements=9"
+                << " dt=1e-5 conventional=" << conventional_passed
+                << " igr=" << igr_passed << " passed=" << passed << '\n';
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (options.rodas3_screen)
     return ranks == 1 && CheckRodas3RankOneScreen(rank)
         ? EXIT_SUCCESS : EXIT_FAILURE;

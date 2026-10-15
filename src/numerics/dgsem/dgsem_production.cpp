@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <initializer_list>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -33,6 +34,35 @@ namespace mfem
 {
 namespace dgsem
 {
+namespace
+{
+// MFEM matrix/vector sizes and the packed kernel offsets use signed int.
+// Check products before computing them or asking an allocator to use them.
+bool FitsDGSEMIndexProduct(std::initializer_list<int> factors)
+{
+  int product = 1;
+  for (const int factor : factors)
+  {
+    if (factor < 0 ||
+        (factor != 0 && product > std::numeric_limits<int>::max() / factor))
+      return false;
+    product *= factor;
+  }
+  return true;
+}
+
+bool DGSEMOrderExtents(int dim, int order, int& n1d, int& dof)
+{
+  if ((dim != 1 && dim != 2) || order < 1 ||
+      order == std::numeric_limits<int>::max()) return false;
+  n1d = order + 1;
+  // The one-dimensional derivative matrices are dense even in 1D.
+  if (!FitsDGSEMIndexProduct({n1d, n1d})) return false;
+  dof = dim == 1 ? n1d : n1d * n1d;
+  return true;
+}
+}
+
 namespace overintegration_internal
 {
 void BuildVolumeQuadratureMaps2D(const FiniteElement& fe,
@@ -44,6 +74,8 @@ void BuildVolumeQuadratureMaps2D(const FiniteElement& fe,
                 fe.GetMapType()==FiniteElement::VALUE,
               "Overintegrated volume maps require value-mapped 2D quadrilaterals.");
   const int dof=fe.GetDof(),nq=rule.GetNPoints();
+  MFEM_VERIFY(dof>0&&nq>0&&FitsDGSEMIndexProduct({dof,2,nq}),
+              "Overintegrated volume maps exceed MFEM integer indexing.");
   interpolation.SetSize(nq,dof);weak_derivative.SetSize(dof,2*nq);
   interpolation.GetMemory().UseDevice(true);weak_derivative.GetMemory().UseDevice(true);
   real_t* b=interpolation.HostWrite();real_t* g=weak_derivative.HostWrite();
@@ -74,17 +106,10 @@ int RequestedVolumeQuadratureOrder()
   const char* raw=::igrlab::GetEnv("DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER");
   if(!raw)return 0;
   errno=0;char* end=nullptr;const long value=std::strtol(raw,&end,10);
-  MFEM_VERIFY(raw[0]&&end&&!*end&&errno==0&&value>=0&&value<=26,
-    "DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER must be an integer in [0,26].");
+  MFEM_VERIFY(raw[0]&&end&&!*end&&errno==0&&value>=0&&
+                value<=std::numeric_limits<int>::max(),
+    "DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER must be a nonnegative native integer.");
   return static_cast<int>(value);
-}
-
-// Explicit research extension; default qualification remains p1--p4.
-// Generic packed kernels and the fused path are independently checked to p7.
-inline int MaximumDGSEMProductionOrder()
-{
-  return ::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", false)
-      ? 7 : 4;
 }
 
 inline int AbsoluteDof(int vdof)
@@ -574,13 +599,11 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   {
     return DGSEMProductionReason::UnsupportedDimension;
   }
-  if (m.order < 1 || m.order > MaximumDGSEMProductionOrder())
+  int n1d = 0, expected_dof = 0;
+  if (!DGSEMOrderExtents(m.dimension, m.order, n1d, expected_dof))
   {
     return DGSEMProductionReason::UnsupportedOrder;
   }
-  const int n1d = m.order + 1;
-  const int expected_dof =
-    m.dimension == 1 ? n1d : n1d * n1d;
   if (m.elements <= 0 || m.dofs_per_element != expected_dof)
   {
     return DGSEMProductionReason::UnsupportedTensorElement;
@@ -589,6 +612,9 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   {
     return DGSEMProductionReason::UnsupportedEquationCount;
   }
+  if (!FitsDGSEMIndexProduct({m.elements, expected_dof,
+                             m.dimension, m.equations}))
+    return DGSEMProductionReason::UnsupportedTensorElement;
   const int rows = m.elements * m.dofs_per_element;
   if (!m.lex_to_local || m.lex_to_local->Size() != m.dofs_per_element)
   {
@@ -663,7 +689,8 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
 
   if (!m.inverse_mass || m.inverse_mass->Height() != rows ||
       (m.inverse_mass->Width() != m.dofs_per_element &&
-       m.inverse_mass->Width() != 1))
+       m.inverse_mass->Width() != 1) ||
+      !FitsDGSEMIndexProduct({rows, m.inverse_mass->Width()}))
   {
     return DGSEMProductionReason::InvalidMetric;
   }
@@ -693,7 +720,8 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
     return DGSEMProductionReason::InvalidFaceRange;
   }
   const int nfaces = m.normals->Height();
-  if (m.normals->Width() != m.dimension ||
+  if (!FitsDGSEMIndexProduct({nfaces, m.equations}) ||
+      m.normals->Width() != m.dimension ||
       m.face_weights->Size() != nfaces ||
       m.left_elements->Size() != nfaces ||
       m.left_local_dofs->Size() != nfaces ||
@@ -1233,7 +1261,9 @@ void PrepareOverintegratedVolume(DGSEMProductionCache& c,
                 mesh->SpaceDimension()==2&&!mesh->Nonconforming(),
               "Overintegrated DGSEM volume currently requires conforming affine FP64 2D quadrilaterals.");
   const auto& fe=*vfes.GetFE(0);const int p=fe.GetOrder();
-  MFEM_VERIFY(p>=1&&p<=7,"Overintegrated DGSEM volume supports p1 through p7.");
+  int n1d=0,dof=0;
+  MFEM_VERIFY(DGSEMOrderExtents(2,p,n1d,dof)&&dof==c.dof,
+              "Overintegrated DGSEM volume exceeds its runtime tensor indexing.");
   if(c.sigma_field)
   {
     MFEM_VERIFY(c.sigma_fes&&dynamic_cast<const L2_FECollection*>(c.sigma_fes->FEColl())&&
@@ -1243,10 +1273,19 @@ void PrepareOverintegratedVolume(DGSEMProductionCache& c,
   if(mesh->GetNodes())
     MFEM_VERIFY(mesh->GetNodes()->FESpace()->GetMaxElementOrder()<=p,
                 "Overintegrated DGSEM volume requires geometry degree <= state degree.");
-  const auto& ir=IntRules.Get(Geometry::SQUARE,std::max(2*p,requested));
+  const int quadrature_order=std::max(2*p,requested);
+  const int quadrature_n1d=quadrature_order/2+1;
+  // IntRules uses a tensor Gauss-Legendre rule here. Bound its point count
+  // before construction, then check the actual rule and map sizes below.
+  MFEM_VERIFY(FitsDGSEMIndexProduct({quadrature_n1d,quadrature_n1d})&&
+                FitsDGSEMIndexProduct({c.ne,quadrature_n1d,quadrature_n1d,8})&&
+                FitsDGSEMIndexProduct({c.dof,2,quadrature_n1d,quadrature_n1d}),
+              "Overintegrated volume exceeds MFEM integer indexing.");
+  const auto& ir=IntRules.Get(Geometry::SQUARE,quadrature_order);
   const int nq=ir.GetNPoints();
-  MFEM_VERIFY(std::size_t(c.ne)*nq<=std::size_t(std::numeric_limits<int>::max()),
-              "Overintegrated volume exceeds MFEM row indexing.");
+  MFEM_VERIFY(FitsDGSEMIndexProduct({c.ne,nq,8})&&
+                FitsDGSEMIndexProduct({c.dof,2,nq}),
+              "Overintegrated volume exceeds MFEM integer indexing.");
   const int qrows=c.ne*nq;
   overintegration_internal::BuildVolumeQuadratureMaps2D(fe,ir,c.volume_interpolation,c.volume_weak_derivative);
   c.volume_quadrature_metrics.SetSize(qrows,4);
@@ -1985,16 +2024,15 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   }
 
   std::vector<int> reference_lex_to_local;
+  int n1d = 0, expected_dof = 0;
   if (topology_reason == DGSEMProductionReason::None)
   {
     topology_order = op_->vfes.GetFE(0)->GetOrder();
-    if (topology_order < 1 || topology_order > MaximumDGSEMProductionOrder())
+    if (!DGSEMOrderExtents(op_->dim, topology_order, n1d, expected_dof))
     {
       topology_reason = DGSEMProductionReason::UnsupportedOrder;
     }
   }
-  const int n1d = topology_order + 1;
-  const int expected_dof = op_->dim == 1 ? n1d : n1d * n1d;
   const Geometry::Type expected_geometry =
     op_->dim == 1 ? Geometry::SEGMENT : Geometry::SQUARE;
   if (topology_reason == DGSEMProductionReason::None)
@@ -2377,19 +2415,20 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     }
     const FiniteElement& first_fe = *op_->vfes.GetFE(0);
     const int order = first_fe.GetOrder();
-    if (order < 1 || order > MaximumDGSEMProductionOrder())
+    int expected_dof = 0;
+    if (!DGSEMOrderExtents(op_->dim, order, c.n1d, expected_dof))
     {
       return fail(DGSEMProductionReason::UnsupportedOrder);
     }
     c.selection.order = order;
-    c.n1d = order + 1;
     c.dof = first_fe.GetDof();
-    c.rows = c.ne * c.dof;
-    const int expected_dof = op_->dim == 1 ? c.n1d : c.n1d * c.n1d;
     if (c.dof != expected_dof)
     {
       return fail(DGSEMProductionReason::UnsupportedTensorElement);
     }
+    if (!FitsDGSEMIndexProduct({c.ne, c.dof, op_->dim, c.equations}))
+      return fail(DGSEMProductionReason::UnsupportedTensorElement);
+    c.rows = c.ne * c.dof;
 
     c.lex_to_local.SetSize(c.dof);
     c.lex_to_local = -1;
@@ -2438,6 +2477,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       }
     }
 
+    if (!FitsDGSEMIndexProduct({c.rows, diagonal_inverse_mass ? 1 : c.dof}))
+      return fail(DGSEMProductionReason::UnsupportedTensorElement);
     c.element_vdofs.SetSize(c.rows * c.equations);
     c.inverse_mass.SetSize(c.rows, diagonal_inverse_mass ? 1 : c.dof);
     c.coordinates.SetSize(c.rows, op_->dim);
@@ -2640,6 +2681,9 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
                            const IntegrationPoint* neighbor_point,
                            const LoweredEulerBoundary& boundary)
     {
+      MFEM_VERIFY(left_elements.size() <
+                    std::size_t(std::numeric_limits<int>::max() / c.equations),
+                  "Packed DGSEM faces exceed MFEM integer indexing.");
       left_elements.push_back(element_l);
       left_local.push_back(local_l);
       right_elements.push_back(element_r);
@@ -3016,7 +3060,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
         return fail(DGSEMProductionReason::UnsupportedSigma);
       }
       c.sigma_ldof = scalar_fes->GetFE(0)->GetDof();
-      if (c.sigma_ldof <= 0)
+      if (c.sigma_ldof <= 0 ||
+          !FitsDGSEMIndexProduct({nfaces, c.sigma_ldof}))
       {
         return fail(DGSEMProductionReason::UnsupportedSigma);
       }
@@ -3029,6 +3074,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       }
       else
       {
+        if (!FitsDGSEMIndexProduct({c.rows, c.sigma_ldof}))
+          return fail(DGSEMProductionReason::UnsupportedSigma);
         c.sigma_element_dofs.SetSize(c.rows * c.sigma_ldof);
         c.sigma_interpolation.SetSize(c.rows, c.sigma_ldof);
         Array<int> scalar_dofs;
@@ -3144,6 +3191,11 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.contravariant_flux.SetSize(c.rows, op_->dim * c.equations);
     if (c.llf_volume_active)
     {
+      const int lines = op_->dim == 1 ? 1 : c.n1d;
+      const int pairs_per_line = c.n1d * (c.n1d - 1) / 2;
+      if (!FitsDGSEMIndexProduct({c.ne, op_->dim, lines,
+                                 pairs_per_line, c.equations}))
+        return fail(DGSEMProductionReason::UnsupportedTensorElement);
       c.volume_pair_dissipation.SetSize(
         DGSEMVolumePairCount(op_->dim, c.ne, c.n1d), c.equations);
     }
@@ -3585,14 +3637,14 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   const bool subcell_blend = ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_SUBCELL_BLEND", false);
   MFEM_VERIFY(!subcell_blend || (fused_residual && c.n1d >= 4),
-      "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p7 path.");
+      "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p10 path.");
   MFEM_VERIFY(!fused_dmma || fused_residual,
               "DG_IGR_DGSEM_FUSED_DMMA requires DG_IGR_DGSEM_FUSED_RESIDUAL.");
   if (fused_residual)
   {
-    MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 8 &&
+    MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 11 &&
         c.inverse_mass.Width() == 1 && Device::Allows(Backend::CUDA_MASK),
-        "DG_IGR_DGSEM_FUSED_RESIDUAL requires CUDA 2D p1--p7 with "
+        "DG_IGR_DGSEM_FUSED_RESIDUAL requires CUDA 2D p1--p10 with "
         "compact diagonal mass.");
     if (!c.fused_residual_logged)
     {

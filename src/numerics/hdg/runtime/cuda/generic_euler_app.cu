@@ -17,6 +17,12 @@ GenericEulerHdgCudaAppSession::Initialize(
     const generic::EulerHdgRequest& request) noexcept
 { return session_->Initialize(request); }
 
+GenericEulerHdgCudaAppSession::result_type
+GenericEulerHdgCudaAppSession::Initialize(
+    const generic::EulerHdgRequest& request,
+    const cuda_w8a::CudaTracePolicyKind trace_policy) noexcept
+{ return session_->InitializeRequest(request, trace_policy); }
+
 std::uint32_t GenericEulerHdgCudaAppSession::capabilities() const noexcept
 { return session_->capabilities(); }
 

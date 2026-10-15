@@ -318,22 +318,19 @@ else()
   list(APPEND _arguments --time-step-save "${HDG_MAIN_DT_SAVE}" --vtk_save)
 endif()
 
-if(HDG_MAIN_RANKS EQUAL 1)
-  execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E env
-      "DG_IGR_VTK_PREFIX_PATH=${HDG_MAIN_OUTPUT}"
-      "${HDG_MAIN_EXECUTABLE}" ${_arguments}
-    RESULT_VARIABLE _status OUTPUT_VARIABLE _stdout ERROR_VARIABLE _stderr)
-else()
-  execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E env
-      "DG_IGR_VTK_PREFIX_PATH=${HDG_MAIN_OUTPUT}"
-      "${HDG_MAIN_MPIEXEC}" "${HDG_MAIN_NUMPROC_FLAG}" "${HDG_MAIN_RANKS}"
-      ${HDG_MAIN_MPIEXEC_PREFLAGS}
-      "${HDG_MAIN_EXECUTABLE}" ${_arguments}
-      ${HDG_MAIN_MPIEXEC_POSTFLAGS}
-    RESULT_VARIABLE _status OUTPUT_VARIABLE _stdout ERROR_VARIABLE _stderr)
-endif()
+# This script invokes a target-file path, so CMake's TEST_LAUNCHER does not
+# apply to its child process. Use the selected MPI launcher even for rank one:
+# singleton MPI initialization is unavailable on some Slurm/OpenMPI builds.
+set(_application_command
+  "${HDG_MAIN_MPIEXEC}" "${HDG_MAIN_NUMPROC_FLAG}" "${HDG_MAIN_RANKS}"
+  ${HDG_MAIN_MPIEXEC_PREFLAGS}
+  "${HDG_MAIN_EXECUTABLE}" ${HDG_MAIN_MPIEXEC_POSTFLAGS}
+  ${_arguments})
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" -E env
+    "DG_IGR_VTK_PREFIX_PATH=${HDG_MAIN_OUTPUT}"
+    ${_application_command}
+  RESULT_VARIABLE _status OUTPUT_VARIABLE _stdout ERROR_VARIABLE _stderr)
 
 if(DEFINED HDG_MAIN_EXPECT_REJECTION_PATTERN)
   set(_combined_output "${_stdout}\n${_stderr}")
@@ -359,7 +356,7 @@ if(HDG_MAIN_VERIFY_REPEATABLE_OUTPUT AND NOT HDG_MAIN_NO_VTK)
   execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
       "DG_IGR_VTK_PREFIX_PATH=${_repeat_output}"
-      "${HDG_MAIN_EXECUTABLE}" ${_arguments}
+      ${_application_command}
     RESULT_VARIABLE _repeat_status
     OUTPUT_VARIABLE _repeat_stdout
     ERROR_VARIABLE _repeat_stderr)

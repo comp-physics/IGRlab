@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 include(CheckLanguage)
 include(cmake/IGRlabCompatibility.cmake)
+include(cmake/IGRlabMPITestLauncher.cmake)
 igrlab_cache_alias(IGRLAB_BUILD_TESTS DG_IGR_BUILD_TESTS
                    BOOL ON "Build IGRlab correctness tests")
 igrlab_cache_alias(IGRLAB_ENABLE_HDG_EULER_EXPERIMENT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
@@ -274,3 +275,5 @@ add_subdirectory(examples/dgsem_supersonic_cylinder)
 if(BUILD_TESTING AND DG_IGR_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
+
+igrlab_configure_mpi_test_launchers()

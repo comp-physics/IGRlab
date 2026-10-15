@@ -10,14 +10,21 @@
 #include "mfem.hpp"
 #include "test_utils.hpp"
 
+#ifdef MFEM_USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <memory>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -357,6 +364,9 @@ struct DimensionalKernelErrors
   double volume = 0.0;
   double surface = 0.0;
   double inverse_mass = 0.0;
+  int inverse_mass_order = 0;
+  std::string inverse_mass_representation;
+  double inverse_mass_reference_scale = 0.0;
   double constant_residual = 0.0;
   double local_conservation = 0.0;
   double reduction = 0.0;
@@ -404,6 +414,28 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
   const std::string requested = RequestedDevice();
   EnsureDeviceConfigured(ctx, requested);
   const auto runtime = mfem::dgsem::GetDGSEMDeviceRuntimeInfo();
+  bool fp64_tensor_supported = false;
+  if (runtime.cuda)
+  {
+#ifdef MFEM_USE_CUDA
+    int compute_major = 0;
+    const cudaError_t status = cudaDeviceGetAttribute(
+        &compute_major, cudaDevAttrComputeCapabilityMajor, mfem::Device::GetId());
+    ctx.Check(status == cudaSuccess && compute_major > 0,
+              "DGSEM CUDA tensor parity capability query succeeds");
+    if (status != cudaSuccess || compute_major <= 0) { return; }
+    fp64_tensor_supported = compute_major >= 8;
+    if (!fp64_tensor_supported)
+    {
+      std::cout << "[SKIP] DGSEM FP64 DMMA tensor parity subcases require CUDA "
+                   "compute capability major 8 or newer; configured major="
+                << compute_major << ". Ordinary SIMT parity remains enabled.\n";
+    }
+#else
+    ctx.Check(false, "DGSEM CUDA tensor parity requires CUDA compilation");
+    return;
+#endif
+  }
 
   double max_basis_error = 0.0;
   std::array<DimensionalKernelErrors, 2> dimension_errors;
@@ -421,7 +453,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     double& max_local_conservation = errors.local_conservation;
     double& max_reduction_error = errors.reduction;
 
-    for (int order = 1; order <= 7; ++order)
+    for (int order = 1; order <= 10; ++order)
     {
       const auto& basis = mfem::dgsem::GetLGLBasis1D(order);
       const int n1d = basis.n;
@@ -868,7 +900,9 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           for (bool frozen_speed : {false, true})
           for (bool tensor_contraction : {false, true})
           {
-            mfem::DenseMatrix fused;
+            if (tensor_contraction && !fp64_tensor_supported) { continue; }
+            mfem::DenseMatrix fused(dof, 4);
+            fused = std::numeric_limits<mfem::real_t>::quiet_NaN();
             mfem::Vector fused_speeds, ordinary_speeds;
             mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma,
                 rho_floor, llf, frozen_speed, lex_to_local, basis.Dsplit,
@@ -880,8 +914,10 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                 rho_floor, states, sigma, ordinary_speeds, frozen_speed);
             ctx.Check(MaxDifference(fused, expected) < 32.0 * pointwise_tol,
                       tensor_contraction
-                        ? "Fused FP64 DMMA residual matches central/LLF host algebra"
-                        : "Fused FP64 SIMT residual matches central/LLF host algebra");
+                        ? "Fused FP64 DMMA residual matches central/LLF host algebra p" +
+                            std::to_string(order)
+                        : "Fused FP64 SIMT residual matches central/LLF host algebra p" +
+                            std::to_string(order));
             fused_speeds.HostRead(); ordinary_speeds.HostRead();
             double speed_error = 0.0;
             for (int row = 0; row < dof; ++row)
@@ -952,6 +988,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           for (double factor : {0.0, 0.37, 1.0})
             for (bool tensor : {false, true})
             {
+              if (tensor && !fp64_tensor_supported) { continue; }
               blend = factor;
               mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
                   false, true, lex_to_local, basis.Dsplit, basis.weights, states,
@@ -1057,6 +1094,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           }
         for (bool tensor_contraction : {false, true})
         {
+          if (tensor_contraction && !fp64_tensor_supported) { continue; }
           mfem::DenseMatrix fused;
           mfem::Vector fused_speeds;
           mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
@@ -1081,6 +1119,13 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
       mfem::DenseMatrix inverse_mass(inverse_rows, dof);
       inverse_mass = 0.0;
       mfem::DenseMatrix weak(inverse_rows, num_equations);
+      const bool mass_consistent_fixture = order > 4;
+      mfem::DenseMatrix strong_target;
+      if (mass_consistent_fixture)
+      {
+        strong_target.SetSize(inverse_rows, num_equations);
+      }
+      bool valid_mass_consistent_fixture = true;
       for (int element = 0; element < inverse_ne; ++element)
       {
         for (int local = 0; local < dof; ++local)
@@ -1097,15 +1142,53 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           }
           inverse_mass(element * dof + local, local) =
             (1.0 + 0.125 * element) / tensor_weight;
+          const mfem::real_t diagonal =
+              inverse_mass(element * dof + local, local);
+          if (mass_consistent_fixture)
+          {
+            valid_mass_consistent_fixture =
+                valid_mass_consistent_fixture &&
+                std::isfinite(static_cast<double>(diagonal)) && diagonal >= 1.0;
+          }
           for (int equation = 0; equation < num_equations; ++equation)
           {
-            weak(element * dof + local, equation) =
+            const mfem::real_t target =
               0.1 * (1 + element) + 0.03 * local - 0.02 * equation;
+            // Retain the original p1-p4 data exactly. At higher orders use
+            // weak = M*f for a bounded nodal target f: inverse LGL endpoint
+            // weights otherwise amplify this artificial residual as p^4.
+            // This rule depends only on the quadrature mass, not a measured
+            // error or a device's multiply/add contraction policy.
+            weak(element * dof + local, equation) =
+                mass_consistent_fixture ? target / diagonal : target;
+            if (mass_consistent_fixture)
+            {
+              strong_target(element * dof + local, equation) = target;
+            }
           }
         }
       }
+      if (mass_consistent_fixture)
+      {
+        ctx.Check(valid_mass_consistent_fixture,
+                  "High-order inverse-mass fixture has finite positive LGL mass");
+        if (!valid_mass_consistent_fixture) { return; }
+      }
       mfem::DenseMatrix device_strong;
       mfem::DenseMatrix host_strong(inverse_rows, num_equations);
+      const auto record_inverse_mass_error =
+          [&](const char* representation, const mfem::DenseMatrix& actual,
+              const mfem::DenseMatrix& reference)
+          {
+            const double error = MaxDifference(actual, reference);
+            if (error > max_inverse_mass_error)
+            {
+              max_inverse_mass_error = error;
+              errors.inverse_mass_order = order;
+              errors.inverse_mass_representation = representation;
+              errors.inverse_mass_reference_scale = MaxAbs(reference);
+            }
+          };
       mfem::dgsem::ApplyInverseMassDevice(inverse_ne,
                                           dof,
                                           inverse_mass,
@@ -1127,9 +1210,15 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           }
         }
       }
-      max_inverse_mass_error =
-        std::max(max_inverse_mass_error,
-                 MaxDifference(device_strong, host_strong));
+      record_inverse_mass_error("dense-diagonal", device_strong, host_strong);
+      if (mass_consistent_fixture)
+      {
+        ctx.Check(MaxDifference(device_strong, strong_target) <=
+                      mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
+                  "DGSEM " + std::to_string(dim) + "D p" +
+                      std::to_string(order) +
+                      " inverse mass reconstructs the mass-consistent nodal target");
+      }
 
       // The collocated mass has an exact compact representation. Exercise
       // both device branches on identical data before introducing a truly
@@ -1145,9 +1234,8 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                           diagonal_mass,
                                           weak,
                                           diagonal_strong);
-      max_inverse_mass_error =
-        std::max(max_inverse_mass_error,
-                 MaxDifference(diagonal_strong, device_strong));
+      record_inverse_mass_error("compact-vs-dense", diagonal_strong,
+                                device_strong);
 
       inverse_mass.HostReadWrite();
       for (int row = 0; row < inverse_rows; ++row)
@@ -1165,25 +1253,50 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                           inverse_mass,
                                           weak,
                                           device_strong);
+      long double maximum_absolute_dot = 0.0L;
       for (int row = 0; row < inverse_rows; ++row)
       {
         for (int equation = 0; equation < num_equations; ++equation)
         {
           double value = 0.0;
+          long double absolute_dot = 0.0L;
           for (int j = 0; j < dof; ++j)
           {
             value += inverse_mass(row, j) *
                      weak((row / dof) * dof + j, equation);
+            if (mass_consistent_fixture)
+            {
+              absolute_dot +=
+                  std::abs(static_cast<long double>(inverse_mass(row, j)) *
+                           static_cast<long double>(
+                               weak((row / dof) * dof + j, equation)));
+            }
           }
           host_strong(row, equation) = value;
+          maximum_absolute_dot = std::max(maximum_absolute_dot, absolute_dot);
         }
       }
-      max_inverse_mass_error =
-        std::max(max_inverse_mass_error,
-                 MaxDifference(device_strong, host_strong));
+      record_inverse_mass_error("dense-full", device_strong, host_strong);
+      if (mass_consistent_fixture)
+      {
+        // Each unfused n-term dot has forward error <= gamma_(2n)*sum|a*b|;
+        // FMA is covered by that same bound. Two such FP64 evaluations stay
+        // within the frozen absolute gate without changing that gate.
+        const long double roundoff =
+            0.5L * std::numeric_limits<double>::epsilon();
+        const long double operations = 2.0L * dof;
+        const long double gamma_n =
+            operations * roundoff / (1.0L - operations * roundoff);
+        ctx.Check(2.0L * gamma_n * maximum_absolute_dot <=
+                      mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
+                  "High-order inverse-mass fixture roundoff bound fits the frozen gate");
+        ctx.Check(MaxDifference(host_strong, diagonal_strong) >
+                      100.0 * mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
+                  "High-order inverse-mass dense perturbation remains nontrivial");
+      }
     }
 
-    for (int face_order = 1; face_order <= 4; ++face_order)
+    for (int face_order = 1; face_order <= 10; ++face_order)
     {
       const auto& face_basis = mfem::dgsem::GetLGLBasis1D(face_order);
       const int face_n1d = face_basis.n;
@@ -1431,7 +1544,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     std::max(dimension_errors[0].reduction, dimension_errors[1].reduction);
 
   ctx.Check(max_basis_error <= mfem::dgsem::DGSEMReferenceTolerances::sbp,
-            "DGSEM MFEM device p1-p4 basis parity uses frozen SBP gate");
+            "DGSEM MFEM device p1-p10 basis parity uses frozen SBP gate");
   for (int dim = 1; dim <= 2; ++dim)
   {
     const auto& errors = dimension_errors[static_cast<std::size_t>(dim - 1)];
@@ -1439,31 +1552,43 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     if (dim == 2)
     {
       ctx.Check(errors.metric <= metric_tol,
-                "DGSEM MFEM device direct p1-p4 2D sheared metric parity");
+                "DGSEM MFEM device direct p1-p10 2D sheared metric parity");
     }
     ctx.Check(errors.sigma_flux <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " frozen scalar-sigma tensor-flux parity");
     ctx.Check(errors.volume <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " central volume parity");
     ctx.Check(errors.surface <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " local/shared/boundary surface parity");
+    std::ostringstream inverse_mass_details;
+    if (errors.inverse_mass >
+        mfem::dgsem::DGSEMReferenceTolerances::inverse_mass)
+    {
+      inverse_mass_details << std::setprecision(17)
+          << "; worst_order=" << errors.inverse_mass_order
+          << " representation=" << errors.inverse_mass_representation
+          << " max_abs_error=" << errors.inverse_mass
+          << " reference_scale=" << errors.inverse_mass_reference_scale
+          << " tolerance="
+          << mfem::dgsem::DGSEMReferenceTolerances::inverse_mass;
+    }
     ctx.Check(errors.inverse_mass <=
                 mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
-                " inverse-mass parity");
+              "DGSEM MFEM device direct p1-p10 " + dimension +
+                " inverse-mass parity" + inverse_mass_details.str());
     ctx.Check(errors.constant_residual <=
                 mfem::dgsem::DGSEMReferenceTolerances::constant_affine,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " constant-state cancellation");
     ctx.Check(errors.local_conservation <=
                 mfem::dgsem::DGSEMReferenceTolerances::conservation,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " component-wise local-face conservation");
     ctx.Check(errors.reduction <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " deterministic speed reduction parity");
   }
   ctx.Check(
@@ -1509,7 +1634,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
         << mfem::MemoryTypeName[static_cast<int>(runtime.device_memory_type)]
         << "\",\n"
         << "  \"dimensions\": [1,2],\n"
-        << "  \"orders\": [1,2,3,4,5,6,7],\n"
+        << "  \"orders\": [1,2,3,4,5,6,7,8,9,10],\n"
         << "  \"direct_kernel_dimensions\": {\"basis\":[1,2],"
            "\"metric\":[2],\"euler_sigma_flux\":[1,2],"
            "\"volume\":[1,2],\"surface\":[1,2],"

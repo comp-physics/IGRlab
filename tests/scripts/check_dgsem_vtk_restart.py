@@ -249,7 +249,7 @@ def base_command(args: argparse.Namespace, mesh: Path) -> list[str]:
                 "--igr-sigma-cadence", "extrapolated-every-step",
             ]
         )
-    if args.mpi_ranks > 1:
+    if args.mpi_ranks > 1 or args.mpi_single_rank:
         return [args.mpiexec, args.mpi_numproc_flag, str(args.mpi_ranks), *app]
     return app
 
@@ -1174,6 +1174,8 @@ def main() -> int:
     parser.add_argument("--order", type=int, choices=(1, 2, 3, 4), required=True)
     parser.add_argument("--mpiexec", default="mpiexec")
     parser.add_argument("--mpi-numproc-flag", default="-n")
+    parser.add_argument("--mpi-single-rank", action="store_true",
+                        help="Use the selected MPI launcher even for one rank")
     parser.add_argument("--negative-controls", action="store_true")
     parser.add_argument("--rank-piece-reorder-negative", action="store_true")
     parser.add_argument(

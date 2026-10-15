@@ -1,6 +1,13 @@
 # IGRlab correctness tests. Historical dg_igr target/CTest names remain
 # transitional interfaces for existing scripts and retained evidence.
 
+set(_igrlab_serial_mpi_args "")
+if(IGRLAB_MPI_TEST_LAUNCHER)
+  set(_igrlab_serial_mpi_args --mpi-single-rank --mpi-ranks 1
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}")
+endif()
+
 add_test(NAME dg_igr_cuda_build_policy
   COMMAND /usr/bin/env bash
           ${CMAKE_SOURCE_DIR}/tests/scripts/check_cuda_build_policy.sh
@@ -10,6 +17,31 @@ set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   LABELS "build;cuda;contract"
   TIMEOUT 30
 )
+
+foreach(build_check pace_submission pace_manifest pace_discovery delta_site dependency_bindings
+                    prebuilt_validation mfem_cache app_iteration)
+  add_test(NAME igrlab_${build_check}
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/test_${build_check}.py)
+  set_tests_properties(igrlab_${build_check} PROPERTIES
+    LABELS "build;contract;python;no-gpu"
+    TIMEOUT 30)
+endforeach()
+
+foreach(study_check gpu_study study_build study_workloads study_profiles study_retry)
+  add_test(NAME igrlab_${study_check}_python
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/scripts/perf/test_${study_check}.py)
+  set_tests_properties(igrlab_${study_check}_python PROPERTIES
+    LABELS "profiling;study;contract;python;no-gpu" TIMEOUT 120)
+endforeach()
+
+add_test(NAME igrlab_mpi_test_launcher
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/tests/scripts/test_mpi_test_launcher.py
+          --cmake ${CMAKE_COMMAND})
+set_tests_properties(igrlab_mpi_test_launcher PROPERTIES
+  LABELS "build;contract;python;no-gpu" TIMEOUT 30)
 
 add_test(NAME dg_igr_hdg_tensor_campaign_python
   COMMAND /usr/bin/env python3
@@ -159,6 +191,153 @@ add_executable(dg_igr_unit_tests
   test_diagnostics.cpp
 )
 
+add_executable(dg_igr_exact_face_test test_igr_exact_face.cpp)
+target_link_libraries(dg_igr_exact_face_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_exact_face_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+set(_igrlab_exact_face_command dg_igr_exact_face_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Exact face MPI test launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_exact_face_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_exact_face_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_exact_face_cpu COMMAND ${_igrlab_exact_face_command} cpu)
+set_tests_properties(dg_igr_exact_face_cpu PROPERTIES
+  LABELS "igr;exact-face;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_igr_exact_face.cpp PROPERTIES LANGUAGE CUDA)
+  target_compile_options(dg_igr_exact_face_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_exact_face_cuda COMMAND ${_igrlab_exact_face_command} cuda)
+  set_tests_properties(dg_igr_exact_face_cuda PROPERTIES
+    LABELS "igr;exact-face;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_dgsem_maximum_test test_dgsem_maximum.cpp)
+target_link_libraries(dg_igr_dgsem_maximum_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dgsem_maximum_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+set(_igrlab_dgsem_maximum_command dg_igr_dgsem_maximum_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Maximum parity MPI launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_dgsem_maximum_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dgsem_maximum_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dgsem_maximum_cpu
+  COMMAND ${_igrlab_dgsem_maximum_command} cpu)
+set_tests_properties(dg_igr_dgsem_maximum_cpu PROPERTIES
+  LABELS "dgsem;maximum;parity;cpu" TIMEOUT 120 RUN_SERIAL TRUE)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_dgsem_maximum.cpp PROPERTIES LANGUAGE CUDA)
+  target_compile_options(dg_igr_dgsem_maximum_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_dgsem_maximum_cuda
+    COMMAND ${_igrlab_dgsem_maximum_command} cuda)
+  set_tests_properties(dg_igr_dgsem_maximum_cuda PROPERTIES
+    LABELS "dgsem;maximum;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_dg_device_faces_test test_dg_device_faces.cpp)
+target_link_libraries(dg_igr_dg_device_faces_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dg_device_faces_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+set_source_files_properties(test_dg_device_faces.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_dg_device_faces_command dg_igr_dg_device_faces_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_dg_device_faces_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dg_device_faces_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dg_device_faces_cpu
+  COMMAND ${_igrlab_dg_device_faces_command} cpu)
+set_tests_properties(dg_igr_dg_device_faces_cpu PROPERTIES
+  LABELS "dg;face;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dg_device_faces_cuda
+    COMMAND ${_igrlab_dg_device_faces_command} cuda)
+  set_tests_properties(dg_igr_dg_device_faces_cuda PROPERTIES
+    LABELS "dg;face;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_face_density_host_cache_test
+  test_igr_face_density_host_cache.cpp)
+target_link_libraries(dg_igr_face_density_host_cache_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_face_density_host_cache_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+# Keep CXX in CUDA builds: __CUDACC__ would change the original host oracle.
+set_source_files_properties(test_igr_face_density_host_cache.cpp PROPERTIES
+  LANGUAGE CXX)
+set(_igrlab_host_face_cache_command dg_igr_face_density_host_cache_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Host face-density MPI launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_host_face_cache_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_face_density_host_cache_test> ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_face_density_host_cache_cpu_mpi4
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_face_density_host_cache_test> ${MPIEXEC_POSTFLAGS} cpu)
+  set_tests_properties(dg_igr_face_density_host_cache_cpu_mpi4 PROPERTIES
+    LABELS "igr;exact-face;cache;parity;cpu;mpi" TIMEOUT 180
+    RUN_SERIAL TRUE PROCESSORS 4)
+endif()
+add_test(NAME dg_igr_face_density_host_cache_cpu
+  COMMAND ${_igrlab_host_face_cache_command} cpu)
+set_tests_properties(dg_igr_face_density_host_cache_cpu PROPERTIES
+  LABELS "igr;exact-face;cache;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_face_density_host_cache_cuda
+    COMMAND ${_igrlab_host_face_cache_command} cuda)
+  set_tests_properties(dg_igr_face_density_host_cache_cuda PROPERTIES
+    LABELS "igr;exact-face;cache;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_euler_admissibility_cache_test
+  test_euler_admissibility_cache.cpp)
+# Keep the original MFEM/EOS oracle and the actual helper caller in CXX.
+set_source_files_properties(test_euler_admissibility_cache.cpp PROPERTIES
+  LANGUAGE CXX)
+target_link_libraries(dg_igr_euler_admissibility_cache_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_euler_admissibility_cache_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+set(_igrlab_admissibility_command dg_igr_euler_admissibility_cache_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Admissibility MPI test launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_admissibility_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_euler_admissibility_cache_test> ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_euler_admissibility_cache_cpu_mpi4
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_euler_admissibility_cache_test> ${MPIEXEC_POSTFLAGS} cpu)
+  set_tests_properties(dg_igr_euler_admissibility_cache_cpu_mpi4 PROPERTIES
+    LABELS "admissibility;cache;parity;cpu;mpi;subcommunicator"
+    TIMEOUT 180 RUN_SERIAL TRUE PROCESSORS 4)
+endif()
+add_test(NAME dg_igr_euler_admissibility_cache_cpu
+  COMMAND ${_igrlab_admissibility_command} cpu)
+set_tests_properties(dg_igr_euler_admissibility_cache_cpu PROPERTIES
+  LABELS "admissibility;cache;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  target_sources(dg_igr_euler_admissibility_cache_test PRIVATE
+    test_euler_admissibility_cache_cuda.cu)
+  target_compile_definitions(dg_igr_euler_admissibility_cache_test PRIVATE
+    IGRLAB_ADMISSIBILITY_CUDA_PROBE=1)
+  target_compile_options(dg_igr_euler_admissibility_cache_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_euler_admissibility_cache_cuda
+    COMMAND ${_igrlab_admissibility_command} cuda)
+  set_tests_properties(dg_igr_euler_admissibility_cache_cuda PROPERTIES
+    LABELS "admissibility;cache;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_nodal_source_test test_igr_nodal_source.cpp)
 target_link_libraries(dg_igr_nodal_source_test PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_nodal_source_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -257,6 +436,42 @@ target_link_libraries(dg_igr_unit_tests PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
 )
+
+# Small evolution gates use the production DG/DGSEM Mult and SSPRK(3,3)
+# implementations.  Longer convergence ladders remain separately selectable.
+add_executable(igrlab_numerical_evolution_test test_numerical_evolution.cpp)
+target_link_libraries(igrlab_numerical_evolution_test PRIVATE igr_mfem mfem)
+target_include_directories(igrlab_numerical_evolution_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(igrlab_numerical_evolution_test PRIVATE cxx_std_17)
+target_compile_options(igrlab_numerical_evolution_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+add_test(NAME igrlab_numerical_conservation_cpu
+  COMMAND igrlab_numerical_evolution_test --conservation cpu)
+set_tests_properties(igrlab_numerical_conservation_cpu PROPERTIES
+  LABELS "numerical-acceptance;numerical-smoke;conservation;dg;dgsem;production;cpu"
+  PROCESSORS 1 TIMEOUT 180)
+add_test(NAME igrlab_numerical_dg_convergence_cpu
+  COMMAND igrlab_numerical_evolution_test --convergence cpu)
+set_tests_properties(igrlab_numerical_dg_convergence_cpu PROPERTIES
+  LABELS "numerical-acceptance;numerical-convergence;convergence;spatial;dg;production;cpu"
+  PROCESSORS 1 TIMEOUT 300)
+if(MFEM_USE_CUDA)
+  # The source stays ordinary C++; final device-symbol resolution reaches the
+  # production CUDA kernels in igr_mfem through the same link closure as units.
+  set_target_properties(igrlab_numerical_evolution_test PROPERTIES
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  add_test(NAME igrlab_numerical_conservation_cuda
+    COMMAND igrlab_numerical_evolution_test --conservation cuda)
+  add_test(NAME igrlab_numerical_backend_parity_cuda
+    COMMAND igrlab_numerical_evolution_test --backend-parity cuda)
+  set_tests_properties(igrlab_numerical_conservation_cuda
+                       igrlab_numerical_backend_parity_cuda PROPERTIES
+    LABELS "numerical-acceptance;numerical-smoke;conservation;dg;dgsem;production;cuda"
+    PROCESSORS 1 TIMEOUT 240 RUN_SERIAL TRUE)
+  set_property(TEST igrlab_numerical_backend_parity_cuda APPEND PROPERTY
+    LABELS "backend-parity;cpu")
+endif()
 
 if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
   if(IGRLAB_BUILD_RESEARCH_TESTS)
@@ -553,7 +768,7 @@ if (MFEM_USE_CUDA)
   set(DG_IGR_EXACT_IID_DEVICE_PARITY_REF
       "${CMAKE_CURRENT_BINARY_DIR}/exact-iid-device-parity-reference.txt")
   add_test(NAME dg_igr_exact_iid_device_parity_cpu_reference
-    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+    COMMAND dg_igr_exact_iid_device_parity_test
             cpu --write-reference ${DG_IGR_EXACT_IID_DEVICE_PARITY_REF}
   )
   set_tests_properties(dg_igr_exact_iid_device_parity_cpu_reference PROPERTIES
@@ -563,7 +778,7 @@ if (MFEM_USE_CUDA)
     RUN_SERIAL TRUE
   )
   add_test(NAME dg_igr_exact_iid_device_parity_cuda
-    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+    COMMAND dg_igr_exact_iid_device_parity_test
             cuda --compare ${DG_IGR_EXACT_IID_DEVICE_PARITY_REF}
   )
   set_tests_properties(dg_igr_exact_iid_device_parity_cuda PROPERTIES
@@ -583,18 +798,18 @@ add_test(NAME dg_igr_dgsem_flux_tests COMMAND dg_igr_unit_tests --dgsem-flux)
 add_test(NAME dg_igr_dgsem_operator_tests COMMAND dg_igr_unit_tests --dgsem-operator)
 if(MFEM_USE_CUDA)
   add_test(NAME dg_igr_dgsem_operator_cuda
-    COMMAND ${CMAKE_COMMAND} -E env
-            DG_IGR_TEST_DEVICE=cuda
-            DG_IGR_DGSEM_DEVICE=cuda
-            $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+    COMMAND dg_igr_unit_tests --dgsem-operator
   )
   set_tests_properties(dg_igr_dgsem_operator_cuda PROPERTIES
+    ENVIRONMENT "DG_IGR_TEST_DEVICE=cuda;DG_IGR_DGSEM_DEVICE=cuda"
     LABELS "cuda;dgsem;production;llf"
     TIMEOUT 180
     RUN_SERIAL TRUE
   )
 endif()
 add_test(NAME dg_igr_dgsem_advection_tests COMMAND dg_igr_unit_tests --dgsem-advection)
+set_tests_properties(dg_igr_dgsem_advection_tests PROPERTIES
+  LABELS "numerical-acceptance;numerical-convergence;convergence;spatial;dgsem;production;cpu")
 add_test(NAME dg_igr_dgsem_igr_tests COMMAND dg_igr_unit_tests --dgsem-igr)
 add_test(NAME dg_igr_dgsem_portability_refactor_tests
          COMMAND dg_igr_unit_tests --dgsem-operator --dgsem-igr)
@@ -602,10 +817,16 @@ add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_diagnostics_cuda COMMAND dg_igr_unit_tests --diagnostics)
+  set_tests_properties(dg_igr_diagnostics_cuda PROPERTIES
+    ENVIRONMENT "DG_IGR_TEST_DEVICE=cuda"
+    LABELS "cuda;diagnostics;parity" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
 
 if(TARGET dgsem_smooth_advection_periodic)
   add_test(NAME dg_igr_hdg_static_source_legacy_ignored_by_dgsem
-    COMMAND $<TARGET_FILE:dgsem_smooth_advection_periodic>
+    COMMAND dgsem_smooth_advection_periodic
             -dev cpu -rs 0 -rp 0 -o 1 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
             -no-glvis -no-vtk -no-save-state -iprint 0
             --hdg-static-source 0.01
@@ -617,7 +838,7 @@ if(TARGET dgsem_smooth_advection_periodic)
   )
 
   add_test(NAME dg_igr_static_source_ordinary_dg_smoke
-    COMMAND $<TARGET_FILE:dgsem_smooth_advection_periodic>
+    COMMAND dgsem_smooth_advection_periodic
             -dev cpu -rs 0 -rp 0 -o 1 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
             -no-glvis -no-vtk -no-save-state -iprint 0
             --dg-backend dg --static-source 0.01
@@ -633,6 +854,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_sigma_vtk_lifecycle_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-cpu
@@ -648,6 +870,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_vtk_restart_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cpu
@@ -663,6 +886,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --time-integrator ssprk104
@@ -681,6 +905,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_vtk_restart_order${restart_order}_cpu
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cpu
               --order ${restart_order}
@@ -696,6 +921,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_vtk_restart_cfl_save_boundary_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --cfl-driven
@@ -711,6 +937,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_vtk_restart_no_igr_cpu
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder>
               --device cpu
               --no-igr
@@ -725,6 +952,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_vtk_restart_ssprk104_no_igr_cpu
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder>
               --device cpu
               --no-igr
@@ -781,6 +1009,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_sigma_vtk_lifecycle_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cuda
               --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-cuda
@@ -794,6 +1023,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_vtk_restart_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cuda
               --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cuda
@@ -807,6 +1037,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cuda
               --time-integrator ssprk104
@@ -824,6 +1055,7 @@ if (TARGET supersonic_cylinder_w_igr)
       add_test(NAME dg_vtk_restart_ssprk104_no_igr_cuda
         COMMAND /usr/bin/env python3
                 ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+                ${_igrlab_serial_mpi_args}
                 --exe $<TARGET_FILE:supersonic_cylinder>
                 --device cuda
                 --no-igr
@@ -899,6 +1131,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_p1_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 1
@@ -914,6 +1147,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_p4_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 4
@@ -928,6 +1162,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_p3_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 3
@@ -942,6 +1177,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 1
@@ -1001,6 +1237,7 @@ if (TARGET dgsem_sedov_taylor_blast)
     add_test(NAME dgsem_vtk_restart_p2_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
               --device cuda
               --order 2
@@ -1016,6 +1253,7 @@ if (TARGET dgsem_sedov_taylor_blast)
     add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
               --device cuda
               --order 1
@@ -1592,7 +1830,7 @@ function(add_example_regression test_name target mesh_path_rel)
     endif()
 
     add_test(NAME ${test_name}
-      COMMAND $<TARGET_FILE:${target}>
+      COMMAND ${target}
               -m ${CMAKE_SOURCE_DIR}/${mesh_path_rel}
               -rs 0 -rp 0 -o 1 -tf ${reg_tf} -dt ${reg_dt} -c 0.0
               -no-glvis -vs 1000000 -nan-scan

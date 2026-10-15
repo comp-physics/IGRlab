@@ -30,7 +30,7 @@
  */
 namespace igrlab
 {
-namespace igr_internal { struct FaceDensityCUDAProjectionCache; struct NodalVelocitySourceCache; }
+namespace igr_internal { struct FaceDensityCUDAProjectionCache; class HostFaceDensityPreparationCache; struct NodalVelocitySourceCache; }
 
 enum class IGRSolvePurpose
 {
@@ -646,6 +646,7 @@ private:
   // are recomputed on every invocation. shared_ptr permits this private
   // implementation type to remain incomplete in the public class header.
   std::shared_ptr<igr_internal::FaceDensityCUDAProjectionCache> face_density_cuda_cache_;
+  std::shared_ptr<igr_internal::HostFaceDensityPreparationCache> face_density_host_cache_;
   // For the local length policy, alpha_ stores C_alpha while this cache stores
   // the physical per-element alpha_e = C_alpha h_e^2.  It is reused until the
   // mesh sequence or C_alpha changes.

@@ -2,8 +2,13 @@
 #include "sim/context/example_context.hpp"
 #include "sim/io/vis_helpers.hpp"
 #include "sim/state/euler_state_bundle.hpp"
+#include "utils/diagnostics/detail/euler_admissibility_device.hpp"
+#include "utils/diagnostics/non_finite.hpp"
 
+#include <cmath>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 #include "test_utils.hpp"
 
@@ -25,6 +30,103 @@ dg_sim::RunConfig MakeRunConfig(int order)
   cfg.dg_backend = dg_sim::DGBackend::DG;
   cfg.mesh_path.clear();
   return cfg;
+}
+
+void CheckFiniteScanShortcut(TestContext& ctx)
+{
+  int rank = 0, ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  const bool cuda = mfem::igrlab::detail::AdmissibilityOrdinaryCuda();
+  mfem::Array<int> status;
+  mfem::Vector empty;
+  ctx.Check(mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                empty, MPI_COMM_WORLD, status) == cuda,
+            "Empty device finite scan takes the consistent empty-state path.");
+
+  using Scalar = mfem::real_t;
+  mfem::Vector state(8);
+  const auto fill_finite = [&]()
+  {
+    auto* values = state.HostWrite();
+    values[0] = std::numeric_limits<Scalar>::max();
+    values[1] = std::numeric_limits<Scalar>::lowest();
+    values[2] = std::numeric_limits<Scalar>::denorm_min();
+    values[3] = -std::numeric_limits<Scalar>::denorm_min();
+    values[4] = Scalar(0.0);
+    values[5] = Scalar(-0.0);
+    values[6] = std::numeric_limits<Scalar>::min();
+    values[7] = -std::numeric_limits<Scalar>::min();
+  };
+  const auto upload_current = [&]()
+  {
+    state.UseDevice(true);
+    (void)state.ReadWrite(true);
+  };
+  fill_finite();
+  ctx.Check(!mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status),
+            "A host-authoritative state keeps the full finite scanner.");
+  const auto full = mfem::igrlab::ScanNonFiniteDetailed(
+      state, MPI_COMM_WORLD, 2, mfem::Ordering::byNODES);
+  ctx.Check(full.summary.global_non_finite == 0 &&
+                full.summary.global_min == std::numeric_limits<Scalar>::lowest() &&
+                full.summary.global_max == std::numeric_limits<Scalar>::max() &&
+                full.first_bad_rank == -1 &&
+                full.global_component_non_finite == std::vector<int>({0, 0}),
+            "Full finite diagnostics retain exact extrema and component metadata.");
+  if (!cuda) { return; }
+
+  upload_current();
+  ctx.Check(mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status) &&
+                !state.GetMemory().HostIsValid(),
+            "Device finite extremes, signed zeros and subnormals pass without state host staging.");
+
+  // One rank declining is sufficient even when every other rank is device-ready.
+  if (rank == ranks - 1) { (void)state.HostReadWrite(); }
+  ctx.Check(!mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status),
+            "A single rank declining the device route sends all ranks to full diagnostics.");
+
+  const Scalar bad_values[] = {
+    std::numeric_limits<Scalar>::quiet_NaN(),
+    std::numeric_limits<Scalar>::infinity(),
+    -std::numeric_limits<Scalar>::infinity()};
+  for (const Scalar bad : bad_values)
+  {
+    fill_finite();
+    if (rank == ranks - 1) { state.HostReadWrite()[2] = bad; }
+    upload_current();
+    ctx.Check(!mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                  state, MPI_COMM_WORLD, status) &&
+                  !state.GetMemory().HostIsValid(),
+              "One-rank NaN or signed infinity forces collective fallback without state host staging.");
+    const auto detailed = mfem::igrlab::ScanNonFiniteDetailed(
+        state, MPI_COMM_WORLD, 2, mfem::Ordering::byNODES);
+    ctx.Check(detailed.summary.global_non_finite == 1 &&
+                  detailed.summary.global_min == std::numeric_limits<Scalar>::lowest() &&
+                  detailed.summary.global_max == std::numeric_limits<Scalar>::max() &&
+                  detailed.first_bad_rank == ranks - 1 &&
+                  detailed.global_component_non_finite == std::vector<int>({1, 0}) &&
+                  detailed.first_local_entry.found == (rank == ranks - 1),
+              "Fallback preserves exact global counts, extrema, first rank and component metadata.");
+    if (rank == ranks - 1)
+    {
+      ctx.Check(detailed.first_local_entry.local_index == 2 &&
+                    detailed.first_local_entry.scalar_dof == 1 &&
+                    detailed.first_local_entry.component == 0 &&
+                    (std::isnan(bad) ? std::isnan(detailed.first_local_entry.value) :
+                      detailed.first_local_entry.value == bad),
+                "Fallback preserves the first nonfinite value and its local mapping.");
+    }
+  }
+  fill_finite();
+  upload_current();
+  ctx.Check(mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status) &&
+                !state.GetMemory().HostIsValid(),
+            "A fresh finite device state clears the previous nonfinite result.");
 }
 
 int FindInterfaceSideElement(const dg_sim::ExampleContext& ctx, bool left)
@@ -74,8 +176,210 @@ double ReduceOwnedCount(bool owned)
 
 int RunDiagnosticsTests(TestContext& ctx)
 {
+  CheckFiniteScanShortcut(ctx);
   constexpr double gamma = 1.4;
   constexpr double rho_floor = 1.0e-12;
+
+  // Startup may defer unobserved projections, but the first output refresh
+  // must use the fully initialized state, including subsequent state changes.
+  for (const auto backend : {dg_sim::DGBackend::DG, dg_sim::DGBackend::DGSEM})
+  {
+    mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+      2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    auto pmesh = std::make_unique<mfem::ParMesh>(MPI_COMM_WORLD, serial_mesh);
+    dg_sim::RunConfig run_cfg = MakeRunConfig(/*order=*/5);
+    run_cfg.dg_backend = backend;
+    dg_sim::ExampleContext example_ctx(run_cfg, std::move(pmesh), "L2",
+                                       /*need_sigma=*/false,
+                                       /*need_h1=*/false);
+    dg_sim::EulerStateBundle bundle(example_ctx, gamma, rho_floor,
+                                     /*project_initial_state=*/false);
+    mfem::VectorFunctionCoefficient ic(
+      4, [](const mfem::Vector& x, mfem::Vector& y)
+      {
+        y.SetSize(4);
+        const double rho = 1.0 + 0.2 * x(0);
+        const double u = 0.25 + 0.1 * x(1);
+        const double v = -0.05 + 0.1 * x(0);
+        y(0) = rho;
+        y(1) = rho * u;
+        y(2) = rho * v;
+        y(3) = (1.0 + 0.1 * x(1)) / 0.4 +
+               0.5 * rho * (u * u + v * v);
+      });
+    bundle.sol.ProjectCoefficient(ic);
+    mfem::PressureCoefficient pressure_coeff(bundle.sol, 2, gamma);
+    mfem::VelocityFromConsCoefficient velocity_coeff(2, &bundle.sol, rho_floor);
+    mfem::ParGridFunction pressure_reference(&example_ctx.spaces.fes);
+    mfem::ParGridFunction velocity_reference(&example_ctx.spaces.dfes);
+    const auto same_values = [](const mfem::Vector& a, const mfem::Vector& b)
+    {
+      if (a.Size() != b.Size()) { return false; }
+      const auto* av = a.HostRead();
+      const auto* bv = b.HostRead();
+      for (int i = 0; i < a.Size(); ++i)
+      {
+        if (!std::isfinite(av[i]) || av[i] != bv[i]) { return false; }
+      }
+      return true;
+    };
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    velocity_reference.ProjectCoefficient(velocity_coeff);
+    dg_sim::EulerPressureView eager_pressure(example_ctx.spaces.fes, bundle.sol,
+                                             2, gamma);
+    dg_sim::EulerVelocityView eager_velocity(example_ctx.spaces.dfes, bundle.sol,
+                                             2, rho_floor);
+    ctx.Check(same_values(eager_pressure.pressure, pressure_reference) &&
+                same_values(eager_velocity.velocity, velocity_reference),
+              "Default Euler view constructors retain eager exact projections.");
+
+    // Model an initialization/admission change before the first consumer.
+    const int ndofs = example_ctx.spaces.fes.GetNDofs();
+    auto* state = bundle.sol.HostReadWrite();
+    for (int i = 0; i < ndofs; ++i) { state[3 * ndofs + i] += 0.375; }
+    bundle.pressure_view.pressure = std::numeric_limits<double>::quiet_NaN();
+    bundle.velocity_view.velocity = std::numeric_limits<double>::quiet_NaN();
+    dg_sim::UpdateEulerOutputFields(bundle.field_list);
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    velocity_reference.ProjectCoefficient(velocity_coeff);
+    ctx.Check(same_values(bundle.pressure_view.pressure, pressure_reference) &&
+                same_values(bundle.velocity_view.velocity, velocity_reference),
+              "Deferred Euler views exactly refresh the final initialized state.");
+    bundle.ProjectIC(ic);
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    ctx.Check(same_values(bundle.pressure_view.pressure, pressure_reference),
+              "ProjectIC retains its immediate pressure refresh.");
+
+    const bool cuda = mfem::Device::Allows(mfem::Backend::CUDA) &&
+                      sizeof(mfem::real_t) == sizeof(double);
+    const auto check_current_projection = [&](bool expect_device,
+                                               const char* message)
+    {
+      pressure_reference.ProjectCoefficient(pressure_coeff);
+      velocity_reference.ProjectCoefficient(velocity_coeff);
+      if (cuda)
+      {
+        bundle.sol.UseDevice(true);
+        (void)bundle.sol.ReadWrite(); // make the current device copy authoritative
+      }
+      dg_sim::UpdateEulerOutputFields(bundle.field_list);
+      if (cuda)
+      {
+        ctx.Check(bundle.sol.GetMemory().HostIsValid() != expect_device,
+                  "Derived projection uses the admitted device route or host fallback.");
+      }
+      const auto same_bits = [](const mfem::Vector& a, const mfem::Vector& b)
+      {
+        return a.Size() == b.Size() &&
+          std::memcmp(a.HostRead(), b.HostRead(),
+                      a.Size() * sizeof(mfem::real_t)) == 0;
+      };
+      ctx.Check(same_bits(bundle.pressure_view.pressure, pressure_reference) &&
+                  same_bits(bundle.velocity_view.velocity, velocity_reference),
+                message);
+    };
+    check_current_projection(true,
+      "Collocated p5 GL/LGL CUDA projections exactly match generic coefficients.");
+    check_current_projection(true,
+      "Warm collocation plans still read the current device state exactly.");
+
+    auto* edge_state = bundle.sol.HostReadWrite();
+    for (int i = 0; i < ndofs; ++i)
+    {
+      edge_state[i] = i % 2 ? 1.0e-18 : -0.0;
+      edge_state[ndofs + i] = i % 3 ? 1.0e-18 : -0.0;
+      edge_state[2 * ndofs + i] = i % 2 ? -1.0e-18 : -0.0;
+      edge_state[3 * ndofs + i] = 1.0;
+    }
+    check_current_projection(true,
+      "Pressure and velocity retain their distinct density floors and signed zeros.");
+    bundle.sol.HostReadWrite()[ndofs] =
+      std::numeric_limits<mfem::real_t>::quiet_NaN();
+    check_current_projection(false,
+      "Nonfinite collocated input preserves the full generic NaN projection.");
+
+    example_ctx.Mesh().UniformRefinement();
+    example_ctx.spaces.fes.Update();
+    example_ctx.spaces.dfes.Update();
+    example_ctx.spaces.vfes.Update();
+    bundle.sol.Update();
+    bundle.pressure_view.pressure.Update();
+    bundle.velocity_view.velocity.Update();
+    pressure_reference.Update();
+    velocity_reference.Update();
+    bundle.sol.ProjectCoefficient(ic);
+    check_current_projection(true,
+      "Mesh/space updates invalidate collocation plans before the next projection.");
+  }
+
+  // Mixed geometry and different input/output nodes retain coefficient
+  // interpolation, rather than treating nearby or unrelated DOFs as collocated.
+  for (const bool mixed_geometry : {false, true})
+  {
+    mfem::Mesh mesh = mixed_geometry
+      ? mfem::Mesh(2, 6, 3, 0, 2)
+      : mfem::Mesh::MakeCartesian2D(2, 1, mfem::Element::QUADRILATERAL,
+                                    true, 1.0, 1.0);
+    if (mixed_geometry)
+    {
+      const mfem::real_t vertices[6][2] = {{0,0},{0.5,0},{1,0},{0,1},{0.5,1},{1,1}};
+      for (const auto& vertex : vertices) { mesh.AddVertex(vertex); }
+      mesh.AddQuad(0, 1, 4, 3);
+      mesh.AddTriangle(1, 2, 5);
+      mesh.AddTriangle(1, 5, 4);
+      mesh.FinalizeTopology();
+      mesh.Finalize();
+    }
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    mfem::L2_FECollection input_fec(5, 2, mfem::BasisType::GaussLegendre);
+    mfem::L2_FECollection output_fec(5, 2, mixed_geometry
+      ? mfem::BasisType::GaussLegendre : mfem::BasisType::GaussLobatto);
+    mfem::ParFiniteElementSpace input_fes(&pmesh, &input_fec, 4,
+                                          mfem::Ordering::byNODES);
+    mfem::ParFiniteElementSpace scalar_fes(&pmesh, &output_fec);
+    mfem::ParFiniteElementSpace vector_fes(&pmesh, &output_fec, 2,
+                                           mfem::Ordering::byNODES);
+    mfem::ParGridFunction state(&input_fes);
+    FillConstantState(EulerConsFromPrim2D(1.0, 0.25, -0.05, 1.0, gamma), state);
+    // Nonconstant values make a mistaken GL-to-LGL direct gather observable.
+    auto* values = state.HostReadWrite();
+    for (int i = 0; i < input_fes.GetNDofs(); ++i)
+    {
+      values[i] += 0.001 * (i % 7);
+      values[3 * input_fes.GetNDofs() + i] += 0.002 * (i % 5);
+    }
+    mfem::PressureCoefficient pressure_coeff(state, 2, gamma);
+    mfem::VelocityFromConsCoefficient velocity_coeff(2, &state, rho_floor);
+    mfem::ParGridFunction pressure_reference(&scalar_fes), velocity_reference(&vector_fes);
+    pressure_reference.ProjectCoefficient(pressure_coeff);
+    velocity_reference.ProjectCoefficient(velocity_coeff);
+    dg_sim::EulerPressureView pressure(scalar_fes, state, 2, gamma, false);
+    dg_sim::EulerVelocityView velocity(vector_fes, state, 2, rho_floor, false);
+    if (mfem::Device::Allows(mfem::Backend::CUDA))
+    {
+      state.UseDevice(true);
+      (void)state.ReadWrite();
+    }
+    pressure.Update(); velocity.Update();
+    // A globally mixed mesh can leave a rank with only quadrilaterals, where
+    // the matching nodal spaces admit the device path. Require host residency
+    // only on nonempty partitions that actually contain unsupported geometry
+    // or different input/output nodes; compare values on every rank below.
+    bool local_requires_host = !mixed_geometry;
+    for (int e = 0; e < pmesh.GetNE(); ++e)
+    {
+      local_requires_host = local_requires_host ||
+          pmesh.GetElementBaseGeometry(e) != mfem::Geometry::SQUARE;
+    }
+    ctx.Check(state.Size() == 0 || !local_requires_host ||
+                  state.GetMemory().HostIsValid(),
+              "Locally unsupported or noncollocated spaces retain the host coefficient path.");
+    ctx.Check(std::memcmp(pressure.pressure.HostRead(), pressure_reference.HostRead(),
+                         pressure_reference.Size() * sizeof(mfem::real_t)) == 0 &&
+                std::memcmp(velocity.velocity.HostRead(), velocity_reference.HostRead(),
+                            velocity_reference.Size() * sizeof(mfem::real_t)) == 0,
+              "Unsupported layouts exactly match generic pressure/velocity projection.");
+  }
 
   // H1 diagnostics scalar outputs must live on scalar spaces (vdim=1).
   {

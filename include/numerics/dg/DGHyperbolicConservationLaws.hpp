@@ -118,6 +118,13 @@ public:
     std::unique_ptr<HyperbolicFormIntegrator> formIntegrator_,
     bool preassembleWeakDivergence = true);
 
+  /// Standard sign=+1 MFEM integrator with an explicit quadrature contract.
+  /// Custom integrators use the owning constructor and retain host ES assembly.
+  DGHyperbolicConservationLaws(FiniteElementSpace& vfes_,
+                             const NumericalFlux& numerical_flux,
+                             int int_order_offset,
+                             bool preassembleWeakDivergence = true);
+
   DGHyperbolicConservationLaws(const DGHyperbolicConservationLaws&) = delete;
   DGHyperbolicConservationLaws&
   operator=(const DGHyperbolicConservationLaws&) = delete;
@@ -451,6 +458,11 @@ private:
   /// Return true when the custom device face residual path is available.
   bool UseDeviceFaceResidual_() const;
 
+  bool SupportsPackedEntropyFacePolicy_() const;
+  bool AddDeviceFaceContributionsEntropyStable_(const Vector& x_in,
+                                                Vector& z_out,
+                                                real_t& max_face_speed) const;
+
   /// Add DG face contributions with a packed Euler/Rusanov device path.
   bool AddDeviceFaceContributionsEulerRusanov_(const Vector& x_in,
                                                Vector& z_inout,
@@ -503,7 +515,7 @@ private:
 
   /// Per-element scalar dof count used by packed inverse-mass apply.
   int invmass_elem_dof_ = 0;
-  /// Flattened per-element inverse mass blocks (column-major dof x dof).
+  /// Exact diagonal entries (ne*dof), or column-major dense blocks (ne*dof*dof).
   Vector invmass_data_flat_;
   /// Per-element vector-dof map in node-major, equation-minor layout.
   Array<int> invmass_elem_vdof_map_;
@@ -522,6 +534,15 @@ private:
   int face_int_order_offset_ = 1;
   /// Packed DG face apply is ready when all required metadata exists.
   bool face_apply_ready_ = false;
+  /// Only the standard constructor establishes sign/quadrature equivalence.
+  bool standard_face_integrator_ = false;
+  const NumericalFlux* standard_face_flux_ = nullptr;
+  int standard_face_int_order_offset_ = 1;
+  bool face_entropy_ready_ = false;
+  bool face_built_entropy_policy_ = false;
+  Array<int> face_entropy_element_offsets_;
+  Array<int> face_entropy_element_sides_;
+  mutable Vector face_entropy_flux_;
   /// Packed interior face scalar dof count.
   int face_elem_dof_ = 0;
   /// Interior-face quadrature point count.

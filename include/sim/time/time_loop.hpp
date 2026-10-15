@@ -23,6 +23,7 @@
 #include "numerics/limiters/zhang_shu.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
 #include "utils/diagnostics/non_finite.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace dg_sim
 {
@@ -568,6 +569,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                            const TimeLoopConfig& cfg,
                            const TimeLoopHooks& hooks = {})
 {
+  ::igrlab::NVTXRange range("Time/RunTimeLoop");
   TimeLoopResult result;
   result.termination_reason = "running";
   PopulateExplicitCFLDiagnostics(result, cfg, stepper);
@@ -1143,6 +1145,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 
     if (cfg.nan_scan)
     {
+      ::igrlab::NVTXRange range("Time/accepted-state-nonfinite-scan");
       const mfem::igrlab::NonFiniteSummary summary =
         mfem::igrlab::ScanNonFinite(sol);
       if (summary.global_non_finite > 0)

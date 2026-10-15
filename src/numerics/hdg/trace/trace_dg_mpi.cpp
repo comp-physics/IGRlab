@@ -269,20 +269,27 @@ bool DGInterfaceTraceMap::IsConsistent() const noexcept
       }
     }
   }
-  for (std::size_t local_dof = 0; local_dof < dofs.entries.size(); ++local_dof)
+  std::vector<std::uint8_t> seen;
+  try
   {
-    std::size_t appearances = 0;
-    for (const DGInterfaceFaceMap& face : faces)
-      for (const int signed_vdof : face.signed_local_vdofs)
-      {
-        if (DecodeSignedVDof(signed_vdof) == static_cast<int>(local_dof))
-        {
-          ++appearances;
-        }
-      }
-    if (appearances != 1) { return false; }
+    seen.assign(dofs.entries.size(), 0);
   }
-  return true;
+  catch (const std::bad_alloc&) { return false; }
+  catch (const std::length_error&) { return false; }
+
+  for (const DGInterfaceFaceMap& face : faces)
+    for (const int signed_vdof : face.signed_local_vdofs)
+    {
+      const int vdof = DecodeSignedVDof(signed_vdof);
+      if (vdof < 0 || static_cast<std::size_t>(vdof) >= seen.size())
+      {
+        return false;
+      }
+      const std::size_t local_dof = static_cast<std::size_t>(vdof);
+      if (seen[local_dof] != 0) { return false; }
+      seen[local_dof] = 1;
+    }
+  return std::find(seen.begin(), seen.end(), 0) == seen.end();
 }
 
 bool BuildDGInterfaceTraceMap(const mfem::ParFiniteElementSpace& space,

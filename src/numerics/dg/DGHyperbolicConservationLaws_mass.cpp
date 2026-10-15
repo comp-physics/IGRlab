@@ -1,40 +1,128 @@
 #include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace mfem
 {
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
 
+namespace
+{
+
+bool AssembleCollocatedInverseMass(const FiniteElement& fe,
+                                  ElementTransformation& transformation,
+                                  const IntegrationRule& rule,
+                                  Vector& shape,
+                                  DenseMatrix& inverse)
+{
+  const int dof = fe.GetDof();
+  if (rule.GetNPoints() != dof)
+  {
+    return false;
+  }
+
+  // Admit only exact nodal collocation under the same physical shapes and
+  // quadrature as MassIntegrator. No near-zero tolerance or lumping is used.
+  inverse.SetSize(dof);
+  inverse = 0.0;
+  shape.SetSize(dof);
+  for (int q = 0; q < rule.GetNPoints(); ++q)
+  {
+    const IntegrationPoint& point = rule.IntPoint(q);
+    transformation.SetIntPoint(&point);
+    fe.CalcPhysShape(transformation, shape);
+    int node = -1;
+    for (int i = 0; i < dof; ++i)
+    {
+      if (shape(i) == 0.0)
+      {
+        continue;
+      }
+      if (shape(i) != 1.0 || node >= 0)
+      {
+        return false;
+      }
+      node = i;
+    }
+    if (node < 0 || inverse(node, node) != 0.0)
+    {
+      return false;
+    }
+    const real_t weight = transformation.Weight() * point.weight;
+    if (!std::isfinite(weight) || weight <= 0.0)
+    {
+      return false;
+    }
+    inverse(node, node) = weight;
+  }
+  for (int i = 0; i < dof; ++i)
+  {
+    const real_t reciprocal = 1.0 / inverse(i, i);
+    if (!std::isfinite(reciprocal))
+    {
+      return false;
+    }
+    inverse(i, i) = reciprocal;
+  }
+  return true;
+}
+
+struct PackedDiagonalInverseMassKernel
+{
+  int neq = 0;
+  const int* map = nullptr;
+  const real_t* diagonal = nullptr;
+  const real_t* zin = nullptr;
+  real_t* yout = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int vdof = map[entry];
+    yout[vdof] = diagonal[entry / neq] * zin[vdof];
+  }
+};
+
+} // namespace
+
 // -----------------------------------------------------------------------------
 // Compute inverse mass matrices
 // -----------------------------------------------------------------------------
 //
-// For each element T, assemble M_T^{-1} by applying InverseIntegrator(MassIntegrator).
-// We store the dense inverse per element, so we can do:
+// Assemble exact nodally collocated masses directly; otherwise retain
+// InverseIntegrator(MassIntegrator). Store the dense inverse per element for:
 //     y_T = M_T^{-1} z_T
 // cheaply in Mult().
 //
 void DGHyperbolicConservationLaws::ComputeInvMass()
 {
+  ::igrlab::NVTXRange range("DG/setup-inverse-mass");
   InverseIntegrator inv_mass(new MassIntegrator());
   invmass.resize(vfes.GetNE());
   static IntegrationRules lgl_rules(0, Quadrature1D::GaussLobatto);
+  Vector shape;
 
   for (int i = 0; i < vfes.GetNE(); i++)
   {
     const FiniteElement& fe = *vfes.GetFE(i);
     const int dof = fe.GetDof();
+    ElementTransformation& transformation = *vfes.GetElementTransformation(i);
+    const IntegrationRule* collocated_rule = nullptr;
     if (const auto* tbe = dynamic_cast<const TensorBasisElement*>(&fe))
     {
       if (tbe->GetBasisType() == BasisType::GaussLobatto)
       {
         const int order = std::max(1, 2 * fe.GetOrder() - 1);
-        inv_mass.SetIntRule(&lgl_rules.Get(fe.GetGeomType(), order));
+        collocated_rule = &lgl_rules.Get(fe.GetGeomType(), order);
+        inv_mass.SetIntRule(collocated_rule);
       }
       else
       {
         inv_mass.SetIntRule(nullptr);
+        if (tbe->GetBasisType() == BasisType::GaussLegendre)
+        {
+          collocated_rule = &MassIntegrator::GetRule(fe, fe, transformation);
+        }
       }
     }
     else
@@ -42,9 +130,12 @@ void DGHyperbolicConservationLaws::ComputeInvMass()
       inv_mass.SetIntRule(nullptr);
     }
     invmass[i].SetSize(dof);
-    inv_mass.AssembleElementMatrix(fe,
-                                   *vfes.GetElementTransformation(i),
-                                   invmass[i]);
+    if (!collocated_rule ||
+        !AssembleCollocatedInverseMass(fe, transformation, *collocated_rule,
+                                      shape, invmass[i]))
+    {
+      inv_mass.AssembleElementMatrix(fe, transformation, invmass[i]);
+    }
   }
 }
 
@@ -109,10 +200,37 @@ void DGHyperbolicConservationLaws::BuildInvMassApplyData_()
     }
   }
 
-  invmass_data_flat_.SetSize(ne * dof * dof);
+  // Inspect the assembled inverses themselves: compress only exact diagonal
+  // blocks, without a tolerance or a change to mass quadrature/inversion.
+  // Any nonzero off-diagonal entry retains the existing dense apply.
+  bool diagonal = true;
+  for (int e = 0; diagonal && e < ne; ++e)
+  {
+    for (int c = 0; diagonal && c < dof; ++c)
+    {
+      for (int r = 0; r < dof; ++r)
+      {
+        if (r != c && invmass[e](r, c) != 0.0)
+        {
+          diagonal = false;
+          break;
+        }
+      }
+    }
+  }
+
+  invmass_data_flat_.SetSize(ne * dof * (diagonal ? 1 : dof));
   real_t* minv_flat = invmass_data_flat_.HostWrite();
   for (int e = 0; e < ne; ++e)
   {
+    if (diagonal)
+    {
+      for (int i = 0; i < dof; ++i)
+      {
+        minv_flat[e * dof + i] = invmass[e](i, i);
+      }
+      continue;
+    }
     const int m_off = e * dof * dof;
     for (int c = 0; c < dof; ++c)
     {
@@ -234,6 +352,25 @@ void DGHyperbolicConservationLaws::ApplyInverseMassPacked_(
   auto zin = z_in.Read();
   auto yout = y_out.Write();
 
+  if (invmass_data_flat_.Size() == ne * dof)
+  {
+    PackedDiagonalInverseMassKernel kernel;
+    kernel.neq = neq;
+    kernel.map = map;
+    kernel.diagonal = minv;
+    kernel.zin = zin;
+    kernel.yout = yout;
+#ifdef DG_IGR_HAS_ACCEL_FORALL
+    mfem::forall(ne * ldof, kernel);
+#else
+    for (int entry = 0; entry < ne * ldof; ++entry)
+    {
+      kernel(entry);
+    }
+#endif
+    return;
+  }
+
 #ifdef DG_IGR_HAS_ACCEL_FORALL
   // invmass_data_flat_ stores each local inverse mass in column-major order:
   // entry (row=i, col=j) is minv[moff + j*dof + i].
@@ -284,6 +421,16 @@ void DGHyperbolicConservationLaws::ApplyInverseMassHost_(
     auto minv = invmass_data_flat_.HostRead();
     auto zin = z_in.HostRead();
     auto yout = y_out.HostWrite();
+
+    if (invmass_data_flat_.Size() == ne * dof)
+    {
+      for (int entry = 0; entry < ne * ldof; ++entry)
+      {
+        const int vdof = map[entry];
+        yout[vdof] = minv[entry / neq] * zin[vdof];
+      }
+      return;
+    }
 
     for (int e = 0; e < ne; ++e)
     {

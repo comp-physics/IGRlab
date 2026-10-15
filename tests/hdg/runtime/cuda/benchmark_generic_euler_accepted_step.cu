@@ -432,6 +432,19 @@ bool ParsePositiveInt(const std::string_view text, const int minimum,
   return true;
 }
 
+bool ParseAssemblyQuadratureOrder(const std::string_view text,
+                                  int& value) noexcept
+{
+  int parsed = 0;
+  const auto result = std::from_chars(
+      text.data(), text.data() + text.size(), parsed);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+      !dg::hdg::generic::ValidAssemblyQuadratureOrder(parsed))
+    return false;
+  value = parsed;
+  return true;
+}
+
 bool ParsePositiveDouble(const std::string_view text, double& value) noexcept
 {
   double parsed = 0.0;
@@ -518,6 +531,12 @@ bool SelectTracePolicy(
   if (text == "engine-default")
   {
     options.trace_policy = CudaTracePolicyKind::engine_default;
+    return true;
+  }
+  if (text == "ordinary-ilu-jacobi5-refresh")
+  {
+    options.trace_policy =
+        CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh;
     return true;
   }
   if (text == "common-fast")
@@ -845,6 +864,7 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       if (++index >= argc || !SelectTracePolicy(argv[index], options))
       {
         error = "--trace-policy requires engine-default, common-fast, "
+                "ordinary-ilu-jacobi5-refresh, "
                 "equilibrated-mgr, native-element-schwarz-fp64, or "
                 "native-element-schwarz-matrix-free-fp64, or "
                 "native-element-schwarz-equilibrated-field-split-fp64, or "
@@ -868,9 +888,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc ||
           !ParsePositiveInt(argv[index], 1, options.order) ||
-          options.order > 3)
+          !dg::hdg::generic::PlanPolynomialShape(options.order).valid)
       {
-        error = "--order requires 1, 2, or 3";
+        error = "--order requires a positive order with representable local dimensions";
         return false;
       }
       continue;
@@ -1000,12 +1020,11 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     if (argument == "--igr-volume-quadrature-order")
     {
       if (++index >= argc ||
-          !ParsePositiveInt(argv[index], 1,
-                            options.igr_volume_assembly_quadrature_order) ||
-          options.igr_volume_assembly_quadrature_order > 14)
+          !ParseAssemblyQuadratureOrder(argv[index],
+                            options.igr_volume_assembly_quadrature_order))
       {
         error =
-            "--igr-volume-quadrature-order requires an integer in [1,14]";
+            "--igr-volume-quadrature-order requires a positive representable rule";
         return false;
       }
       continue;
@@ -1013,12 +1032,11 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     if (argument == "--igr-face-quadrature-order")
     {
       if (++index >= argc ||
-          !ParsePositiveInt(argv[index], 1,
-                            options.igr_face_assembly_quadrature_order) ||
-          options.igr_face_assembly_quadrature_order > 14)
+          !ParseAssemblyQuadratureOrder(argv[index],
+                            options.igr_face_assembly_quadrature_order))
       {
         error =
-            "--igr-face-quadrature-order requires an integer in [1,14]";
+            "--igr-face-quadrature-order requires a positive representable rule";
         return false;
       }
       continue;
@@ -1120,6 +1138,22 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     error = "the IGR quadrature options require --mode igr";
     return false;
   }
+  if (!dg::hdg::generic::PlanPolynomialShape(options.order,
+          options.regularization == RegularizationKind::igr).valid)
+  {
+    error = "--order exceeds the selected system's local index representation";
+    return false;
+  }
+  if (options.trace_policy ==
+          CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh &&
+      (options.engine != CudaEngineKind::ordinary ||
+       options.regularization != RegularizationKind::igr ||
+       options.time_treatment != EulerHdgTimeTreatment::backward_euler))
+  {
+    error = "ordinary-ilu-jacobi5-refresh requires ordinary IGR "
+            "backward Euler";
+    return false;
+  }
   if ((options.trace_policy ==
            CudaTracePolicyKind::native_element_schwarz_fp64 ||
        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
@@ -1166,14 +1200,14 @@ void PrintUsage(const char* executable)
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
                " [--time-integrator backward-euler|partitioned-backward-euler|rodas3]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
+               " [--trace-policy engine-default|ordinary-ilu-jacobi5-refresh|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
                "coupled-sigma-jacobi2-fp64|native-element-schwarz-matrix-"
                "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
-               " [--order 1|2|3] [--mesh-n N]"
+               " [--order P] [--mesh-n N]"
                " [--domain-periods K] [--dt DT]"
                " [--time-atol ATOL --time-rtol RTOL]"
                " [--linear-rtol RTOL]"
@@ -1186,14 +1220,14 @@ void PrintUsage(const char* executable)
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
                " [--time-integrator backward-euler|partitioned-backward-euler|rodas3]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
+               " [--trace-policy engine-default|ordinary-ilu-jacobi5-refresh|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
                "coupled-sigma-jacobi2-fp64|native-element-schwarz-matrix-"
                "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
-               " [--order 1|2|3] [--mesh-n N]"
+               " [--order P] [--mesh-n N]"
                " [--domain-periods K] [--dt DT]"
                " [--time-atol ATOL --time-rtol RTOL]"
                " [--linear-rtol RTOL]"
@@ -2517,7 +2551,8 @@ int RunBenchmark(const Options& options)
   const CudaTracePolicyKind effective_trace_policy =
       options.trace_policy == CudaTracePolicyKind::engine_default
       ? DefaultCudaTracePolicyRequest(
-            options.engine, igr_active, rank_count, options.time_treatment)
+            options.engine, igr_active, rank_count, options.time_treatment,
+            options.order)
       : options.trace_policy;
   if (CudaQualificationTestAccess::InitializeBenchmarkTracePolicy(
           session, request, effective_trace_policy).status !=
