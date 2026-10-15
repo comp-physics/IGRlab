@@ -2,10 +2,13 @@
 #include "sim/context/example_context.hpp"
 #include "sim/io/vis_helpers.hpp"
 #include "sim/state/euler_state_bundle.hpp"
+#include "utils/diagnostics/detail/euler_admissibility_device.hpp"
+#include "utils/diagnostics/non_finite.hpp"
 
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 #include "test_utils.hpp"
 
@@ -27,6 +30,103 @@ dg_sim::RunConfig MakeRunConfig(int order)
   cfg.dg_backend = dg_sim::DGBackend::DG;
   cfg.mesh_path.clear();
   return cfg;
+}
+
+void CheckFiniteScanShortcut(TestContext& ctx)
+{
+  int rank = 0, ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  const bool cuda = mfem::igrlab::detail::AdmissibilityOrdinaryCuda();
+  mfem::Array<int> status;
+  mfem::Vector empty;
+  ctx.Check(mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                empty, MPI_COMM_WORLD, status) == cuda,
+            "Empty device finite scan takes the consistent empty-state path.");
+
+  using Scalar = mfem::real_t;
+  mfem::Vector state(8);
+  const auto fill_finite = [&]()
+  {
+    auto* values = state.HostWrite();
+    values[0] = std::numeric_limits<Scalar>::max();
+    values[1] = std::numeric_limits<Scalar>::lowest();
+    values[2] = std::numeric_limits<Scalar>::denorm_min();
+    values[3] = -std::numeric_limits<Scalar>::denorm_min();
+    values[4] = Scalar(0.0);
+    values[5] = Scalar(-0.0);
+    values[6] = std::numeric_limits<Scalar>::min();
+    values[7] = -std::numeric_limits<Scalar>::min();
+  };
+  const auto upload_current = [&]()
+  {
+    state.UseDevice(true);
+    (void)state.ReadWrite(true);
+  };
+  fill_finite();
+  ctx.Check(!mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status),
+            "A host-authoritative state keeps the full finite scanner.");
+  const auto full = mfem::igrlab::ScanNonFiniteDetailed(
+      state, MPI_COMM_WORLD, 2, mfem::Ordering::byNODES);
+  ctx.Check(full.summary.global_non_finite == 0 &&
+                full.summary.global_min == std::numeric_limits<Scalar>::lowest() &&
+                full.summary.global_max == std::numeric_limits<Scalar>::max() &&
+                full.first_bad_rank == -1 &&
+                full.global_component_non_finite == std::vector<int>({0, 0}),
+            "Full finite diagnostics retain exact extrema and component metadata.");
+  if (!cuda) { return; }
+
+  upload_current();
+  ctx.Check(mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status) &&
+                !state.GetMemory().HostIsValid(),
+            "Device finite extremes, signed zeros and subnormals pass without state host staging.");
+
+  // One rank declining is sufficient even when every other rank is device-ready.
+  if (rank == ranks - 1) { (void)state.HostReadWrite(); }
+  ctx.Check(!mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status),
+            "A single rank declining the device route sends all ranks to full diagnostics.");
+
+  const Scalar bad_values[] = {
+    std::numeric_limits<Scalar>::quiet_NaN(),
+    std::numeric_limits<Scalar>::infinity(),
+    -std::numeric_limits<Scalar>::infinity()};
+  for (const Scalar bad : bad_values)
+  {
+    fill_finite();
+    if (rank == ranks - 1) { state.HostReadWrite()[2] = bad; }
+    upload_current();
+    ctx.Check(!mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                  state, MPI_COMM_WORLD, status) &&
+                  !state.GetMemory().HostIsValid(),
+              "One-rank NaN or signed infinity forces collective fallback without state host staging.");
+    const auto detailed = mfem::igrlab::ScanNonFiniteDetailed(
+        state, MPI_COMM_WORLD, 2, mfem::Ordering::byNODES);
+    ctx.Check(detailed.summary.global_non_finite == 1 &&
+                  detailed.summary.global_min == std::numeric_limits<Scalar>::lowest() &&
+                  detailed.summary.global_max == std::numeric_limits<Scalar>::max() &&
+                  detailed.first_bad_rank == ranks - 1 &&
+                  detailed.global_component_non_finite == std::vector<int>({1, 0}) &&
+                  detailed.first_local_entry.found == (rank == ranks - 1),
+              "Fallback preserves exact global counts, extrema, first rank and component metadata.");
+    if (rank == ranks - 1)
+    {
+      ctx.Check(detailed.first_local_entry.local_index == 2 &&
+                    detailed.first_local_entry.scalar_dof == 1 &&
+                    detailed.first_local_entry.component == 0 &&
+                    (std::isnan(bad) ? std::isnan(detailed.first_local_entry.value) :
+                      detailed.first_local_entry.value == bad),
+                "Fallback preserves the first nonfinite value and its local mapping.");
+    }
+  }
+  fill_finite();
+  upload_current();
+  ctx.Check(mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+                state, MPI_COMM_WORLD, status) &&
+                !state.GetMemory().HostIsValid(),
+            "A fresh finite device state clears the previous nonfinite result.");
 }
 
 int FindInterfaceSideElement(const dg_sim::ExampleContext& ctx, bool left)
@@ -76,6 +176,7 @@ double ReduceOwnedCount(bool owned)
 
 int RunDiagnosticsTests(TestContext& ctx)
 {
+  CheckFiniteScanShortcut(ctx);
   constexpr double gamma = 1.4;
   constexpr double rho_floor = 1.0e-12;
 
@@ -260,8 +361,19 @@ int RunDiagnosticsTests(TestContext& ctx)
       (void)state.ReadWrite();
     }
     pressure.Update(); velocity.Update();
-    ctx.Check(state.GetMemory().HostIsValid(),
-              "Mixed or noncollocated spaces retain the host coefficient path.");
+    // A globally mixed mesh can leave a rank with only quadrilaterals, where
+    // the matching nodal spaces admit the device path. Require host residency
+    // only on nonempty partitions that actually contain unsupported geometry
+    // or different input/output nodes; compare values on every rank below.
+    bool local_requires_host = !mixed_geometry;
+    for (int e = 0; e < pmesh.GetNE(); ++e)
+    {
+      local_requires_host = local_requires_host ||
+          pmesh.GetElementBaseGeometry(e) != mfem::Geometry::SQUARE;
+    }
+    ctx.Check(state.Size() == 0 || !local_requires_host ||
+                  state.GetMemory().HostIsValid(),
+              "Locally unsupported or noncollocated spaces retain the host coefficient path.");
     ctx.Check(std::memcmp(pressure.pressure.HostRead(), pressure_reference.HostRead(),
                          pressure_reference.Size() * sizeof(mfem::real_t)) == 0 &&
                 std::memcmp(velocity.velocity.HostRead(), velocity_reference.HostRead(),

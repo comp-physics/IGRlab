@@ -321,6 +321,7 @@ private:
     igrlab::RK3Defaults::kLimiterSteps; ///< <0 => optional limiters always on
   bool nan_scan_stages_ = false;
   bool stage_nan_detected_ = false;
+  mfem::Array<int> nonfinite_status_scratch_; // one reusable device result
   bool admissibility_scan_stages_ = false;
   bool stage_pair_capture_written_ = false;
   std::uint64_t state_generation_ = 0;

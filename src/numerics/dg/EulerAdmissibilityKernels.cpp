@@ -1,5 +1,6 @@
 #include "utils/diagnostics/euler_admissibility.hpp"
 
+#include <algorithm>
 #include <climits>
 #include <limits>
 #include <new>
@@ -20,6 +21,25 @@ namespace detail
 namespace
 {
 constexpr int scan_threads = 128;
+
+__global__ void NonFiniteStatusKernel(const mfem::real_t* state, int count,
+                                      int* status)
+{
+  const std::size_t first = static_cast<std::size_t>(blockIdx.x) *
+      blockDim.x + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = first; i < static_cast<std::size_t>(count); i += stride)
+  {
+    // Classify the exponent without arithmetic: finite DBL_MAX, signed zero
+    // and subnormals must pass even when a floating norm would overflow.
+    const unsigned long long bits = __double_as_longlong(state[i]);
+    if ((bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+    {
+      atomicExch(status, 1);
+      return;
+    }
+  }
+}
 
 struct DeviceElement
 {
@@ -493,6 +513,40 @@ bool EvaluateAdmissibilityDevice(const AdmissibilityDevicePlan& plan,
     }
     return true;
 }
+bool CanSkipDetailedFiniteScan(const mfem::Vector& state, MPI_Comm comm,
+                              mfem::Array<int>& status)
+{
+  int local_skip = 0;
+  if (AdmissibilityOrdinaryCuda())
+  {
+    if (state.Size() == 0)
+    {
+      local_skip = 1;
+    }
+    else if (state.GetMemory().DeviceIsValid())
+    {
+      status.SetSize(1);
+      status.GetMemory().UseDevice(true);
+      status.HostWrite()[0] = 0;
+      int* device_status = status.ReadWrite(true);
+      const int blocks = std::min(1024, (state.Size() - 1) / scan_threads + 1);
+      NonFiniteStatusKernel<<<blocks, scan_threads>>>(
+          state.Read(true), state.Size(), device_status);
+      MFEM_GPU_CHECK(cudaGetLastError());
+      // This synchronizes only the four-byte result, never the state vector.
+      local_skip = status.HostRead()[0] == 0 ? 1 : 0;
+    }
+  }
+  // Even a rank that declines the native CUDA route participates. A remote
+  // failure or host-authoritative vector must send every rank into the same
+  // full scanner and its existing MPI collective sequence.
+  int global_skip = 0;
+  MFEM_VERIFY(MPI_Allreduce(&local_skip, &global_skip, 1,
+                           mfem::MPITypeMap<int>::mpi_type, MPI_MIN, comm) ==
+                  MPI_SUCCESS,
+              "RK finite-status agreement failed.");
+  return global_skip != 0;
+}
 #else
 // The canonical source remains usable without native CUDA compilation. No
 // CXX-only or alternate backend may accidentally execute CUDA expressions.
@@ -505,6 +559,9 @@ std::shared_ptr<AdmissibilityDevicePlan> MakeAdmissibilityDevicePlan(
 { charged_bytes = 0; return {}; }
 bool EvaluateAdmissibilityDevice(const AdmissibilityDevicePlan&,
   const mfem::Vector&, double, double, double, EulerAdmissibilitySummary&)
+{ return false; }
+bool CanSkipDetailedFiniteScan(const mfem::Vector&, MPI_Comm,
+                              mfem::Array<int>&)
 { return false; }
 #endif
 } // namespace detail

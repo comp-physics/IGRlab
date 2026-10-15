@@ -94,6 +94,66 @@ inline int CudaDecodeSigned(const int encoded, double& sign) noexcept
   return encoded >= 0 ? encoded : -1 - encoded;
 }
 
+// Temporary host setup scratch, never retained by an engine. CSR row ranges
+// are disjoint, so an index outside the current row is a stale lookup entry;
+// no O(number of true rows) clear is needed when switching rows.
+class CudaSparseOwnedRowLookup
+{
+public:
+  static constexpr std::size_t maximum_bytes = 16 * 1024 * 1024;
+
+  bool Initialize(const int columns) noexcept
+  {
+    targets_.clear();
+    begin_ = end_ = -1;
+    if (columns <= 0 || static_cast<std::size_t>(columns) >
+                            maximum_bytes / sizeof(int))
+      return false;
+    try
+    {
+      targets_.assign(static_cast<std::size_t>(columns), -1);
+      return true;
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  bool Admits(const int column) const noexcept
+  {
+    return column >= 0 &&
+        static_cast<std::size_t>(column) < targets_.size();
+  }
+
+  int Find(const std::vector<int>& columns, const int begin,
+           const int end, const int column) noexcept
+  {
+    if (!Admits(column)) return -1;
+    if (begin != begin_ || end != end_)
+    {
+      // Last write wins: walking backwards retains the first CSR occurrence,
+      // including a diagonal-first entry and any unsorted duplicate columns.
+      for (int entry = end; entry > begin;)
+      {
+        --entry;
+        const int owned_column = columns[static_cast<std::size_t>(entry)];
+        if (Admits(owned_column))
+          targets_[static_cast<std::size_t>(owned_column)] = entry;
+      }
+      begin_ = begin;
+      end_ = end;
+    }
+    const int target = targets_[static_cast<std::size_t>(column)];
+    return target >= begin && target < end ? target : -1;
+  }
+
+private:
+  std::vector<int> targets_{};
+  int begin_ = -1;
+  int end_ = -1;
+};
+
 inline bool CudaEvaluateStaticExteriorStateHost(
     const CudaStaticBoundaryPolicy& policy,
     const std::array<double, conserved_components>& interior,
@@ -1377,6 +1437,7 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildPersistentTrueSystem() noexcept
 {
+  ::igrlab::NVTXRange setup_profile_region("HDG persistent true-system setup");
   const CudaTracePolicyDescriptor& trace_policy = trace_policy_descriptor_;
   if (!CudaTracePolicyDescriptorIsExact(trace_policy) ||
       trace_policy.igr_active != shape_.igr_active)
@@ -2086,13 +2147,15 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildSparseStagingPlan() noexcept
 {
+  ::igrlab::NVTXRange staging_profile_region("HDG sparse staging plan");
   // The generic true graph is persistent, so resolve its topology once.  The
   // old staging builder linearly scanned every owned true row for every dense
   // element-Schur entry.  That made setup O(E * n_t^2 * N_true), even for the
   // native rank-one matrix-free operator.  Keep the exact CSR staging needed
   // by the independent residual and robust native checks, but resolve local
-  // rows directly and use logarithmic searches wherever immutable row
-  // topology is sorted (with a bounded row-local fallback otherwise).
+  // rows directly. A bounded temporary row lookup avoids a CSR search for
+  // every local element-Schur column; the original searches remain available
+  // if the scratch allocation is unavailable or a column is outside it.
   std::vector<std::pair<std::int64_t, int>> owned_row_lookup;
   std::vector<unsigned char> diag_tail_sorted;
   std::vector<unsigned char> offd_sorted;
@@ -2163,6 +2226,9 @@ BuildSparseStagingPlan() noexcept
   }
   if (!CollectiveContinue(structure_searchable)) return false;
 
+  CudaSparseOwnedRowLookup owned_row_targets;
+  (void)owned_row_targets.Initialize(shape_.true_trace_count);
+
   const auto find_row = [&](const std::int64_t global)
   {
     const auto found = std::lower_bound(
@@ -2184,6 +2250,15 @@ BuildSparseStagingPlan() noexcept
           static_cast<std::size_t>(row)];
       const int end = true_structure_.diag_offsets[
           static_cast<std::size_t>(row + 1)];
+      if (owned_row_targets.Admits(owned_column))
+      {
+        const int found = owned_row_targets.Find(
+            true_structure_.diag_columns, begin, end, owned_column);
+        if (found < 0) return false;
+        section = 0;
+        target = found;
+        return true;
+      }
       if (begin < end && true_structure_.diag_columns[
               static_cast<std::size_t>(begin)] == owned_column)
       {
@@ -2247,88 +2322,91 @@ BuildSparseStagingPlan() noexcept
   };
 
   bool local_plan_valid = true;
-  for (int element = 0; element < shape_.elements; ++element)
-    for (int row = 0; row < shape_.trace_dofs; ++row)
-    {
-      double row_sign = 1.0;
-      const int row_local = CudaDecodeSigned(
-          signed_element_trace_[static_cast<std::size_t>(element) *
-                                    shape_.trace_dofs + row], row_sign);
-      const std::int64_t row_global =
-          local_global_true_[static_cast<std::size_t>(row_local)];
-      const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
-      const int true_row = row_owner == rank_
-          ? local_true_index_[static_cast<std::size_t>(row_local)] : -1;
-      const int vector_source = element * shape_.trace_dofs + row;
-      if (row_owner == rank_)
+  {
+    ::igrlab::NVTXRange mapping_profile_region("HDG sparse staging local maps");
+    for (int element = 0; element < shape_.elements; ++element)
+      for (int row = 0; row < shape_.trace_dofs; ++row)
       {
-        if (true_row < 0)
-        {
-          local_plan_valid = false;
-        }
-        else
-        {
-          host_vector_owned_source_[static_cast<std::size_t>(
-              shape_.vector_owned_count)] = vector_source;
-          host_vector_owned_target_[static_cast<std::size_t>(
-              shape_.vector_owned_count)] = true_row;
-          ++shape_.vector_owned_count;
-        }
-      }
-      else
-      {
-        host_vector_send_source_[static_cast<std::size_t>(
-            shape_.vector_send_count)] = vector_source;
-        vector_send_keys_[static_cast<std::size_t>(shape_.vector_send_count)] =
-            row_global;
-        ++shape_.vector_send_count;
-      }
-      for (int column = 0; column < shape_.trace_dofs; ++column)
-      {
-        double column_sign = 1.0;
-        const int column_local = CudaDecodeSigned(
+        double row_sign = 1.0;
+        const int row_local = CudaDecodeSigned(
             signed_element_trace_[static_cast<std::size_t>(element) *
-                                      shape_.trace_dofs + column],
-            column_sign);
-        const std::int64_t column_global =
-            local_global_true_[static_cast<std::size_t>(column_local)];
-        const int column_owner =
-            local_owner_[static_cast<std::size_t>(column_local)];
-        const int owned_column = column_owner == rank_
-            ? local_true_index_[static_cast<std::size_t>(column_local)] : -1;
-        const int source = (element * shape_.trace_dofs + row) *
-                               shape_.trace_dofs + column;
+                                      shape_.trace_dofs + row], row_sign);
+        const std::int64_t row_global =
+            local_global_true_[static_cast<std::size_t>(row_local)];
+        const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
+        const int true_row = row_owner == rank_
+            ? local_true_index_[static_cast<std::size_t>(row_local)] : -1;
+        const int vector_source = element * shape_.trace_dofs + row;
         if (row_owner == rank_)
         {
-          int section = -1, target = -1;
-          if (!find_target(
-                  true_row, owned_column, column_global, section, target))
+          if (true_row < 0)
           {
             local_plan_valid = false;
           }
           else
           {
-            host_matrix_owned_source_[static_cast<std::size_t>(
-                shape_.matrix_owned_count)] = source;
-            host_matrix_owned_section_[static_cast<std::size_t>(
-                shape_.matrix_owned_count)] = section;
-            host_matrix_owned_target_[static_cast<std::size_t>(
-                shape_.matrix_owned_count)] = target;
-            ++shape_.matrix_owned_count;
+            host_vector_owned_source_[static_cast<std::size_t>(
+                shape_.vector_owned_count)] = vector_source;
+            host_vector_owned_target_[static_cast<std::size_t>(
+                shape_.vector_owned_count)] = true_row;
+            ++shape_.vector_owned_count;
           }
         }
         else
         {
-          host_matrix_send_source_[static_cast<std::size_t>(
-              shape_.matrix_send_count)] = source;
-          matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count)] =
+          host_vector_send_source_[static_cast<std::size_t>(
+              shape_.vector_send_count)] = vector_source;
+          vector_send_keys_[static_cast<std::size_t>(shape_.vector_send_count)] =
               row_global;
-          matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count) + 1] =
-              column_global;
-          ++shape_.matrix_send_count;
+          ++shape_.vector_send_count;
+        }
+        for (int column = 0; column < shape_.trace_dofs; ++column)
+        {
+          double column_sign = 1.0;
+          const int column_local = CudaDecodeSigned(
+              signed_element_trace_[static_cast<std::size_t>(element) *
+                                        shape_.trace_dofs + column],
+              column_sign);
+          const std::int64_t column_global =
+              local_global_true_[static_cast<std::size_t>(column_local)];
+          const int column_owner =
+              local_owner_[static_cast<std::size_t>(column_local)];
+          const int owned_column = column_owner == rank_
+              ? local_true_index_[static_cast<std::size_t>(column_local)] : -1;
+          const int source = (element * shape_.trace_dofs + row) *
+                                 shape_.trace_dofs + column;
+          if (row_owner == rank_)
+          {
+            int section = -1, target = -1;
+            if (!find_target(
+                    true_row, owned_column, column_global, section, target))
+            {
+              local_plan_valid = false;
+            }
+            else
+            {
+              host_matrix_owned_source_[static_cast<std::size_t>(
+                  shape_.matrix_owned_count)] = source;
+              host_matrix_owned_section_[static_cast<std::size_t>(
+                  shape_.matrix_owned_count)] = section;
+              host_matrix_owned_target_[static_cast<std::size_t>(
+                  shape_.matrix_owned_count)] = target;
+              ++shape_.matrix_owned_count;
+            }
+          }
+          else
+          {
+            host_matrix_send_source_[static_cast<std::size_t>(
+                shape_.matrix_send_count)] = source;
+            matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count)] =
+                row_global;
+            matrix_send_keys_[2 * static_cast<std::size_t>(shape_.matrix_send_count) + 1] =
+                column_global;
+            ++shape_.matrix_send_count;
+          }
         }
       }
-    }
+  }
 
   if (!CollectiveContinue(local_plan_valid)) { return false; }
   if (ranks_ == 2)
@@ -2430,6 +2508,7 @@ BuildSparseStagingPlan() noexcept
           trace_policy_descriptor_.trace_preconditioner);
   if (use_element_schwarz)
   {
+    ::igrlab::NVTXRange schwarz_profile_region("HDG sparse staging Schwarz plan");
     const int expected_patch_rows =
         NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
     const bool direct_rank_one = ranks_ == 1 &&
@@ -2484,6 +2563,7 @@ BuildSparseStagingPlan() noexcept
         destination, source, static_cast<std::size_t>(count) * sizeof(int),
         CudaTransferCategory::topology, CudaTransferSite::map_upload);
   };
+  ::igrlab::NVTXRange upload_profile_region("HDG sparse staging upload");
   bool uploaded = upload(
                 view_.matrix_owned_source, host_matrix_owned_source_.data(),
                 shape_.matrix_owned_count) &&

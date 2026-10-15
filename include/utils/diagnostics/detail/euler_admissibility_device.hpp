@@ -20,6 +20,15 @@ struct AdmissibilityShapeTable;
 struct AdmissibilityElementSamples;
 struct AdmissibilityDevicePlan;
 
+// Internal successful-path shortcut for RK's failure-only detailed scanner.
+// True certifies that every rank inspected the current device state and found
+// only finite values. Any unsupported/local-host route or nonfinite value makes
+// every rank return false, so all ranks enter the unchanged detailed scanner.
+// The caller owns one reusable integer of scratch; no state values are copied
+// to the host. Full public scan summaries and metadata remain unchanged.
+bool CanSkipDetailedFiniteScan(const mfem::Vector& state, MPI_Comm comm,
+                              mfem::Array<int>& status);
+
 inline bool AdmissibilityOrdinaryCuda()
 {
   const unsigned long native = static_cast<unsigned long>(mfem::Backend::CPU) |

@@ -412,8 +412,13 @@ void RK3SSPWithLimiter::MaybeScanVector(Vector& v, double t, const char* label)
   }
 
   ::igrlab::NVTXRange range("RK/nonfinite-scan");
-  ParGridFunction stage(&vfes_, v);
   const MPI_Comm comm = vfes_.GetComm();
+  if (mfem::igrlab::detail::CanSkipDetailedFiniteScan(
+        v, comm, nonfinite_status_scratch_))
+  {
+    return;
+  }
+  ParGridFunction stage(&vfes_, v);
   const int vdim = stage.VectorDim();
   const auto ordering = vfes_.GetOrdering();
   const auto scan =

@@ -383,6 +383,79 @@ struct CudaDirectZhangShuAudit
 struct CudaQualificationTestAccess
 {
   template <typename Engine>
+  static bool VerifySparseStagingMaps(Engine& engine)
+  {
+    const auto& numerics = engine.numerics_;
+    const auto& shape = numerics.shape_;
+    const auto& structure = numerics.true_structure_;
+    int owned_entry = 0;
+    int sent_entry = 0;
+    bool valid = true;
+    for (int element = 0; element < shape.elements; ++element)
+      for (int row = 0; row < shape.trace_dofs; ++row)
+      {
+        const int encoded_row = numerics.signed_element_trace_[
+            static_cast<std::size_t>(element) * shape.trace_dofs + row];
+        const int local_row = encoded_row < 0 ? -1 - encoded_row : encoded_row;
+        const int owner = numerics.local_owner_[local_row];
+        const int true_row = numerics.local_true_index_[local_row];
+        for (int column = 0; column < shape.trace_dofs; ++column)
+        {
+          const int encoded_column = numerics.signed_element_trace_[
+              static_cast<std::size_t>(element) * shape.trace_dofs + column];
+          const int local_column = encoded_column < 0
+              ? -1 - encoded_column : encoded_column;
+          const int source = (element * shape.trace_dofs + row) *
+              shape.trace_dofs + column;
+          if (owner != numerics.rank_)
+          {
+            valid = valid && sent_entry < shape.matrix_send_count &&
+                numerics.host_matrix_send_source_[sent_entry] == source &&
+                numerics.matrix_send_keys_[2 * sent_entry] ==
+                    numerics.local_global_true_[local_row] &&
+                numerics.matrix_send_keys_[2 * sent_entry + 1] ==
+                    numerics.local_global_true_[local_column];
+            ++sent_entry;
+            continue;
+          }
+
+          // Independent linear scan: do not use production lookup/search
+          // helpers, and require the first matching CSR slot in its order.
+          const int section = numerics.local_owner_[local_column] ==
+                  numerics.rank_ ? 0 : 1;
+          int target = -1;
+          if (true_row >= 0 && true_row < shape.true_trace_count)
+          {
+            const auto& offsets = section == 0
+                ? structure.diag_offsets : structure.offd_offsets;
+            for (int entry = offsets[true_row];
+                 entry < offsets[true_row + 1]; ++entry)
+            {
+              const bool matches = section == 0
+                  ? structure.diag_columns[entry] ==
+                        numerics.local_true_index_[local_column]
+                  : structure.offd_columns[entry] ==
+                        numerics.local_global_true_[local_column];
+              if (matches)
+              {
+                target = entry;
+                break;
+              }
+            }
+          }
+          valid = valid && target >= 0 &&
+              owned_entry < shape.matrix_owned_count &&
+              numerics.host_matrix_owned_source_[owned_entry] == source &&
+              numerics.host_matrix_owned_section_[owned_entry] == section &&
+              numerics.host_matrix_owned_target_[owned_entry] == target;
+          ++owned_entry;
+        }
+      }
+    return valid && owned_entry == shape.matrix_owned_count &&
+        sent_entry == shape.matrix_send_count;
+  }
+
+  template <typename Engine>
   static bool VerifyInitialStateHashesAndReferenceShapes(Engine& engine)
   {
     auto& numerics = engine.numerics_;
@@ -393,6 +466,8 @@ struct CudaQualificationTestAccess
         shape.true_trace_count > 0 && numerics.ranks_ >= 1 &&
         numerics.ranks_ <= 2;
     if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    local_valid = VerifySparseStagingMaps(engine);
 
     // Independently rebuild each reference basis. Reused reference values
     // must have exactly the original bits, including signed zeros.
@@ -6299,7 +6374,7 @@ bool CheckLifecycle(const int order, const bool physical,
   if (!CudaQualificationTestAccess::VerifyInitialStateHashesAndReferenceShapes(
           session))
   {
-    std::cerr << "CUDA initial state hash/reference shape mismatch order="
+    std::cerr << "CUDA initial state hash/reference shape/staging map mismatch order="
               << order << '\n';
     return false;
   }
@@ -8797,6 +8872,38 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
         !options.partitioned_smoke && !any_rodas3_screen));
 }
 
+bool CheckSparseOwnedRowLookup()
+{
+  using dg::hdg::runtime::cuda_w8a::detail::CudaSparseOwnedRowLookup;
+  CudaSparseOwnedRowLookup lookup;
+  if (!lookup.Initialize(8)) return false;
+  // Diagonal-first/sorted tail, unsorted duplicates, disjoint and empty rows.
+  // Revisit earlier rows to catch stale targets from a more recent row.
+  const std::vector<int> columns{5, 0, 2, 5, 7, 3, 7, 1, 3, 6, 0, 2};
+  const std::array<int, 5> offsets{{0, 5, 9, 9, 12}};
+  const std::array<int, 7> visits{{0, 1, 2, 3, 0, 1, 3}};
+  for (const int row : visits)
+    for (int column = 0; column < 8; ++column)
+    {
+      int expected = -1;
+      for (int entry = offsets[row]; entry < offsets[row + 1]; ++entry)
+        if (columns[entry] == column)
+        {
+          expected = entry;
+          break;
+        }
+      if (lookup.Find(columns, offsets[row], offsets[row + 1], column) !=
+          expected)
+        return false;
+    }
+  const int beyond_cap = static_cast<int>(
+      CudaSparseOwnedRowLookup::maximum_bytes / sizeof(int)) + 1;
+  return !lookup.Admits(-1) && !lookup.Admits(8) &&
+      !lookup.Initialize(beyond_cap) && !lookup.Admits(0) &&
+      lookup.Initialize(8) &&
+      lookup.Find(columns, offsets[0], offsets[1], 5) == 0;
+}
+
 bool CheckRecoveryDispatchAdmission() noexcept
 {
   static_assert(CudaBorrowedRecoveryForEngine(CudaEngineKind::ordinary) ==
@@ -8848,9 +8955,9 @@ int main(int argc, char* argv[])
   }
   selected_cuda_engine = options.engine;
   selected_time_treatment = options.time_treatment;
-  const bool admission = options.rodas3_screen ||
-      options.rodas3_rank2_screen ||
-      (order > 0 && CheckContractAdmission(order));
+  const bool admission = CheckSparseOwnedRowLookup() &&
+      (options.rodas3_screen || options.rodas3_rank2_screen ||
+       (order > 0 && CheckContractAdmission(order)));
   mfem::Device device("cuda");
   (void)device;
   if (options.assembly_arithmetic_only)

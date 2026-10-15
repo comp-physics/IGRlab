@@ -6616,8 +6616,8 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     __syncthreads();
   }
   // A thread owns the same RHS columns for every pivot. Swaps therefore
-  // depend only on earlier work by that thread; synchronize once before
-  // the forward solve redistributes entries across the block.
+  // depend only on earlier work by that thread; publish the permuted RHS
+  // before either triangular solve.
   for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
   for(int row=0;row<ni;++row)
   {
@@ -6630,16 +6630,20 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     }
   }
   __syncthreads();
-  for(int column=0;column<ni;++column)
+  // Keep each RHS with one thread through the forward solve. For a fixed
+  // (row,rhs), the elimination form subtracts columns 0..row-1 in order;
+  // those source rows are already final when this increasing-row recurrence
+  // reaches them. The same scalar subtraction/multiply order is retained,
+  // while each row is written once and no per-column block barrier is needed.
+  for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+  for(int row=0;row<ni;++row)
   {
-    const int remaining=ni-column-1;
-    for(int item=threadIdx.x;item<remaining*cols;item+=blockDim.x)
-    {
-      const int row=column+1+item/cols,rhs=item%cols;
-      w[row*cols+rhs]-=lu[row*ni+column]*w[column*cols+rhs];
-    }
-    __syncthreads();
+    double value=w[row*cols+rhs];
+    for(int column=0;column<row;++column)
+      value-=lu[row*ni+column]*w[column*cols+rhs];
+    w[row*cols+rhs]=value;
   }
+  __syncthreads();
   // Back substitution also has independent RHS columns. Keep each scalar
   // recurrence intact, with one barrier before the cross-column Schur work.
   for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)

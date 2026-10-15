@@ -961,14 +961,15 @@ int main(int argc, char** argv)
   for (const int order : {2, 4})
   { CheckCase(order, 7, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error); }
   CheckCase(3, 9, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
-  // Native p4/p5/p6 quadrature exercises multiple output tiles, including
-  // tiles that span the two sides and partially filled final output tiles.
+  // Native p4/p5/p6 quadrature covers side-spanning 64-row groups and partial
+  // output groups. P5 has a full first group and an eight-row tail.
   for (const int order : {4, 5, 6})
   {
     for (const int basis : {mfem::BasisType::GaussLegendre,
                             mfem::BasisType::GaussLobatto})
     { CheckCase(order, 2 * order + 1, basis, 0, cases, max_assembled_error); }
   }
+  CheckCase(5, 11, mfem::BasisType::GaussLegendre, 1, cases, max_assembled_error);
   CheckCase(5, 11, mfem::BasisType::GaussLegendre, 2, cases, max_assembled_error);
   CheckCase(6, 13, mfem::BasisType::GaussLegendre, 1, cases, max_assembled_error);
   // P7 has 128 output rows: exactly two full 64-row groups.
@@ -978,7 +979,7 @@ int main(int argc, char** argv)
                           mfem::BasisType::GaussLobatto})
   { CheckCase(10, 21, basis, 0, cases, max_assembled_error); }
   // Q1 tests valid side-one sources for all inactive warp lanes while P5
-  // still exercises multiple output groups and a partially filled tail.
+  // exercises a partially filled second 64-row output group.
   MFEM_VERIFY(IntRules.Get(Geometry::SEGMENT, 0).GetNPoints() == 1,
               "Lower-bound shuffle fixture must contain one quadrature point.");
   CheckCase(5, 0, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
@@ -987,6 +988,7 @@ int main(int argc, char** argv)
   // Fill all projection lanes while also exercising a partial output group.
   CheckCase(5, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(4, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
+  CheckCase(5, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   std::cout << "Exact face record/gather parity: backend=" << backend
             << " cases=" << cases << " max_assembled_error="
             << max_assembled_error << '\n';
