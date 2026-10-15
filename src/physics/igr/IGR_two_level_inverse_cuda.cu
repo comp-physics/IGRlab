@@ -1,5 +1,6 @@
 #include "igrlab/compat.hpp"
 #include "IGR_two_level_inverse.hpp"
+#include "IGR_device_krylov.hpp"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -300,7 +301,10 @@ public:
       { MFEM_VERIFY(diagonal(i) > 0.0 && std::isfinite(diagonal(i)), "Nonpositive H1 coarse diagonal."); }
       coarse_jacobi_ = std::make_unique<mfem::OperatorJacobiSmoother>(
         diagonal, coarse_essential_, 1.0);
-      coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm());
+      device_coarse_cg_ = DeviceKrylovRequested("DG_IGR_IGR_COARSE_CG_BACKEND",
+        DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"));
+      if (device_coarse_cg_) { coarse_cg_ = MakeDeviceCGSolver(sfes.GetComm()); }
+      else { coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm()); }
       coarse_cg_->SetOperator(*coarse_);
       coarse_cg_->SetPreconditioner(*coarse_jacobi_);
       coarse_cg_->SetRelTol(1.0e-2);
@@ -317,6 +321,7 @@ public:
     std::cout << "[igr-two-level] n=" << height << " elements=" << ne_
               << " block_dof=" << dof_ << " coarse_n=" << nc
               << " coarse_mode=" << coarse_mode
+              << " coarse_cg_backend=" << (device_coarse_cg_ ? "cuda-fp64" : "mfem")
               << " coarse_order=" << coarse_order
               << " element_colors=" << element_color_count
               << " coarse_colors=" << coarse_color_count
@@ -386,7 +391,8 @@ private:
   mfem::Vector inverse_blocks_, coarse_inverse_;
   std::unique_ptr<mfem::SparseMatrix> prolong_, coarse_;
   std::unique_ptr<mfem::OperatorJacobiSmoother> coarse_jacobi_;
-  std::unique_ptr<mfem::CGSolver> coarse_cg_;
+  std::unique_ptr<mfem::IterativeSolver> coarse_cg_;
+  bool device_coarse_cg_ = false;
   mutable mfem::Vector coarse_rhs_, coarse_solution_, coarse_fine_;
   cublasHandle_t handle_ = nullptr;
 };
