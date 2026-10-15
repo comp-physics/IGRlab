@@ -1,6 +1,7 @@
 #include "igrlab/compat.hpp"
 #include "IGR_two_level_inverse.hpp"
 #include "IGR_device_krylov.hpp"
+#include "IGR_two_level_blocks_cuda.cuh"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -231,6 +232,8 @@ public:
                 inverse_data + std::size_t(e) * dof_ * dof_);
     }
 
+    blocks_.Configure(ne_, dof_, inverse_blocks_);
+
     Graph coarse_graph(nc);
     for (int e = 0; e < ne_; ++e)
     {
@@ -365,22 +368,7 @@ public:
                   "Two-level coarse CG did not reach its 1e-2 tolerance in 100 iterations.");
     }
     prolong_->Mult(coarse_solution_, coarse_fine_);
-    y.SetSize(height);
-    y.UseDevice(true);
-    const double* input = x.Read();
-    const double* coarse_value = coarse_fine_.Read();
-    const double* inverse = inverse_blocks_.Read();
-    const int* map = element_dofs_.Read();
-    double* output = y.Write();
-    const int d = dof_;
-    mfem::forall(height, [=] MFEM_HOST_DEVICE(int entry)
-    {
-      const int e = entry / d, i = entry % d;
-      double value = coarse_value[map[entry]];
-      for (int j = 0; j < d; ++j)
-      { value += inverse[(e * d + j) * d + i] * input[map[e * d + j]]; }
-      output[map[entry]] = value;
-    });
+    blocks_.Mult(x, coarse_fine_, element_dofs_, y);
   }
 
 private:
@@ -389,6 +377,7 @@ private:
   mfem::Array<int> element_dofs_;
   mfem::Array<int> coarse_essential_;
   mfem::Vector inverse_blocks_, coarse_inverse_;
+  TwoLevelBlocks blocks_;
   std::unique_ptr<mfem::SparseMatrix> prolong_, coarse_;
   std::unique_ptr<mfem::OperatorJacobiSmoother> coarse_jacobi_;
   std::unique_ptr<mfem::IterativeSolver> coarse_cg_;
