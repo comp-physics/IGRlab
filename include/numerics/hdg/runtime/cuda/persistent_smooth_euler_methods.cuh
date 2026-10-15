@@ -1776,6 +1776,19 @@ BuildPersistentTrueSystem() noexcept
       TransportPolicy::Synchronize(CudaTransferSite::initial_trace_upload);
   if (!CollectiveContinue(staging_ready))
     return false;
+  if (borrowed_topology_ && shape_.borrowed_host_inputs)
+  {
+    // Uploads are complete. Runtime assembly reads device maps; Schwarz
+    // retains only its scalar shape/multiplicity metadata on the host.
+    std::vector<int>{}.swap(host_matrix_owned_source_);
+    std::vector<int>{}.swap(host_matrix_owned_section_);
+    std::vector<int>{}.swap(host_matrix_owned_target_);
+    std::vector<int>{}.swap(element_schwarz_plan_.signed_element_true_dofs);
+    std::vector<int>{}.swap(element_schwarz_plan_.first_element_sources);
+    std::vector<int>{}.swap(element_schwarz_plan_.second_element_sources);
+    std::vector<int>{}.swap(element_schwarz_plan_.true_multiplicity);
+    std::vector<int>{}.swap(element_schwarz_plan_.true_incidence_slots);
+  }
   // Materialize the exact Krylov/factor allocation footprint before the
   // allocation baseline. The topology matrix is deliberately diagonally
   // dominant here; each real generation overwrites only its already-fixed

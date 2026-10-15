@@ -4426,6 +4426,7 @@ static_assert((sizeof(BorrowedVolumeCache) + sizeof(BorrowedFaceCache)) *
                   borrowed_euler_elements_per_block <=
               48 * 1024);
 
+template <bool ClearVolume>
 __device__ void BorrowedEulerZeroElement(CudaDeviceView v,CudaMeshShape s,
                                          const int e,const int lane)
 {
@@ -4436,23 +4437,28 @@ __device__ void BorrowedEulerZeroElement(CudaDeviceView v,CudaMeshShape s,
   const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
   const std::size_t doff=static_cast<std::size_t>(e)*nt*nt;
   for(int i=lane;i<ni;i+=borrowed_euler_group_threads)
-  {v.residual_r[e_i+i]=0.0;v.f[e_i+i]=0.0;}
+  {
+    if constexpr(ClearVolume)v.residual_r[e_i+i]=0.0;
+    v.f[e_i+i]=0.0;
+  }
   for(int i=lane;i<nt;i+=borrowed_euler_group_threads)
   {v.residual_g[e_t+i]=0.0;v.g[e_t+i]=0.0;}
-  for(int i=lane;i<ni*ni;i+=borrowed_euler_group_threads)v.a[ao+i]=0.0;
+  if constexpr(ClearVolume)
+    for(int i=lane;i<ni*ni;i+=borrowed_euler_group_threads)v.a[ao+i]=0.0;
   for(int i=lane;i<ni*nt;i+=borrowed_euler_group_threads)v.b[bo+i]=0.0;
   for(int i=lane;i<nt*ni;i+=borrowed_euler_group_threads)v.c[co+i]=0.0;
   for(int i=lane;i<nt*nt;i+=borrowed_euler_group_threads)v.d[doff+i]=0.0;
   if(lane==0)v.status[e]=1.0;
 }
 
+template <bool ClearVolume>
 __global__ void BorrowedEulerZeroKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int group=threadIdx.x/borrowed_euler_group_threads;
   const int lane=threadIdx.x%borrowed_euler_group_threads;
   const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
   if(e>=s.elements)return;
-  BorrowedEulerZeroElement(v,s,e,lane);
+  BorrowedEulerZeroElement<ClearVolume>(v,s,e,lane);
 }
 
 // The first four lanes retain the original interpolant ownership and scalar
@@ -4979,7 +4985,7 @@ __device__ bool BorrowedEulerFaceElement(
   return true;
 }
 
-// Tensor assembly and the ordinary p3/p5 specializations assign a warp to an
+// Tensor assembly and the wider ordinary row schedule assign a warp to an
 // element so independent dense rows do not queue behind four owners.  Every
 // entry still visits faces and quadrature points in the same order; all
 // interpolants and coupled flux work retain their original owners.
@@ -5978,6 +5984,20 @@ __global__ void BorrowedEulerTensorVolumeCoefficientKernel(
     if(!valid&&lane==0)atomicExch(&failed,1);
   }
   __syncthreads();
+  // The first contraction overwrites every A/residual entry, so successful
+  // tensor assembly does not need to clear them beforehand. A rejected first
+  // coefficient chunk never reaches that contraction: retain the historical
+  // zero outputs using this already-running block. Later failures preserve
+  // the completed earlier chunks exactly as before.
+  if(failed&&q_begin==0)
+  {
+    const int ni=s.interior_dofs;
+    const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+    for(int entry=threadIdx.x;entry<ni*ni;entry+=blockDim.x)
+      v.a[ao+entry]=0.0;
+    for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+      v.residual_r[e*ni+row]=0.0;
+  }
   if(threadIdx.x==0&&failed)v.status[e]=-1.0;
 }
 
@@ -6091,6 +6111,20 @@ __device__ __forceinline__ Real BorrowedEulerTensorVolumeRight(
   return 0.0;
 }
 
+// Preserve zero outputs for unsupported device images as well as coefficient
+// rejection, even though native tensor admission normally excludes them.
+[[maybe_unused]] __device__ void ClearTensorVolumeComponent(
+    CudaDeviceView v,CudaMeshShape s,const int e,const int row_component)
+{
+  const int si=s.scalar_interior_dofs,ni=s.interior_dofs;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni+
+      static_cast<std::size_t>(row_component)*si*ni;
+  for(int entry=threadIdx.x;entry<si*ni;entry+=blockDim.x)
+    v.a[ao+entry]=0.0;
+  for(int row=threadIdx.x;row<si;row+=blockDim.x)
+    v.residual_r[e*ni+ByNodes(row,si,row_component)]=0.0;
+}
+
 // One block owns one (element,row-component) slab.  Each warp owns complete
 // 8x8 output tiles, accumulates all q and phi/dx/dy products in FP64 m8n8k4
 // fragments, then writes each A/residual entry exactly once per deterministic
@@ -6102,9 +6136,9 @@ __global__ void BorrowedEulerTensorVolumeContractionKernel(
 {
   const int e=blockIdx.x;
   const int row_component=blockIdx.y;
-  if(e>=s.elements||row_component>=s.interior_components||
-     v.status[e]!=1.0)return;
+  if(e>=s.elements||row_component>=s.interior_components)return;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  if(v.status[e]!=1.0)return;
   constexpr int tensor_warps=4;
   const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
   const int si=s.scalar_interior_dofs,ni=s.interior_dofs;
@@ -6192,6 +6226,7 @@ __global__ void BorrowedEulerTensorVolumeContractionKernel(
     __syncwarp();
   }
 #else
+  if(first_chunk)ClearTensorVolumeComponent(v,s,e,row_component);
   if(row_component==0&&threadIdx.x==0)v.status[e]=-1.0;
 #endif
 }
@@ -6209,9 +6244,9 @@ __global__ void BorrowedEulerMatchedVolumeContractionKernel(
 {
   const int e=blockIdx.x;
   const int row_component=blockIdx.y;
-  if(e>=s.elements||row_component>=s.interior_components||
-     v.status[e]!=1.0)return;
+  if(e>=s.elements||row_component>=s.interior_components)return;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  if(v.status[e]!=1.0)return;
   constexpr int tile_extent=16,inner_extent=8,tile_warps=4;
   const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
   const int si=s.scalar_interior_dofs,ni=s.interior_dofs;
@@ -6393,8 +6428,37 @@ __global__ void BorrowedEulerMatchedVolumeContractionKernel(
   }
 
 #else
+  if(first_chunk)ClearTensorVolumeComponent(v,s,e,row_component);
   if(row_component==0&&threadIdx.x==0)v.status[e]=-1.0;
 #endif
+}
+
+int SelectedBorrowedAssemblyGroupThreads(const CudaMeshShape& s) noexcept
+{
+  // Select once per process, but dispatch from each session's order/shape.
+  // Shared cache capacity is fixed per element, independent of polynomial
+  // order; the warp path changes only row ownership and preserves scalar sums.
+  static const int selected=[]() noexcept
+  {
+    const char* value=::igrlab::GetEnv("DG_IGR_HDG_ASSEMBLY_GROUP_THREADS");
+    if(value==nullptr||std::strcmp(value,"auto")==0)return 0;
+    if(std::strcmp(value,"legacy")==0)return -1;
+    if(std::strcmp(value,"4")==0)return borrowed_euler_group_threads;
+    if(std::strcmp(value,"32")==0)return borrowed_euler_warp_threads;
+    std::fprintf(stderr,"Invalid DG_IGR_HDG_ASSEMBLY_GROUP_THREADS=%s; "
+        "expected auto, legacy, 4, or 32.\n",value);
+    return -2;
+  }();
+  if(selected==-2)return 0;
+  if(selected>0)return selected;
+  if(selected==-1)
+    return ((s.order==3&&s.scalar_interior_dofs==16&&s.scalar_face_dofs==4)||
+            (s.order==5&&s.scalar_interior_dofs==36&&s.scalar_face_dofs==6))?
+        borrowed_euler_warp_threads:borrowed_euler_group_threads;
+  const auto shape=generic::PlanPolynomialShape(s.order,s.igr_active);
+  return shape.valid&&s.scalar_interior_dofs==shape.scalar_interior_dofs&&
+      s.scalar_face_dofs==shape.scalar_face_dofs&&s.scalar_interior_dofs>=16?
+      borrowed_euler_warp_threads:borrowed_euler_group_threads;
 }
 
 int SelectedExperimentalFaceBlockThreads() noexcept
@@ -9233,17 +9297,12 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
                                const bool differentiate_nonlinearities) noexcept
 {
   const int face_block_threads=SelectedExperimentalFaceBlockThreads();
-  if(face_block_threads==0)return false;
+  const int group_threads=SelectedBorrowedAssemblyGroupThreads(s);
+  if(face_block_threads==0||group_threads==0)return false;
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
-  BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
+  BorrowedEulerZeroKernel<true><<<blocks,borrowed_euler_block_threads>>>(v,s);
   if(!LaunchOk())return false;
-  // Distribute independent dense rows over a warp for the measured p3/p5
-  // quadrilateral layouts. Other orders retain the four-lane path. The
-  // interpolant owners and per-entry accumulation order remain unchanged.
-  const bool warp_rows=
-      (s.order==3&&s.scalar_interior_dofs==16&&s.scalar_face_dofs==4)||
-      (s.order==5&&s.scalar_interior_dofs==36&&s.scalar_face_dofs==6);
-  if(warp_rows)
+  if(group_threads==borrowed_euler_warp_threads)
   {
     constexpr int elements_per_block=borrowed_euler_block_threads/
         borrowed_euler_warp_threads;
@@ -9318,7 +9377,8 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
         v.boundary_pressure==nullptr)))
     return false;
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
-  BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
+  // The first tensor volume chunk assigns A and residual_r completely.
+  BorrowedEulerZeroKernel<false><<<blocks,borrowed_euler_block_threads>>>(v,s);
   if(!LaunchOk())return false;
   bool first_chunk=true;
   for(int q_begin=0;q_begin<s.volume_points;)

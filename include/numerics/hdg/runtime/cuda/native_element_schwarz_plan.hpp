@@ -325,57 +325,71 @@ inline NativeElementSchwarzPlan BuildDirectNativeElementSchwarzPlan(
     result.minimum_multiplicity = *multiplicity_bounds.first;
     result.maximum_multiplicity = *multiplicity_bounds.second;
 
-    for (std::size_t target = 0; target < element_entries; ++target)
+    // Every admitted patch row has this element's incidence and at most one
+    // other incidence.  Consequently a patch entry always contains its own
+    // element source, and has a second source exactly when its row and column
+    // have the same other element. Decode those other incidences once per row;
+    // the dense fill then needs neither division nor incidence intersections.
+    std::vector<int> other_elements(rows, -1);
+    std::vector<int> other_local_rows(rows, -1);
+    for (std::size_t element = 0; element < elements; ++element)
     {
-      const std::size_t target_element = target / (rows * rows);
-      const std::size_t target_entry = target - target_element * rows * rows;
-      const std::size_t target_row = target_element * rows +
-          target_entry / rows;
-      const std::size_t target_column = target_element * rows +
-          target_entry % rows;
-      const int row_truth = NativeElementSchwarzDecodedDof(
-          result.signed_element_true_dofs[target_row]);
-      const int column_truth = NativeElementSchwarzDecodedDof(
-          result.signed_element_true_dofs[target_column]);
-
-      int first = -1;
-      int second = -1;
-      const int row_multiplicity = result.true_multiplicity[
-          static_cast<std::size_t>(row_truth)];
-      const int column_multiplicity = result.true_multiplicity[
-          static_cast<std::size_t>(column_truth)];
-      for (int row_incidence = 0; row_incidence < row_multiplicity;
-           ++row_incidence)
+      const std::size_t element_row_base = element * rows;
+      for (std::size_t row = 0; row < rows; ++row)
       {
-        const int source_row = result.true_incidence_slots[
-            2 * static_cast<std::size_t>(row_truth) +
-            static_cast<std::size_t>(row_incidence)];
-        if (source_row < 0) return result;
-        const int source_element = source_row / input.patch_rows;
-        for (int column_incidence = 0;
-             column_incidence < column_multiplicity; ++column_incidence)
+        const int slot = static_cast<int>(element_row_base + row);
+        const int truth = NativeElementSchwarzDecodedDof(
+            result.signed_element_true_dofs[element_row_base + row]);
+        const std::size_t incidence_base =
+            2 * static_cast<std::size_t>(truth);
+        const int first_slot = result.true_incidence_slots[incidence_base];
+        const int second_slot =
+            result.true_incidence_slots[incidence_base + 1];
+        const int other_slot = first_slot == slot ? second_slot : first_slot;
+        if (first_slot != slot && second_slot != slot) return result;
+        other_elements[row] = other_slot < 0
+            ? -1 : other_slot / input.patch_rows;
+        other_local_rows[row] = other_slot < 0
+            ? -1 : other_slot % input.patch_rows;
+      }
+
+      const std::size_t element_entry_base = element_row_base * rows;
+      for (std::size_t row = 0; row < rows; ++row)
+      {
+        const std::size_t target_base = element_entry_base + row * rows;
+        const int other_element = other_elements[row];
+        if (other_element < 0)
         {
-          const int source_column = result.true_incidence_slots[
-              2 * static_cast<std::size_t>(column_truth) +
-              static_cast<std::size_t>(column_incidence)];
-          if (source_column < 0) return result;
-          if (source_column / input.patch_rows != source_element) continue;
-          const int source = source_row * input.patch_rows +
-              source_column % input.patch_rows;
-          if (first < 0)
-            first = source;
-          else if (second < 0 && first != source)
-            second = source;
+          for (std::size_t column = 0; column < rows; ++column)
+            result.first_element_sources[target_base + column] =
+                static_cast<int>(target_base + column);
+          result.maximum_contributors = std::max(
+              result.maximum_contributors, 1);
+          continue;
+        }
+
+        const int other_source_base =
+            (other_element * input.patch_rows + other_local_rows[row]) *
+            input.patch_rows;
+        // A shared row's diagonal necessarily has both contributions.
+        result.maximum_contributors = 2;
+        for (std::size_t column = 0; column < rows; ++column)
+        {
+          const std::size_t target = target_base + column;
+          const int own_source = static_cast<int>(target);
+          if (other_elements[column] == other_element)
+          {
+            const int other_source =
+                other_source_base + other_local_rows[column];
+            result.first_element_sources[target] =
+                std::min(own_source, other_source);
+            result.second_element_sources[target] =
+                std::max(own_source, other_source);
+          }
           else
-            return result;
+            result.first_element_sources[target] = own_source;
         }
       }
-      if (first < 0) return result;
-      if (second >= 0 && second < first) std::swap(first, second);
-      result.first_element_sources[target] = first;
-      result.second_element_sources[target] = second;
-      result.maximum_contributors = std::max(
-          result.maximum_contributors, second >= 0 ? 2 : 1);
     }
 
     result.valid = result.maximum_contributors >= 1 &&

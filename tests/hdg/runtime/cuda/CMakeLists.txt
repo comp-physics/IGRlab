@@ -29,6 +29,16 @@ set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_tensor_volume_chunks
+  COMMAND dg_igr_hdg_runtime_cuda_w8a_leaf --tensor-volume-chunks)
+set_tests_properties(dg_igr_hdg_runtime_cuda_tensor_volume_chunks
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;tensor;assembly;failure"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 300)
+
 add_executable(dg_igr_hdg_runtime_cuda_hash_exact
   test_hash_exact.cu)
 target_include_directories(dg_igr_hdg_runtime_cuda_hash_exact
@@ -467,7 +477,7 @@ endforeach()
 # physical element and nine periodic IGR elements. One committed dt=1e-5
 # step checks CPU/ordinary/tensor parity; each engine lifecycle also checks
 # prepare/abort/retry/commit and copied input ownership at this order.
-foreach(_order IN ITEMS 5 10)
+foreach(_order IN ITEMS 4 5 7 10)
   add_test(
     NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
     COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment

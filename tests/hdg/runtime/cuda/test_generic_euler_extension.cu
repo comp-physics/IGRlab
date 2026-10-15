@@ -388,6 +388,34 @@ struct CudaQualificationTestAccess
     const auto& numerics = engine.numerics_;
     const auto& shape = numerics.shape_;
     const auto& structure = numerics.true_structure_;
+    // Successful initialization releases duplicate host maps after upload.
+    // Inspect the retained device copies, so this oracle also catches an
+    // upload-lifetime error instead of validating only the discarded source.
+    const auto released = [](const std::vector<int>& values)
+    { return values.empty() && values.capacity() == 0; };
+    const auto& schwarz = numerics.element_schwarz_plan_;
+    if (!released(numerics.host_matrix_owned_source_) ||
+        !released(numerics.host_matrix_owned_section_) ||
+        !released(numerics.host_matrix_owned_target_) ||
+        !released(schwarz.signed_element_true_dofs) ||
+        !released(schwarz.first_element_sources) ||
+        !released(schwarz.second_element_sources) ||
+        !released(schwarz.true_multiplicity) ||
+        !released(schwarz.true_incidence_slots))
+      return false;
+    std::vector<int> owned_sources(shape.matrix_owned_count);
+    std::vector<int> owned_sections(shape.matrix_owned_count);
+    std::vector<int> owned_targets(shape.matrix_owned_count);
+    const auto copy = [](const int* source, std::vector<int>& values)
+    {
+      return values.empty() || cudaMemcpy(
+          values.data(), source, values.size() * sizeof(int),
+          cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    if (!copy(numerics.view_.matrix_owned_source, owned_sources) ||
+        !copy(numerics.view_.matrix_owned_section, owned_sections) ||
+        !copy(numerics.view_.matrix_owned_target, owned_targets))
+      return false;
     int owned_entry = 0;
     int sent_entry = 0;
     bool valid = true;
@@ -445,9 +473,9 @@ struct CudaQualificationTestAccess
           }
           valid = valid && target >= 0 &&
               owned_entry < shape.matrix_owned_count &&
-              numerics.host_matrix_owned_source_[owned_entry] == source &&
-              numerics.host_matrix_owned_section_[owned_entry] == section &&
-              numerics.host_matrix_owned_target_[owned_entry] == target;
+              owned_sources[owned_entry] == source &&
+              owned_sections[owned_entry] == section &&
+              owned_targets[owned_entry] == target;
           ++owned_entry;
         }
       }

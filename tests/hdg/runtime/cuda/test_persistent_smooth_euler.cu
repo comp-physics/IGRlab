@@ -1,5 +1,6 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 
 #include <mfem.hpp>
 
@@ -856,6 +857,141 @@ class NativeDeviceAllocation
   std::size_t count_ = 0;
 };
 
+bool TensorVolumeFailedChunkFixture()
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  // Poison retained storage before every launch. A first-chunk rejection
+  // must leave zero volume outputs; a later rejection must retain exactly
+  // the previously completed chunk. This exercises both four- and seven-
+  // component volume slabs without relying on a successful trace solve.
+  for (const bool igr_active : {false, true})
+  {
+    CudaMeshShape shape{};
+    shape.elements = 1;
+    shape.order = 2;
+    shape.scalar_interior_dofs = 9;
+    shape.scalar_face_dofs = 3;
+    shape.interior_components = igr_active ? 7 : 4;
+    shape.trace_components = igr_active ? 5 : 4;
+    shape.interior_dofs = shape.interior_components * 9;
+    shape.trace_dofs = 4 * shape.trace_components * 3;
+    shape.interior_count = shape.interior_dofs;
+    shape.local_trace_count = shape.trace_dofs;
+    shape.borrowed_host_inputs = true;
+    shape.igr_active = igr_active;
+    shape.igr_alpha = 0.01;
+    shape.igr_beta = 1.0;
+    shape.face_points = 1;
+    const int ni = shape.interior_dofs, nt = shape.trace_dofs;
+    const auto capacity = PlanTensorVolumeScratch(ni, nt, 1, igr_active);
+    if (!capacity.valid) return false;
+    shape.volume_points = capacity.capacity_points + 1;
+    const auto scratch = PlanTensorVolumeScratch(
+        ni, nt, shape.volume_points, igr_active);
+    if (!scratch.valid || scratch.chunk_points >= shape.volume_points)
+      return false;
+    const int full_points = shape.volume_points;
+    std::vector<double> host;
+    const auto reserve = [&](const std::size_t count, const double value)
+    {
+      const std::size_t offset = host.size();
+      host.resize(offset + count, value);
+      return offset;
+    };
+    const auto state = reserve(ni, 0.0);
+    const auto old = reserve(ni, 0.0);
+    const auto trace = reserve(nt, 0.0);
+    for (int row = 0; row < 9; ++row)
+    {
+      host[state + row] = host[old + row] = 1.0;
+      host[state + 3 * 9 + row] = 2.5;
+      host[old + 3 * 9 + row] = 2.0;
+    }
+    for (int face = 0; face < 4; ++face)
+      for (int row = 0; row < 3; ++row)
+      {
+        const int offset = face * shape.trace_components * 3 + row;
+        host[trace + offset] = 1.0;
+        host[trace + offset + 9] = 2.5;
+      }
+    const auto volume_shape = reserve(full_points * 9, 1.0 / 9.0);
+    const auto volume_derivative = reserve(full_points * 9 * 2, 0.0);
+    const auto volume_weight = reserve(full_points, 1.0);
+    const auto face_shape = reserve(4 * 9, 1.0 / 9.0);
+    const auto trace_shape = reserve(4 * 3, 1.0 / 3.0);
+    // Reject before any face contribution, leaving volume entries available
+    // for comparison with the deliberately rejected coefficient chunk.
+    const auto face_weight = reserve(4, -1.0);
+    const auto face_normal = reserve(4 * 2, 1.0);
+    const auto face_h = reserve(4, 1.0);
+    const auto a = reserve(ni * ni, -123.0);
+    const auto r = reserve(ni, -123.0);
+    const auto b = reserve(ni * nt, -123.0);
+    const auto c = reserve(nt * ni, -123.0);
+    const auto d = reserve(nt * nt, -123.0);
+    const auto f = reserve(ni, -123.0);
+    const auto g = reserve(nt, -123.0);
+    const auto residual_g = reserve(nt, -123.0);
+    const auto status = reserve(1, -123.0);
+    const auto workspace = reserve(scratch.workspace_doubles, -123.0);
+    NativeDeviceAllocation<double> device;
+    if (!device.CopyFrom(host)) return false;
+    CudaDeviceView view{};
+    double* const base = device.data();
+    view.work_interior = base + state;
+    view.old_interior = base + old;
+    view.current_local_trace = base + trace;
+    view.volume_shape = base + volume_shape;
+    view.volume_derivative = base + volume_derivative;
+    view.volume_weight = base + volume_weight;
+    view.face_interior_shape = base + face_shape;
+    view.face_trace_shape = base + trace_shape;
+    view.face_weight = base + face_weight;
+    view.face_normal = base + face_normal;
+    view.face_h = base + face_h;
+    view.a = base + a; view.b = base + b;
+    view.c = base + c; view.d = base + d;
+    view.f = base + f; view.g = base + g;
+    view.residual_r = base + r; view.residual_g = base + residual_g;
+    view.status = base + status;
+    view.solve_workspace = base + workspace;
+    const auto run = [&](const int points, std::vector<double>& result)
+    {
+      shape.volume_points = points;
+      std::uint64_t tiles = 0;
+      return cudaMemcpy(base, host.data(), host.size() * sizeof(double),
+                        cudaMemcpyHostToDevice) == cudaSuccess &&
+          CudaLaunchBorrowedAssembly(
+              view, shape, 0.1, CudaBorrowedAssemblyKind::tensor_volume,
+              tiles) && cudaDeviceSynchronize() == cudaSuccess &&
+          device.CopyTo(result);
+    };
+    std::vector<double> expected(host.size()), actual(host.size());
+    if (!run(scratch.chunk_points, expected) || expected[status] >= 0.0 ||
+        std::none_of(expected.begin() + a, expected.begin() + a + ni * ni,
+                     [](const double value) { return value != 0.0; }) ||
+        std::none_of(expected.begin() + r, expected.begin() + r + ni,
+                     [](const double value) { return value != 0.0; }))
+      return false;
+    host[volume_weight + scratch.chunk_points] = -1.0;
+    if (!run(full_points, actual) || actual[status] != -1.0 ||
+        !std::equal(expected.begin() + a, expected.begin() + a + ni * ni,
+                    actual.begin() + a) ||
+        !std::equal(expected.begin() + r, expected.begin() + r + ni,
+                    actual.begin() + r))
+      return false;
+    host[volume_weight + scratch.chunk_points] = 1.0;
+    host[volume_weight] = -1.0;
+    if (!run(full_points, actual) || actual[status] != -1.0 ||
+        !std::all_of(actual.begin() + a, actual.begin() + a + ni * ni,
+                     [](const double value) { return value == 0.0; }) ||
+        !std::all_of(actual.begin() + r, actual.begin() + r + ni,
+                     [](const double value) { return value == 0.0; }))
+      return false;
+  }
+  return true;
+}
+
 struct NativeCsrFixture
 {
   int rows = 0;
@@ -1597,7 +1733,8 @@ bool RankOneEquilibratedMgrFixture()
 }
 
 bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
-                           NativeSolveFixtureResult& result)
+                           NativeSolveFixtureResult& result,
+                           const double initial_solution = 0.0)
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
   result = {};
@@ -1643,7 +1780,8 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
       !matrix_columns.CopyFrom(fixture.matrix.columns) ||
       !matrix_values.CopyFrom(fixture.matrix.values) ||
       !right_hand_side.CopyFrom(fixture.right_hand_side) ||
-      !solution.Allocate(static_cast<std::size_t>(rows)) ||
+      !solution.CopyFrom(std::vector<double>(
+          static_cast<std::size_t>(rows), initial_solution)) ||
       !basis.Allocate(requirements.basis_doubles) ||
       !vectors.Allocate(requirements.vector_doubles) ||
       !reduction.Allocate(requirements.reduction_doubles) ||
@@ -3626,10 +3764,85 @@ bool NativeBreakdownFixtureExact()
           result.control, fixture.policy);
 }
 
+bool NativeInitialResidualFixturesExact()
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  struct Case
+  {
+    const char* name;
+    double rhs_entry;
+    NativeTraceSolveStatus status;
+    int actual_residual_checks;
+  };
+  const std::array<Case, 3> cases{{
+      {"zero", 0.0, NativeTraceSolveStatus::converged, 1},
+      {"nonfinite", std::numeric_limits<double>::quiet_NaN(),
+       NativeTraceSolveStatus::nonfinite_input, 0},
+      {"overflow", std::numeric_limits<double>::max(),
+       NativeTraceSolveStatus::numerical_breakdown, 1}}};
+  for (const bool igr : {false, true})
+  {
+    NativeSolveFixture fixture{};
+    fixture.matrix = DenseToDiagonalFirstCsr(
+        {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, 3);
+    fixture.ilu.factor = fixture.matrix;
+    fixture.ilu.permutation = {2, 0, 1};
+    fixture.ilu.inverse_diagonal = {1.0, 1.0, 1.0};
+    fixture.policy.rank_count = 1;
+    fixture.policy.krylov_dimension = 2;
+    fixture.policy.maximum_iterations = 4;
+    fixture.policy.relative_tolerance = 1.0e-12;
+    fixture.igr = igr;
+    for (const Case& test : cases)
+    {
+      fixture.right_hand_side = {0.0, test.rhs_entry, -0.0};
+      NativeSolveFixtureResult result{};
+      constexpr double initial_solution = 13.0;
+      const bool launched = RunNativeSolveFixture(
+          fixture, result, initial_solution);
+      const auto& control = result.control;
+      const bool converged = test.status == NativeTraceSolveStatus::converged;
+      // Nonfinite input leaves the supplied solution untouched; admitted input
+      // must replace it with the solver's zero initial guess before the norm.
+      const double expected_solution = test.actual_residual_checks == 0
+          ? initial_solution : 0.0;
+      const bool solution_exact = result.solution.size() == 3 &&
+          std::all_of(result.solution.begin(), result.solution.end(),
+                      [expected_solution](const double value)
+                      { return value == expected_solution; });
+      if (!launched || control.schema != native_trace_control_schema ||
+          control.status != test.status ||
+          (control.failure_mask == 0) != converged ||
+          control.iterations != 0 || control.restart_cycles != 0 ||
+          control.preconditioner_applications != 0 ||
+          control.operator_applications != 0 ||
+          control.actual_residual_checks != test.actual_residual_checks ||
+          control.rhs_norm != 0.0 || control.initial_residual_norm != 0.0 ||
+          control.estimated_residual_norm != 0.0 ||
+          control.actual_residual_norm != 0.0 ||
+          control.relative_residual_norm != 0.0 || !solution_exact ||
+          NativeTraceResultIsReadyForTrueResidual(control, fixture.policy) !=
+              converged)
+      {
+        std::cerr << "native trace initial residual fixture failed case="
+                  << test.name << " igr=" << igr << " status="
+                  << NativeTraceSolveStatusName(control.status)
+                  << " failure_mask=" << control.failure_mask
+                  << " residual_checks=" << control.actual_residual_checks
+                  << '\n';
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool NativeTraceDeviceFixtures() noexcept
 {
   try
   {
+    if (!NativeInitialResidualFixturesExact()) return false;
+
     // A generic five-row system cannot finish within one GMRES(2) cycle;
     // compare its restarted native result with an independent pivoted solve.
     const NativeSolveFixture conventional =
@@ -5705,6 +5918,13 @@ int main(int argc, char** argv)
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   const std::string_view mode = argc == 2 ? argv[1] : "";
+  if (mode == "--tensor-volume-chunks")
+  {
+    const bool pass = ranks == 1 && TensorVolumeFailedChunkFixture();
+    if (!pass && rank == 0)
+      std::cerr << "tensor volume rejected-chunk initialization failed\n";
+    return pass ? 0 : 1;
+  }
   const bool known_mode = mode.empty() || mode == "--token-negatives" ||
       mode == "--functional";
   const bool policies = NativeBoundedResultPolicy() &&
@@ -5722,7 +5942,8 @@ int main(int argc, char** argv)
          : LifecycleAndRecovery<RankTwoTag>(ranks))
       : false);
   const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
-      (lifecycle && RetainedLuStageLeafFixture() &&
+      (lifecycle && TensorVolumeFailedChunkFixture() &&
+       RetainedLuStageLeafFixture() &&
        NativeTraceDeviceFixtures() &&
        NativeElementSchwarzDeviceFixture() &&
        NativeFixedSigmaJacobiDeviceFixtures());

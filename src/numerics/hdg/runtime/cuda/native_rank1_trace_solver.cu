@@ -2271,8 +2271,8 @@ __global__ void NativeRankOneTraceSolveKernel(
 
   double rhs_norm = GridNorm(system.rhs, rows, workspace, control,
                              grid, block_scratch);
-  double residual_norm = GridNorm(first_basis, rows, workspace, control,
-                                  grid, block_scratch);
+  // The zero initial guess leaves the residual equal to the copied RHS.
+  double residual_norm = rhs_norm;
   if (grid.thread_rank() == 0)
   {
     control->rhs_norm = rhs_norm;
