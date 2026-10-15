@@ -3386,7 +3386,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   if (using_two_level_inverse)
   {
-    last_precond_name_ = "two-level-inverse-fp64";
+    last_precond_name_ = "two-level-inverse-" + two_level_block_precision;
   }
   if (using_screened_patch)
   {
