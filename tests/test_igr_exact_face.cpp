@@ -884,7 +884,7 @@ int main(int argc, char** argv)
   }
   CheckCase(5, 11, mfem::BasisType::GaussLegendre, 2, cases, max_assembled_error);
   CheckCase(6, 13, mfem::BasisType::GaussLegendre, 1, cases, max_assembled_error);
-  // P7 has exactly two full dof tiles on the paired-side CUDA path.
+  // P7 has 128 output rows: exactly two full 64-row groups.
   CheckCase(7, 15, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   // P10 has 242 output rows: several bounded row groups and a final tail.
   for (const int basis : {mfem::BasisType::GaussLegendre,
@@ -897,7 +897,7 @@ int main(int argc, char** argv)
   CheckCase(5, 0, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   // Q16 fills all projection lanes; Q17 exercises the generic fallback.
   CheckCase(4, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
-  // Fill all projection lanes while using paired-side output ownership.
+  // Fill all projection lanes while also exercising a partial output group.
   CheckCase(5, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(4, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   std::cout << "Exact face record/gather parity: backend=" << backend
