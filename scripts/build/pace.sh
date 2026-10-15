@@ -109,6 +109,7 @@ fi
 pace_args=()
 pace_submit=0 pace_plan=0 pace_tests_only=0 pace_tests=1 pace_smoke=0 pace_mode=cpu pace_arch="" pace_clean_set=0 pace_help=0
 pace_a100=0 pace_cpu_set=0 pace_arch_set=0 pace_a100_arch_conflict=0
+pace_iterate=0 pace_explicit_clean=0 pace_no_deps=0 pace_test_filter=0 pace_target=""
 pace_root="" pace_dependency_root="" pace_spack_root=${IGRLAB_PACE_SPACK_ROOT:-}
 pace_jobs=${IGRLAB_BUILD_JOBS:-4} pace_mfem_jobs=""
 pace_build_time=08:00:00 pace_validation_time=02:00:00
@@ -135,13 +136,37 @@ while (($#)); do
     --no-tests) pace_tests=0; pace_args+=("$1") ;;
     --tests-only) pace_tests_only=1; pace_args+=("$1") ;;
     --smoke) pace_smoke=1; pace_args+=("$1") ;;
-    --clean|--no-clean) pace_clean_set=1; pace_args+=("$1") ;;
+    --clean) pace_explicit_clean=1; pace_clean_set=1; pace_args+=("$1") ;;
+    --no-clean) pace_clean_set=1; pace_args+=("$1") ;;
+    --no-deps) pace_no_deps=1; pace_args+=("$1") ;;
+    --iterate) pace_iterate=1; pace_args+=("$1") ;;
+    --target)
+      [[ $# -ge 2 && -n $2 ]] || pace_fail "--target requires a name"
+      pace_target=$2; pace_args+=("$1" "$2"); shift ;;
+    --test-regex|--test-label)
+      [[ $# -ge 2 && -n $2 ]] || pace_fail "$1 requires a regex"
+      pace_test_filter=1; pace_args+=("$1" "$2"); shift ;;
     --caliper) pace_fail "the site profiles are cpu, cuda-sm70 and cuda-sm80; Caliper has no PACE profile yet" ;;
     --help|-h) pace_help=1; pace_args+=("$1") ;;
     *) pace_args+=("$1") ;;
   esac
   shift
 done
+[[ $pace_iterate == 0 || $pace_explicit_clean == 0 ]] || pace_fail "--iterate conflicts with --clean"
+[[ -z $pace_target || $pace_iterate == 1 ]] || pace_fail "--target requires --iterate"
+if [[ $pace_iterate == 1 ]]; then
+  [[ $pace_smoke == 0 ]] || pace_fail "--iterate does not run --smoke; select tests with --tests-only and a filter"
+  [[ $pace_no_deps == 1 ]] || pace_args+=(--no-deps)
+  if [[ $pace_tests_only == 1 ]]; then
+    [[ $pace_tests == 1 ]] || pace_fail "--tests-only conflicts with --no-tests"
+    [[ $pace_test_filter == 1 ]] || pace_fail "--iterate --tests-only requires --test-regex or --test-label"
+    [[ -z $pace_target ]] || pace_fail "--target conflicts with --tests-only"
+  else
+    [[ $pace_test_filter == 0 ]] || pace_fail "iteration test filters require --tests-only"
+    [[ $pace_tests == 0 ]] || pace_args+=(--no-tests)
+    pace_tests=0
+  fi
+fi
 if [[ $pace_help == 1 ]]; then
   printf 'PACE GPU profiles:\n  --gpu --cuda-arch 70       Native V100 workflow debugging (gpu-v100).\n  --a100 / --gpu            Native A100 architecture 80 (gpu-a100 default).\n\nPACE submission limits (site wrapper options):\n  --build-time HH:MM:SS       Positive build limit up to 08:00:00 (default).\n  --validation-time HH:MM:SS  Positive validation limit up to 02:00:00 (default).\n\n'
   exec "${pace_source}/build.sh" --help
@@ -189,23 +214,27 @@ if [[ $pace_plan == 1 ]]; then
   exec "${pace_source}/build.sh" "${pace_args[@]}"
 fi
 [[ $(hostname -f) == *.pace.gatech.edu || -d /storage/pace-apps ]] || pace_fail "this profile requires PACE; use --print-plan for an offline plan"
-if [[ -z $pace_spack_root ]]; then
-  command -v spack >/dev/null 2>&1 || pace_fail "initialize Spack once or provide --spack-root /path/to/spack/core"
-  pace_spack_root=$(spack location -r)
+pace_spack_args=()
+if [[ $pace_iterate == 0 ]]; then
+  if [[ -z $pace_spack_root ]]; then
+    command -v spack >/dev/null 2>&1 || pace_fail "initialize Spack once or provide --spack-root /path/to/spack/core"
+    pace_spack_root=$(spack location -r)
+  fi
+  pace_spack_root=$(realpath -e -- "$pace_spack_root")
+  [[ -f $pace_spack_root/share/spack/setup-env.sh ]] || pace_fail "Spack shell setup is missing"
+  pace_spack_args=(--spack-root "$pace_spack_root")
 fi
-pace_spack_root=$(realpath -e -- "$pace_spack_root")
-[[ -f $pace_spack_root/share/spack/setup-env.sh ]] || pace_fail "Spack shell setup is missing"
 if [[ $pace_submit == 1 ]]; then
   [[ -z ${SLURM_JOB_ID:-} ]] || pace_fail "--submit is for the login node; omit it inside an allocation"
   # Reject source/flag errors before occupying a queued compute allocation.
   "${pace_source}/build.sh" "${pace_args[@]}" --print-plan
-  if [[ $pace_dependency_root != "$pace_root" ]]; then
+  if [[ $pace_iterate == 0 && $pace_dependency_root != "$pace_root" ]]; then
     "${pace_source}/build.sh" "${pace_args[@]}" --output-root "$pace_dependency_root" --print-plan
   fi
   pace_prepare_site_directory "$pace_dependency_root/site/pace/requests"
   pace_prepare_site_directory "$pace_dependency_root/site/pace/logs"
   pace_request=$(mktemp "$pace_dependency_root/site/pace/requests/build.XXXXXXXX.json")
-  python3 - "$pace_request" "$pace_source" --site pace --site-root "$pace_dependency_root" --spack-root "$pace_spack_root" \
+  python3 - "$pace_request" "$pace_source" --site pace --site-root "$pace_dependency_root" "${pace_spack_args[@]}" \
     --build-time "$pace_build_time" --validation-time "$pace_validation_time" "${pace_args[@]}" <<'PY'
 import json, sys
 with open(sys.argv[1], 'w') as f:
@@ -232,7 +261,9 @@ PY
       --cpus-per-task=2 --mem=48G --time="$pace_validation_time" --no-requeue --job-name=IGRlab-check \
       --output="$pace_dependency_root/site/pace/logs/check-%j.out" \
       --error="$pace_dependency_root/site/pace/logs/check-%j.err" "$0" --worker validation "$pace_request")
-    printf 'PACE validation submitted: %s (prebuilt validation, embers, %s)\n' "${pace_validation%%;*}" "$pace_partition"
+    pace_validation_kind='prebuilt validation'
+    [[ $pace_iterate == 0 ]] || pace_validation_kind='selected iteration tests'
+    printf 'PACE validation submitted: %s (%s, embers, %s)\n' "${pace_validation%%;*}" "$pace_validation_kind" "$pace_partition"
   fi
   printf 'Logs: %s/site/pace/logs; request: %s\n' "$pace_dependency_root" "$pace_request"
   exit 0
@@ -240,6 +271,10 @@ fi
 [[ -n ${SLURM_JOB_ID:-} && ${SLURM_JOB_ACCOUNT:-} == gts-sbryngelson3 &&
    ${SLURM_JOB_QOS:-} == embers ]] || pace_fail "use --submit or a free embers compute allocation"
 [[ $(hostname -f) != *login* ]] || pace_fail "compilation requires a compute node"
+if [[ $pace_iterate == 1 && $pace_tests_only == 0 ]]; then
+  [[ ${SLURM_JOB_PARTITION:-} == cpu-small && -z ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || \
+    pace_fail "app iteration compilation requires CPU compute without GPUs"
+fi
 if [[ $pace_mode == gpu && ($pace_tests == 1 || $pace_smoke == 1) ]]; then
   # Interactive srun steps can expose only the step's assigned GPU IDs.
   [[ ${SLURM_JOB_PARTITION:-} == "$pace_gpu_partition" && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || \
@@ -247,6 +282,24 @@ if [[ $pace_mode == gpu && ($pace_tests == 1 || $pace_smoke == 1) ]]; then
   export DG_IGR_TEST_DEVICE=cuda
 fi
 type module >/dev/null 2>&1 || pace_fail "PACE environment modules are unavailable"
+# App iteration enters the cached CMake build directly. No dependency discovery,
+# Spack activation, manifest preparation, or qualification receipts are involved.
+if [[ $pace_iterate == 1 ]]; then
+  module purge
+  mapfile -t pace_modules < <(python3 - "$pace_config" "$pace_profile" <<'PYCODE'
+import json, sys
+print('\n'.join(json.load(open(sys.argv[1]))['profiles'][sys.argv[2]]['modules']))
+PYCODE
+  )
+  module load "${pace_modules[@]}"
+  export OMPI_CC=gcc OMPI_CXX=g++ OMPI_FC=gfortran
+  unset OMPI_MCA_plm OMPI_MCA_ras OMPI_MCA_pml OMPI_MCA_btl OMPI_MCA_ess OMPI_MCA_ess_singleton_isolated
+  unset SPACK_ENV SPACK_ROOT CUDA_ARCHS MFEM_CUDA_ARCHS APP_CUDA_ARCHS SPACK_CUDA_ARCH
+  unset NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS
+  export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
+  printf '[site] PACE app iteration profile=%s account=%s\n' "$pace_profile" "$SLURM_JOB_ACCOUNT"
+  exec "${pace_source}/build.sh" "${pace_args[@]}"
+fi
 # Retained environments own their recipes; fresh roots query the selected tool.
 pace_recipe_args=(--site-root "$pace_dependency_root" --recipe-profile "$pace_profile")
 if [[ -n ${IGRLAB_PACE_RECIPE_ROOT:-} ]]; then

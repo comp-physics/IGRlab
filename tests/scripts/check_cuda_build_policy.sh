@@ -342,6 +342,7 @@ clean_env=(
   -u IGRLAB_CUDA_ARCH
   -u IGRLAB_MFEM_CUDA_ARCHS
   -u IGRLAB_APP_CUDA_ARCHS
+  -u IGRLAB_VALIDATION_MODE
 )
 
 # The synthetic exact-source composition exercises normal-mode source
@@ -359,6 +360,40 @@ assert_contains "${plan}" "app_cuda_archs=120"
 assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=16"
 assert_contains "${plan}" "output_root=${default_output_root}"
+assert_not_exists "${default_output_root}"
+
+# Iteration preserves the application build scope and skips dependency setup.
+iteration_plan="$("${clean_env[@]}" XDG_CACHE_HOME="${default_cache_root}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 --iterate --print-plan)"
+assert_contains "${iteration_plan}" "route=app-only dependency_work=none artifact_hashes=none run_tests=0"
+[[ "$(plan_field "${iteration_plan}" scope)" == "$(plan_field "${plan}" scope)" ]] || \
+  fail "iteration changes the persistent build scope"
+ambient_plan="$("${clean_env[@]}" IGRLAB_VALIDATION_MODE=iteration \
+  bash "${fixture_root}/build.sh" --cpu-only --print-plan)"
+assert_contains "${ambient_plan}" 'clean=1 install_deps=1'
+for filter in regex label no-tests; do
+  case "${filter}" in
+    regex) iteration_args=(--tests-only --test-regex '^focused$') ;;
+    label) iteration_args=(--tests-only --test-label '^special$') ;;
+    no-tests) iteration_args=(--no-tests) ;;
+  esac
+  filtered_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+    --cpu-only --iterate "${iteration_args[@]}" --print-plan)"
+  [[ "${filtered_plan}" != *'test_label=^numerical-smoke$'* ]] || \
+    fail "iteration overrides an explicit filter or adds tests to a build-only plan"
+done
+for clean_order in first last overwritten; do
+  case "${clean_order}" in
+    first) iteration_args=(--clean --iterate) ;;
+    last) iteration_args=(--iterate --clean) ;;
+    overwritten) iteration_args=(--clean --no-clean --iterate) ;;
+  esac
+  if conflict_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+    --cpu-only "${iteration_args[@]}" --print-plan 2>&1)"; then
+    fail "iteration accepts explicit --clean (${clean_order})"
+  fi
+  assert_contains "${conflict_plan}" '--iterate conflicts with --clean'
+done
 assert_not_exists "${default_output_root}"
 
 # Canonical build names preserve legacy scripts and select explicit overrides.

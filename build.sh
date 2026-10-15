@@ -60,6 +60,8 @@ CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
 TESTS_ONLY=0
+ITERATE=0
+APP_TARGETS=()
 CLEAN_WAS_SET=0
 BUILD_RESEARCH_TESTS="${IGRLAB_BUILD_RESEARCH_TESTS:-${DG_IGR_BUILD_RESEARCH_TESTS:-OFF}}"
 TEST_REGEX=""
@@ -215,10 +217,17 @@ Options:
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
+  --iterate         Build only IGRlab in an existing configured build tree.
+                    No dependency work, artifact hashes, install, or automatic
+                    tests. Keep the same checkout and --output-root.
+  --target NAME     With --iterate, build this application target (repeatable).
+                    Defaults to all application targets. No clean/install targets.
   --no-deps         Do not run `spack install`.
   --no-tests        Do not run CTest.
   --tests-only      Validate an existing successful canonical build receipt and
                     run tests without configuring, building, or installing.
+                    With --iterate, run only an explicit test filter directly,
+                    without receipt validation or a qualification claim.
   --research-tests  Build research-only tests and experiments (default: off).
   --no-research-tests
                     Exclude research-only targets, overriding the environment.
@@ -309,6 +318,16 @@ while (($#)); do
     --print-plan) PRINT_PLAN=1 ;;
     --clean) CLEAN=1; CLEAN_WAS_SET=1 ;;
     --no-clean) CLEAN=0 ;;
+    --iterate) ITERATE=1 ;;
+    --target)
+      [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_.+-]*$ ]] || {
+        echo "ERROR: --target requires an application target name." >&2; exit 2;
+      }
+      case "$2" in
+        clean|install|install.*|package|package_source|test|edit_cache|rebuild_cache|help)
+          echo "ERROR: --target requires an application target, not $2." >&2; exit 2 ;;
+      esac
+      APP_TARGETS+=("$2"); shift ;;
     --no-deps) INSTALL_DEPS=0 ;;
     --no-tests) RUN_TESTS=0 ;;
     --tests-only) TESTS_ONLY=1 ;;
@@ -336,6 +355,32 @@ while (($#)); do
   esac
   shift
 done
+
+# Iteration exits before dependency setup and qualification.
+if ((ITERATE)); then
+  if ((CLEAN_WAS_SET)); then
+    echo "ERROR: --iterate conflicts with --clean; retain the existing build tree for iteration." >&2
+    exit 2
+  fi
+  CLEAN=0
+  INSTALL_DEPS=0
+  if ((RUN_SMOKE)); then
+    echo "ERROR: --iterate requires explicit filtered tests, not --smoke." >&2; exit 2
+  fi
+  if ((TESTS_ONLY)); then
+    [[ -n "${TEST_REGEX}" || -n "${TEST_LABEL}" ]] || {
+      echo "ERROR: --iterate --tests-only requires --test-regex or --test-label." >&2; exit 2;
+    }
+    ((${#APP_TARGETS[@]} == 0)) || { echo "ERROR: --target conflicts with --tests-only." >&2; exit 2; }
+  else
+    [[ -z "${TEST_REGEX}" && -z "${TEST_LABEL}" ]] || {
+      echo "ERROR: --iterate test filters require --tests-only." >&2; exit 2;
+    }
+    RUN_TESTS=0
+  fi
+elif ((${#APP_TARGETS[@]})); then
+  echo "ERROR: --target requires --iterate." >&2; exit 2
+fi
 
 if ((A100_PROFILE)); then
   if ((CPU_MODE_WAS_SET || A100_ARCH_CONFLICT)); then
@@ -2674,6 +2719,28 @@ else
 fi
 
 configure_output_layout
+
+# The edit/build loop never enters dependency setup or qualification. CMake's
+# existing application graph owns incremental rebuilds; MFEM is an imported lib.
+if ((ITERATE)); then
+  echo "[build-plan] mode=${MODE} profile=${PROFILE} app_jobs=${JOBS}"
+  echo "[build-plan] output_root=${OUTPUT_ROOT} worktree_id=${WORKTREE_ID} scope=${OUTPUT_SCOPE}"
+  echo "[build-plan] route=app-only dependency_work=none artifact_hashes=none run_tests=${RUN_TESTS}"
+  echo "[build-plan] app_build=${APP_BUILD} targets=${APP_TARGETS[*]:-all} test_regex=${TEST_REGEX} test_label=${TEST_LABEL}"
+  if ((PRINT_PLAN)); then exit 0; fi
+  validate_directory_components "${APP_BUILD}" "existing application build"
+  initialize_output_lock_path
+  acquire_output_lock
+  iteration_args=(--source "${SCRIPT_DIR}" --app-build "${APP_BUILD}"
+                  --spack-env "${SPACK_ENV}" --profile "${PROFILE}" --jobs "${JOBS}")
+  for app_target in "${APP_TARGETS[@]}"; do iteration_args+=(--target "${app_target}"); done
+  if ((TESTS_ONLY)); then
+    iteration_args+=(--tests-only)
+    [[ -z "${TEST_REGEX}" ]] || iteration_args+=(--test-regex="${TEST_REGEX}")
+    [[ -z "${TEST_LABEL}" ]] || iteration_args+=(--test-label="${TEST_LABEL}")
+  fi
+  exec python3 -B "${SCRIPT_DIR}/scripts/build/app_iteration.py" "${iteration_args[@]}"
+fi
 preflight_temp_root
 
 if ((TESTS_ONLY)); then
@@ -2719,6 +2786,7 @@ fi
 
 echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} mfem_cuda_archs=${MFEM_CUDA_ARCHS} app_cuda_archs=${APP_CUDA_ARCHS} app_jobs=${JOBS} mfem_jobs=${MFEM_JOBS}"
 echo "[build-plan] output_root=${OUTPUT_ROOT} worktree_id=${WORKTREE_ID} scope=${OUTPUT_SCOPE}"
+echo "[build-plan] clean=${CLEAN} install_deps=${INSTALL_DEPS} run_tests=${RUN_TESTS} test_regex=${TEST_REGEX} test_label=${TEST_LABEL}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
 echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE} research_tests=${BUILD_RESEARCH_TESTS}"

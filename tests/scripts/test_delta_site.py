@@ -167,6 +167,84 @@ print(os.environ.get('SBATCH_REPLY', str(7000 + count)))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls("build")[-1]["argv"].count("--tests-only"), 1)
 
+    def test_iteration_submits_only_app_build_without_spack_or_default_tests(self):
+        shutil.rmtree(self.spack)
+        result = self.submit("--a100", "--iterate", "--target", "dg_igr")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (build,) = self.calls("sbatch")
+        request = json.loads(Path(build[-1]).read_text())["argv"]
+        for flag in ("--iterate", "--no-clean", "--no-deps", "--no-tests"):
+            self.assertIn(flag, request)
+        self.assertNotIn("--spack-root", request)
+        self.assertNotIn("--test-label", request)
+        result = self.run_wrapper(*build[-3:], env=self.env | {"SLURM_NTASKS": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.calls("build")[-1]["argv"]
+        self.assertIn("--iterate", args)
+        self.assertEqual(args[args.index("--target") + 1], "dg_igr")
+        self.assertEqual(args.count("--no-tests"), 1)
+
+    def test_iteration_explicit_filtered_tests_submit_only_run_job(self):
+        result = self.submit("--a100", "--iterate", "--tests-only", "--test-regex", "^focused$")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls("sbatch")
+        self.assertEqual(call[-2], "validation")
+        result = self.run_wrapper(*call[-3:], env=self.env | {"SLURM_NTASKS": "4"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.calls("build")[-1]["argv"]
+        self.assertEqual(args[args.index("--test-regex") + 1], "^focused$")
+        self.assertNotIn("--no-tests", args)
+
+    def test_iteration_rejects_implicit_or_unfiltered_tests(self):
+        for extra in (("--test-regex", "^focused$"), ("--tests-only",), ("--smoke",),
+                      ("--tests-only", "--test-label", "focused", "--target", "dg_igr")):
+            with self.subTest(extra=extra):
+                result = self.submit("--a100", "--iterate", *extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls("sbatch"), [])
+
+    def test_iteration_compute_bypasses_every_dependency_and_receipt_helper(self):
+        shutil.rmtree(self.spack)
+        config = self.repo / "cmake/sites"
+        config.mkdir(parents=True)
+        shutil.copy2(SOURCE / "cmake/sites/delta.json", config / "delta.json")
+        for name in ("delta_discover.py", "delta_manifest.py", "test_result_receipt.py", "prebuilt_validation.py"):
+            (self.helper.parent / name).write_text("raise SystemExit('EXPENSIVE HELPER REACHED')\n")
+        self.executable(self.fake_bin / "spack", "#!/bin/sh\necho SPACK_REACHED >&2\nexit 99\n")
+        self.executable(self.fake_bin / "hostname", "#!/bin/sh\necho cn001.delta.ncsa.illinois.edu\n")
+        self.executable(self.fake_bin / "module", "#!/bin/sh\nexit 0\n")
+        self.executable(self.fake_bin / "scontrol", """#!/usr/bin/env python3
+import os, pwd
+print('JobId=7001 JobState=RUNNING UserId=%s(%s) Account=%s Partition=%s AllocTRES=cpu=8' % (
+    pwd.getpwuid(os.getuid()).pw_name, os.getuid(), os.environ['SLURM_JOB_ACCOUNT'], os.environ['SLURM_JOB_PARTITION']))
+""")
+        for test_args in ((), ("--tests-only", "--test-regex", "^focused$")):
+            with self.subTest(test_args=test_args):
+                allocated = self.env | {"SLURM_JOB_ID": "7001", "SLURM_JOB_ACCOUNT": "bdiy-delta-cpu",
+                                        "SLURM_JOB_PARTITION": "cpu"}
+                result = self.run_wrapper("--site", "delta", "--cpu-only", "--iterate",
+                    "--output-root", str(self.output), *test_args, env=allocated)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("app iteration", result.stdout)
+                self.assertIn("--iterate", self.calls("build")[-1]["argv"])
+        self.assertFalse(self.output.exists())
+
+    def test_iteration_rejects_clean_in_either_order_before_submission(self):
+        for args in (("--iterate", "--clean"), ("--clean", "--iterate"),
+                     ("--clean", "--no-clean", "--iterate")):
+            with self.subTest(args=args):
+                result = self.submit("--a100", *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--iterate conflicts with --clean", result.stderr)
+                self.assertEqual(self.calls("sbatch"), [])
+                self.assertEqual(self.calls("build"), [])
+
+    def test_ambient_iteration_mode_does_not_enable_preset(self):
+        result = self.submit("--a100", "--print-plan",
+                             env=self.env | {"IGRLAB_VALIDATION_MODE": "iteration"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--iterate", self.calls("build")[-1]["argv"])
+
     def test_offline_plan_creates_no_outputs_or_scheduler_calls_and_pins_native_arch(self):
         result = self.submit("--gpu", "--cuda-arch", "80", "--print-plan")
         self.assertEqual(result.returncode, 0, result.stderr)

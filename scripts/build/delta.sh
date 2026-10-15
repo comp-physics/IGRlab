@@ -130,6 +130,7 @@ fi
 delta_args=()
 delta_submit=0 delta_plan=0 delta_tests_only=0 delta_tests=1 delta_smoke=0 delta_mode=cpu delta_arch="" delta_clean_set=0 delta_help=0
 delta_a100=0 delta_cpu_set=0 delta_arch_set=0 delta_a100_arch_conflict=0
+delta_iterate=0 delta_explicit_clean=0 delta_no_deps=0 delta_test_filter=0 delta_target=""
 delta_root="" delta_dependency_root="" delta_spack_root=${IGRLAB_DELTA_SPACK_ROOT:-}
 delta_jobs=${IGRLAB_BUILD_JOBS:-4} delta_mfem_jobs=""
 delta_build_time=01:00:00 delta_validation_time=01:00:00
@@ -156,13 +157,37 @@ while (($#)); do
     --no-tests) delta_tests=0; delta_args+=("$1") ;;
     --tests-only) delta_tests_only=1; delta_args+=("$1") ;;
     --smoke) delta_smoke=1; delta_args+=("$1") ;;
-    --clean|--no-clean) delta_clean_set=1; delta_args+=("$1") ;;
+    --clean) delta_explicit_clean=1; delta_clean_set=1; delta_args+=("$1") ;;
+    --no-clean) delta_clean_set=1; delta_args+=("$1") ;;
+    --no-deps) delta_no_deps=1; delta_args+=("$1") ;;
+    --iterate) delta_iterate=1; delta_args+=("$1") ;;
+    --target)
+      [[ $# -ge 2 && -n $2 ]] || delta_fail "--target requires a name"
+      delta_target=$2; delta_args+=("$1" "$2"); shift ;;
+    --test-regex|--test-label)
+      [[ $# -ge 2 && -n $2 ]] || delta_fail "$1 requires a regex"
+      delta_test_filter=1; delta_args+=("$1" "$2"); shift ;;
     --caliper) delta_fail "the Delta site profiles are cpu and cuda-sm80; Caliper has no Delta profile yet" ;;
     --help|-h) delta_help=1; delta_args+=("$1") ;;
     *) delta_args+=("$1") ;;
   esac
   shift
 done
+[[ $delta_iterate == 0 || $delta_explicit_clean == 0 ]] || delta_fail "--iterate conflicts with --clean"
+[[ -z $delta_target || $delta_iterate == 1 ]] || delta_fail "--target requires --iterate"
+if [[ $delta_iterate == 1 ]]; then
+  [[ $delta_smoke == 0 ]] || delta_fail "--iterate does not run --smoke; select tests with --tests-only and a filter"
+  [[ $delta_no_deps == 1 ]] || delta_args+=(--no-deps)
+  if [[ $delta_tests_only == 1 ]]; then
+    [[ $delta_tests == 1 ]] || delta_fail "--tests-only conflicts with --no-tests"
+    [[ $delta_test_filter == 1 ]] || delta_fail "--iterate --tests-only requires --test-regex or --test-label"
+    [[ -z $delta_target ]] || delta_fail "--target conflicts with --tests-only"
+  else
+    [[ $delta_test_filter == 0 ]] || delta_fail "iteration test filters require --tests-only"
+    [[ $delta_tests == 0 ]] || delta_args+=(--no-tests)
+    delta_tests=0
+  fi
+fi
 if [[ $delta_help == 1 ]]; then
   printf 'Delta site:\n  --site delta --site-root DIR --spack-root DIR --submit\n  --a100 / --gpu            Native A100 architecture 80 (gpuA100x4).\n  --build-time HH:MM:SS       CPU build limit (default 01:00:00).\n  --validation-time HH:MM:SS  Separate validation limit (default 01:00:00).\n  Both limits may span multiple hours, subject to Delta scheduler policy.\n  --no-tests submits only a CPU build; --tests-only submits only validation.\n\n'
   exec "${delta_source}/build.sh" --help
@@ -209,23 +234,27 @@ if [[ $delta_plan == 1 ]]; then
   exec "${delta_source}/build.sh" "${delta_args[@]}"
 fi
 [[ $(hostname -f) == *.delta.ncsa.illinois.edu ]] || delta_fail "this profile requires Delta; use --print-plan for an offline plan"
-if [[ -z $delta_spack_root ]]; then
-  command -v spack >/dev/null 2>&1 || delta_fail "initialize Spack once or provide --spack-root /path/to/spack/core"
-  delta_spack_root=$(spack location -r)
+delta_spack_args=()
+if [[ $delta_iterate == 0 ]]; then
+  if [[ -z $delta_spack_root ]]; then
+    command -v spack >/dev/null 2>&1 || delta_fail "initialize Spack once or provide --spack-root /path/to/spack/core"
+    delta_spack_root=$(spack location -r)
+  fi
+  delta_spack_root=$(realpath -e -- "$delta_spack_root")
+  [[ -f $delta_spack_root/share/spack/setup-env.sh ]] || delta_fail "Spack shell setup is missing"
+  delta_spack_args=(--spack-root "$delta_spack_root")
 fi
-delta_spack_root=$(realpath -e -- "$delta_spack_root")
-[[ -f $delta_spack_root/share/spack/setup-env.sh ]] || delta_fail "Spack shell setup is missing"
 if [[ $delta_submit == 1 ]]; then
   [[ -z ${SLURM_JOB_ID:-} ]] || delta_fail "--submit is for the login node; omit it inside an allocation"
   # Reject source/flag errors before occupying a queued compute allocation.
   "${delta_source}/build.sh" "${delta_args[@]}" --print-plan
-  if [[ $delta_dependency_root != "$delta_root" ]]; then
+  if [[ $delta_iterate == 0 && $delta_dependency_root != "$delta_root" ]]; then
     "${delta_source}/build.sh" "${delta_args[@]}" --output-root "$delta_dependency_root" --print-plan
   fi
   delta_prepare_site_directory "$delta_dependency_root/site/delta/requests"
   delta_prepare_site_directory "$delta_dependency_root/site/delta/logs"
   delta_request=$(mktemp "$delta_dependency_root/site/delta/requests/build.XXXXXXXX.json")
-  python3 - "$delta_request" "$delta_source" --site delta --site-root "$delta_dependency_root" --spack-root "$delta_spack_root" \
+  python3 - "$delta_request" "$delta_source" --site delta --site-root "$delta_dependency_root" "${delta_spack_args[@]}" \
     --build-time "$delta_build_time" --validation-time "$delta_validation_time" "${delta_args[@]}" <<'PY'
 import json, sys
 with open(sys.argv[1], 'w') as f:
@@ -257,7 +286,9 @@ PY
       --error="$delta_dependency_root/site/delta/logs/check-%j.err" "$0" --worker validation "$delta_request")
     delta_validation=${delta_validation%%;*}
     [[ $delta_validation =~ ^[1-9][0-9]*$ ]] || delta_fail "scheduler returned an invalid validation job ID"
-    printf 'Delta validation submitted: %s (prebuilt validation, %s, %s)\n' "$delta_validation" "$delta_account" "$delta_partition"
+    delta_validation_kind='prebuilt validation'
+    [[ $delta_iterate == 0 ]] || delta_validation_kind='selected iteration tests'
+    printf 'Delta validation submitted: %s (%s, %s, %s)\n' "$delta_validation" "$delta_validation_kind" "$delta_account" "$delta_partition"
   fi
   printf 'Logs: %s/site/delta/logs; request: %s\n' "$delta_dependency_root" "$delta_request"
   exit 0
@@ -278,6 +309,24 @@ if [[ $delta_mode == gpu && $delta_tests_only == 1 ]]; then
   export DG_IGR_TEST_DEVICE=cuda
 fi
 type module >/dev/null 2>&1 || delta_fail "Delta environment modules are unavailable"
+# App iteration enters the cached CMake build directly. No dependency discovery,
+# Spack activation, manifest preparation, or qualification receipts are involved.
+if [[ $delta_iterate == 1 ]]; then
+  module purge
+  mapfile -t delta_modules < <(python3 - "$delta_config" "$delta_profile" <<'PYCODE'
+import json, sys
+print('\n'.join(json.load(open(sys.argv[1]))['profiles'][sys.argv[2]]['modules']))
+PYCODE
+  )
+  module load "${delta_modules[@]}"
+  export OMPI_CC=gcc OMPI_CXX=g++ OMPI_FC=gfortran
+  unset OMPI_MCA_plm OMPI_MCA_ras OMPI_MCA_pml OMPI_MCA_btl OMPI_MCA_ess OMPI_MCA_ess_singleton_isolated
+  unset SPACK_ENV SPACK_ROOT CUDA_ARCHS MFEM_CUDA_ARCHS APP_CUDA_ARCHS SPACK_CUDA_ARCH
+  unset NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS
+  export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
+  printf '[site] Delta app iteration profile=%s account=%s\n' "$delta_profile" "$SLURM_JOB_ACCOUNT"
+  exec "${delta_source}/build.sh" "${delta_args[@]}"
+fi
 # Retained environments own their recipes; fresh roots query the selected tool.
 delta_recipe_args=(--site-root "$delta_dependency_root" --recipe-profile "$delta_profile")
 if [[ -n ${IGRLAB_DELTA_RECIPE_ROOT:-} ]]; then

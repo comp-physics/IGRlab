@@ -1,5 +1,10 @@
 # Building on Delta
 
+For routine optimization, use the [fast iteration workflow](iteration.md).
+Keep one candidate checkout and build root, and use `--iterate --target NAME`
+to rebuild only the application being measured. Dependency setup and full
+qualification stay outside this loop.
+
 Use the canonical `build.sh --site delta` front end. Its initial profiles are
 CPU and native A100 (`cuda-sm80`), funded by `bdiy-delta-cpu` and
 `bdiy-delta-gpu`. CUDA compilation runs on the `cpu` partition; validation

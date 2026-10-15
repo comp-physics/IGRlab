@@ -183,6 +183,92 @@ print(9000 + count)
         self.assertFalse(self.output.exists())
         self.assertEqual(self.calls('sbatch'), [])
 
+    def test_iteration_submits_only_app_build_without_spack_or_default_tests(self):
+        shutil.rmtree(self.spack)
+        result = self.submit('--a100', '--iterate', '--target', 'dg_igr')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (build,) = self.calls('sbatch')
+        request = json.loads(Path(build[-1]).read_text())['argv']
+        for flag in ('--iterate', '--no-clean', '--no-deps', '--no-tests'):
+            self.assertIn(flag, request)
+        self.assertNotIn('--spack-root', request)
+        self.assertNotIn('--test-label', request)
+        result = self.run_helper(*build[-3:], env=self.env | {
+            'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers', 'SLURM_NTASKS': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.calls('build')[-1]
+        self.assertIn('--iterate', args)
+        self.assertEqual(args[args.index('--target') + 1], 'dg_igr')
+        self.assertEqual(args.count('--no-tests'), 1)
+
+    def test_iteration_explicit_filtered_tests_submit_only_run_job(self):
+        result = self.submit('--a100', '--iterate', '--tests-only', '--test-regex', '^focused$')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls('sbatch')
+        self.assertEqual(call[-2], 'validation')
+        result = self.run_helper(*call[-3:], env=self.env | {
+            'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers', 'SLURM_NTASKS': '4'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.calls('build')[-1]
+        self.assertEqual(args[args.index('--test-regex') + 1], '^focused$')
+        self.assertNotIn('--no-tests', args)
+
+    def test_iteration_rejects_implicit_or_unfiltered_tests(self):
+        for extra in (('--test-regex', '^focused$'), ('--tests-only',), ('--smoke',),
+                      ('--tests-only', '--test-label', 'focused', '--target', 'dg_igr')):
+            with self.subTest(extra=extra):
+                result = self.submit('--a100', '--iterate', *extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls('sbatch'), [])
+
+    def test_iteration_compute_bypasses_every_dependency_and_receipt_helper(self):
+        shutil.rmtree(self.spack)
+        config = self.repo / 'cmake/sites'
+        config.mkdir(parents=True)
+        shutil.copy2(SOURCE / 'cmake/sites/pace.json', config / 'pace.json')
+        for name in ('pace_discover.py', 'pace_manifest.py', 'test_result_receipt.py', 'prebuilt_validation.py'):
+            (self.helper.parent / name).write_text("raise SystemExit('EXPENSIVE HELPER REACHED')\n")
+        self.write_executable(self.fake_bin / 'spack', '#!/bin/sh\necho SPACK_REACHED >&2\nexit 99\n')
+        self.write_executable(self.fake_bin / 'hostname', '#!/bin/sh\necho atl1-1.pace.gatech.edu\n')
+        self.write_executable(self.fake_bin / 'module', '#!/bin/sh\nexit 0\n')
+        for test_args in ((), ('--tests-only', '--test-regex', '^focused$')):
+            with self.subTest(test_args=test_args):
+                allocated = self.env | {'SLURM_JOB_ID': '9001', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                    'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'cpu-small'}
+                result = self.run_helper('--site', 'pace', '--cpu-only', '--iterate',
+                    '--output-root', str(self.output), *test_args, env=allocated)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('app iteration', result.stdout)
+                self.assertIn('--iterate', self.calls('build')[-1])
+        self.assertFalse(self.output.exists())
+
+    def test_iteration_build_rejects_gpu_allocation(self):
+        self.write_executable(self.fake_bin / 'hostname', '#!/bin/sh\necho atl1-1.pace.gatech.edu\n')
+        result = self.run_helper('--site', 'pace', '--a100', '--iterate',
+            '--output-root', str(self.output), env=self.env | {
+                'SLURM_JOB_ID': '9001', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'gpu-a100', 'SLURM_JOB_GPUS': '0'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('CPU compute without GPUs', result.stderr)
+        self.assertEqual(self.calls('build'), [])
+
+    def test_iteration_rejects_explicit_clean_in_either_order(self):
+        for args in (('--iterate', '--clean'), ('--clean', '--iterate'),
+                     ('--clean', '--no-clean', '--iterate')):
+            with self.subTest(args=args):
+                result = self.submit('--a100', *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('--iterate conflicts with --clean', result.stderr)
+                self.assertEqual(self.calls('build'), [])
+                self.assertEqual(self.calls('sbatch'), [])
+
+    def test_ambient_iteration_mode_does_not_enable_preset(self):
+        result = self.run_helper('--site', 'pace', '--a100', '--print-plan',
+                                 '--output-root', str(self.output),
+                                 env=self.env | {'IGRLAB_VALIDATION_MODE': 'iteration'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('--iterate', self.calls('build')[-1])
+
     def test_focused_wall_times_are_site_options_and_retained_in_worker_request(self):
         result = self.submit('--a100', '--build-time', '00:30:00',
                              '--validation-time', '00:15:00', '--test-regex', '^focused$')
