@@ -60,3 +60,63 @@ targets or tests match the edited source. Once a candidate is worth keeping,
 use the normal build route with `--no-clean --no-deps` and the appropriate
 checks to rebuild the remaining application targets and qualify it. Dependency
 updates remain a separate, explicit operation.
+
+## Shared CUDA Krylov prototype
+
+The shared IGR path has an opt-in, rank-one ordinary-CUDA FGMRES implementation.
+The default remains MFEM. Select the implementation independently from the
+physical method and preconditioner configuration:
+
+| Environment variable | Default | Opt-in choice |
+| --- | --- | --- |
+| `IGRLAB_IGR_KRYLOV_BACKEND` | `mfem` | `cuda-fp64` (requires explicit FGMRES) |
+| `IGRLAB_IGR_COARSE_CG_BACKEND` | follows the outer backend | `mfem` or `cuda-fp64` |
+| `IGRLAB_IGR_COARSE_CG_EXECUTION` | `host-polled` | `cooperative` (admitted CUDA coarse solves) |
+| `IGRLAB_IGR_TWO_LEVEL_BLOCK_PRECISION` | `fp64` | `fp32` (requires the owned CUDA FGMRES path) |
+
+The legacy `DG_IGR_` spellings remain accepted. CPU and multiple-rank outer
+solves use MFEM. The existing two-level preconditioner remains rank-one CUDA.
+Its coarse CG retains the original `1e-2` preconditioned-norm tolerance and
+100-iteration limit. Setting the coarse backend explicitly permits comparisons
+of the outer implementation alone and the nested implementation alone.
+
+The FP64 control caches workspace and keeps reductions, recurrence scalars,
+ordered modified Gram–Schmidt, Givens rotations and the small backsolve on the
+GPU. FGMRES uses the existing restart dimension of 50. There is still one host
+convergence read per Krylov iteration, and called operators/preconditioners
+may have their own synchronization. This is not fully device-controlled
+execution. FGMRES retains MFEM's recurrence target
+`max(atol, rtol*||b-A*x0||)`, including warm starts. Before accepting an iterate,
+it also recomputes the original FP64 residual and requires
+`||b-A*x|| <= max(atol, rtol*||b||)`. These are separate gates: a near-solution
+warm start must not shrink the true-residual target below attainable FP64
+cancellation. `GetInitialNorm()` reports the initial residual and
+`GetFinalNorm()` reports the recomputed true residual. A failed certificate
+restarts within the unchanged iteration budget. Compare iterations and
+end-to-end timing: different reductions and final certification need not match
+MFEM bit for bit or perform exactly the same work.
+
+The FP32 option changes only the element inverse-block preconditioner action.
+It uses IEEE FP32 FMA, retains FP64 state/coarse algebra/residuals, and retains
+the FP64 inverse backup for unsafe-conversion/nonfinite/underflow row recovery.
+It therefore adds an FP32 buffer and does not reduce total inverse storage.
+Setup and teardown messages report storage and aggregate recovered rows. This
+first prototype does not permanently escalate the entire preconditioner after
+outer stagnation; reject a candidate that fails its original-operator residual
+gate.
+
+Build the focused algebra fixtures incrementally before reserving a GPU:
+`--target dg_igr_device_krylov_test` and, with HDG runtime tests configured,
+`--target dg_igr_igr_two_level_inverse_cuda_test`. The first fixture checks
+restarted flexible solves against MFEM, repeated near-solution warm starts,
+inconsistent-operator rejection, happy breakdown, zero RHS,
+iteration limits, preconditioned CG norms and invalid curvature. The second
+checks the two-level construction/current operator, IEEE FP32 action errors
+and extreme-value recovery. Run it with
+`IGRLAB_IGR_COARSE_CG_BACKEND=cuda-fp64` to exercise nested device CG. These
+algebra fixtures do not establish application speedups or long-horizon accuracy.
+
+See [original-architecture solver options](original-architecture-solvers.md)
+for cooperative admission, HDG local-solve selectors, measured results and
+validation scope. The application closure certificate is distinct from the
+strict internal FGMRES convergence test described above.

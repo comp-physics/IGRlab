@@ -1,5 +1,7 @@
 #include "igrlab/compat.hpp"
 #include "IGR_two_level_inverse.hpp"
+#include "IGR_device_krylov.hpp"
+#include "IGR_two_level_blocks_cuda.cuh"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -230,6 +232,8 @@ public:
                 inverse_data + std::size_t(e) * dof_ * dof_);
     }
 
+    blocks_.Configure(ne_, dof_, inverse_blocks_);
+
     Graph coarse_graph(nc);
     for (int e = 0; e < ne_; ++e)
     {
@@ -300,7 +304,19 @@ public:
       { MFEM_VERIFY(diagonal(i) > 0.0 && std::isfinite(diagonal(i)), "Nonpositive H1 coarse diagonal."); }
       coarse_jacobi_ = std::make_unique<mfem::OperatorJacobiSmoother>(
         diagonal, coarse_essential_, 1.0);
-      coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm());
+      device_coarse_cg_ = DeviceKrylovRequested("DG_IGR_IGR_COARSE_CG_BACKEND",
+        DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"));
+      if (CooperativeCoarseCGRequested())
+      {
+        MFEM_VERIFY(device_coarse_cg_,
+                    "Cooperative coarse execution requires cuda-fp64 coarse CG.");
+        coarse_cg_ = MakeCooperativeCGSolver(sfes.GetComm());
+        cooperative_coarse_cg_ = bool(coarse_cg_);
+        if (!cooperative_coarse_cg_)
+        { mfem::out << "[igr-cooperative-cg] fallback=host-polled reason=unsupported-hardware\n"; }
+      }
+      if (device_coarse_cg_ && !coarse_cg_) { coarse_cg_ = MakeDeviceCGSolver(sfes.GetComm()); }
+      else if (!device_coarse_cg_) { coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm()); }
       coarse_cg_->SetOperator(*coarse_);
       coarse_cg_->SetPreconditioner(*coarse_jacobi_);
       coarse_cg_->SetRelTol(1.0e-2);
@@ -317,6 +333,8 @@ public:
     std::cout << "[igr-two-level] n=" << height << " elements=" << ne_
               << " block_dof=" << dof_ << " coarse_n=" << nc
               << " coarse_mode=" << coarse_mode
+              << " coarse_cg_backend=" << (device_coarse_cg_ ? "cuda-fp64" : "mfem")
+              << " coarse_cg_execution=" << (cooperative_coarse_cg_ ? "cooperative" : "host-polled")
               << " coarse_order=" << coarse_order
               << " element_colors=" << element_color_count
               << " coarse_colors=" << coarse_color_count
@@ -360,22 +378,7 @@ public:
                   "Two-level coarse CG did not reach its 1e-2 tolerance in 100 iterations.");
     }
     prolong_->Mult(coarse_solution_, coarse_fine_);
-    y.SetSize(height);
-    y.UseDevice(true);
-    const double* input = x.Read();
-    const double* coarse_value = coarse_fine_.Read();
-    const double* inverse = inverse_blocks_.Read();
-    const int* map = element_dofs_.Read();
-    double* output = y.Write();
-    const int d = dof_;
-    mfem::forall(height, [=] MFEM_HOST_DEVICE(int entry)
-    {
-      const int e = entry / d, i = entry % d;
-      double value = coarse_value[map[entry]];
-      for (int j = 0; j < d; ++j)
-      { value += inverse[(e * d + j) * d + i] * input[map[e * d + j]]; }
-      output[map[entry]] = value;
-    });
+    blocks_.Mult(x, coarse_fine_, element_dofs_, y);
   }
 
 private:
@@ -384,9 +387,12 @@ private:
   mfem::Array<int> element_dofs_;
   mfem::Array<int> coarse_essential_;
   mfem::Vector inverse_blocks_, coarse_inverse_;
+  TwoLevelBlocks blocks_;
   std::unique_ptr<mfem::SparseMatrix> prolong_, coarse_;
   std::unique_ptr<mfem::OperatorJacobiSmoother> coarse_jacobi_;
-  std::unique_ptr<mfem::CGSolver> coarse_cg_;
+  std::unique_ptr<mfem::IterativeSolver> coarse_cg_;
+  bool device_coarse_cg_ = false;
+  bool cooperative_coarse_cg_ = false;
   mutable mfem::Vector coarse_rhs_, coarse_solution_, coarse_fine_;
   cublasHandle_t handle_ = nullptr;
 };

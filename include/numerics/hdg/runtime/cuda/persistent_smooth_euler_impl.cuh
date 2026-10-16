@@ -910,6 +910,9 @@ struct CudaGenericArenaLayout
   std::size_t rodas_element_trace_vectors = 0;
   std::size_t rodas_coupling_matrices = 0;
   std::size_t solve_workspace = 0;
+  std::size_t local_solve_workspace = 0;
+  std::size_t local_solve_work = 0;
+  std::size_t local_solve_vendor_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
 
@@ -998,6 +1001,12 @@ struct CudaDeviceView
   double* lu = nullptr;
   double* pivots = nullptr;
   double* solve_workspace = nullptr;
+  // Opt-in local-algebra experiment only. Scalar work shares a double-sized
+  // arena with the FP64 control; the existing FP64 A/LU/W arenas are retained.
+  double* local_solve_workspace = nullptr;
+  double* local_solve_work = nullptr;
+  double* local_solve_vendor_workspace = nullptr;
+  void* local_solve_vendor_handle = nullptr;
   double* schur = nullptr;
   double* condensed_rhs = nullptr;
   double* true_residual = nullptr;
@@ -1085,6 +1094,8 @@ struct CudaMeshShape
   bool igr_active = false;
   bool borrowed_static_source = false;
   bool borrowed_host_inputs = false;
+  CudaLocalSolveKind local_solve = CudaLocalSolveKind::current;
+  CudaLocalSolveBackend local_solve_backend = CudaLocalSolveBackend::simt;
   bool borrowed_static_boundary_policies = false;
 };
 
@@ -2286,6 +2297,8 @@ bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
     double absolute_tolerance, double relative_tolerance,
     double* differential_result, double* algebraic_result,
     double* differential_measure) noexcept;
+bool CudaCreateRefinedCublasHandle(void*& handle) noexcept;
+void CudaDestroyRefinedCublasHandle(void*& handle) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape,
                             generic::CudaEngineKind engine,
@@ -2316,6 +2329,12 @@ bool CudaLaunchGatherRemoteVector(const CudaDeviceView& view,
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& view,
                                    const CudaMeshShape& shape,
                                    double* true_vector) noexcept;
+// Rank-one opt-in assembly retains small globally assembled RHS values when
+// opposing element face contributions are much larger than the correction.
+bool CudaLaunchRefinedTrueRhs(const CudaDeviceView& view,
+                              const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRefinedOriginalCoupledSquaredNorms(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchRecover(const CudaDeviceView& view,
                        const CudaMeshShape& shape,
                        generic::CudaEngineKind engine) noexcept;
@@ -2399,6 +2418,18 @@ public:
   CudaPersistentNumerics() noexcept = default;
   ~CudaPersistentNumerics() noexcept
   {
+    if (local_solve_elements_ != 0.0)
+      std::fprintf(stderr, "HDG local-solve summary mode=%s elements=%.0f "
+          "correction_sweeps=%.0f fp64_fallbacks=%.0f failed=%.0f "
+          "max_original_coupled_relative_residual=%.17g backend=%s\n",
+          shape_.local_solve == CudaLocalSolveKind::fp32_refine
+              ? "fp32-refine" : "fp64-refine",
+          local_solve_elements_, local_solve_corrections_,
+          local_solve_fallbacks_, local_solve_failures_,
+          local_solve_maximum_coupled_residual_,
+          shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched
+              ? "cublas-batched" : "simt");
+    CudaDestroyRefinedCublasHandle(local_solve_vendor_handle_);
     CudaDestroyRankOneMgrState(rank_one_mgr_state_);
     const CudaArenaReleasePass first = ReleaseArenas();
     const CudaArenaReleasePass second = ReleaseArenas();
@@ -2662,6 +2693,16 @@ public:
     {
       ReportCudaSetupFailure(evidence.rank, "bind-arena-views");
       return false;
+    }
+    if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched)
+    {
+      if (!CollectiveContinue(
+              CudaCreateRefinedCublasHandle(local_solve_vendor_handle_)))
+      {
+        ReportCudaSetupFailure(evidence.rank, "local-cublas-handle");
+        return false;
+      }
+      view_.local_solve_vendor_handle = local_solve_vendor_handle_;
     }
     if (!CollectiveContinue(UploadTopologyAndState()))
     {
@@ -4301,8 +4342,12 @@ public:
         detail::CudaResearchVolumeUsesReducedPrecision(
             shape_.borrowed_host_inputs &&
             cuda_engine_ == generic::CudaEngineKind::tensor_core);
-    result.precision_work.all_fp64_policy = !reduced_precision_volume;
-    result.precision_work.accounting_complete = !reduced_precision_volume;
+    result.precision_work.all_fp64_policy = !reduced_precision_volume &&
+        shape_.local_solve != CudaLocalSolveKind::fp32_refine;
+    // Per-element correction/fallback counts are available in the private
+    // experiment workspace. Whole-attempt accounting is not yet qualified.
+    result.precision_work.accounting_complete = !reduced_precision_volume &&
+        shape_.local_solve == CudaLocalSolveKind::current;
     // The frozen non-borrowed lifecycle has no Euler conservation contract.
     // Borrowed Euler attempts remain fail-closed until their measured balance
     // has passed below.
@@ -4504,7 +4549,8 @@ public:
               std::numeric_limits<std::uint64_t>::max())
         return false;
       std::uint64_t mma_tiles = 0;
-      if (!CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles))
+      if (!CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles) ||
+          !ObserveLocalSolveWork())
         return false;
       if (cuda_engine_ == generic::CudaEngineKind::tensor_core)
       {
@@ -4581,7 +4627,8 @@ public:
             ::igrlab::observability::RegionId::hdg_interior_recovery);
         recovery_launched = CudaLaunchRecover(view_, shape_, cuda_engine_);
       }
-      const bool recovered = recovery_launched && StatusPassed();
+      const bool recovered = recovery_launched && StatusPassed() &&
+          OriginalCoupledResidualPassed();
       const bool frozen_partitioned_increments = recovered &&
           (!partitioned_backward_euler_ ||
            CudaLaunchPartitionedBackwardEulerFreezeIncrements(
@@ -4750,7 +4797,8 @@ public:
           CudaLaunchRecover(view_, shape_, cuda_engine_);
     }
     const bool coherent_solve =
-        coherent_recovery_launched && StatusPassed();
+        coherent_recovery_launched && StatusPassed() &&
+        OriginalCoupledResidualPassed();
     const bool coherent_partitioned_increments = coherent_solve &&
         (!partitioned_backward_euler_ ||
          CudaLaunchPartitionedBackwardEulerFreezeIncrements(
@@ -5801,6 +5849,20 @@ private:
     shape_.global_true_trace_count = static_cast<int>(global_true);
     shape_.borrowed_static_source = false;
     shape_.borrowed_host_inputs = config.use_borrowed_host_inputs;
+    shape_.local_solve = SelectedCudaLocalSolve();
+    shape_.local_solve_backend = SelectedCudaLocalSolveBackend();
+    if (shape_.local_solve == CudaLocalSolveKind::invalid ||
+        shape_.local_solve_backend == CudaLocalSolveBackend::invalid ||
+        (shape_.local_solve == CudaLocalSolveKind::current &&
+         shape_.local_solve_backend != CudaLocalSolveBackend::simt) ||
+        (shape_.local_solve != CudaLocalSolveKind::current &&
+         (!shape_.borrowed_host_inputs || ranks_ != 1 || rodas3_)))
+    {
+      std::fprintf(stderr, "HDG local solve requires current, fp64-refine, or "
+          "fp32-refine; backend requires simt or cublas-batched, with cublas "
+          "requiring a refinement mode; experimental modes require rank-one borrowed BE.\n");
+      return false;
+    }
     shape_.borrowed_static_boundary_policies =
         config.use_borrowed_host_inputs &&
         config.borrowed_boundary_policies.count != 0;
@@ -5906,6 +5968,14 @@ private:
           checked_product(solve_base, trace_plus_one, layout.solve_workspace) &&
           checked_product(layout.local_matrix, 2, layout.two_exchange_keys);
       if (!valid) return false;
+      if (shape_.local_solve != CudaLocalSolveKind::current)
+      {
+        layout.local_solve_workspace = layout.solve_workspace;
+        if (!checked_product(elements, 3, layout.local_solve_work)) return false;
+        if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched &&
+            (!checked_product(elements, 4, layout.local_solve_vendor_workspace) ||
+             !checked_add(layout.local_solve_vendor_workspace, 1))) return false;
+      }
       layout.elements = elements;
       layout.interior = interior;
       layout.local_trace = local_trace;
@@ -5968,7 +6038,11 @@ private:
             checked_add(doubles, two_coupling) && checked_add(doubles, layout.local_matrix) &&
             checked_add(doubles, interior) && checked_add(doubles, layout.element_trace) &&
             checked_add(doubles, layout.element_interior2) && checked_add(doubles, interior) &&
-            checked_add(doubles, layout.solve_workspace) && checked_add(doubles, layout.local_matrix) &&
+            checked_add(doubles, layout.solve_workspace) &&
+            checked_add(doubles, layout.local_solve_workspace) &&
+            checked_add(doubles, layout.local_solve_work) &&
+            checked_add(doubles, layout.local_solve_vendor_workspace) &&
+            checked_add(doubles, layout.local_matrix) &&
             checked_add(doubles, layout.element_trace) && checked_add(doubles, true_trace) &&
             checked_add(doubles, two_local_matrix) && checked_add(doubles, two_element_trace) &&
             checked_add(doubles, layout.volume_shape) && checked_add(doubles, layout.volume_derivative) &&
@@ -6247,6 +6321,14 @@ private:
   bool VerifyResidencyAndTicket(CudaRunEvidence& evidence) noexcept;
   bool Ticket(CudaFailurePhase phase) noexcept;
   bool StatusPassed() noexcept;
+  bool ObserveLocalSolveWork() noexcept;
+  bool OriginalCoupledResidualPassed() noexcept;
+  void* local_solve_vendor_handle_ = nullptr;
+  double local_solve_elements_ = 0.0;
+  double local_solve_corrections_ = 0.0;
+  double local_solve_fallbacks_ = 0.0;
+  double local_solve_failures_ = 0.0;
+  double local_solve_maximum_coupled_residual_ = 0.0;
   bool DistributeCurrentTrace(const double* true_values) noexcept;
   bool DistributeTraceIncrement() noexcept;
   bool AssembleTrueVector(const double* element_values,

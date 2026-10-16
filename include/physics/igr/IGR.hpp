@@ -722,6 +722,8 @@ private:
   std::string screened_patch_key_;
   std::unique_ptr<mfem::IterativeSolver> stationary_correction_;
   int stationary_sweeps_ = 0;
+  // Cached rank-one CUDA FGMRES workspace; selected only by explicit opt-in.
+  std::unique_ptr<mfem::IterativeSolver> device_fgmres_;
   NonconvergencePolicy nonconvergence_policy_ =
     NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;
