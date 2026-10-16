@@ -12,6 +12,9 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   face_data_dirty_ = true;
   weakdiv_elem_dof_ = 0;
   weakdiv_data_flat_.SetSize(0);
+  weakdiv_shared_map_.reset();
+  weakdiv_shared_row_sums_.SetSize(0);
+  weakdiv_shared_flux_.SetSize(0);
   weakdiv_volume_speed_.SetSize(0);
   weakdiv_q_sigma_telemetry_.SetSize(0);
   weakdiv_volume_speed_reduce_workspace_.SetSize(0);
@@ -190,6 +193,94 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   const int dof = weakdiv_elem_dof_;
   const int neq = num_equations;
   const int ldof = dof * neq;
+  const int space_dim = dim; // device lambdas must not capture the host owner
+
+  const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
+  const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  if (shared && !weakdiv_shared_map_)
+  {
+    MFEM_VERIFY(dim == 2 && neq == 4 && dof <= 256 &&
+                  Device::Allows(Backend::CUDA_MASK),
+                "Shared DG weak divergence requires CUDA 2D Euler.");
+    // Share only one identical affine geometry, never a representative cell.
+    // Assembly at translated coordinates may differ by ordinary roundoff;
+    // bound that difference against the actual FP64 operator norm explicitly.
+    real_t reference_edges[4] = {0.0, 0.0, 0.0, 0.0};
+    real_t reference_norm = 0.0, difference_norm = 0.0;
+    for (int i = 0; i < dof; ++i)
+    {
+      real_t sum = 0.0;
+      for (int j = 0; j < dof * dim; ++j) { sum += std::abs(weakdiv[0](i, j)); }
+      reference_norm = std::max(reference_norm, sum);
+    }
+    for (int e = 0; e < ne; ++e)
+    {
+      const FiniteElement& fe = *vfes.GetFE(e);
+      ElementTransformation* tr = vfes.GetElementTransformation(e);
+      MFEM_VERIFY(fe.GetGeomType() == Geometry::SQUARE && tr->Order() == 1,
+                  "Shared DG weak divergence requires affine quadrilaterals.");
+      // Bilinear quads are affine iff their mixed corner difference is zero.
+      // Evaluate corners (exact 0/1 shape values), rather than comparing
+      // Jacobians recomputed at irrational high-order reference nodes.
+      Vector corners[4] = {Vector(2), Vector(2), Vector(2), Vector(2)};
+      for (int q = 0; q < 4; ++q)
+      {
+        IntegrationPoint corner;
+        corner.Set2(q % 2, q / 2);
+        tr->Transform(corner, corners[q]);
+      }
+      for (int d = 0; d < 2; ++d)
+      {
+        MFEM_VERIFY(corners[3][d] - corners[1][d] == corners[2][d] - corners[0][d],
+                    "Shared DG weak divergence rejects non-affine geometry.");
+        for (int direction = 0; direction < 2; ++direction)
+        {
+          const real_t edge = corners[direction + 1][d] - corners[0][d];
+          if (e == 0) { reference_edges[d + 2 * direction] = edge; }
+          MFEM_VERIFY(edge == reference_edges[d + 2 * direction],
+                      "Shared DG weak divergence requires identical affine element geometry.");
+        }
+      }
+      for (int i = 0; i < dof; ++i)
+      {
+        real_t difference = 0.0;
+        for (int j = 0; j < dof * dim; ++j)
+        {
+          MFEM_VERIFY(std::isfinite(weakdiv[e](i, j)), "Nonfinite shared DG matrix.");
+          difference += std::abs(weakdiv[e](i, j) - weakdiv[0](i, j));
+        }
+        difference_norm = std::max(difference_norm, difference);
+      }
+    }
+    const real_t roundoff_limit = 64.0 * dof * std::numeric_limits<real_t>::epsilon();
+    MFEM_VERIFY(reference_norm > 0.0 && difference_norm <= roundoff_limit * reference_norm,
+                "Shared DG element matrices differ beyond the assembly-roundoff bound.");
+    std::cout << "[shared-reference-map] event=operator-equivalence method=dg-weakdiv"
+              << " geometry=identical-affine-parallelograms matrix_relative_inf_error="
+              << difference_norm / reference_norm << " limit=" << roundoff_limit
+              << std::endl;
+    weakdiv_shared_row_sums_.SetSize(dof, dim);
+    weakdiv_shared_row_sums_.GetMemory().UseDevice(true);
+    real_t* sums = weakdiv_shared_row_sums_.HostWrite();
+    for (int i = 0; i < dof; ++i)
+    {
+      for (int d = 0; d < dim; ++d)
+      {
+        sums[i + dof * d] = 0.0;
+        for (int j = 0; j < dof; ++j)
+        {
+          sums[i + dof * d] += weakdiv[0](i, j * dim + d);
+        }
+      }
+    }
+    weakdiv_shared_map_ = std::make_unique<::igrlab::shared_reference::Map>();
+    weakdiv_shared_map_->Configure(weakdiv[0], ne * neq, shared_precision, "dg-weakdiv");
+    weakdiv_shared_flux_.SetSize(ne * neq * dof * dim);
+    weakdiv_shared_flux_.UseDevice(true);
+    weakdiv_shared_flux_.Write();
+  }
+  MFEM_VERIFY(!shared || weakdiv_shared_map_->GetPrecision() == shared_precision,
+              "Shared reference precision cannot change on a live DG operator.");
 
   const int* sigma_map = nullptr;
   const real_t* sigma_interp = nullptr;
@@ -236,9 +327,9 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.invariant_domain_flux = invariant_domain_flux;
   kernel.track_volume_speed = track_volume_speed;
   kernel.state_map = invmass_elem_vdof_map_.Read();
-  kernel.weakdiv = weakdiv_data_flat_.Read();
+  kernel.weakdiv = shared ? nullptr : weakdiv_data_flat_.Read();
   kernel.x = x_in.Read();
-  kernel.z = z_inout.ReadWrite();
+  kernel.z = shared ? nullptr : z_inout.ReadWrite();
   kernel.volume_speed =
     track_volume_speed ? weakdiv_volume_speed_.Write() : nullptr;
   kernel.q_sigma_telemetry =
@@ -246,7 +337,35 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.sigma_map = sigma_map;
   kernel.sigma_interp = sigma_interp;
   kernel.sigma_vals = sigma_vals;
+  kernel.packed_flux = shared ? weakdiv_shared_flux_.Write() : nullptr;
   mfem::forall(ne, kernel);
+  if (shared)
+  {
+    const int k = dof * dim, columns = ne * neq;
+    const real_t* flux = weakdiv_shared_flux_.Read();
+    real_t* input = weakdiv_shared_map_->Input().Write();
+    mfem::forall(k * columns, [=] MFEM_HOST_DEVICE(int entry)
+    {
+      const int row = entry % k, column = entry / k;
+      input[entry] = flux[entry] - flux[row % space_dim + k * column];
+    });
+    weakdiv_shared_map_->Apply();
+    const real_t* output = weakdiv_shared_map_->Output().Read();
+    const real_t* row_sums = weakdiv_shared_row_sums_.Read();
+    const int* map = invmass_elem_vdof_map_.Read();
+    real_t* z_out = z_inout.ReadWrite();
+    mfem::forall(dof * columns, [=] MFEM_HOST_DEVICE(int entry)
+    {
+      const int i = entry % dof, column = entry / dof;
+      const int e = column / neq, equation = column % neq;
+      real_t value = output[entry];
+      for (int d = 0; d < space_dim; ++d)
+      {
+        value += row_sums[i + dof * d] * flux[d + k * column];
+      }
+      z_out[map[e * ldof + i * neq + equation]] += value;
+    });
+  }
 #else
   auto state_map = invmass_elem_vdof_map_.HostRead();
   auto weak_flat = weakdiv_data_flat_.HostRead();
@@ -403,7 +522,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       mfem::Mpi::Root())
   {
     std::cout << "[dg-device] event=weakdiv-volume-path"
-              << " selected=packed-mfem-forall-"
+              << " selected=" << (shared ? "shared-reference-" : "packed-mfem-forall-")
               << (use_sigma ? "euler-igr" : "euler")
               << " backend=device\n";
     weakdiv_volume_path_logged_ = true;

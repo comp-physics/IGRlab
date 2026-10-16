@@ -312,6 +312,10 @@ struct PackedWeakDivEulerKernel
   const int* sigma_map = nullptr;
   const real_t* sigma_interp = nullptr;
   const real_t* sigma_vals = nullptr;
+  // Optional FP64 pointwise-flux output. The shared fixed linear map is
+  // applied separately; all pressure/sigma/speed/telemetry algebra above it
+  // remains identical to the existing fused weak-divergence path.
+  real_t* packed_flux = nullptr;
 
   MFEM_HOST_DEVICE void operator()(int e) const
   {
@@ -379,6 +383,38 @@ struct PackedWeakDivEulerKernel
                                       sigma_rho_floor,
                                       invariant_domain_pressure_floor);
         element_max_speed = fmax(element_max_speed, nodal_speed);
+      }
+
+      if (packed_flux)
+      {
+        const int stride = dof * dim;
+        for (int d = 0; d < dim; ++d)
+        {
+          const int row = j * dim + d;
+          packed_flux[row + stride * (e * neq)] = mom[d];
+          for (int m = 0; m < dim; ++m)
+          {
+            real_t value = mom[m] * mom[d] * inv_rho;
+            if (m == d)
+            {
+              value += pressure;
+              if (use_sigma)
+              {
+                value += ::igrlab::frozen_scalar_igr_algebra::
+                  TensorSigmaMomentumDiagonalTerm(sigma_j);
+              }
+            }
+            packed_flux[row + stride * (e * neq + 1 + m)] = value;
+          }
+          real_t value = mom[d] * H;
+          if (use_sigma)
+          {
+            value += ::igrlab::frozen_scalar_igr_algebra::
+              TensorSigmaEnergyTermFromInverseDensity(sigma_j, mom[d], inv_rho_sigma);
+          }
+          packed_flux[row + stride * (e * neq + energy_eq)] = value;
+        }
+        continue;
       }
 
       for (int i = 0; i < dof; ++i)

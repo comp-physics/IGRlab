@@ -92,6 +92,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
          "src/numerics/dg/EulerAdmissibilityKernels.cpp"
          "src/numerics/dgsem/dgsem_device.cpp"
+         "src/numerics/shared_reference_map.cpp"
          "src/numerics/hdg/device/device_core.cpp"
          "src/numerics/hdg/scalar_hdg_oracle.cpp"
          "src/numerics/limiters/zhang_shu.cpp"

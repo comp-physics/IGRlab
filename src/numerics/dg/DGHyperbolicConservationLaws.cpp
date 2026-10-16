@@ -466,6 +466,15 @@ bool DGHyperbolicConservationLaws::SupportsPhysicalBoundaryFluxIntegral() const
 
 void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
 {
+  const bool shared_reference_requested =
+    ::igrlab::shared_reference::RequestedPrecision() !=
+      ::igrlab::shared_reference::Precision::Off;
+  MFEM_VERIFY(!shared_reference_requested ||
+                (Device::Allows(Backend::CUDA_MASK) && dim == 2 &&
+                 num_equations == 4 && vfes.GetNE() > 0 &&
+                 (vol_mode_ == VolumeMode::DGSEMFluxDiff || !weakdiv.empty())),
+              "Shared reference operators require CUDA 2D Euler and a "
+              "preassembled DG or supported DGSEM volume path.");
   MFEM_VERIFY(!p0_face_reference_x_slopes_ ||
                 (Device::Allows(Backend::CUDA_MASK) && vol_mode_ == VolumeMode::WeakDivergence &&
                  p0_face_reference_x_slopes_->Size() == vfes.GetVSize()),
@@ -610,6 +619,8 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       RequiresStrictDGSEMProduction(*formIntegrator);
     const dgsem::DGSEMProductionSelection selection =
       dgsem_op.BindProductionPolicy(requested_strict);
+    MFEM_VERIFY(!shared_reference_requested || selection.supported,
+                "Explicit shared reference maps cannot use the DGSEM host fallback.");
     const bool strict = selection.strict;
     const dgsem::DGSEMProductionReason reason_code = selection.reason;
     const bool dispatch_transition =

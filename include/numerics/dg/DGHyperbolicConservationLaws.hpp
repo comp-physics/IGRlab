@@ -30,6 +30,7 @@
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/modal_damping.hpp"
 #include "numerics/dgsem/dgsem_production.hpp"
+#include "numerics/shared_reference_map.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
 #include "physics/igr/igr_flux.hpp"
 
@@ -665,6 +666,9 @@ private:
   int weakdiv_elem_dof_ = 0;
   /// Flattened per-element weak-divergence blocks (row-major dof x (dof*dim)).
   Vector weakdiv_data_flat_;
+  mutable std::unique_ptr<::igrlab::shared_reference::Map> weakdiv_shared_map_;
+  mutable DenseMatrix weakdiv_shared_row_sums_;
+  mutable Vector weakdiv_shared_flux_;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;
   /// Persistent per-volume-node q_sigma aggregates (five FP64 scalars/slot).

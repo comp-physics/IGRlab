@@ -1111,6 +1111,8 @@ struct DGSEMProductionCache
   bool frozen_sigma_spectral_speed = false;
   bool llf_volume_active = false;
   bool fused_residual_logged = false;
+  std::unique_ptr<::igrlab::shared_reference::Map> shared_volume_map;
+  Vector shared_volume_row_sums;
   int overintegration_order = -1;
   long overintegration_nodes_sequence = -1;
   DenseMatrix volume_interpolation, volume_weak_derivative;
@@ -1346,6 +1348,13 @@ DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   AppendMatrixWorkspace(cache.volume_pair_dissipation, evidence);
   AppendVectorWorkspace(cache.nodal_speeds, evidence);
   AppendMatrixWorkspace(cache.weak_volume, evidence);
+  if (cache.shared_volume_map && cache.shared_volume_map->Ready())
+  {
+    AppendMatrixWorkspace(cache.shared_volume_map->Matrix(), evidence);
+    AppendMatrixWorkspace(cache.shared_volume_map->Input(), evidence);
+    AppendMatrixWorkspace(cache.shared_volume_map->Output(), evidence);
+    AppendVectorWorkspace(cache.shared_volume_row_sums, evidence);
+  }
   if(cache.volume_quadrature_states.Height()>0)
   {
     AppendMatrixWorkspace(cache.volume_quadrature_states,evidence);
@@ -2407,6 +2416,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   if (!c.topology_ready)
   {
     c.FinishSubcellBlend();
+    c.shared_volume_map.reset();
+    c.shared_volume_row_sums.SetSize(0);
     c.ne = op_->vfes.GetNE();
     c.equations = op_->num_equations;
     if (c.ne <= 0 || op_->vfes.GetOrdering() != Ordering::byNODES)
@@ -3636,6 +3647,13 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
       "DG_IGR_DGSEM_FUSED_DMMA", false);
   const bool subcell_blend = ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_SUBCELL_BLEND", false);
+  const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
+  const bool shared_volume = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  MFEM_VERIFY(!shared_volume || (op_->dim == 2 && !fused_residual && !fused_dmma &&
+                !subcell_blend && !overintegrated_volume &&
+                Device::Allows(Backend::CUDA_MASK)),
+              "Shared DGSEM maps require CUDA 2D central volume with fused "
+              "residual, fused DMMA, subcell blend and overintegration disabled.");
   MFEM_VERIFY(!subcell_blend || (fused_residual && c.n1d >= 4),
       "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p10 path.");
   MFEM_VERIFY(!fused_dmma || fused_residual,
@@ -3682,13 +3700,26 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                     c.contravariant_flux,
                                     c.nodal_speeds,
                                     c.frozen_sigma_spectral_speed);
-    ApplyCentralVolumeDevice(op_->dim,
+    if (shared_volume)
+    {
+      if (!c.shared_volume_map)
+      {
+        c.shared_volume_map = std::make_unique<::igrlab::shared_reference::Map>();
+      }
+      ApplySharedCentralVolumeDevice(c.n1d, c.lex_to_local, basis.Dsplit,
+          basis.weights, c.contravariant_flux, c.weak_volume,
+          *c.shared_volume_map, c.shared_volume_row_sums, shared_precision);
+    }
+    else
+    {
+      ApplyCentralVolumeDevice(op_->dim,
                            c.n1d,
                            c.lex_to_local,
                            basis.Dsplit,
                            basis.weights,
                            c.contravariant_flux,
                            c.weak_volume);
+    }
     if (c.llf_volume_active)
     {
       AddEulerLLFVolumeDissipationDevice(op_->dim,
