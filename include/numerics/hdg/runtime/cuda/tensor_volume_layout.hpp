@@ -255,9 +255,19 @@ constexpr TensorVolumeMmaWorkPlan PlanTensorVolumeMmaWork(
   return plan;
 }
 
+// Coupled Krylov keeps the ordinary engine's admission/recovery policy while
+// using tensor volume assembly. Dispatch and accounting must agree on that
+// actual volume route rather than infer it from the engine alone.
+constexpr bool UsesBorrowedTensorVolume(
+    const bool borrowed_host_inputs, const bool tensor_engine,
+    const bool coupled_krylov) noexcept
+{
+  return borrowed_host_inputs && (tensor_engine || coupled_krylov);
+}
+
 /**
  * Update the two constant-size tensor-volume aggregate values atomically with
- * respect to overflow checks.  Ordinary CUDA must retain exact zeros.
+ * respect to overflow checks. Ordinary split assembly retains exact zeros.
  */
 constexpr bool AccumulateTensorVolumeWork(
     const bool tensor_selected, const std::uint64_t invocation_mma_tiles,

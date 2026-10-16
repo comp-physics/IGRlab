@@ -910,6 +910,11 @@ struct CudaGenericArenaLayout
   std::size_t rodas_element_trace_vectors = 0;
   std::size_t rodas_coupling_matrices = 0;
   std::size_t solve_workspace = 0;
+  std::size_t local_solve_workspace = 0;
+  std::size_t local_solve_work = 0;
+  std::size_t local_solve_vendor_workspace = 0;
+  std::size_t coupled_storage = 0;
+  std::size_t coupled_krylov_storage = 0;
   std::size_t two_exchange_keys = 0;
 };
 
@@ -998,6 +1003,24 @@ struct CudaDeviceView
   double* lu = nullptr;
   double* pivots = nullptr;
   double* solve_workspace = nullptr;
+  // Opt-in local-algebra experiment only. Scalar work shares a double-sized
+  // arena with the FP64 control; the existing FP64 A/LU/W arenas are retained.
+  double* local_solve_workspace = nullptr;
+  double* local_solve_work = nullptr;
+  double* local_solve_vendor_workspace = nullptr;
+  void* local_solve_vendor_handle = nullptr;
+  double* coupled_lu = nullptr;
+  double* coupled_rhs = nullptr;
+  double* coupled_c = nullptr;
+  double* coupled_product = nullptr;
+  double* coupled_pivots = nullptr;
+  double* coupled_row_exponents = nullptr;
+  double* coupled_interior_total = nullptr;
+  double* coupled_trace_total = nullptr;
+  double* coupled_base_rhs = nullptr;
+  double* coupled_trace_residual = nullptr;
+  double* coupled_diagnostics = nullptr;
+  double* coupled_krylov_workspace = nullptr;
   double* schur = nullptr;
   double* condensed_rhs = nullptr;
   double* true_residual = nullptr;
@@ -1085,6 +1108,10 @@ struct CudaMeshShape
   bool igr_active = false;
   bool borrowed_static_source = false;
   bool borrowed_host_inputs = false;
+  CudaLocalSolveKind local_solve = CudaLocalSolveKind::current;
+  CudaCoupledApplyKind coupled_apply = CudaCoupledApplyKind::serial;
+  CudaCoupledAccuracyKind coupled_accuracy = CudaCoupledAccuracyKind::strict;
+  CudaLocalSolveBackend local_solve_backend = CudaLocalSolveBackend::simt;
   bool borrowed_static_boundary_policies = false;
 };
 
@@ -2286,6 +2313,24 @@ bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
     double absolute_tolerance, double relative_tolerance,
     double* differential_result, double* algebraic_result,
     double* differential_measure) noexcept;
+bool CudaCreateRefinedCublasHandle(void*& handle, bool approximate = false) noexcept;
+bool CudaCoupledTf32Supported() noexcept;
+bool CudaCoupledTensorHardwareSupported() noexcept;
+bool CudaLaunchCoupledAccumulate(const CudaDeviceView&, const CudaMeshShape&, bool first) noexcept;
+bool CudaLaunchCoupledResidualRhs(const CudaDeviceView&, const CudaMeshShape&) noexcept;
+bool CudaLaunchCoupledCertificateSolve(const CudaDeviceView&, const CudaMeshShape&, bool cached_factor=false) noexcept;
+struct CudaCoupledKrylovResult
+{
+  int iterations=0,restarts=0,preconditioner_applications=0;
+  double relative_residual=0.0;
+  bool converged=false;
+};
+bool CudaLaunchCoupledKrylovSetup(const CudaDeviceView&,const CudaMeshShape&) noexcept;
+bool CudaSolveCoupledNativeKrylov(const CudaDeviceView&,const CudaMeshShape&,double,int,CudaCoupledKrylovResult&) noexcept;
+bool CudaLaunchCoupledKrylovInitialize(const CudaDeviceView&,const CudaMeshShape&) noexcept;
+bool CudaLaunchCoupledCertificateNorms(const CudaDeviceView&, const CudaMeshShape&) noexcept;
+bool CudaLaunchCoupledFallback(const CudaDeviceView&, const CudaMeshShape&) noexcept;
+void CudaDestroyRefinedCublasHandle(void*& handle) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape,
                             generic::CudaEngineKind engine,
@@ -2316,6 +2361,12 @@ bool CudaLaunchGatherRemoteVector(const CudaDeviceView& view,
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& view,
                                    const CudaMeshShape& shape,
                                    double* true_vector) noexcept;
+// Rank-one opt-in assembly retains small globally assembled RHS values when
+// opposing element face contributions are much larger than the correction.
+bool CudaLaunchRefinedTrueRhs(const CudaDeviceView& view,
+                              const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRefinedOriginalCoupledSquaredNorms(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchRecover(const CudaDeviceView& view,
                        const CudaMeshShape& shape,
                        generic::CudaEngineKind engine) noexcept;
@@ -2397,8 +2448,73 @@ public:
   using state_slot = CompleteStateSlot<CudaInteriorState, CudaTrueTraceState>;
 
   CudaPersistentNumerics() noexcept = default;
+
+  bool PublicationResidualPolicyMatches(
+      const CudaLocalSolveKind declared_mode,
+      const CudaCoupledAccuracyKind declared_accuracy,
+      const double declared_limit) const noexcept
+  {
+    // Legacy/strict publication retains its fixed ceiling. A physical policy
+    // must match both the consensus declaration and actually admitted mode.
+    if (declared_accuracy == CudaCoupledAccuracyKind::strict)
+      return shape_.coupled_accuracy == declared_accuracy &&
+          declared_limit == 1.0e-10;
+    return CudaLocalSolveIsKrylov(shape_.local_solve) &&
+        shape_.local_solve == declared_mode &&
+        shape_.coupled_accuracy == declared_accuracy &&
+        (declared_accuracy == CudaCoupledAccuracyKind::physical_1e6 ||
+         declared_accuracy == CudaCoupledAccuracyKind::physical_1e4) &&
+        declared_limit == true_residual_relative_tolerance_;
+  }
   ~CudaPersistentNumerics() noexcept
   {
+    if (local_solve_elements_ != 0.0)
+      std::fprintf(stderr, "HDG local-solve summary mode=%s elements=%.0f "
+          "correction_sweeps=%.0f fp64_fallbacks=%.0f failed=%.0f "
+          "max_original_coupled_relative_residual=%.17g backend=%s\n",
+          CudaLocalSolveName(shape_.local_solve),
+          local_solve_elements_, local_solve_corrections_,
+          local_solve_fallbacks_, local_solve_failures_,
+          local_solve_maximum_coupled_residual_,
+          shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched
+              ? "cublas-batched" : "simt");
+    if (CudaLocalSolveIsCoupled(shape_.local_solve))
+      std::fprintf(stderr, "HDG coupled-solve summary mode=%s solves=%.0f "
+          "outer_corrections=%.0f fp64_fallbacks=%.0f failed=%.0f "
+          "max_original_coupled_relative_residual=%.17g "
+          "max_original_condensed_relative_residual=%.17g gemm_calls=%.0f "
+          "tf32_gemm_calls=%.0f\n", CudaLocalSolveName(shape_.local_solve),
+          coupled_solves_, coupled_outer_corrections_, coupled_fp64_fallbacks_,
+          coupled_failures_, local_solve_maximum_coupled_residual_,
+          coupled_maximum_condensed_residual_, coupled_gemm_calls_, coupled_tf32_gemm_calls_);
+    if (CudaLocalSolveIsKrylov(shape_.local_solve))
+      std::fprintf(stderr, "HDG coupled-krylov summary mode=%s solves=%.0f without_recovery=%.0f "
+          "refinement_corrections=%.0f krylov_iterations=%.0f restarts=%.0f preconditioner_applications=%.0f "
+          "setups=%.0f shifted_patches=%.0f setup_failures=%.0f fp64_recoveries=%.0f failed=%.0f "
+          "raw_coupled_checks=%.0f raw_max_original_coupled=%.17g "
+          "raw_condensed_checks=%.0f raw_max_original_condensed=%.17g "
+          "accepted_max_original_coupled=%.17g accepted_max_original_condensed=%.17g "
+          "certificate_factorizations=%.0f certificate_factor_reuses=%.0f\n",
+          CudaLocalSolveName(shape_.local_solve),coupled_solves_,coupled_krylov_without_recovery_,
+          coupled_outer_corrections_,coupled_krylov_iterations_,coupled_krylov_restarts_,
+          coupled_krylov_preconditioners_,coupled_krylov_setups_,coupled_krylov_setups_*shape_.elements,
+          coupled_krylov_setup_failures_,coupled_fp64_fallbacks_,coupled_failures_,
+          coupled_krylov_raw_coupled_checks_,coupled_krylov_raw_coupled_,
+          coupled_krylov_raw_condensed_checks_,coupled_krylov_raw_condensed_,
+          local_solve_maximum_coupled_residual_,coupled_maximum_condensed_residual_,
+          coupled_krylov_certificate_factors_,coupled_krylov_certificate_reuses_);
+    if (CudaLocalSolveIsCoupled(shape_.local_solve))
+      std::fprintf(stderr, "HDG coupled-progress summary fallback_trace=%.0f "
+          "fallback_nonfinite=%.0f fallback_runtime=%.0f fallback_contraction=%.0f fallback_outer_limit=%.0f "
+          "fallback_certificate=%.0f certificate_retries=%.0f certificate_checks=%.0f "
+          "max_initial_coupled=%.17g last_coupled=%.17g max_intermediate_coupled=%.17g "
+          "last_condensed=%.17g max_intermediate_condensed=%.17g\n",
+          coupled_fallback_trace_, coupled_fallback_nonfinite_, coupled_fallback_runtime_, coupled_fallback_contraction_,
+          coupled_fallback_outer_limit_, coupled_fallback_certificate_, coupled_certificate_retries_,
+          coupled_certificate_checks_, coupled_max_initial_residual_, coupled_last_intermediate_residual_,
+          coupled_max_intermediate_residual_, coupled_last_intermediate_condensed_,
+          coupled_max_intermediate_condensed_);
+    CudaDestroyRefinedCublasHandle(local_solve_vendor_handle_);
     CudaDestroyRankOneMgrState(rank_one_mgr_state_);
     const CudaArenaReleasePass first = ReleaseArenas();
     const CudaArenaReleasePass second = ReleaseArenas();
@@ -2512,6 +2628,11 @@ public:
         : 1.0e-13;
     true_residual_relative_tolerance_ = config.use_generic_numerical_policy
         ? config.numerical_policy.true_residual_relative_tolerance : 1.0e-10;
+    // The opt-in physical-budget experiment still measures both residuals
+    // against original FP64 matrices. Nonlinear, positivity and conservation
+    // policies are unchanged; external field budgets must also be checked.
+    true_residual_relative_tolerance_ = CudaCoupledAcceptanceTolerance(
+        shape_.coupled_accuracy, true_residual_relative_tolerance_);
     nonlinear_relative_tolerance_ = config.use_generic_numerical_policy
         ? config.numerical_policy.nonlinear_relative_tolerance : 1.0e-10;
     maximum_linear_iterations_ = config.use_generic_numerical_policy
@@ -2662,6 +2783,40 @@ public:
     {
       ReportCudaSetupFailure(evidence.rank, "bind-arena-views");
       return false;
+    }
+    if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched)
+    {
+      if (!CollectiveContinue(
+              CudaCreateRefinedCublasHandle(local_solve_vendor_handle_,
+                  CudaLocalSolveIsCoupled(shape_.local_solve))))
+      {
+        ReportCudaSetupFailure(evidence.rank, "local-cublas-handle");
+        return false;
+      }
+      view_.local_solve_vendor_handle = local_solve_vendor_handle_;
+      if (CudaLocalSolveIsKrylov(shape_.local_solve))
+        std::fprintf(stderr,"HDG coupled-krylov setup mode=%s outer=iterative-refinement "
+            "inner=fgmres inner_precision=%s construction=%s master=fp64 authority=original-fp64 "
+            "preconditioner=shifted-element-schwarz trace_patch=assembled-principal patch_shift=0.0001 volume=fp64-wmma rhs_normalization=power-two-max "
+            "apply=%s accuracy_policy=%s acceptance=%s "
+            "restart=24 maximum_iterations=144 refinement_limit=%d inner_tolerance=%.17g "
+            "coupled_tolerance=%.17g condensed_tolerance=%.17g recovery=original-fp64-hypre\n",
+            CudaLocalSolveName(shape_.local_solve),CudaLocalSolveUsesFp32Krylov(shape_.local_solve)?"fp32":"fp64",
+            CudaLocalSolveUsesTf32(shape_.local_solve)?"wmma-tf32":"fp64-pedantic",
+            CudaCoupledApplyName(shape_.coupled_apply), CudaCoupledAccuracyName(shape_.coupled_accuracy),
+            shape_.coupled_accuracy == CudaCoupledAccuracyKind::strict ? "strict" : "physical-budget",
+            shape_.local_solve==CudaLocalSolveKind::coupled_krylov_fp32_once?1:4,
+            CudaCoupledInnerTolerance(shape_.local_solve, shape_.coupled_accuracy,
+                                      true_residual_relative_tolerance_),
+            true_residual_relative_tolerance_,true_residual_relative_tolerance_);
+      else if (CudaLocalSolveIsCoupled(shape_.local_solve))
+        std::fprintf(stderr, "HDG coupled-solve setup mode=%s outer=defect-correction "
+            "preconditioner=blocked-approximate layout=padded-row-major block=32 "
+            "gemm_compute=%s authority=original-fp64 coupled_tolerance=%.17g "
+            "condensed_tolerance=%.17g inner_tolerance=0.0001 outer_limit=4 "
+            "certificate_rhs=2\n", CudaLocalSolveName(shape_.local_solve),
+            shape_.local_solve == CudaLocalSolveKind::coupled_tf32 ? "fast-tf32" : "fp64-pedantic",
+            true_residual_relative_tolerance_, true_residual_relative_tolerance_);
     }
     if (!CollectiveContinue(UploadTopologyAndState()))
     {
@@ -4227,6 +4382,14 @@ public:
     CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
     CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
         element_schwarz_attempt_state_);
+    const std::uint64_t coupled_extra_calls_before = coupled_additional_trace_attempts_;
+    const double native_solves_before=coupled_solves_;
+    const double native_without_recovery_before=coupled_krylov_without_recovery_;
+    const double native_recoveries_before=coupled_fp64_fallbacks_;
+    const double native_failures_before=coupled_failures_;
+    const double native_setups_before=coupled_krylov_setups_;
+    const double native_iterations_before=coupled_krylov_iterations_;
+    const double native_preconditioners_before=coupled_krylov_preconditioners_;
     CudaNumericalResult result{};
     result.tensor_core.selected_engine = cuda_engine_;
     result.tensor_core.requested_trace_policy =
@@ -4299,10 +4462,17 @@ public:
     result.tensor_core.fallback_accounting_complete = true;
     const bool reduced_precision_volume =
         detail::CudaResearchVolumeUsesReducedPrecision(
-            shape_.borrowed_host_inputs &&
-            cuda_engine_ == generic::CudaEngineKind::tensor_core);
-    result.precision_work.all_fp64_policy = !reduced_precision_volume;
-    result.precision_work.accounting_complete = !reduced_precision_volume;
+            detail::UsesBorrowedTensorVolume(
+                shape_.borrowed_host_inputs,
+                cuda_engine_ == generic::CudaEngineKind::tensor_core,
+                CudaLocalSolveIsKrylov(shape_.local_solve)));
+    result.precision_work.all_fp64_policy = !reduced_precision_volume &&
+        shape_.local_solve != CudaLocalSolveKind::fp32_refine &&
+        !CudaLocalSolveUsesTf32(shape_.local_solve);
+    // Per-element correction/fallback counts are available in the private
+    // experiment workspace. Whole-attempt accounting is not yet qualified.
+    result.precision_work.accounting_complete = !reduced_precision_volume &&
+        shape_.local_solve == CudaLocalSolveKind::current;
     // The frozen non-borrowed lifecycle has no Euler conservation contract.
     // Borrowed Euler attempts remain fail-closed until their measured balance
     // has passed below.
@@ -4504,7 +4674,8 @@ public:
               std::numeric_limits<std::uint64_t>::max())
         return false;
       std::uint64_t mma_tiles = 0;
-      if (!CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles))
+      if (!CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles) ||
+          !ObserveLocalSolveWork())
         return false;
       if (cuda_engine_ == generic::CudaEngineKind::tensor_core)
       {
@@ -4581,7 +4752,8 @@ public:
             ::igrlab::observability::RegionId::hdg_interior_recovery);
         recovery_launched = CudaLaunchRecover(view_, shape_, cuda_engine_);
       }
-      const bool recovered = recovery_launched && StatusPassed();
+      const bool recovered = recovery_launched && StatusPassed() &&
+          OriginalCoupledResidualPassed();
       const bool frozen_partitioned_increments = recovered &&
           (!partitioned_backward_euler_ ||
            CudaLaunchPartitionedBackwardEulerFreezeIncrements(
@@ -4750,7 +4922,8 @@ public:
           CudaLaunchRecover(view_, shape_, cuda_engine_);
     }
     const bool coherent_solve =
-        coherent_recovery_launched && StatusPassed();
+        coherent_recovery_launched && StatusPassed() &&
+        OriginalCoupledResidualPassed();
     const bool coherent_partitioned_increments = coherent_solve &&
         (!partitioned_backward_euler_ ||
          CudaLaunchPartitionedBackwardEulerFreezeIncrements(
@@ -4946,8 +5119,10 @@ public:
         result.linear_iterations ==
             result.newton_correction_linear_iterations +
                 result.final_coherent_linear_iterations &&
-        result.linear_solve_attempts ==
-            result.trace_solves + result.true_residual_tightenings &&
+        coupled_additional_trace_attempts_ >= coupled_extra_calls_before &&
+        completed_linear_solve_attempts == completed_trace_solves +
+            static_cast<std::uint64_t>(result.true_residual_tightenings) +
+            (coupled_additional_trace_attempts_ - coupled_extra_calls_before) &&
         result.scalar_closure_solves >= 0 &&
         result.scalar_closure_linear_iterations >= 0 &&
         result.scalar_closure_linear_solve_attempts >=
@@ -5127,8 +5302,23 @@ public:
                                mgr_preconditioner_applications == 0 &&
                        result.tensor_core.mgr_f_ilu_setups == 0 &&
                        result.tensor_core.mgr_f_ilu_applications == 0);
+    // The new route counts full-coupled native solves separately. Do not
+    // invent legacy trace calls to satisfy an implementation-specific census.
+    const bool native_coupled_accounting = CudaLocalSolveIsKrylov(shape_.local_solve) &&
+        linear_work_accounting_complete &&
+        coupled_solves_-native_solves_before==static_cast<double>(completed_trace_solves) &&
+        coupled_krylov_setups_-native_setups_before==coupled_solves_-native_solves_before &&
+        coupled_krylov_without_recovery_-native_without_recovery_before+
+          coupled_fp64_fallbacks_-native_recoveries_before==coupled_solves_-native_solves_before &&
+        coupled_failures_==native_failures_before &&
+        coupled_krylov_iterations_-native_iterations_before==
+          coupled_krylov_preconditioners_-native_preconditioners_before &&
+        coupled_krylov_iterations_-native_iterations_before<=result.linear_iterations &&
+        result.tensor_core.hypre_trace_solve_calls==coupled_fp64_fallbacks_-native_recoveries_before &&
+        result.tensor_core.native_rank1_trace_solve_calls==0;
     result.telemetry = DeviceResident() && NoFallback() &&
-        result.tensor_core.trace_solver_accounting_complete &&
+        (CudaLocalSolveIsKrylov(shape_.local_solve)?native_coupled_accounting:
+            result.tensor_core.trace_solver_accounting_complete) &&
         AllocatorPolicy::W8OwnedAllocationCalls() ==
             baseline_w8_owned_allocation_calls_ &&
         AllocatorPolicy::DeallocationEvents() ==
@@ -5801,6 +5991,54 @@ private:
     shape_.global_true_trace_count = static_cast<int>(global_true);
     shape_.borrowed_static_source = false;
     shape_.borrowed_host_inputs = config.use_borrowed_host_inputs;
+    shape_.local_solve = SelectedCudaLocalSolve();
+    shape_.local_solve_backend = SelectedCudaLocalSolveBackend();
+    shape_.coupled_apply = SelectedCudaCoupledApply();
+    shape_.coupled_accuracy = SelectedCudaCoupledAccuracy();
+    if (shape_.coupled_apply == CudaCoupledApplyKind::invalid ||
+        shape_.coupled_accuracy == CudaCoupledAccuracyKind::invalid ||
+        (!CudaLocalSolveIsKrylov(shape_.local_solve) &&
+         (shape_.coupled_apply != CudaCoupledApplyKind::serial ||
+          shape_.coupled_accuracy != CudaCoupledAccuracyKind::strict)) ||
+        (shape_.coupled_apply == CudaCoupledApplyKind::inverse_tf32 &&
+         !CudaLocalSolveUsesTf32(shape_.local_solve)))
+    {
+      std::fprintf(stderr, "HDG coupled controls require a coupled-krylov mode; "
+          "apply=serial|cooperative|inverse|inverse-tf32, "
+          "accuracy=strict|physical-1e-6|physical-1e-4; inverse-tf32 requires TF32 construction.\n");
+      return false;
+    }
+    if (shape_.local_solve == CudaLocalSolveKind::invalid ||
+        shape_.local_solve_backend == CudaLocalSolveBackend::invalid ||
+        (shape_.local_solve == CudaLocalSolveKind::current &&
+         shape_.local_solve_backend != CudaLocalSolveBackend::simt) ||
+        (shape_.local_solve != CudaLocalSolveKind::current &&
+         (!shape_.borrowed_host_inputs || ranks_ != 1 || rodas3_)) ||
+        (CudaLocalSolveIsCoupled(shape_.local_solve) &&
+         (shape_.local_solve_backend != CudaLocalSolveBackend::cublas_batched ||
+          cuda_engine_ != generic::CudaEngineKind::ordinary || partitioned_backward_euler_ ||
+          !CudaCoupledTracePolicyIsExact(trace_policy_descriptor_) ||
+          (CudaLocalSolveUsesTf32(shape_.local_solve) &&
+           !CudaCoupledTf32Supported()))))
+    {
+      std::fprintf(stderr, "HDG local solve requires current, fp64-refine, or "
+          "fp32-refine; backend requires simt or cublas-batched, with cublas "
+          "requiring a refinement mode; experimental modes require rank-one borrowed BE. "
+          "coupled-fp64/coupled-tf32 require ordinary monolithic BE, cublas-batched, "
+          "ordinary-ilu-jacobi5-refresh; TF32 construction also requires SM80+ and TF32 override enabled. "
+          "coupled-krylov-* uses the same recovery admission; cublas-batched names the retained "
+          "FP64 vendor handle, while its TF32 construction uses explicit WMMA.\n");
+      return false;
+    }
+    if (CudaLocalSolveIsKrylov(shape_.local_solve) &&
+        (config.order != 5 || !shape_.igr_active || !CudaCoupledTensorHardwareSupported() ||
+         static_cast<long long>(shape_.interior_count)+shape_.true_trace_count > std::numeric_limits<int>::max()-127 ||
+         CudaResearchVolumeUsesReducedPrecision(true)))
+    {
+      std::fprintf(stderr,"HDG coupled-krylov requires borrowed rank-one monolithic IGR BE p5, "
+          "SM80+, bounded combined vector size, and original FP64 tensor volume assembly.\n");
+      return false;
+    }
     shape_.borrowed_static_boundary_policies =
         config.use_borrowed_host_inputs &&
         config.borrowed_boundary_policies.count != 0;
@@ -5906,6 +6144,43 @@ private:
           checked_product(solve_base, trace_plus_one, layout.solve_workspace) &&
           checked_product(layout.local_matrix, 2, layout.two_exchange_keys);
       if (!valid) return false;
+      if (shape_.local_solve != CudaLocalSolveKind::current)
+      {
+        layout.local_solve_workspace = layout.solve_workspace;
+        if (!checked_product(elements, 3, layout.local_solve_work)) return false;
+        if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched &&
+            (!checked_product(elements, 4, layout.local_solve_vendor_workspace) ||
+             !checked_add(layout.local_solve_vendor_workspace, 1))) return false;
+      }
+      if (CudaLocalSolveIsCoupled(shape_.local_solve))
+      {
+        const std::size_t np = ((interior_dofs + 15) / 16) * 16;
+        const std::size_t mp = ((trace_dofs + 15) / 16) * 16;
+        const std::size_t q = ((trace_dofs + 16) / 16) * 16;
+        std::size_t per_element = 0, term = 0;
+        for (const auto dimensions : {std::pair<std::size_t,std::size_t>{np,np},
+            {np,q}, {mp,np}, {mp,mp}, {np,2}, {interior_dofs,1}})
+          if (!checked_product(dimensions.first, dimensions.second, term) ||
+              !checked_add(per_element, term)) return false;
+        if (!checked_product(per_element, elements, layout.coupled_storage) ||
+            !checked_product(true_trace, 3, term) ||
+            !checked_add(layout.coupled_storage, term) ||
+            !checked_add(layout.coupled_storage, 8)) return false;
+      }
+      if (CudaLocalSolveIsKrylov(shape_.local_solve))
+      {
+        // Capacity uses double slots even for the FP32 variants. No memory
+        // saving is claimed while all original FP64 matrices are retained.
+        std::size_t per_element=0, term=0, total=0;
+        const std::size_t l=interior_dofs+trace_dofs,np=((interior_dofs+15)/16)*16;
+        for (const auto dims : {std::pair<std::size_t,std::size_t>{l,l},
+            {trace_dofs,trace_dofs}, {trace_dofs,2}, {np,1}})
+          if(!checked_product(dims.first,dims.second,term)||!checked_add(per_element,term))return false;
+        if(!checked_product(per_element,elements,total)||
+           !checked_product(interior+true_trace,53,term)||!checked_add(total,term)||
+           !checked_add(total,true_trace)||!checked_add(total,128*25+3*26+1))return false;
+        layout.coupled_krylov_storage=total;
+      }
       layout.elements = elements;
       layout.interior = interior;
       layout.local_trace = local_trace;
@@ -5968,7 +6243,13 @@ private:
             checked_add(doubles, two_coupling) && checked_add(doubles, layout.local_matrix) &&
             checked_add(doubles, interior) && checked_add(doubles, layout.element_trace) &&
             checked_add(doubles, layout.element_interior2) && checked_add(doubles, interior) &&
-            checked_add(doubles, layout.solve_workspace) && checked_add(doubles, layout.local_matrix) &&
+            checked_add(doubles, layout.solve_workspace) &&
+            checked_add(doubles, layout.local_solve_workspace) &&
+            checked_add(doubles, layout.local_solve_work) &&
+            checked_add(doubles, layout.local_solve_vendor_workspace) &&
+            checked_add(doubles, layout.coupled_storage) &&
+            checked_add(doubles, layout.coupled_krylov_storage) &&
+            checked_add(doubles, layout.local_matrix) &&
             checked_add(doubles, layout.element_trace) && checked_add(doubles, true_trace) &&
             checked_add(doubles, two_local_matrix) && checked_add(doubles, two_element_trace) &&
             checked_add(doubles, layout.volume_shape) && checked_add(doubles, layout.volume_derivative) &&
@@ -6247,6 +6528,42 @@ private:
   bool VerifyResidencyAndTicket(CudaRunEvidence& evidence) noexcept;
   bool Ticket(CudaFailurePhase phase) noexcept;
   bool StatusPassed() noexcept;
+  bool ObserveLocalSolveWork() noexcept;
+  bool OriginalCoupledResidualPassed() noexcept;
+  void* local_solve_vendor_handle_ = nullptr;
+  double local_solve_elements_ = 0.0;
+  double local_solve_corrections_ = 0.0;
+  double local_solve_fallbacks_ = 0.0;
+  double local_solve_failures_ = 0.0;
+  double local_solve_maximum_coupled_residual_ = 0.0;
+  double coupled_solves_ = 0.0, coupled_outer_corrections_ = 0.0;
+  double coupled_fp64_fallbacks_ = 0.0, coupled_failures_ = 0.0;
+  double coupled_maximum_condensed_residual_ = 0.0;
+  double coupled_krylov_iterations_=0, coupled_krylov_restarts_=0;
+  double coupled_krylov_preconditioners_=0, coupled_krylov_setups_=0;
+  double coupled_krylov_setup_failures_=0, coupled_krylov_without_recovery_=0;
+  double coupled_krylov_raw_coupled_=0, coupled_krylov_raw_condensed_=0;
+  double coupled_krylov_raw_condensed_checks_=0, coupled_krylov_raw_coupled_checks_=0;
+  double coupled_krylov_certificate_factors_=0, coupled_krylov_certificate_reuses_=0;
+  bool SolveCoupledKrylovSystem(generic::EulerHdgLinearSolveRole,double&,std::uint64_t,
+      int&,int&,int&,CudaTensorCoreEvidence&) noexcept;
+  double coupled_gemm_calls_ = 0.0, coupled_tf32_gemm_calls_ = 0.0;
+  // Bounded aggregates only. Intermediate residuals exclude FP64 fallback
+  // and are never mixed into the accepted original-system residual maxima.
+  // Certificate checks/retries cover the approximate path only; a retry is
+  // counted when continuation is requested, before dispatching its new RHS.
+  double coupled_fallback_trace_ = 0.0, coupled_fallback_nonfinite_ = 0.0;
+  double coupled_fallback_runtime_ = 0.0;
+  double coupled_fallback_contraction_ = 0.0, coupled_fallback_outer_limit_ = 0.0;
+  double coupled_fallback_certificate_ = 0.0, coupled_certificate_retries_ = 0.0;
+  double coupled_certificate_checks_ = 0.0;
+  double coupled_max_initial_residual_ = 0.0, coupled_last_intermediate_residual_ = 0.0;
+  double coupled_max_intermediate_residual_ = 0.0, coupled_last_intermediate_condensed_ = 0.0;
+  double coupled_max_intermediate_condensed_ = 0.0;
+  std::uint64_t coupled_additional_trace_attempts_ = 0;
+  bool SolveCoupledApproximateSystem(generic::EulerHdgLinearSolveRole role,
+      double& relative, std::uint64_t generation, int& iterations,
+      int& attempts, int& tightenings, CudaTensorCoreEvidence& evidence) noexcept;
   bool DistributeCurrentTrace(const double* true_values) noexcept;
   bool DistributeTraceIncrement() noexcept;
   bool AssembleTrueVector(const double* element_values,
@@ -6273,7 +6590,8 @@ private:
                        bool same_matrix_retry,
                        bool same_operator_new_rhs,
                        int& linear_iterations,
-                       CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
+                       CudaTensorCoreEvidence& tensor_core_evidence,
+                       bool coupled_rebuild_same_generation = false) noexcept;
   bool SolveTrueSystem(generic::EulerHdgLinearSolveRole role,
                        CudaNativeTraceActiveSubspace active_subspace,
                        double& true_relative_residual,

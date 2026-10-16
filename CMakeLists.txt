@@ -241,9 +241,10 @@ endif()
 
 if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
     if(NOT _dg_igr_expected_arch STREQUAL "80" AND
+       NOT _dg_igr_expected_arch STREQUAL "90" AND
        NOT _dg_igr_expected_arch STREQUAL "120")
         message(FATAL_ERROR
-                "HDG CUDA components require native architecture 80 or 120.")
+                "HDG CUDA components require native architecture 80, 90, or 120.")
     endif()
     # Share the normalized, validated profile with every CUDA component and
     # final executable, including tests in sibling directories.

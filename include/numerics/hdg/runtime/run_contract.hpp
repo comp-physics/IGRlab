@@ -1359,11 +1359,14 @@ public:
                         const StateCoordinates coordinates,
                         const PersistentResourceDescriptor resources,
                         const std::uint64_t initial_attempt_sequence = 0,
-                        CollectivePolicy collective_policy = {})
+                        CollectivePolicy collective_policy = {},
+                        const double accepted_true_residual_limit =
+                            true_relative_residual_limit)
       : committed_(std::move(committed)),
         candidate_(std::move(candidate)),
         coordinates_(coordinates),
         resources_(resources),
+        accepted_true_residual_limit_(accepted_true_residual_limit),
         collective_policy_(std::move(collective_policy)),
         attempt_sequence_(initial_attempt_sequence),
         incarnation_(detail::AcquireContractIncarnation())
@@ -1372,7 +1375,9 @@ public:
     {
       constructor_failure_ = FailureReason::incarnation_exhausted;
     }
-    else if (!resources_.Valid())
+    else if (!resources_.Valid() ||
+             !std::isfinite(accepted_true_residual_limit_) ||
+             !(accepted_true_residual_limit_ > 0.0))
     {
       constructor_failure_ = FailureReason::invalid_resource_descriptor;
     }
@@ -1659,7 +1664,7 @@ public:
     if (!std::isfinite(report.telemetry.true_relative_residual) ||
         report.telemetry.true_relative_residual < 0.0 ||
         report.telemetry.true_relative_residual >
-            true_relative_residual_limit)
+            accepted_true_residual_limit_)
     {
       local_gates.true_residual = false;
     }
@@ -1957,7 +1962,7 @@ public:
     if (!std::isfinite(report.telemetry.true_relative_residual) ||
         report.telemetry.true_relative_residual < 0.0 ||
         report.telemetry.true_relative_residual >
-            true_relative_residual_limit)
+            accepted_true_residual_limit_)
     {
       local_gates.true_residual = false;
     }
@@ -2867,6 +2872,9 @@ private:
   state_slot candidate_{};
   StateCoordinates coordinates_{};
   PersistentResourceDescriptor resources_{};
+  // Immutable for the run. Callers must bind an explicit nondefault limit to
+  // their admitted numerical policy; telemetry always retains the actual norm.
+  const double accepted_true_residual_limit_ = true_relative_residual_limit;
   CollectivePolicy collective_policy_{};
   RunTelemetry telemetry_{};
   StateCoordinates prepared_target_{};

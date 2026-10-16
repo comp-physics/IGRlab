@@ -11,7 +11,8 @@ get_filename_component(DG_IGR_REPOSITORY_ROOT
 
 add_executable(dg_igr_hdg_paraview_output_test
   test_parallel_vtk.cpp
-  "${DG_IGR_REPOSITORY_ROOT}/src/sim/hdg/parallel_vtk.cpp")
+  "${DG_IGR_REPOSITORY_ROOT}/src/sim/hdg/parallel_vtk.cpp"
+  "${DG_IGR_REPOSITORY_ROOT}/src/sim/state/euler_derived_fields.cpp")
 target_include_directories(dg_igr_hdg_paraview_output_test PRIVATE
   "${DG_IGR_REPOSITORY_ROOT}/include")
 target_link_libraries(dg_igr_hdg_paraview_output_test PRIVATE mfem MPI::MPI_CXX)

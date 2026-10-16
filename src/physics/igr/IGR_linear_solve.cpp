@@ -2417,17 +2417,32 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     ? ReadEnvInt("DG_IGR_IGR_TWO_LEVEL_ORDER", 1) : 1;
   const bool device_coarse_requested = DeviceKrylovRequested(
     "DG_IGR_IGR_COARSE_CG_BACKEND", DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"));
+  const bool cooperative_coarse_requested = CooperativeCoarseCGRequested();
+  MFEM_VERIFY(!using_two_level_inverse || !cooperative_coarse_requested ||
+                (two_level_coarse == "cg" && device_coarse_requested),
+              "Cooperative coarse execution requires two-level cg and cuda-fp64 coarse backend.");
   const char* two_level_block_env = ::igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_BLOCK_PRECISION");
   const std::string two_level_block_precision =
     two_level_block_env && two_level_block_env[0] ? two_level_block_env : "fp64";
   MFEM_VERIFY(two_level_block_precision == "fp64" || two_level_block_precision == "fp32",
               "DG_IGR_IGR_TWO_LEVEL_BLOCK_PRECISION must be fp64|fp32.");
+  const std::string two_level_local = TwoLevelLocalMode();
+  MFEM_VERIFY(two_level_local == "element" || using_two_level_inverse,
+              "Shared patch local modes require the two-level inverse preconditioner.");
+  const bool shared_patch_two_level = using_two_level_inverse && two_level_local != "element";
+  const std::string two_level_patch_composition = TwoLevelPatchComposition();
+  MFEM_VERIFY(two_level_patch_composition == "additive" || shared_patch_two_level,
+              "Multiplicative patch composition requires the two-level shared-patch preconditioner.");
+  MFEM_VERIFY(!shared_patch_two_level || two_level_block_precision == "fp64",
+              "Shared patch modes require the element block precision selector to remain fp64.");
   const bool mixed_two_level = using_two_level_inverse && two_level_block_precision == "fp32";
-  MFEM_VERIFY(!mixed_two_level || DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"),
-              "FP32 two-level blocks require IGRLAB_IGR_KRYLOV_BACKEND=cuda-fp64 "
+  MFEM_VERIFY(!(mixed_two_level || shared_patch_two_level) || DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"),
+              "FP32 two-level blocks and shared patches require IGRLAB_IGR_KRYLOV_BACKEND=cuda-fp64 "
               "for original FP64 operator residual authority.");
   const std::string two_level_key = two_level_coarse + ":" + std::to_string(two_level_order)
-    + (device_coarse_requested ? ":cuda-fp64:" : ":mfem:") + two_level_block_precision;
+    + (device_coarse_requested ? ":cuda-fp64:" : ":mfem:") + two_level_block_precision
+    + (cooperative_coarse_requested ? ":cooperative:" : ":host-polled:") + two_level_local
+    + ":" + two_level_patch_composition;
   MFEM_VERIFY(!using_two_level_inverse ||
                 (std::string(two_level_env) == "fp64" && using_cuda &&
                  !using_dense_inverse),
@@ -3087,8 +3102,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool device_krylov_admitted = using_cuda && krylov_ranks == 1 &&
     !mfem::Device::Allows(mfem::Backend::CEED_MASK | mfem::Backend::OCCA_MASK);
   const bool use_device_krylov = device_krylov_requested && device_krylov_admitted;
-  MFEM_VERIFY(!mixed_two_level || use_device_krylov,
-              "FP32 two-level blocks require the admitted rank-one CUDA FGMRES path.");
+  MFEM_VERIFY(!(mixed_two_level || shared_patch_two_level) || use_device_krylov,
+              "FP32 two-level blocks and shared patches require the admitted rank-one CUDA FGMRES path.");
   MFEM_VERIFY(!use_device_krylov || solver_choice == LinearSolverType::FGMRES,
               "CUDA FP64 Krylov currently requires explicit FGMRES.");
   if (use_device_krylov)
@@ -3386,7 +3401,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   if (using_two_level_inverse)
   {
-    last_precond_name_ = "two-level-inverse-" + two_level_block_precision;
+    last_precond_name_ = shared_patch_two_level ? "two-level-" + two_level_local
+      : "two-level-inverse-" + two_level_block_precision;
   }
   if (using_screened_patch)
   {

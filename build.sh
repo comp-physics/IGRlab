@@ -1981,8 +1981,9 @@ validate_reused_mfem() {
   if [[ "${MODE}" == "gpu" ]]; then
     mpi_spec="openmpi+cuda"
     hypre_spec="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
-    if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]]; then
-      # The SM70/SM80 manifests pin compatible releases; identity still binds the DAG hash.
+    if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ||
+          "${SPACK_CUDA_ARCH}" == "90" ]]; then
+      # SM70/SM80/SM90 environments select compatible releases; identity still binds the DAG hash.
       hypre_spec="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
     fi
   else
@@ -2657,8 +2658,9 @@ if [[ "${MODE}" == "cpu" && "${CUDA_ARCH_WAS_SET}" == "1" ]]; then
   exit 2
 fi
 if [[ "${MODE}" == "gpu" && "${HDG_RUNTIME}" == "ON" &&
-      "${SPACK_CUDA_ARCH}" != "80" && "${SPACK_CUDA_ARCH}" != "120" ]]; then
-  echo "ERROR: --hdg-runtime requires native CUDA architecture 80 or 120." >&2
+      "${SPACK_CUDA_ARCH}" != "80" && "${SPACK_CUDA_ARCH}" != "90" &&
+      "${SPACK_CUDA_ARCH}" != "120" ]]; then
+  echo "ERROR: --hdg-runtime requires native CUDA architecture 80, 90, or 120." >&2
   exit 2
 fi
 if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then

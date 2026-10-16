@@ -429,6 +429,17 @@ assert_contains "${a100_plan}" "mode=gpu profile=cuda-sm80 dependency_cuda_arch=
 assert_contains "${a100_plan}" "hdg_runtime=ON"
 assert_contains "${a100_plan}" "env=${fixture_root}/spack-envs/cuda-sm80"
 assert_not_exists "${a100_output_root}"
+# Native SM90 uses the supplied environment; this does not imply a site adapter.
+h100_output_root="${tmp_root}/h100-output"
+h100_spack_env="${tmp_root}/h100-spack-env"
+h100_plan="$("${clean_env[@]}" IGRLAB_SPACK_ENV="${h100_spack_env}" \
+  bash "${fixture_root}/build.sh" --gpu --cuda-arch 90 --hdg-runtime \
+  --output-root "${h100_output_root}" --print-plan)"
+assert_contains "${h100_plan}" "mode=gpu profile=cuda-sm90 dependency_cuda_arch=90 mfem_cuda_archs=90 app_cuda_archs=90"
+assert_contains "${h100_plan}" "hdg_runtime=ON"
+assert_contains "${h100_plan}" "env=${h100_spack_env}"
+assert_not_exists "${h100_output_root}"
+assert_not_exists "${h100_spack_env}"
 # A command-line architecture selection overrides the environment default.
 plan="$("${clean_env[@]}" SPACK_CUDA_ARCH=120 bash "${fixture_root}/build.sh" \
   --a100 --gpu --cuda-arch 80 --print-plan)"
@@ -446,7 +457,7 @@ for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-uns
     arch-first) conflict_args=(--cuda-arch 120 --a100) ;;
     arch-last) conflict_args=(--a100 --cuda-arch 120) ;;
     overwritten-arch) conflict_args=(--cuda-arch 120 --cuda-arch 80 --a100) ;;
-    hdg-unsupported) conflict_args=(--gpu --cuda-arch 90 --hdg-runtime) ;;
+    hdg-unsupported) conflict_args=(--gpu --cuda-arch 100 --hdg-runtime) ;;
     hdg-v100) conflict_args=(--gpu --cuda-arch 70 --hdg-runtime) ;;
   esac
   set +e
@@ -458,7 +469,7 @@ for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-uns
   set -e
   [[ ${reject_rc} -eq 2 ]] || fail "A100 conflict ${conflict} exited ${reject_rc}, expected 2"
   if [[ "${conflict}" == hdg-* ]]; then
-    assert_contains "${reject_output}" "--hdg-runtime requires native CUDA architecture 80 or 120"
+    assert_contains "${reject_output}" "--hdg-runtime requires native CUDA architecture 80, 90, or 120"
   else
     assert_contains "${reject_output}" "--a100 conflicts"
   fi
@@ -847,7 +858,7 @@ assert_contains "${reject_output}" "output lock is already held"
 assert_not_exists "${tmp_root}/locked-helper.log"
 assert_not_exists "${tmp_root}/locked-spack.log"
 
-# SM70/SM80 manifests own their release pins; both dependency lookup sites must
+# SM70/SM80/SM90 environments own release pins; both dependency lookup sites must
 # accept that release while leaving the reviewed SM120 develop query unchanged.
 for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SPEC"; do
   query_driver="${driver_and_variable%:*}"
@@ -858,10 +869,10 @@ for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SP
     capture && /^[ ]*fi$/ { exit }
   ' "${query_driver}")"
   [[ -n "${query_selection}" ]] || fail "missing HYPRE query in ${query_driver}"
-  for query_arch in 70 80 120; do
+  for query_arch in 70 80 90 120; do
     selected_query="$(SPACK_CUDA_ARCH="${query_arch}" bash -c \
       "${query_selection}"$'\n''printf "%s" "${!1}"' -- "${query_variable}")"
-    if [[ "${query_arch}" == 70 || "${query_arch}" == 80 ]]; then
+    if [[ "${query_arch}" == 70 || "${query_arch}" == 80 || "${query_arch}" == 90 ]]; then
       [[ "${selected_query}" == "hypre+mpi+cuda cuda_arch=${query_arch}" ]] || \
         fail "SM${query_arch} HYPRE query does not admit its release pin: ${selected_query}"
     else
@@ -910,7 +921,7 @@ done
   done
 )
 
-# Exercise the production SM70/SM80 static-HYPRE linkage selector without invoking
+# Exercise the SM70/SM80/SM90 static-HYPRE linkage selector without invoking
 # a compiler. SM120 must not query OpenBLAS or gain host LAPACK dependencies.
 (
   eval "$(awk '
@@ -932,7 +943,7 @@ done
       *) return 1 ;;
     esac
   }
-  for SPACK_CUDA_ARCH in 70 80; do
+  for SPACK_CUDA_ARCH in 70 80 90; do
     HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
     touch "${openblas_fixture}/lib64/libopenblas.so"
     cmake_args=()
@@ -967,7 +978,7 @@ done
   spack_location() { fail "SM120 queried an OpenBLAS prefix"; }
   spack() { fail "SM120 queried OpenBLAS metadata"; }
   configure_cuda_hypre_linalg
-  [[ ${#cmake_args[@]} == 0 ]] || fail "SM120 gained SM70/SM80-only linalg arguments"
+  [[ ${#cmake_args[@]} == 0 ]] || fail "SM120 gained SM70/SM80/SM90-only linalg arguments"
 )
 
 # The reuse tuple is revalidated only after a real dependency install and

@@ -2227,6 +2227,22 @@ constexpr bool CudaOrdinaryRankOneRefreshPolicyIsExact(
       descriptor.ilu_upper_jacobi_iterations == 0;
 }
 
+// The coupled prototype uses the qualified ordinary Jacobi5 policy, which
+// is distinct from the engine-default/direct policy used by retained RODAS.
+constexpr bool CudaCoupledTracePolicyIsExact(
+    const CudaTracePolicyDescriptor& descriptor) noexcept
+{
+  return CudaTracePolicyDescriptorIsExact(descriptor) &&
+      descriptor.selected_engine == generic::CudaEngineKind::ordinary &&
+      descriptor.rank_count == 1 && descriptor.igr_active &&
+      descriptor.requested_selection == CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh &&
+      descriptor.resolved_selection == CudaTracePolicyKind::ordinary_ilu_jacobi5_refresh &&
+      descriptor.trace_preconditioner == CudaTracePreconditionerKind::hypre_ilu0 &&
+      descriptor.ilu_factor_reuse_policy == CudaIluFactorReusePolicy::refresh_each_trace_solve &&
+      descriptor.ilu_triangular_solve_kind == CudaIluTriangularSolveKind::iterative_jacobi &&
+      descriptor.ilu_lower_jacobi_iterations == 5 && descriptor.ilu_upper_jacobi_iterations == 5;
+}
+
 /** Exact engine-default policy admitted by the two-rank host-staged leaf. */
 constexpr bool CudaHostStagedRankTwoPolicyIsExact(
     const CudaTracePolicyDescriptor& descriptor) noexcept
@@ -2335,6 +2351,120 @@ struct CudaTensorCoreEvidence
 
 namespace detail
 {
+
+enum class CudaLocalSolveKind { current, fp64_refine, fp32_refine, coupled_fp64, coupled_tf32, coupled_krylov_fp64, coupled_krylov_tf32, coupled_krylov_fp32, coupled_krylov_fp32_once, invalid };
+
+inline CudaLocalSolveKind SelectedCudaLocalSolve() noexcept
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_HDG_LOCAL_SOLVE");
+  if (value == nullptr || *value == '\0' || std::string_view(value) == "current")
+    return CudaLocalSolveKind::current;
+  if (std::string_view(value) == "fp64-refine") return CudaLocalSolveKind::fp64_refine;
+  if (std::string_view(value) == "fp32-refine") return CudaLocalSolveKind::fp32_refine;
+  if (std::string_view(value) == "coupled-fp64") return CudaLocalSolveKind::coupled_fp64;
+  if (std::string_view(value) == "coupled-tf32") return CudaLocalSolveKind::coupled_tf32;
+  if (std::string_view(value) == "coupled-krylov-fp64") return CudaLocalSolveKind::coupled_krylov_fp64;
+  if (std::string_view(value) == "coupled-krylov-tf32") return CudaLocalSolveKind::coupled_krylov_tf32;
+  if (std::string_view(value) == "coupled-krylov-fp32") return CudaLocalSolveKind::coupled_krylov_fp32;
+  if (std::string_view(value) == "coupled-krylov-fp32-once") return CudaLocalSolveKind::coupled_krylov_fp32_once;
+  return CudaLocalSolveKind::invalid;
+}
+inline bool CudaLocalSolveIsKrylov(CudaLocalSolveKind kind) noexcept
+{return kind == CudaLocalSolveKind::coupled_krylov_fp64 || kind == CudaLocalSolveKind::coupled_krylov_tf32 || kind == CudaLocalSolveKind::coupled_krylov_fp32 || kind == CudaLocalSolveKind::coupled_krylov_fp32_once;}
+inline bool CudaLocalSolveUsesFp32Krylov(CudaLocalSolveKind kind) noexcept
+{return kind == CudaLocalSolveKind::coupled_krylov_fp32 || kind == CudaLocalSolveKind::coupled_krylov_fp32_once;}
+inline bool CudaLocalSolveUsesTf32(CudaLocalSolveKind kind) noexcept
+{return kind == CudaLocalSolveKind::coupled_tf32 || kind == CudaLocalSolveKind::coupled_krylov_tf32 || CudaLocalSolveUsesFp32Krylov(kind);}
+
+inline bool CudaLocalSolveIsCoupled(CudaLocalSolveKind kind) noexcept
+{return kind == CudaLocalSolveKind::coupled_fp64 || kind == CudaLocalSolveKind::coupled_tf32 || CudaLocalSolveIsKrylov(kind);}
+inline const char* CudaLocalSolveName(CudaLocalSolveKind kind) noexcept
+{
+  switch(kind)
+  {
+  case CudaLocalSolveKind::current:return "current";
+  case CudaLocalSolveKind::fp64_refine:return "fp64-refine";
+  case CudaLocalSolveKind::fp32_refine:return "fp32-refine";
+  case CudaLocalSolveKind::coupled_fp64:return "coupled-fp64";
+  case CudaLocalSolveKind::coupled_tf32:return "coupled-tf32";
+  case CudaLocalSolveKind::coupled_krylov_fp64:return "coupled-krylov-fp64";
+  case CudaLocalSolveKind::coupled_krylov_tf32:return "coupled-krylov-tf32";
+  case CudaLocalSolveKind::coupled_krylov_fp32:return "coupled-krylov-fp32";
+  case CudaLocalSolveKind::coupled_krylov_fp32_once:return "coupled-krylov-fp32-once";
+  default:return "invalid";
+  }
+}
+
+// Experimental coupled solver controls. Scientific acceptance is selected
+// separately from arithmetic and preconditioner application.
+enum class CudaCoupledApplyKind { serial, cooperative, inverse, inverse_tf32, invalid };
+inline CudaCoupledApplyKind SelectedCudaCoupledApply() noexcept
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_HDG_COUPLED_APPLY");
+  if (!value || !*value || std::string_view(value) == "serial") return CudaCoupledApplyKind::serial;
+  if (std::string_view(value) == "cooperative") return CudaCoupledApplyKind::cooperative;
+  if (std::string_view(value) == "inverse") return CudaCoupledApplyKind::inverse;
+  if (std::string_view(value) == "inverse-tf32") return CudaCoupledApplyKind::inverse_tf32;
+  return CudaCoupledApplyKind::invalid;
+}
+inline const char* CudaCoupledApplyName(CudaCoupledApplyKind kind) noexcept
+{
+  switch (kind) {
+    case CudaCoupledApplyKind::serial: return "serial";
+    case CudaCoupledApplyKind::cooperative: return "cooperative";
+    case CudaCoupledApplyKind::inverse: return "inverse";
+    case CudaCoupledApplyKind::inverse_tf32: return "inverse-tf32";
+    default: return "invalid";
+  }
+}
+enum class CudaCoupledAccuracyKind { strict, physical_1e6, physical_1e4, invalid };
+inline CudaCoupledAccuracyKind SelectedCudaCoupledAccuracy() noexcept
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_HDG_COUPLED_ACCURACY");
+  if (!value || !*value || std::string_view(value) == "strict") return CudaCoupledAccuracyKind::strict;
+  if (std::string_view(value) == "physical-1e-6") return CudaCoupledAccuracyKind::physical_1e6;
+  if (std::string_view(value) == "physical-1e-4") return CudaCoupledAccuracyKind::physical_1e4;
+  return CudaCoupledAccuracyKind::invalid;
+}
+inline const char* CudaCoupledAccuracyName(CudaCoupledAccuracyKind kind) noexcept
+{
+  switch (kind) {
+    case CudaCoupledAccuracyKind::strict: return "strict";
+    case CudaCoupledAccuracyKind::physical_1e6: return "physical-1e-6";
+    case CudaCoupledAccuracyKind::physical_1e4: return "physical-1e-4";
+    default: return "invalid";
+  }
+}
+inline double CudaCoupledAcceptanceTolerance(CudaCoupledAccuracyKind kind, double strict) noexcept
+{
+  switch (kind) {
+    case CudaCoupledAccuracyKind::strict: return strict;
+    case CudaCoupledAccuracyKind::physical_1e6: return 1.e-6;
+    case CudaCoupledAccuracyKind::physical_1e4: return 1.e-4;
+    default: return std::numeric_limits<double>::quiet_NaN();
+  }
+}
+
+inline double CudaCoupledInnerTolerance(CudaLocalSolveKind mode,
+    CudaCoupledAccuracyKind accuracy, double accepted_tolerance) noexcept
+{
+  if (CudaLocalSolveUsesFp32Krylov(mode))
+    return mode == CudaLocalSolveKind::coupled_krylov_fp32_once ? 1.e-6 : 1.e-3;
+  return accuracy == CudaCoupledAccuracyKind::strict ? 1.e-12 :
+      (0.01 * accepted_tolerance > 1.e-12 ? 0.01 * accepted_tolerance : 1.e-12);
+}
+
+enum class CudaLocalSolveBackend { simt, cublas_batched, invalid };
+
+inline CudaLocalSolveBackend SelectedCudaLocalSolveBackend() noexcept
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_HDG_LOCAL_SOLVE_BACKEND");
+  if (value == nullptr || *value == '\0' || std::string_view(value) == "simt")
+    return CudaLocalSolveBackend::simt;
+  if (std::string_view(value) == "cublas-batched")
+    return CudaLocalSolveBackend::cublas_batched;
+  return CudaLocalSolveBackend::invalid;
+}
 
 // Research-only volume arithmetic is selected before launching the process.
 // FP64 state, faces, condensation, trace solves, and time advancement remain

@@ -1941,3 +1941,17 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   set_tests_properties(dg_igr_shared_reference_cuda PROPERTIES
     LABELS "cuda;dg;dgsem;shared-reference" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
+
+# Shared-reference patch GEMM: actual patch columns and current-A acceptance.
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MPI)
+  add_executable(dg_igr_shared_patch_test test_igr_shared_patch_cuda.cu)
+  target_link_libraries(dg_igr_shared_patch_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_shared_patch_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_shared_patch_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_shared_patch_cuda COMMAND dg_igr_shared_patch_test)
+  set_tests_properties(dg_igr_shared_patch_cuda PROPERTIES
+    LABELS "cuda;igr;krylov" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+endif()
