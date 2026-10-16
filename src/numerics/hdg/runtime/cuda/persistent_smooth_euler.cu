@@ -14,6 +14,8 @@
 #include <umpire/Umpire.hpp>
 
 #include <mma.h>
+#include <cublas_v2.h>
+#include <type_traits>
 
 #include <algorithm>
 #include <atomic>
@@ -6746,6 +6748,27 @@ __device__ bool RefinedLocalSolve(CudaDeviceView v,CudaMeshShape s,const int e,
   return false;
 }
 
+__device__ void RefinedFormSchur(CudaDeviceView v,CudaMeshShape s,const int e)
+{
+  const int n=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const double* w=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
+  const double* c=v.c+static_cast<std::size_t>(e)*nt*n;
+  const double* d=v.d+static_cast<std::size_t>(e)*nt*nt;
+  __shared__ int failed;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
+  for(int i=threadIdx.x;i<nt*cols;i+=blockDim.x)
+  {
+    const int row=i/cols,column=i%cols;
+    double value=column<nt?d[row*nt+column]:v.g[e*nt+row];
+    for(int j=0;j<n;++j)value-=c[row*n+j]*w[j*cols+column];
+    if(!isfinite(value))atomicExch(&failed,1);
+    if(column<nt)v.schur[(static_cast<std::size_t>(e)*nt+row)*nt+column]=value;
+    else v.condensed_rhs[e*nt+row]=value;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[e]=failed?-1:1;
+}
 template <bool Mixed>
 __global__ void RefinedBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
@@ -6772,25 +6795,171 @@ __global__ void RefinedBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     v.local_solve_work[3*e+2]=success?1.0:0.0;
   }
   if(!success){if(threadIdx.x==0)v.status[e]=-1;return;}
+  RefinedFormSchur(v,s,e);
+}
+
+// cuBLAS uses column-major factor/RHS batches. The existing FP64 arenas keep
+// their element strides; typed packs occupy only the required bytes. Original
+// A/B/f and corrected row-major W remain unchanged by the library.
+template <typename Scalar>
+__global__ void RefinedCublasPackKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
   const int n=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
-  const double* w=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
-  const double* c=v.c+static_cast<std::size_t>(e)*nt*n;
-  const double* d=v.d+static_cast<std::size_t>(e)*nt*nt;
+  Scalar* lu=reinterpret_cast<Scalar*>(v.lu+static_cast<std::size_t>(e)*n*n);
+  Scalar* rhs=reinterpret_cast<Scalar*>(
+      v.local_solve_workspace+static_cast<std::size_t>(e)*n*cols);
+  int* state=reinterpret_cast<int*>(v.local_solve_vendor_workspace+3*s.elements);
   __shared__ int failed;
-  if(threadIdx.x==0)failed=0;
-  __syncthreads();
-  for(int i=threadIdx.x;i<nt*cols;i+=blockDim.x)
+  if(threadIdx.x==0)
   {
-    const int row=i/cols,column=i%cols;
-    double value=column<nt?d[row*nt+column]:v.g[e*nt+row];
-    for(int j=0;j<n;++j)value-=c[row*n+j]*w[j*cols+column];
-    if(!isfinite(value))atomicExch(&failed,1);
-    if(column<nt)v.schur[(static_cast<std::size_t>(e)*nt+row)*nt+column]=value;
-    else v.condensed_rhs[e*nt+row]=value;
+    failed=0;
+    reinterpret_cast<Scalar**>(v.local_solve_vendor_workspace)[e]=lu;
+    reinterpret_cast<Scalar**>(v.local_solve_vendor_workspace+s.elements)[e]=rhs;
+    for(int i=0;i<3;++i)v.local_solve_work[3*e+i]=0.0;
   }
   __syncthreads();
-  if(threadIdx.x==0)v.status[e]=failed?-1:1;
+  for(int i=threadIdx.x;i<n*n;i+=blockDim.x)
+  {
+    const int row=i%n,column=i/n;
+    const double value=v.a[(static_cast<std::size_t>(e)*n+row)*n+column];
+    lu[i]=static_cast<Scalar>(value);
+    if(!isfinite(value)||!isfinite(static_cast<double>(lu[i])))atomicExch(&failed,1);
+  }
+  for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)
+  {
+    const int row=i%n,column=i/n;
+    const double value=column<nt?v.b[(static_cast<std::size_t>(e)*n+row)*nt+column]:v.f[e*n+row];
+    rhs[i]=static_cast<Scalar>(value);
+    if(!isfinite(value)||!isfinite(static_cast<double>(rhs[i])))atomicExch(&failed,1);
+  }
+  __syncthreads();
+  // Invalid conversions never enter a vendor factorization. A harmless
+  // identity placeholder keeps a fixed batch; this element falls back later.
+  if(failed)
+  {
+    for(int i=threadIdx.x;i<n*n;i+=blockDim.x)lu[i]=i%n==i/n?Scalar(1):Scalar(0);
+    for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)rhs[i]=Scalar(0);
+  }
+  if(threadIdx.x==0)state[e]=failed?-1:1;
 }
+
+template <typename Scalar>
+__global__ void RefinedCublasFactorCheckKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int n=s.interior_dofs,cols=s.trace_dofs+1;
+  Scalar* lu=reinterpret_cast<Scalar*>(v.lu+static_cast<std::size_t>(e)*n*n);
+  Scalar* rhs=reinterpret_cast<Scalar*>(v.local_solve_workspace+static_cast<std::size_t>(e)*n*cols);
+  const int* info=reinterpret_cast<const int*>(v.local_solve_vendor_workspace+2*s.elements);
+  int* state=reinterpret_cast<int*>(v.local_solve_vendor_workspace+3*s.elements);
+  __shared__ int failed;
+  __shared__ double scale;
+  if(threadIdx.x==0)failed=state[e]<0||info[e]!=0;
+  __syncthreads();
+  double local_scale=0.0;
+  for(int i=threadIdx.x;i<n*n;i+=blockDim.x)
+  {
+    local_scale=fmax(local_scale,fabs(v.a[static_cast<std::size_t>(e)*n*n+i]));
+    if(!isfinite(static_cast<double>(lu[i])))atomicExch(&failed,1);
+  }
+  const double block_scale=BorrowedCondenseBlockScale(local_scale);
+  if(threadIdx.x==0)scale=block_scale;
+  __syncthreads();
+  for(int row=threadIdx.x;row<n;row+=blockDim.x)
+    if(!(fabs(static_cast<double>(lu[row*n+row]))>64.0*DBL_EPSILON*scale))
+      atomicExch(&failed,1);
+  __syncthreads();
+  // Never call getrs on singular/invalid factors. The library-generated
+  // pivots remain valid; applying any of their permutations to zero is safe.
+  if(failed)
+  {
+    for(int i=threadIdx.x;i<n*n;i+=blockDim.x)lu[i]=i%n==i/n?Scalar(1):Scalar(0);
+    for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)rhs[i]=Scalar(0);
+  }
+  if(threadIdx.x==0)state[e]=failed?-1:1;
+}
+
+template <typename Scalar,bool Correction>
+__global__ void RefinedCublasAccumulateKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int n=s.interior_dofs,cols=s.trace_dofs+1;
+  const int* state=reinterpret_cast<const int*>(v.local_solve_vendor_workspace+3*s.elements);
+  if(state[e]!=1)return;
+  const Scalar* rhs=reinterpret_cast<const Scalar*>(v.local_solve_workspace+static_cast<std::size_t>(e)*n*cols);
+  double* x=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
+  for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)
+  {
+    const double value=static_cast<double>(rhs[(i%cols)*n+i/cols]);
+    if constexpr(Correction)x[i]+=value;else x[i]=value;
+  }
+  if constexpr(Correction)
+    if(threadIdx.x==0)v.local_solve_work[3*e]+=1.0;
+}
+
+template <typename Scalar>
+__global__ void RefinedCublasResidualKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int n=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  int* state=reinterpret_cast<int*>(v.local_solve_vendor_workspace+3*s.elements);
+  if(state[e]!=1)return;
+  const double* a=v.a+static_cast<std::size_t>(e)*n*n;
+  const double* b=v.b+static_cast<std::size_t>(e)*n*nt;
+  const double* x=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
+  Scalar* rhs=reinterpret_cast<Scalar*>(v.local_solve_workspace+static_cast<std::size_t>(e)*n*cols);
+  __shared__ int failed,needs_correction;
+  if(threadIdx.x==0){failed=0;needs_correction=0;}
+  __syncthreads();
+  for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)
+  {
+    const int row=i/cols,column=i%cols;
+    const double original_rhs=column<nt?b[row*nt+column]:v.f[e*n+row];
+    double residual=original_rhs,magnitude=fabs(original_rhs);
+    for(int j=0;j<n;++j)
+    {
+      const double term=a[row*n+j]*x[j*cols+column];
+      residual-=term;magnitude+=fabs(term);
+    }
+    const Scalar converted=static_cast<Scalar>(residual);
+    rhs[column*n+row]=converted;
+    if(!isfinite(residual)||!isfinite(magnitude)||!isfinite(x[i])||
+       !isfinite(static_cast<double>(converted)))atomicExch(&failed,1);
+    if(!(fabs(residual)<=1.0e-13*magnitude))atomicExch(&needs_correction,1);
+  }
+  __syncthreads();
+  if(failed||!needs_correction)
+    for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)rhs[i]=Scalar(0);
+  if(threadIdx.x==0)
+  {
+    state[e]=failed?-1:needs_correction?1:0;
+    if(state[e]==0)v.local_solve_work[3*e+2]=1.0;
+    if(state[e]==1)atomicExch(reinterpret_cast<int*>(v.local_solve_vendor_workspace+4*s.elements),1);
+  }
+}
+
+__global__ void RefinedCublasFinishKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int* state=reinterpret_cast<const int*>(v.local_solve_vendor_workspace+3*s.elements);
+  if(state[e]!=0)
+  {
+    // One bounded original-FP64 refactor for conversion, singularity, or
+    // refinement failure. Reuse the established fallback and its criterion.
+    int corrections=0;
+    const bool success=RefinedLocalSolve<double>(v,s,e,corrections);
+    if(threadIdx.x==0)
+    {
+      v.local_solve_work[3*e]+=corrections;
+      v.local_solve_work[3*e+1]=1.0;
+      v.local_solve_work[3*e+2]=success?1.0:0.0;
+    }
+    if(!success){if(threadIdx.x==0)v.status[e]=-1.0;return;}
+  }
+  RefinedFormSchur(v,s,e);
+}
+
 
 __global__ void RefinedLocalWorkSummaryKernel(CudaDeviceView v,CudaMeshShape s)
 {
@@ -9531,6 +9700,57 @@ __global__ void HashPairKernel(const double* first,int first_count,
 
 bool LaunchOk() noexcept { return cudaPeekAtLastError() == cudaSuccess; }
 int Blocks(const int n) noexcept { return (n + 127) / 128; }
+template <typename Scalar>
+bool RefinedCublasCondense(const CudaDeviceView& v,const CudaMeshShape& s)
+{
+  static_assert(sizeof(Scalar*)==sizeof(double));
+  const auto handle=static_cast<cublasHandle_t>(v.local_solve_vendor_handle);
+  Scalar** factors=reinterpret_cast<Scalar**>(v.local_solve_vendor_workspace);
+  Scalar** rhs=reinterpret_cast<Scalar**>(v.local_solve_vendor_workspace+s.elements);
+  int* pivots=reinterpret_cast<int*>(v.pivots);
+  int* info=reinterpret_cast<int*>(v.local_solve_vendor_workspace+2*s.elements);
+  int* active=reinterpret_cast<int*>(v.local_solve_vendor_workspace+4*s.elements);
+  const int n=s.interior_dofs,cols=s.trace_dofs+1;
+  RefinedCublasPackKernel<Scalar><<<s.elements,128>>>(v,s);
+  if(!LaunchOk())return false;
+  cublasStatus_t factor_status;
+  if constexpr(std::is_same_v<Scalar,float>)
+    factor_status=cublasSgetrfBatched(handle,n,factors,n,pivots,info,s.elements);
+  else factor_status=cublasDgetrfBatched(handle,n,factors,n,pivots,info,s.elements);
+  if(factor_status!=CUBLAS_STATUS_SUCCESS)return false;
+  RefinedCublasFactorCheckKernel<Scalar><<<s.elements,128>>>(v,s);
+  const auto solve=[&]() noexcept
+  {
+    int host_info=-1; // getrs info is host-only; getrf info above is device.
+    cublasStatus_t status;
+    if constexpr(std::is_same_v<Scalar,float>)
+      status=cublasSgetrsBatched(handle,CUBLAS_OP_N,n,cols,
+          factors,n,pivots,rhs,n,&host_info,s.elements);
+    else status=cublasDgetrsBatched(handle,CUBLAS_OP_N,n,cols,
+          factors,n,pivots,rhs,n,&host_info,s.elements);
+    return status==CUBLAS_STATUS_SUCCESS&&host_info==0;
+  };
+  if(!LaunchOk()||!solve())return false;
+  RefinedCublasAccumulateKernel<Scalar,false><<<s.elements,128>>>(v,s);
+  for(int step=0;step<=4;++step)
+  {
+    if(!LaunchOk()||cudaMemsetAsync(active,0,sizeof(int),nullptr)!=cudaSuccess)return false;
+    RefinedCublasResidualKernel<Scalar><<<s.elements,128>>>(v,s);
+    int host_active=0;
+    // The bounded convergence observation is timed and uses the existing
+    // transfer ledger. It avoids forcing four whole-batch correction solves.
+    if(!LaunchOk()||!CudaTransportPolicy::DeviceToHost(
+          &host_active,active,sizeof(host_active),
+          CudaTransferCategory::scalar_diagnostic,CudaTransferSite::scalar_status)||
+       !CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status))return false;
+    if(host_active==0||step==4)break;
+    if(!solve())return false;
+    RefinedCublasAccumulateKernel<Scalar,true><<<s.elements,128>>>(v,s);
+  }
+  RefinedCublasFinishKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
+
 template <int BlockThreads,int GroupThreads>
 bool LaunchBorrowedEulerFace(const CudaDeviceView& v,const CudaMeshShape& s,
                              const bool frozen_llf,
@@ -10163,11 +10383,35 @@ bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
   NormReduceKernel<<<1,256>>>(v.status,s.elements,algebraic_result);
   return LaunchOk();
 }
+bool CudaCreateRefinedCublasHandle(void*& opaque) noexcept
+{
+  if(opaque!=nullptr)return false;
+  cublasHandle_t handle=nullptr;
+  if(cublasCreate(&handle)!=CUBLAS_STATUS_SUCCESS)return false;
+  if(cublasSetMathMode(handle,CUBLAS_PEDANTIC_MATH)!=CUBLAS_STATUS_SUCCESS||
+     cublasSetPointerMode(handle,CUBLAS_POINTER_MODE_HOST)!=CUBLAS_STATUS_SUCCESS||
+     cublasSetStream(handle,nullptr)!=CUBLAS_STATUS_SUCCESS)
+  {cublasDestroy(handle);return false;}
+  opaque=handle;
+  std::fprintf(stderr,"HDG local-solve backend=cublas-batched math=pedantic; "
+      "packing, status checks, original-FP64 refinement and fallback are included.\n");
+  return true;
+}
+void CudaDestroyRefinedCublasHandle(void*& opaque) noexcept
+{
+  if(opaque!=nullptr)
+  {
+    (void)cublasDestroy(static_cast<cublasHandle_t>(opaque));
+    opaque=nullptr;
+  }
+}
 bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
                             const generic::CudaEngineKind engine,
                             std::uint64_t& tensor_mma_tiles) noexcept
 {
   tensor_mma_tiles=0;
+  if(s.local_solve==CudaLocalSolveKind::current&&
+     s.local_solve_backend!=CudaLocalSolveBackend::simt)return false;
   if(s.local_solve!=CudaLocalSolveKind::current)
   {
     if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
@@ -10176,7 +10420,18 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
        !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs)||
        (engine!=generic::CudaEngineKind::ordinary&&
         engine!=generic::CudaEngineKind::tensor_core))return false;
-    if(s.local_solve==CudaLocalSolveKind::fp32_refine)
+    if(s.local_solve_backend==CudaLocalSolveBackend::cublas_batched)
+    {
+      if(v.local_solve_vendor_handle==nullptr||v.local_solve_vendor_workspace==nullptr)
+        return false;
+      const bool solved=s.local_solve==CudaLocalSolveKind::fp32_refine
+          ? RefinedCublasCondense<float>(v,s)
+          : s.local_solve==CudaLocalSolveKind::fp64_refine
+              ? RefinedCublasCondense<double>(v,s) : false;
+      if(!solved)return false;
+    }
+    else if(s.local_solve_backend!=CudaLocalSolveBackend::simt)return false;
+    else if(s.local_solve==CudaLocalSolveKind::fp32_refine)
       RefinedBorrowedCondenseKernel<true><<<s.elements,128>>>(v,s);
     else if(s.local_solve==CudaLocalSolveKind::fp64_refine)
       RefinedBorrowedCondenseKernel<false><<<s.elements,128>>>(v,s);

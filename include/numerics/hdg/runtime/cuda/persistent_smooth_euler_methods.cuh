@@ -1183,6 +1183,9 @@ BindArenaViews() noexcept
   {
     view_.local_solve_workspace = take_d(generic_arena_layout_.local_solve_workspace);
     view_.local_solve_work = take_d(generic_arena_layout_.local_solve_work);
+    if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched)
+      view_.local_solve_vendor_workspace = take_d(
+          generic_arena_layout_.local_solve_vendor_workspace);
   }
   view_.schur = take_d(max_d);
   view_.condensed_rhs = take_d(max_er);

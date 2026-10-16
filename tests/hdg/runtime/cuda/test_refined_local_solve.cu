@@ -13,7 +13,12 @@ using namespace dg::hdg::runtime::cuda_w8a::detail;
 struct Arena
 {
   std::vector<void*> buffers;
-  ~Arena(){for(void* p:buffers)cudaFree(p);}
+  void* vendor_handle=nullptr;
+  ~Arena()
+  {
+    CudaDestroyRefinedCublasHandle(vendor_handle);
+    for(void* p:buffers)cudaFree(p);
+  }
   template <typename T=double> T* Get(std::size_t n)
   {
     T* p=nullptr;
@@ -23,14 +28,27 @@ struct Arena
   }
 };
 
-bool Run(const int n,const CudaLocalSolveKind kind)
+bool BindBackend(Arena& arena,CudaDeviceView& v,const CudaMeshShape& s)
 {
-  constexpr int ne=3,nt=3,cols=nt+1;
+  if(s.local_solve_backend==CudaLocalSolveBackend::simt)return true;
+  v.local_solve_vendor_workspace=arena.Get(4*s.elements+1);
+  if(!CudaCreateRefinedCublasHandle(arena.vendor_handle))return false;
+  v.local_solve_vendor_handle=arena.vendor_handle;
+  return true;
+}
+
+bool Run(const int n,const CudaLocalSolveKind kind,
+         const CudaLocalSolveBackend backend,const int nt=3)
+{
+  constexpr int ne=3;
+  const int cols=nt+1;
   Arena arena;
   CudaDeviceView v{};
   CudaMeshShape s{};
   s.elements=ne;s.interior_dofs=n;s.trace_dofs=nt;
   s.interior_count=ne*n;s.borrowed_host_inputs=true;s.local_solve=kind;
+  s.local_solve_backend=backend;
+  if(!BindBackend(arena,v,s))return false;
   s.true_trace_count=ne*nt;s.global_true_trace_count=ne*nt;
   s.vector_owned_count=ne*nt;
   v.signed_element_trace=arena.Get<int>(ne*nt);
@@ -139,7 +157,9 @@ bool Run(const int n,const CudaLocalSolveKind kind)
   v.a[0]=std::numeric_limits<double>::quiet_NaN();
   if(!CudaLaunchCondensation(v,s,dg::hdg::generic::CudaEngineKind::ordinary,tiles)||
      cudaDeviceSynchronize()!=cudaSuccess||v.status[0]!=-1.0)return false;
-  std::cout<<"refined-local n="<<n<<" mixed="<<(kind==CudaLocalSolveKind::fp32_refine)
+  std::cout<<"refined-local n="<<n<<" nrhs="<<cols
+           <<" cublas="<<(backend==CudaLocalSolveBackend::cublas_batched)
+           <<" mixed="<<(kind==CudaLocalSolveKind::fp32_refine)
            <<" max_backward_error="<<maximum_backward_error<<" passed\n";
   return true;
 }
@@ -148,7 +168,8 @@ bool Run(const int n,const CudaLocalSolveKind kind)
 // Shared trace rows have large cancelling g contributions near convergence;
 // local subtraction loses ~1e-16 although the assembled RHS is only 2^-40.
 bool SharedTraceCancellation(const CudaLocalSolveKind kind,
-                             const dg::hdg::generic::CudaEngineKind engine)
+                             const dg::hdg::generic::CudaEngineKind engine,
+                             const CudaLocalSolveBackend backend)
 {
   constexpr int ne=2,n=3,nt=1,cols=2;
   const double delta=std::ldexp(1.0,-40),third=delta/3.0;
@@ -156,6 +177,8 @@ bool SharedTraceCancellation(const CudaLocalSolveKind kind,
   CudaDeviceView v{};CudaMeshShape s{};
   s.elements=ne;s.interior_dofs=n;s.trace_dofs=nt;s.interior_count=ne*n;
   s.borrowed_host_inputs=true;s.local_solve=kind;
+  s.local_solve_backend=backend;
+  if(!BindBackend(arena,v,s))return false;
   s.true_trace_count=1;s.global_true_trace_count=1;s.vector_owned_count=ne;
   v.a=arena.Get(ne*n*n);v.lu=arena.Get(ne*n*n);v.pivots=arena.Get(ne*n);
   v.b=arena.Get(ne*n*nt);v.c=arena.Get(ne*nt*n);v.d=arena.Get(ne*nt*nt);
@@ -207,7 +230,8 @@ bool SharedTraceCancellation(const CudaLocalSolveKind kind,
      cudaDeviceSynchronize()!=cudaSuccess)return false;
   const double perturbed_relative=std::sqrt(v.scalar[0])/std::sqrt(v.scalar[1]);
   if(!std::isfinite(perturbed_relative)||perturbed_relative<=1.e-10)return false;
-  std::cout<<"shared-trace-cancellation mixed="<<(kind==CudaLocalSolveKind::fp32_refine)
+  std::cout<<"shared-trace-cancellation cublas="
+           <<(backend==CudaLocalSolveBackend::cublas_batched)<<" mixed="<<(kind==CudaLocalSolveKind::fp32_refine)
            <<" tensor="<<(engine==dg::hdg::generic::CudaEngineKind::tensor_core)
            <<" corrected_relative="<<correct_relative
            <<" legacy_relative="<<legacy_relative<<" passed\n";
@@ -218,12 +242,17 @@ int main()
 {
   try
   {
-    if(!Run(5,CudaLocalSolveKind::fp64_refine)||!Run(5,CudaLocalSolveKind::fp32_refine)||
-       !Run(17,CudaLocalSolveKind::fp64_refine)||!Run(17,CudaLocalSolveKind::fp32_refine))return 1;
-    for(const auto kind:{CudaLocalSolveKind::fp64_refine,CudaLocalSolveKind::fp32_refine})
-      for(const auto engine:{dg::hdg::generic::CudaEngineKind::ordinary,
-                             dg::hdg::generic::CudaEngineKind::tensor_core})
-        if(!SharedTraceCancellation(kind,engine))return 1;
+    for(const auto backend:{CudaLocalSolveBackend::simt,CudaLocalSolveBackend::cublas_batched})
+      for(const auto kind:{CudaLocalSolveKind::fp64_refine,CudaLocalSolveKind::fp32_refine})
+      {
+        if(!Run(5,kind,backend)||!Run(17,kind,backend))return 1;
+        // Production IGR p1/p7 shapes include nrhs>n and nrhs>blockDim.
+        if(backend==CudaLocalSolveBackend::cublas_batched&&
+           (!Run(28,kind,backend,40)||!Run(448,kind,backend,160)))return 1;
+        for(const auto engine:{dg::hdg::generic::CudaEngineKind::ordinary,
+                               dg::hdg::generic::CudaEngineKind::tensor_core})
+          if(!SharedTraceCancellation(kind,engine,backend))return 1;
+      }
     return 0;
   }
   catch(const char* error){std::cerr<<error<<'\n';return 2;}

@@ -912,6 +912,7 @@ struct CudaGenericArenaLayout
   std::size_t solve_workspace = 0;
   std::size_t local_solve_workspace = 0;
   std::size_t local_solve_work = 0;
+  std::size_t local_solve_vendor_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
 
@@ -1004,6 +1005,8 @@ struct CudaDeviceView
   // arena with the FP64 control; the existing FP64 A/LU/W arenas are retained.
   double* local_solve_workspace = nullptr;
   double* local_solve_work = nullptr;
+  double* local_solve_vendor_workspace = nullptr;
+  void* local_solve_vendor_handle = nullptr;
   double* schur = nullptr;
   double* condensed_rhs = nullptr;
   double* true_residual = nullptr;
@@ -1092,6 +1095,7 @@ struct CudaMeshShape
   bool borrowed_static_source = false;
   bool borrowed_host_inputs = false;
   CudaLocalSolveKind local_solve = CudaLocalSolveKind::current;
+  CudaLocalSolveBackend local_solve_backend = CudaLocalSolveBackend::simt;
   bool borrowed_static_boundary_policies = false;
 };
 
@@ -2293,6 +2297,8 @@ bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
     double absolute_tolerance, double relative_tolerance,
     double* differential_result, double* algebraic_result,
     double* differential_measure) noexcept;
+bool CudaCreateRefinedCublasHandle(void*& handle) noexcept;
+void CudaDestroyRefinedCublasHandle(void*& handle) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape,
                             generic::CudaEngineKind engine,
@@ -2415,12 +2421,15 @@ public:
     if (local_solve_elements_ != 0.0)
       std::fprintf(stderr, "HDG local-solve summary mode=%s elements=%.0f "
           "correction_sweeps=%.0f fp64_fallbacks=%.0f failed=%.0f "
-          "max_original_coupled_relative_residual=%.17g\n",
+          "max_original_coupled_relative_residual=%.17g backend=%s\n",
           shape_.local_solve == CudaLocalSolveKind::fp32_refine
               ? "fp32-refine" : "fp64-refine",
           local_solve_elements_, local_solve_corrections_,
           local_solve_fallbacks_, local_solve_failures_,
-          local_solve_maximum_coupled_residual_);
+          local_solve_maximum_coupled_residual_,
+          shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched
+              ? "cublas-batched" : "simt");
+    CudaDestroyRefinedCublasHandle(local_solve_vendor_handle_);
     CudaDestroyRankOneMgrState(rank_one_mgr_state_);
     const CudaArenaReleasePass first = ReleaseArenas();
     const CudaArenaReleasePass second = ReleaseArenas();
@@ -2684,6 +2693,16 @@ public:
     {
       ReportCudaSetupFailure(evidence.rank, "bind-arena-views");
       return false;
+    }
+    if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched)
+    {
+      if (!CollectiveContinue(
+              CudaCreateRefinedCublasHandle(local_solve_vendor_handle_)))
+      {
+        ReportCudaSetupFailure(evidence.rank, "local-cublas-handle");
+        return false;
+      }
+      view_.local_solve_vendor_handle = local_solve_vendor_handle_;
     }
     if (!CollectiveContinue(UploadTopologyAndState()))
     {
@@ -5831,12 +5850,17 @@ private:
     shape_.borrowed_static_source = false;
     shape_.borrowed_host_inputs = config.use_borrowed_host_inputs;
     shape_.local_solve = SelectedCudaLocalSolve();
+    shape_.local_solve_backend = SelectedCudaLocalSolveBackend();
     if (shape_.local_solve == CudaLocalSolveKind::invalid ||
+        shape_.local_solve_backend == CudaLocalSolveBackend::invalid ||
+        (shape_.local_solve == CudaLocalSolveKind::current &&
+         shape_.local_solve_backend != CudaLocalSolveBackend::simt) ||
         (shape_.local_solve != CudaLocalSolveKind::current &&
          (!shape_.borrowed_host_inputs || ranks_ != 1 || rodas3_)))
     {
       std::fprintf(stderr, "HDG local solve requires current, fp64-refine, or "
-          "fp32-refine; experimental modes require rank-one borrowed BE.\n");
+          "fp32-refine; backend requires simt or cublas-batched, with cublas "
+          "requiring a refinement mode; experimental modes require rank-one borrowed BE.\n");
       return false;
     }
     shape_.borrowed_static_boundary_policies =
@@ -5948,6 +5972,9 @@ private:
       {
         layout.local_solve_workspace = layout.solve_workspace;
         if (!checked_product(elements, 3, layout.local_solve_work)) return false;
+        if (shape_.local_solve_backend == CudaLocalSolveBackend::cublas_batched &&
+            (!checked_product(elements, 4, layout.local_solve_vendor_workspace) ||
+             !checked_add(layout.local_solve_vendor_workspace, 1))) return false;
       }
       layout.elements = elements;
       layout.interior = interior;
@@ -6014,6 +6041,7 @@ private:
             checked_add(doubles, layout.solve_workspace) &&
             checked_add(doubles, layout.local_solve_workspace) &&
             checked_add(doubles, layout.local_solve_work) &&
+            checked_add(doubles, layout.local_solve_vendor_workspace) &&
             checked_add(doubles, layout.local_matrix) &&
             checked_add(doubles, layout.element_trace) && checked_add(doubles, true_trace) &&
             checked_add(doubles, two_local_matrix) && checked_add(doubles, two_element_trace) &&
@@ -6295,6 +6323,7 @@ private:
   bool StatusPassed() noexcept;
   bool ObserveLocalSolveWork() noexcept;
   bool OriginalCoupledResidualPassed() noexcept;
+  void* local_solve_vendor_handle_ = nullptr;
   double local_solve_elements_ = 0.0;
   double local_solve_corrections_ = 0.0;
   double local_solve_fallbacks_ = 0.0;
