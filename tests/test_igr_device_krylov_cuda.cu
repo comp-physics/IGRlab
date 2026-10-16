@@ -126,6 +126,120 @@ void CheckSolution(const mfem::IterativeSolver& solver, const mfem::Operator& op
   MFEM_VERIFY(std::abs(solver.GetFinalNorm() - residual) <= 1.0e-13 * initial_norm,
               "Device Krylov final norm is not its independently recomputed residual.");
 }
+// Exercise the specialized coarse path with actual MFEM CSR and Jacobi rather
+// than a synthetic operator wrapper. The largest CSR exercises many blocks
+// and grid-stride work; n=1 and n=31 cover partial blocks and zero-work lanes.
+bool CheckCooperativeCG()
+{
+  auto cooperative = ::igrlab::igr_internal::MakeCooperativeCGSolver(MPI_COMM_WORLD);
+  const bool admitted = bool(cooperative);
+  if (!cooperative) { cooperative = ::igrlab::igr_internal::MakeDeviceCGSolver(MPI_COMM_WORLD); }
+  auto polled = ::igrlab::igr_internal::MakeDeviceCGSolver(MPI_COMM_WORLD);
+  mfem::Array<int> essential;
+  for (const int size : {1, 31, 513, 262147})
+  {
+    mfem::SparseMatrix a(size);
+    for (int row = 0; row < size; ++row)
+    {
+      a.Add(row, row, 2.5 + 0.2 * (row % 7));
+      if (row > 0) { a.Add(row, row - 1, -0.4); }
+      if (row + 1 < size) { a.Add(row, row + 1, -0.4); }
+    }
+    a.Finalize();
+    mfem::Vector diagonal(size), exact(size), b(size), x(size), other(size), zero(size);
+    a.GetDiag(diagonal);
+    essential.SetSize(size == 31 ? 1 : 0);
+    if (size == 31) { essential[0] = 0; }
+    mfem::OperatorJacobiSmoother jacobi(diagonal, essential, size == 31 ? 0.75 : 1.0);
+    for (int i = 0; i < size; ++i) { exact(i) = 0.5 + std::cos(0.017 * i) + 0.1 * std::sin(0.51 * i); }
+    zero = 0.0;
+    Configure(*cooperative, a, false, 100);
+    cooperative->SetPreconditioner(jacobi);
+    Configure(*polled, a, false, 100);
+    polled->SetPreconditioner(jacobi);
+    const double tolerance = size == 513 ? 1.0e-11 : 1.0e-2;
+    cooperative->SetRelTol(tolerance);
+    polled->SetRelTol(tolerance);
+    for (int solve = 0; solve < 2; ++solve)
+    {
+      if (solve == 1)
+      {
+        // The retained solver must use current CSR values and changed RHS,
+        // not a stale copied matrix or stale control from the preceding solve.
+        const int entries = a.NumNonZeroElems();
+        double* values = a.HostReadWriteData();
+        for (int entry = 0; entry < entries; ++entry) { values[entry] *= 1.125; }
+        double* e = exact.HostReadWrite();
+        for (int i = 0; i < size; ++i) { e[i] += 0.2 * std::sin(0.13 * i); }
+      }
+      a.Mult(exact, b);
+      const double initial = PreconditionedResidual(a, jacobi, b, zero);
+      x = 123.0; // zero-init contract must discard the supplied iterate
+      other = -123.0;
+      cooperative->Mult(b, x);
+      polled->Mult(b, other);
+      const double final = PreconditionedResidual(a, jacobi, b, x);
+      const double reference_final = PreconditionedResidual(a, jacobi, b, other);
+      MFEM_VERIFY(cooperative->GetConverged() && polled->GetConverged() &&
+                    final <= tolerance * initial && reference_final <= tolerance * initial &&
+                    std::abs(cooperative->GetInitialNorm() - initial) <= 2.0e-12 * initial &&
+                    std::abs(cooperative->GetFinalNorm() - final) <= 2.0e-12 * initial,
+                  "Cooperative coarse CG failed its independent original-CSR r.Br certificate.");
+      mfem::Vector error(x), difference(x);
+      error -= exact;
+      difference -= other;
+      MFEM_VERIFY(Norm(error) <= 4.0 * tolerance * Norm(exact) &&
+                    Norm(difference) <= 4.0 * tolerance * Norm(exact),
+                  "Cooperative coarse CG differs from the manufactured solution/device CG.");
+    }
+    if (size == 513)
+    {
+      cooperative->SetMaxIter(0);
+      cooperative->Mult(b, x);
+      MFEM_VERIFY(!cooperative->GetConverged() && cooperative->GetNumIterations() == 0 && Norm(x) == 0.0,
+                  "Cooperative coarse CG ignored its zero iteration budget.");
+      cooperative->SetMaxIter(1);
+      cooperative->Mult(b, x);
+      MFEM_VERIFY(!cooperative->GetConverged() && cooperative->GetNumIterations() == 1,
+                  "Cooperative coarse CG ignored its one iteration budget.");
+      cooperative->SetMaxIter(100);
+    }
+    b = 0.0;
+    x = 123.0;
+    cooperative->Mult(b, x);
+    MFEM_VERIFY(cooperative->GetConverged() && cooperative->GetNumIterations() == 0 && Norm(x) == 0.0,
+                "Cooperative coarse CG zero RHS/reset failed.");
+  }
+
+  // Invalid curvature and input must not be mistaken for early convergence.
+  // A positive Jacobi action is deliberate even for these non-SPD operators.
+  constexpr int bad_size = 7;
+  mfem::Vector diagonal(bad_size), b(bad_size), x(bad_size);
+  diagonal = 1.0;
+  mfem::OperatorJacobiSmoother jacobi(diagonal, essential, 1.0);
+  for (int failure = 0; failure < 4; ++failure)
+  {
+    mfem::SparseMatrix a(bad_size);
+    for (int row = 0; row < bad_size; ++row)
+    {
+      const double value = failure == 0 ? -1.0 : failure == 1 ?
+        std::numeric_limits<double>::quiet_NaN() : 1.0;
+      a.Add(row, row, value);
+      if (failure == 2) { a.Add(row, (row + 1) % bad_size, -1.0); }
+    }
+    a.Finalize();
+    Configure(*cooperative, a, false, 100);
+    cooperative->SetPreconditioner(jacobi);
+    b = 1.0;
+    if (failure == 3) { b.HostReadWrite()[bad_size - 1] = std::numeric_limits<double>::quiet_NaN(); }
+    cooperative->Mult(b, x);
+    MFEM_VERIFY(!cooperative->GetConverged() && Norm(x) == 0.0 &&
+                  cooperative->GetNumIterations() == (failure == 3 ? 0 : 1),
+                "Cooperative coarse CG accepted negative/zero/nonfinite curvature or nonfinite input.");
+  }
+  return admitted;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -280,7 +394,10 @@ int main(int argc, char** argv)
   cg->Mult(rhs, x);
   MFEM_VERIFY(!cg->GetConverged() && Norm(x) == 0.0,
               "Device CG accepted nonfinite curvature.");
-  std::cout << "device_krylov_test passed restarted_flexible_mgs=true"
+  const bool cooperative_admitted = CheckCooperativeCG();
+  std::cout << "device_krylov_test passed cooperative_admitted=" << cooperative_admitted
+            << " cooperative_csr_jacobi_certificate=true cooperative_size_reset=true"
+               " cooperative_failure_paths=true restarted_flexible_mgs=true"
                " true_residual=true cached_reconfigure=true repeated_near_warm=true"
                " inconsistent_operator_rejected=true happy_breakdown=true"
                " zero_rhs=true iteration_cap=true cg_mfem_parity=true preconditioned_cg=true nonpositive_curvature=true nonfinite_curvature=true\n";

@@ -2417,6 +2417,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     ? ReadEnvInt("DG_IGR_IGR_TWO_LEVEL_ORDER", 1) : 1;
   const bool device_coarse_requested = DeviceKrylovRequested(
     "DG_IGR_IGR_COARSE_CG_BACKEND", DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"));
+  const bool cooperative_coarse_requested = CooperativeCoarseCGRequested();
+  MFEM_VERIFY(!using_two_level_inverse || !cooperative_coarse_requested ||
+                (two_level_coarse == "cg" && device_coarse_requested),
+              "Cooperative coarse execution requires two-level cg and cuda-fp64 coarse backend.");
   const char* two_level_block_env = ::igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_BLOCK_PRECISION");
   const std::string two_level_block_precision =
     two_level_block_env && two_level_block_env[0] ? two_level_block_env : "fp64";
@@ -2427,7 +2431,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "FP32 two-level blocks require IGRLAB_IGR_KRYLOV_BACKEND=cuda-fp64 "
               "for original FP64 operator residual authority.");
   const std::string two_level_key = two_level_coarse + ":" + std::to_string(two_level_order)
-    + (device_coarse_requested ? ":cuda-fp64:" : ":mfem:") + two_level_block_precision;
+    + (device_coarse_requested ? ":cuda-fp64:" : ":mfem:") + two_level_block_precision
+    + (cooperative_coarse_requested ? ":cooperative" : ":host-polled");
   MFEM_VERIFY(!using_two_level_inverse ||
                 (std::string(two_level_env) == "fp64" && using_cuda &&
                  !using_dense_inverse),
