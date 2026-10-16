@@ -71,6 +71,7 @@ physical method and preconditioner configuration:
 | --- | --- | --- |
 | `IGRLAB_IGR_KRYLOV_BACKEND` | `mfem` | `cuda-fp64` (requires explicit FGMRES) |
 | `IGRLAB_IGR_COARSE_CG_BACKEND` | follows the outer backend | `mfem` or `cuda-fp64` |
+| `IGRLAB_IGR_COARSE_CG_EXECUTION` | `host-polled` | `cooperative` (admitted CUDA coarse solves) |
 | `IGRLAB_IGR_TWO_LEVEL_BLOCK_PRECISION` | `fp64` | `fp32` (requires the owned CUDA FGMRES path) |
 
 The legacy `DG_IGR_` spellings remain accepted. CPU and multiple-rank outer
@@ -114,3 +115,8 @@ checks the two-level construction/current operator, IEEE FP32 action errors
 and extreme-value recovery. Run it with
 `IGRLAB_IGR_COARSE_CG_BACKEND=cuda-fp64` to exercise nested device CG. These
 algebra fixtures do not establish application speedups or long-horizon accuracy.
+
+See [original-architecture solver options](original-architecture-solvers.md)
+for cooperative admission, HDG local-solve selectors, measured results and
+validation scope. The application closure certificate is distinct from the
+strict internal FGMRES convergence test described above.
