@@ -89,6 +89,60 @@ int main(int argc, char** argv)
     return 1;
   }
 
+  // A first output read leaves the component views host-valid. Later RK
+  // updates make only the owning state device-current; a view's HostRead alone
+  // cannot discover that change. Exercise the actual common output refresh
+  // twice, without an intervening read of the owning host state.
+  const double* const original_host_allocation = bundle.sol.GetData();
+  (void)bundle.state.density.HostRead();
+  (void)bundle.state.momentum.HostRead();
+  (void)bundle.state.momentum_x.HostRead();
+  (void)bundle.state.momentum_y.HostRead();
+  (void)bundle.state.energy.HostRead();
+  dg_sim::EulerFieldList conserved_output;
+  conserved_output.state = &bundle.state;
+  for (int update = 1; update <= 2; ++update)
+  {
+    double* current = bundle.sol.ReadWrite();
+    mfem::forall(ndofs, [=] MFEM_HOST_DEVICE(int i)
+    {
+      current[i] = 2.0 + update + i / 1024.0;
+      current[ndofs + i] = update * 0.25 + i / 2048.0;
+      current[2 * ndofs + i] = -update * 0.125 - i / 4096.0;
+      current[3 * ndofs + i] = 8.0 + update + i / 512.0;
+    });
+    if (mfem::Device::Allows(mfem::Backend::CUDA) &&
+        bundle.sol.GetMemory().HostIsValid())
+    {
+      std::cerr << "[FAIL] output regression did not leave a device-current parent\n";
+      return 3;
+    }
+    // Exclude derived projections here: a CPU fallback must not accidentally
+    // synchronize the parent and hide a missing conserved-output refresh.
+    dg_sim::UpdateEulerOutputFields(conserved_output);
+    const double* density = bundle.state.density.HostRead();
+    const double* momentum = bundle.state.momentum.HostRead();
+    const double* momentum_x = bundle.state.momentum_x.HostRead();
+    const double* momentum_y = bundle.state.momentum_y.HostRead();
+    const double* energy = bundle.state.energy.HostRead();
+    bool current_output = bundle.sol.GetData() == original_host_allocation;
+    for (int i = 0; i < ndofs; ++i)
+    {
+      current_output = current_output &&
+        density[i] == 2.0 + update + i / 1024.0 &&
+        momentum[i] == update * 0.25 + i / 2048.0 &&
+        momentum[ndofs + i] == -update * 0.125 - i / 4096.0 &&
+        momentum_x[i] == momentum[i] && momentum_y[i] == momentum[ndofs + i] &&
+        energy[i] == 8.0 + update + i / 512.0;
+    }
+    if (!current_output)
+    {
+      std::cerr << "[FAIL] output read stale conserved views after device update "
+                << update << "\n";
+      return 3;
+    }
+  }
+
   // Device-local IGR coefficients must consume alpha_e=C_alpha*h_e^2, not a
   // single alpha=C_alpha*h_max^2.  This source is compiled as CUDA and the
   // active backend is selected above, so these kernels execute on the device.
@@ -234,6 +288,7 @@ int main(int argc, char** argv)
   if (mfem::Mpi::Root())
   {
     std::cout << "[PASS] analysis synchronized Euler density after device update\n";
+    std::cout << "[PASS] output synchronized all conserved views after two device updates\n";
     std::cout << "[PASS] device IGR coefficients use per-element "
                  "C_alpha*h_e^2 on a graded mesh\n";
   }

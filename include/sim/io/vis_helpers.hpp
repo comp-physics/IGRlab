@@ -410,6 +410,10 @@ inline void UpdateEulerOutputFields(const EulerFieldList& fields,
 {
   const auto total_start = std::chrono::steady_clock::now();
   EulerOutputFieldTiming local_timing;
+  if (fields.state)
+  {
+    fields.state->RefreshHost();
+  }
   if (fields.pressure)
   {
     const auto pressure_start = std::chrono::steady_clock::now();
@@ -448,6 +452,10 @@ inline void UpdateEulerGLVis(EulerVisWindows& windows,
                              const mfem::ParMesh& pmesh,
                              double t)
 {
+  if (fields.state)
+  {
+    fields.state->RefreshHost();
+  }
   if (fields.sigma)
   {
     MFEM_VERIFY(fields.pressure != nullptr,
