@@ -10,8 +10,8 @@
 namespace
 {
 using namespace mfem;
-using igrlab::igr_internal::MakeTensorVolumeOperator;
-using igrlab::igr_internal::RefreshTensorVolumeCoefficients;
+using ::igrlab::igr_internal::MakeTensorVolumeOperator;
+using ::igrlab::igr_internal::RefreshTensorVolumeCoefficients;
 
 double Relative(const Vector& actual, const Vector& expected)
 {
