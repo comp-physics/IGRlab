@@ -488,6 +488,27 @@ struct PackedSharedWeakDivCenterKernel
   }
 };
 
+struct PackedSharedWeakDivMomentKernel
+{
+  int dof = 0;
+  int k = 0;
+  const real_t* input = nullptr;
+  const real_t* output = nullptr;
+  const real_t* column_sums = nullptr;
+  real_t* correction = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int column) const
+  {
+    real_t observed = 0.0, expected = 0.0;
+    for (int i = 0; i < dof; ++i) { observed += output[i + dof * column]; }
+    for (int j = 0; j < k; ++j)
+    {
+      expected += column_sums[j] * input[j + k * column];
+    }
+    correction[column] = expected - observed;
+  }
+};
+
 struct PackedSharedWeakDivRestoreKernel
 {
   int dof = 0;
@@ -496,6 +517,8 @@ struct PackedSharedWeakDivRestoreKernel
   const real_t* flux = nullptr;
   const real_t* output = nullptr;
   const real_t* row_sums = nullptr;
+  const real_t* mass_fractions = nullptr;
+  const real_t* correction = nullptr;
   const int* map = nullptr;
   real_t* z = nullptr;
 
@@ -503,7 +526,9 @@ struct PackedSharedWeakDivRestoreKernel
   {
     const int i = entry % dof, column = entry / dof;
     const int e = column / neq, equation = column % neq;
-    real_t value = output[entry];
+    // Enforce 1^T y = (1^T W) b on the centered product. The original FP64
+    // anchor is restored only afterwards, preserving the constant-input path.
+    real_t value = output[entry] + mass_fractions[e * dof + i] * correction[column];
     for (int d = 0; d < dim; ++d)
     {
       value += row_sums[i + dof * d] * flux[d + dof * dim * column];

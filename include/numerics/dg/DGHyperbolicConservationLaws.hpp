@@ -668,6 +668,9 @@ private:
   Vector weakdiv_data_flat_;
   mutable std::unique_ptr<::igrlab::shared_reference::Map> weakdiv_shared_map_;
   mutable DenseMatrix weakdiv_shared_row_sums_;
+  mutable Vector weakdiv_shared_column_sums_;
+  mutable Vector weakdiv_shared_mass_fractions_;
+  mutable Vector weakdiv_shared_moment_correction_;
   mutable Vector weakdiv_shared_flux_;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;

@@ -188,6 +188,26 @@ void DGProductionOracle(int order, Precision precision)
   baseline.SetInvariantDomainVolumeSpeedTracking(true);
   candidate.SetInvariantDomainVolumeSpeedTracking(true);
   Vector state(fes.GetVSize()), expected(fes.GetVSize()), actual(fes.GetVSize());
+  // Assemble the physical mass independently of the production inverse and
+  // its cached correction weights. The conserved cell moment is (M 1)^T du/dt,
+  // not an unweighted sum of the strong nodal residual.
+  std::vector<Vector> cell_mass(mesh.GetNE());
+  mfem::MassIntegrator mass_integrator;
+  for (int e = 0; e < mesh.GetNE(); ++e)
+  {
+    DenseMatrix mass;
+    const auto& fe = *fes.GetFE(e);
+    mass_integrator.AssembleElementMatrix(fe, *fes.GetElementTransformation(e), mass);
+    Vector one(fe.GetDof());
+    one = 1.0;
+    cell_mass[e].SetSize(fe.GetDof());
+    mass.Mult(one, cell_mass[e]);
+    for (int i = 0; i < fe.GetDof(); ++i)
+    {
+      MFEM_VERIFY(std::isfinite(cell_mass[e][i]) && cell_mass[e][i] > 0.0,
+                  "Invalid independently assembled cell mass.");
+    }
+  }
   for (int phase = 0; phase < 3; ++phase)
   {
     FillEuler(fes, state, sigma, phase);
@@ -219,6 +239,40 @@ void DGProductionOracle(int order, Precision precision)
                   "Shared DG full RHS failed original operator comparison: p=" << order
                   << " phase=" << phase << " relative_error=" << error / scale);
     }
+    long double largest_cell_moment = 0.0L;
+    for (int e = 0; e < mesh.GetNE(); ++e)
+    {
+      mfem::Array<int> dofs;
+      fes.GetElementDofs(e, dofs);
+      for (int equation = 0; equation < 4; ++equation)
+      {
+        long double reference_moment = 0.0L, candidate_moment = 0.0L, bound = 0.0L;
+        for (int i = 0; i < dofs.Size(); ++i)
+        {
+          const int index = fes.DofToVDof(dofs[i], equation);
+          const long double weight = cell_mass[e][i];
+          reference_moment += weight * b[index];
+          candidate_moment += weight * a[index];
+          bound += weight * (std::abs(a[index]) + std::abs(b[index]));
+        }
+        largest_cell_moment = std::max(largest_cell_moment, std::abs(reference_moment));
+        const long double moment_tolerance =
+          128.0L * std::numeric_limits<double>::epsilon() * dofs.Size() *
+          std::max(1.0L, bound);
+        MFEM_VERIFY(std::abs(candidate_moment - reference_moment) <= moment_tolerance,
+                    "Shared DG changed the original conserved cell moment: p=" << order
+                    << " phase=" << phase << " element=" << e << " equation=" << equation
+                    << " error=" << static_cast<double>(candidate_moment - reference_moment)
+                    << " tolerance=" << static_cast<double>(moment_tolerance));
+      }
+    }
+    if (phase > 0)
+    {
+      // The surface flux yields nonzero individual cell moments even on this
+      // periodic mesh. A blanket zero-moment projection of the full RHS fails.
+      MFEM_VERIFY(largest_cell_moment > 1e-4L,
+                  "Cell-moment regression lacks a nontrivial physical moment.");
+    }
   }
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
 }
@@ -243,6 +297,7 @@ int main(int argc, char** argv)
   }
   std::cout << "shared_reference_test passed real_columns=true padded_tails=true "
                "immutable_matrix=true reused_workspace=true centered_constant=true "
-               "dg_original_rhs=true dgsem_original_split=true nonfinite_exposed=true\n";
+               "dg_original_rhs=true dg_original_cell_moment=true "
+               "dgsem_original_split=true nonfinite_exposed=true\n";
   return 0;
 }

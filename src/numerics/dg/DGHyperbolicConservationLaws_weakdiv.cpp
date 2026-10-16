@@ -14,6 +14,9 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   weakdiv_data_flat_.SetSize(0);
   weakdiv_shared_map_.reset();
   weakdiv_shared_row_sums_.SetSize(0);
+  weakdiv_shared_column_sums_.SetSize(0);
+  weakdiv_shared_mass_fractions_.SetSize(0);
+  weakdiv_shared_moment_correction_.SetSize(0);
   weakdiv_shared_flux_.SetSize(0);
   weakdiv_volume_speed_.SetSize(0);
   weakdiv_q_sigma_telemetry_.SetSize(0);
@@ -254,9 +257,72 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     const real_t roundoff_limit = 64.0 * dof * std::numeric_limits<real_t>::epsilon();
     MFEM_VERIFY(reference_norm > 0.0 && difference_norm <= roundoff_limit * reference_norm,
                 "Shared DG element matrices differ beyond the assembly-roundoff bound.");
+    // For a nodal weak divergence, sum_i grad(phi_i)=0. Preserve the actual
+    // assembled FP64 column sums, including their quadrature roundoff, rather
+    // than assuming that every stored column sums to bitwise zero.
+    weakdiv_shared_column_sums_.SetSize(dof * dim);
+    weakdiv_shared_column_sums_.UseDevice(true);
+    real_t* column_sums = weakdiv_shared_column_sums_.HostWrite();
+    real_t maximum_column_sum = 0.0;
+    for (int j = 0; j < dof * dim; ++j)
+    {
+      long double sum = 0.0L;
+      for (int i = 0; i < dof; ++i) { sum += weakdiv[0](i, j); }
+      column_sums[j] = static_cast<real_t>(sum);
+      maximum_column_sum = std::max(maximum_column_sum, std::abs(column_sums[j]));
+    }
+    MFEM_VERIFY(maximum_column_sum <= roundoff_limit * reference_norm,
+                "Shared DG matrix does not have the weak-divergence constant-test moment.");
+
+    // The already assembled inverse must be exactly diagonal: its reciprocal
+    // is M_ii and hence (M 1)_i. Use each cell's actual mass, not reconstructed
+    // reference weights or a row-uniform weak correction. The resulting strong
+    // correction is constant within the cell after the unchanged inverse mass.
+    MFEM_VERIFY(invmass_data_flat_.Size() == ne * dof,
+                "Shared DG moment preservation requires an exactly diagonal assembled mass.");
+    weakdiv_shared_mass_fractions_.SetSize(ne * dof);
+    weakdiv_shared_mass_fractions_.UseDevice(true);
+    real_t* mass_fractions = weakdiv_shared_mass_fractions_.HostWrite();
+    for (int e = 0; e < ne; ++e)
+    {
+      const auto* tensor = dynamic_cast<const TensorBasisElement*>(vfes.GetFE(e));
+      MFEM_VERIFY(tensor && tensor->GetBasisType() == BasisType::GaussLegendre,
+                  "Shared DG moment preservation requires the nodal Gauss-Legendre mass.");
+      long double total_mass = 0.0L;
+      for (int i = 0; i < dof; ++i)
+      {
+        const real_t inverse = invmass[e](i, i);
+        const real_t mass = 1.0 / inverse;
+        MFEM_VERIFY(std::isfinite(inverse) && inverse > 0.0 &&
+                      std::isfinite(mass) && mass > 0.0,
+                    "Shared DG moment preservation requires finite positive mass weights.");
+        mass_fractions[e * dof + i] = mass;
+        total_mass += mass;
+      }
+      MFEM_VERIFY(std::isfinite(static_cast<real_t>(total_mass)) && total_mass > 0.0L,
+                  "Invalid shared DG cell mass.");
+      for (int i = 0; i < dof; ++i)
+      {
+        mass_fractions[e * dof + i] =
+          static_cast<real_t>(mass_fractions[e * dof + i] / total_mass);
+      }
+    }
+    weakdiv_shared_moment_correction_.SetSize(ne * neq);
+    weakdiv_shared_moment_correction_.UseDevice(true);
+    weakdiv_shared_column_sums_.Read();
+    weakdiv_shared_mass_fractions_.Read();
+    weakdiv_shared_moment_correction_.Write();
     std::cout << "[shared-reference-map] event=operator-equivalence method=dg-weakdiv"
               << " geometry=identical-affine-parallelograms matrix_relative_inf_error="
               << difference_norm / reference_norm << " limit=" << roundoff_limit
+              << std::endl;
+    std::cout << "[shared-reference-map] event=moment-policy method=dg-weakdiv"
+              << " target=original-fp64-weak-moment distribution=assembled-M1"
+              << " precision=fp64 correction=centered-product"
+              << " matrix_column_sum_relative=" << maximum_column_sum / reference_norm
+              << " additional_workspace_bytes="
+              << (std::size_t(dof) * dim + std::size_t(ne) * dof +
+                  std::size_t(ne) * neq) * sizeof(real_t)
               << std::endl;
     weakdiv_shared_row_sums_.SetSize(dof, dim);
     weakdiv_shared_row_sums_.GetMemory().UseDevice(true);
@@ -347,11 +413,17 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       PackedSharedWeakDivCenterKernel{k, dim, flux, input});
     weakdiv_shared_map_->Apply();
     const real_t* output = weakdiv_shared_map_->Output().Read();
+    real_t* correction = weakdiv_shared_moment_correction_.Write();
+    mfem::forall(columns, PackedSharedWeakDivMomentKernel{
+      dof, k, weakdiv_shared_map_->Input().Read(), output,
+      weakdiv_shared_column_sums_.Read(), correction});
     const real_t* row_sums = weakdiv_shared_row_sums_.Read();
     const int* map = invmass_elem_vdof_map_.Read();
     real_t* z_out = z_inout.ReadWrite();
     mfem::forall(dof * columns,
-      PackedSharedWeakDivRestoreKernel{dof, dim, neq, flux, output, row_sums, map, z_out});
+      PackedSharedWeakDivRestoreKernel{dof, dim, neq, flux, output, row_sums,
+        weakdiv_shared_mass_fractions_.Read(), weakdiv_shared_moment_correction_.Read(),
+        map, z_out});
   }
 #else
   auto state_map = invmass_elem_vdof_map_.HostRead();
