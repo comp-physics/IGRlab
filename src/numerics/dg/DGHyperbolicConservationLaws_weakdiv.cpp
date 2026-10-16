@@ -193,7 +193,6 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   const int dof = weakdiv_elem_dof_;
   const int neq = num_equations;
   const int ldof = dof * neq;
-  const int space_dim = dim; // device lambdas must not capture the host owner
 
   const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
@@ -344,27 +343,15 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     const int k = dof * dim, columns = ne * neq;
     const real_t* flux = weakdiv_shared_flux_.Read();
     real_t* input = weakdiv_shared_map_->Input().Write();
-    mfem::forall(k * columns, [=] MFEM_HOST_DEVICE(int entry)
-    {
-      const int row = entry % k, column = entry / k;
-      input[entry] = flux[entry] - flux[row % space_dim + k * column];
-    });
+    mfem::forall(k * columns,
+      PackedSharedWeakDivCenterKernel{k, dim, flux, input});
     weakdiv_shared_map_->Apply();
     const real_t* output = weakdiv_shared_map_->Output().Read();
     const real_t* row_sums = weakdiv_shared_row_sums_.Read();
     const int* map = invmass_elem_vdof_map_.Read();
     real_t* z_out = z_inout.ReadWrite();
-    mfem::forall(dof * columns, [=] MFEM_HOST_DEVICE(int entry)
-    {
-      const int i = entry % dof, column = entry / dof;
-      const int e = column / neq, equation = column % neq;
-      real_t value = output[entry];
-      for (int d = 0; d < space_dim; ++d)
-      {
-        value += row_sums[i + dof * d] * flux[d + k * column];
-      }
-      z_out[map[e * ldof + i * neq + equation]] += value;
-    });
+    mfem::forall(dof * columns,
+      PackedSharedWeakDivRestoreKernel{dof, dim, neq, flux, output, row_sums, map, z_out});
   }
 #else
   auto state_map = invmass_elem_vdof_map_.HostRead();

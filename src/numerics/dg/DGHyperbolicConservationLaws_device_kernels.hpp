@@ -473,6 +473,45 @@ struct PackedWeakDivEulerKernel
   }
 };
 
+// Named functors keep NVCC extended lambdas out of private member functions.
+struct PackedSharedWeakDivCenterKernel
+{
+  int k = 0;
+  int dim = 0;
+  const real_t* flux = nullptr;
+  real_t* input = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int row = entry % k, column = entry / k;
+    input[entry] = flux[entry] - flux[row % dim + k * column];
+  }
+};
+
+struct PackedSharedWeakDivRestoreKernel
+{
+  int dof = 0;
+  int dim = 0;
+  int neq = 0;
+  const real_t* flux = nullptr;
+  const real_t* output = nullptr;
+  const real_t* row_sums = nullptr;
+  const int* map = nullptr;
+  real_t* z = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, column = entry / dof;
+    const int e = column / neq, equation = column % neq;
+    real_t value = output[entry];
+    for (int d = 0; d < dim; ++d)
+    {
+      value += row_sums[i + dof * d] * flux[d + dof * dim * column];
+    }
+    z[map[e * dof * neq + i * neq + equation]] += value;
+  }
+};
+
 struct PackedInteriorFaceEulerRusanovKernel
 {
   int dof = 0;
