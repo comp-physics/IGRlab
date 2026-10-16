@@ -8,6 +8,8 @@
 #include "IGR_nodal_source.hpp"
 #include "IGR_dense_inverse.hpp"
 #include "IGR_two_level_inverse.hpp"
+#include "IGR_tensor_multigrid.hpp"
+#include "IGR_tensor_volume.hpp"
 #include "IGR_screened_patch_inverse.hpp"
 #include "IGR_face_density_cuda.hpp"
 #include "IGR_face_density_host_cache.hpp"
@@ -2379,6 +2381,34 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
   const bool using_cuda = IsCudaBackendActive();
+  const char* tensor_mg_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_MG");
+  const std::string tensor_mg_precision = tensor_mg_env ? tensor_mg_env : "off";
+  const bool using_tensor_mg = tensor_mg_precision != "off";
+  const int tensor_mg_rebuild_interval =
+    ReadEnvInt("DG_IGR_IGR_TENSOR_MG_REBUILD_INTERVAL", 0);
+  const char* tensor_volume_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_VOLUME");
+  const std::string tensor_volume_mode = tensor_volume_env ? tensor_volume_env : "off";
+  const bool using_tensor_volume = tensor_volume_mode != "off";
+  MFEM_VERIFY(tensor_mg_precision == "off" || tensor_mg_precision == "fp64" ||
+                tensor_mg_precision == "fp32" || tensor_mg_precision == "tf32",
+              "IGRLAB_IGR_TENSOR_MG must be off|fp64|fp32|tf32.");
+  MFEM_VERIFY(tensor_volume_mode == "off" || tensor_volume_mode == "simt" ||
+                tensor_volume_mode == "wmma",
+              "IGRLAB_IGR_TENSOR_VOLUME must be off|simt|wmma.");
+  MFEM_VERIFY(tensor_mg_rebuild_interval >= 0,
+              "IGRLAB_IGR_TENSOR_MG_REBUILD_INTERVAL must be nonnegative.");
+  MFEM_VERIFY(!(using_tensor_mg || using_tensor_volume) ||
+                (using_cuda && is_dg && exact_face_sum_op &&
+                 direct_identity_system_ && ess_tdof_list_.Size() == 0 &&
+                 using_device_coeffs_ && use_partial_assembly_ &&
+                 DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND")),
+              "Tensor IGR experiments require CUDA, partial-assembly L2 DG with "
+              "exact faces, current device coefficients, direct identity layout, "
+              "no essential constraints, and CUDA FP64 FGMRES.");
+  MFEM_VERIFY(!using_tensor_mg || spd_ok,
+              "Tensor multigrid requires symmetric SIPG for its FP64 coarse CG solve.");
+  const std::string tensor_mg_key = tensor_mg_precision + ":" +
+    std::to_string(tensor_mg_rebuild_interval);
   const char* dense_inverse_env = ::igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
@@ -2387,6 +2417,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool using_two_level_inverse = two_level_env && two_level_env[0];
   const char* patch_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_RADIUS");
   const bool using_screened_patch = patch_env && patch_env[0];
+  MFEM_VERIFY(!using_tensor_mg ||
+                !(using_dense_inverse || using_two_level_inverse || using_screened_patch),
+              "Tensor multigrid cannot be combined with another experimental preconditioner.");
   const int patch_radius = using_screened_patch
     ? ReadEnvInt("DG_IGR_IGR_PATCH_RADIUS", -1) : -1;
   const char* patch_precision_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_PRECISION");
@@ -2513,6 +2546,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                  patch_precision == "fp64" && solver_choice == LinearSolverType::CG),
               "Screened RAS and mixed precision require FGMRES; FP64 vertex/face-condensed also permit CG.");
 
+  MFEM_VERIFY(!(using_tensor_mg || using_tensor_volume) ||
+                solver_choice == LinearSolverType::FGMRES,
+              "Tensor IGR experiments require explicit FGMRES.");
+
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
   if (RequiresSPD(solver_choice) && !spd_ok)
   {
@@ -2594,6 +2631,37 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                                     true);
 
   const auto pc_setup_start = std::chrono::steady_clock::now();
+  // Preserve A_op as the independent, current-coefficient FP64 authority.
+  // The candidate replaces only its volume action; exact DG faces are shared.
+  std::unique_ptr<ExactFaceSumOperator> tensor_solve_operator;
+  mfem::Operator* iteration_operator = A_op;
+  ExactFaceSumOperator* iteration_face_sum = exact_face_sum_op;
+  if (using_tensor_volume)
+  {
+#ifdef DG_IGR_HAS_TENSOR_PIPELINE_CUDA
+    MFEM_VERIFY(invrho_qf_ && ck_qf_ && exact_face_sum_op,
+                "Tensor volume requires current device quadrature coefficients.");
+    MFEM_VERIFY(!tensor_volume_operator_ || tensor_volume_mode_ == tensor_volume_mode,
+                "Cannot change tensor volume mode on a live solver.");
+    if (!tensor_volume_operator_)
+    {
+      tensor_volume_operator_ = MakeTensorVolumeOperator(
+        sfes_, *invrho_qf_, *ck_qf_, tensor_volume_mode);
+      tensor_volume_mode_ = tensor_volume_mode;
+    }
+    else
+    {
+      RefreshTensorVolumeCoefficients(*tensor_volume_operator_, *invrho_qf_, *ck_qf_);
+    }
+    tensor_solve_operator = std::make_unique<ExactFaceSumOperator>(
+      tensor_volume_operator_.get(), &exact_face_sum_op->FaceOperator(),
+      false, false, direct_identity_system_);
+    iteration_operator = tensor_solve_operator.get();
+    iteration_face_sum = tensor_solve_operator.get();
+#else
+    MFEM_ABORT("Tensor volume experiment requires a CUDA build.");
+#endif
+  }
   std::unique_ptr<KrylovTelemetryOperator> cheb_operator_telemetry;
   std::unique_ptr<mfem::Solver> owned_prec;
   mfem::Solver* prec = nullptr;
@@ -2603,7 +2671,37 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   bool using_operator_chebyshev_base = false;
   {
     ::igrlab::NVTXRange pc_range("IGR/preconditioner-setup");
-    if (using_screened_patch)
+    if (using_tensor_mg)
+    {
+#ifdef DG_IGR_HAS_TENSOR_PIPELINE_CUDA
+      MFEM_VERIFY(!tensor_multigrid_preconditioner_ || tensor_multigrid_key_ == tensor_mg_key,
+                  "Cannot change tensor multigrid configuration on a live solver.");
+      if (!tensor_multigrid_preconditioner_ ||
+          (tensor_mg_rebuild_interval > 0 &&
+           (solve_call - 1) % tensor_mg_rebuild_interval == 0))
+      {
+        const TensorMultigridPrecision precision = tensor_mg_precision == "tf32"
+          ? TensorMultigridPrecision::TF32 : (tensor_mg_precision == "fp32"
+            ? TensorMultigridPrecision::FP32 : TensorMultigridPrecision::FP64);
+        tensor_multigrid_preconditioner_ = MakeTensorMultigridPreconditioner(
+          *A_op, sfes_, precision);
+        tensor_multigrid_key_ = tensor_mg_key;
+        if (mfem::Mpi::Root())
+        {
+          std::cout << "[igr-tensor-pipeline] event=setup solve_call=" << solve_call
+                    << " precision=" << tensor_mg_precision
+                    << " rebuild_interval=" << tensor_mg_rebuild_interval
+                    << " volume=" << tensor_volume_mode
+                    << " acceptance=original-current-fp64" << std::endl;
+        }
+      }
+      tensor_multigrid_preconditioner_->SetOperator(*iteration_operator);
+      prec = tensor_multigrid_preconditioner_.get();
+#else
+      MFEM_ABORT("Tensor multigrid experiment requires a CUDA build.");
+#endif
+    }
+    else if (using_screened_patch)
     {
 #if defined(DG_IGR_HAS_SCREENED_PATCH_CUDA)
       MFEM_VERIFY(!screened_patch_preconditioner_ || screened_patch_key_ == patch_key,
@@ -2869,7 +2967,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       using_operator_chebyshev_base = use_base_operator;
     }
     // else None -> leave prec null
-    if (!using_dense_inverse && !using_two_level_inverse && !using_screened_patch)
+    if (!using_dense_inverse && !using_two_level_inverse && !using_screened_patch &&
+        !using_tensor_mg)
     { prec = owned_prec.get(); }
   }
   const auto pc_setup_stop = std::chrono::steady_clock::now();
@@ -2994,16 +3093,16 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   std::unique_ptr<KrylovTelemetryOperator> solve_operator_telemetry;
   std::unique_ptr<KrylovTelemetryPreconditioner> telemetry_preconditioner;
-  mfem::Operator* solve_operator = A_op;
+  mfem::Operator* solve_operator = iteration_operator;
   mfem::Solver* solve_preconditioner = prec;
   if (use_krylov_telemetry)
   {
     solve_operator_telemetry =
       std::make_unique<KrylovTelemetryOperator>(
-        *A_op,
+        *iteration_operator,
         krylov_telemetry,
-        exact_face_sum_op ? &exact_face_sum_op->BaseOperator() : nullptr,
-        exact_face_sum_op ? &exact_face_sum_op->FaceOperator() : nullptr,
+        iteration_face_sum ? &iteration_face_sum->BaseOperator() : nullptr,
+        iteration_face_sum ? &iteration_face_sum->FaceOperator() : nullptr,
         diagnostic_state_,
         &sfes_,
         &negative_quadratic_capture_written_,
@@ -3102,7 +3201,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool device_krylov_admitted = using_cuda && krylov_ranks == 1 &&
     !mfem::Device::Allows(mfem::Backend::CEED_MASK | mfem::Backend::OCCA_MASK);
   const bool use_device_krylov = device_krylov_requested && device_krylov_admitted;
-  MFEM_VERIFY(!(mixed_two_level || shared_patch_two_level) || use_device_krylov,
+  MFEM_VERIFY(!(mixed_two_level || shared_patch_two_level || using_tensor_mg || using_tensor_volume) || use_device_krylov,
               "FP32 two-level blocks and shared patches require the admitted rank-one CUDA FGMRES path.");
   MFEM_VERIFY(!use_device_krylov || solver_choice == LinearSolverType::FGMRES,
               "CUDA FP64 Krylov currently requires explicit FGMRES.");
@@ -3213,7 +3312,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     extended_certificate_enabled &&
     last_linear_iters_ >= extended_certificate_start;
   const bool certify_independent_residual =
-    certify_current_solve_ || certify_extended_solve;
+    certify_current_solve_ || certify_extended_solve || using_tensor_mg || using_tensor_volume;
   auto recompute_true_residual = [&]()
   {
     mfem::Vector residual(B_);
@@ -3259,9 +3358,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     // method and must not be weakened by the optional diagnostic environment
     // used to screen unusually long solves.
     constexpr double caller_certificate_factor = 5.0;
-    const double certificate_factor = certify_current_solve_
-                                        ? caller_certificate_factor
-                                        : extended_certificate_factor;
+    const double certificate_factor = (using_tensor_mg || using_tensor_volume)
+                                        ? 1.0 : (certify_current_solve_
+                                          ? caller_certificate_factor
+                                          : extended_certificate_factor);
     const double certificate_relative_limit =
       certificate_factor * effective_rtol;
     const double certificate_absolute_limit =
@@ -3331,8 +3431,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 << " rk_stage=" << rk_stage_index_
                 << " iterations=" << last_linear_iters_
                 << " reason="
-                << (certify_current_solve_ ? "caller-requested"
-                                           : "extended-solve")
+                << ((using_tensor_mg || using_tensor_volume) ? "tensor-pipeline"
+                      : (certify_current_solve_ ? "caller-requested"
+                                               : "extended-solve"))
                 << " start=" << extended_certificate_start
                 << " factor=" << certificate_factor
                 << " relative_limit=" << certificate_relative_limit
@@ -3395,6 +3496,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                               : (using_operator_jacobi
                                    ? "operatorjacobi"
                                    : PrecondTypeName(prec_choice)));
+  if (using_tensor_mg)
+  {
+    last_precond_name_ = "tensor-multigrid-" + tensor_mg_precision;
+  }
   if (using_dense_inverse)
   {
     last_precond_name_ = "dense-inverse-" + dense_inverse_precision;
@@ -3453,7 +3558,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
 
   const bool log_linear_event =
-    !last_linear_converged_ ||
+    true_residual_requested || !last_linear_converged_ ||
     (event_log_min_iters > 0 && last_linear_iters_ >= event_log_min_iters);
   if (log_linear_event && mfem::Mpi::Root())
   {

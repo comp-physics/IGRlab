@@ -720,6 +720,12 @@ private:
   std::string two_level_coarse_mode_;
   std::unique_ptr<mfem::Solver> screened_patch_preconditioner_;
   std::string screened_patch_key_;
+  // Opt-in tensor pipeline. Preconditioner data can be deliberately lagged;
+  // current coefficients and the original FP64 residual remain authoritative.
+  std::unique_ptr<mfem::Solver> tensor_multigrid_preconditioner_;
+  std::string tensor_multigrid_key_;
+  std::unique_ptr<mfem::Operator> tensor_volume_operator_;
+  std::string tensor_volume_mode_;
   std::unique_ptr<mfem::IterativeSolver> stationary_correction_;
   int stationary_sweeps_ = 0;
   // Cached rank-one CUDA FGMRES workspace; selected only by explicit opt-in.

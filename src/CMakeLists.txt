@@ -72,13 +72,16 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
                                   physics/igr/IGR_screened_patch_inverse_cuda.cu
                                   physics/igr/IGR_face_density_cuda.cu
                                   physics/igr/IGR_stationary_correction_cuda.cu
-                                  physics/igr/IGR_device_krylov_cuda.cu)
+                                  physics/igr/IGR_device_krylov_cuda.cu
+                                  physics/igr/IGR_tensor_multigrid.cu
+                                  physics/igr/IGR_tensor_volume.cu)
     target_compile_definitions(igr_mfem PRIVATE DG_IGR_HAS_DENSE_INVERSE_CUDA=1
                                               DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA=1
                                               DG_IGR_HAS_SCREENED_PATCH_CUDA=1
                                               DG_IGR_HAS_FACE_DENSITY_CUDA=1
                                               DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1
-                                              DG_IGR_HAS_DEVICE_KRYLOV_CUDA=1)
+                                              DG_IGR_HAS_DEVICE_KRYLOV_CUDA=1
+                                              DG_IGR_HAS_TENSOR_PIPELINE_CUDA=1)
 endif()
 
 set(_dg_igr_default_accel_sources "")
