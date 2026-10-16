@@ -262,7 +262,10 @@ int RunDiagnosticsTests(TestContext& ctx)
         bundle.sol.UseDevice(true);
         (void)bundle.sol.ReadWrite(); // make the current device copy authoritative
       }
-      dg_sim::UpdateEulerOutputFields(bundle.field_list);
+      // Test projection residency separately: the complete output boundary
+      // also synchronizes the owning state for its conserved host views.
+      bundle.pressure_view.Update();
+      bundle.velocity_view.Update();
       if (cuda)
       {
         ctx.Check(bundle.sol.GetMemory().HostIsValid() != expect_device,
