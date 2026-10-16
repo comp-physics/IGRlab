@@ -1809,6 +1809,18 @@ int RunTimeDefaultsTests(TestContext& ctx)
       t += dt;
     }
   };
+  struct TimeLoopScheduleStepper
+  {
+    std::vector<mfem::real_t> accepted_dts;
+    long double integrated_dt = 0.0L;
+
+    void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
+    {
+      accepted_dts.push_back(dt);
+      integrated_dt += static_cast<long double>(dt);
+      t += dt;
+    }
+  };
   struct TimeLoopGrowthBoundOperator
   {
     mfem::real_t previous_accepted_dt =
@@ -2926,6 +2938,178 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.0,
                   1.0e-14,
                   "time loop: zero-step exit keeps initial final_time");
+  }
+
+  // --- decimal output intervals must not introduce roundoff-sized RHS steps ---
+  for (const int total_steps : {100, 1000})
+  {
+    for (const bool resumed : {false, true})
+    {
+      TimeLoopDummyOperator op;
+      TimeLoopScheduleStepper stepper;
+      dg_sim::TimeLoopConfig cfg;
+      cfg.dt = 1.0e-4;
+      cfg.t_final = total_steps * cfg.dt;
+      cfg.vtk_save = true;
+      cfg.dt_save = (total_steps / 4) * cfg.dt;
+      cfg.initial_step = resumed ? total_steps / 4 : 0;
+      cfg.initial_time = resumed ? cfg.dt_save : 0.0;
+      cfg.next_save_time = cfg.initial_time + cfg.dt_save;
+      cfg.initial_state_saved = true;
+      cfg.save_index_offset = resumed ? 2 : 1;
+
+      std::vector<int> save_steps;
+      std::vector<int> save_cycles;
+      std::vector<mfem::real_t> save_times;
+      int final_saves = 0;
+      dg_sim::TimeLoopHooks hooks;
+      hooks.on_save = [&](int step, mfem::real_t time, int cycle, bool final)
+      {
+        save_steps.push_back(step);
+        save_cycles.push_back(cycle);
+        save_times.push_back(time);
+        final_saves += final ? 1 : 0;
+      };
+      const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+      const int segment_steps = total_steps - cfg.initial_step;
+      ctx.Check(result.success && result.steps == total_steps &&
+                  result.segment_steps == segment_steps &&
+                  result.accepted_attempts == segment_steps &&
+                  result.rejected_attempts == 0 &&
+                  stepper.accepted_dts.size() ==
+                    static_cast<std::size_t>(segment_steps),
+                "time loop roundoff: decimal checkpoints preserve physical "
+                "step and attempt counts, including restart");
+      ctx.Check(result.final_time == cfg.t_final && final_saves == 1 &&
+                  result.minimum_accepted_dt > 0.999 * cfg.dt &&
+                  result.maximum_accepted_dt <= cfg.dt,
+                "time loop roundoff: no artificial tiny step or enlarged dt "
+                "and the final clock is exact");
+      const int expected_saves = resumed ? 3 : 4;
+      bool correct_saves =
+        save_steps.size() == static_cast<std::size_t>(expected_saves);
+      for (std::size_t i = 0; i < save_steps.size(); ++i)
+      {
+        const int expected_step =
+          cfg.initial_step + static_cast<int>(i + 1) * (total_steps / 4);
+        correct_saves = correct_saves && save_steps[i] == expected_step &&
+                        save_cycles[i] ==
+                          cfg.save_index_offset + static_cast<int>(i) &&
+                        std::abs(save_times[i] - expected_step * cfg.dt) <=
+                          8.0 * std::numeric_limits<mfem::real_t>::epsilon() *
+                            cfg.t_final;
+      }
+      ctx.Check(correct_saves,
+                "time loop roundoff: every checkpoint is emitted once at "
+                "its physical step with monotone save numbering");
+      ctx.Check(std::abs(stepper.integrated_dt -
+                         static_cast<long double>(cfg.t_final -
+                                                  cfg.initial_time)) <=
+                  512.0L * std::numeric_limits<mfem::real_t>::epsilon() *
+                    cfg.t_final,
+                "time loop roundoff: accepted integration spans the horizon "
+                "up to clock accumulation roundoff");
+    }
+  }
+
+  // --- final-time snapping works with no output or an output every step ---
+  for (const mfem::real_t dt : {mfem::real_t{1.0e-4}, mfem::real_t{1.0e-5}})
+  {
+    for (const bool save_every_step : {false, true})
+    {
+      TimeLoopDummyOperator op;
+      TimeLoopScheduleStepper stepper;
+      dg_sim::TimeLoopConfig cfg;
+      cfg.dt = dt;
+      cfg.t_final = 1000 * dt;
+      cfg.vtk_save = save_every_step;
+      cfg.dt_save = dt;
+      int save_calls = 0;
+      dg_sim::TimeLoopHooks hooks;
+      hooks.on_save = [&](int, mfem::real_t, int, bool) { ++save_calls; };
+      const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+      ctx.Check(result.success && result.steps == 1000 &&
+                  stepper.accepted_dts.size() == 1000 &&
+                  result.minimum_accepted_dt > 0.999 * dt &&
+                  result.final_time == cfg.t_final &&
+                  save_calls == (save_every_step ? 1000 : 0),
+                "time loop roundoff: decimal horizon has exactly 1000 "
+                "physical steps with no output or with frequent output");
+    }
+  }
+
+  // --- small but resolved physical intervals must not be treated as roundoff ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopScheduleStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.dt = 1.0e-4;
+    cfg.t_final = 1.0e-3 + 2.5e-13;
+    cfg.vtk_save = true;
+    cfg.dt_save = 5.0e-4 + 1.25e-13;
+    std::vector<int> save_steps;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step, mfem::real_t, int, bool)
+    {
+      save_steps.push_back(step);
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && result.steps == 12 &&
+                save_steps == std::vector<int>({6, 12}) &&
+                result.minimum_accepted_dt > 1.0e-13 &&
+                result.minimum_accepted_dt < 1.5e-13 &&
+                result.final_time == cfg.t_final,
+              "time loop roundoff: genuine sub-picosecond save/final clips "
+              "remain accepted physical steps");
+  }
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopScheduleStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.dt = 1.0e-15;
+    cfg.t_final = 4.0e-15;
+    cfg.vtk_save = true;
+    cfg.dt_save = cfg.dt;
+    cfg.initial_state_saved = true;
+    int save_calls = 0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int, mfem::real_t, int, bool) { ++save_calls; };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && result.steps == 4 && save_calls == 4 &&
+                result.final_time == cfg.t_final,
+              "time loop roundoff: no absolute time floor skips a small "
+              "physical horizon or suppresses its final output");
+  }
+
+  // --- a rejected save-boundary attempt must not snap its shorter retry ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRetryStepper stepper(/*failures=*/1);
+    const mfem::Vector state_before(bundle.sol);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.dt = 1.0e-4;
+    cfg.t_final = 2.0e-4;
+    cfg.vtk_save = true;
+    cfg.dt_save = 1.0e-4;
+    std::vector<int> save_steps;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step, mfem::real_t, int, bool)
+    {
+      save_steps.push_back(step);
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && result.steps == 4 &&
+                result.rejected_attempts == 1 && stepper.calls == 5 &&
+                save_steps == std::vector<int>({2, 4}) &&
+                result.final_time == cfg.t_final,
+              "time loop roundoff: output boundaries follow accepted retries "
+              "rather than rejected nominal endpoints");
+    bundle.sol = state_before;
   }
 
   // --- save-boundary snapping advances even when on_save hook is missing ---
