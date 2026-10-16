@@ -490,7 +490,12 @@ public:
       coarse_->Add(4*e+i,4*topology[e][s]+j,matrices[2][Entry(e,s,i,j,4)]);
     coarse_->Finalize();
     mfem::Vector diagonal(4*ne_);coarse_->GetDiag(diagonal);
-    for(int i=0;i<diagonal.Size();++i)MFEM_VERIFY(std::isfinite(diagonal(i))&&diagonal(i)>0,"Nonpositive tensor p1 diagonal.");
+    // SparseMatrix::GetDiag writes through the device backend; Vector::operator()
+    // does not synchronize host validity. Validate the actual computed entries.
+    const double* diagonal_values=diagonal.HostRead();
+    for(int i=0;i<diagonal.Size();++i)
+      MFEM_VERIFY(std::isfinite(diagonal_values[i])&&diagonal_values[i]>0,
+                  "Nonpositive tensor p1 diagonal at row "<<i<<": "<<diagonal_values[i]);
     jacobi_=std::make_unique<mfem::OperatorJacobiSmoother>(diagonal,essential_,1.0);
     coarse_solver_=MakeCooperativeCGSolver(sfes.GetComm());cooperative_=bool(coarse_solver_);
     if(!coarse_solver_)coarse_solver_=MakeDeviceCGSolver(sfes.GetComm());
