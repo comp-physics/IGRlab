@@ -16,6 +16,7 @@ namespace {
 using Precision=igrlab::igr_internal::TensorMultigridPrecision;
 using Smoother=igrlab::igr_internal::TensorMultigridSmoother;
 using OperatorMode=igrlab::igr_internal::TensorMultigridOperator;
+using ResidualMode=igrlab::igr_internal::TensorMultigridResidual;
 
 struct Configuration
 {
@@ -23,6 +24,8 @@ struct Configuration
   Smoother smoother;
   int warps,split_k;
   OperatorMode operator_mode=OperatorMode::Sampled;
+  int owned_tile=1;
+  ResidualMode residual_mode=ResidualMode::Auto;
 };
 
 void Assemble(mfem::BilinearForm& form,mfem::Coefficient& reaction,mfem::Coefficient& diffusion)
@@ -46,7 +49,7 @@ double Relative(const mfem::Vector& a,const mfem::Vector& b)
 }
 
 const char* Name(Precision p)
-{return p==Precision::FP64?"fp64":p==Precision::FP32?"fp32":"tf32";}
+{return p==Precision::FP64?"fp64":p==Precision::FP32?"fp32":p==Precision::TF32?"tf32":"tf32x3";}
 const char* Name(Smoother s)
 {return s==Smoother::Separable?"separable":"center";}
 const char* Name(OperatorMode mode)
@@ -142,15 +145,18 @@ void CheckSharedResidualAdmission()
   }
 }
 
-void CheckHierarchy(bool variable)
+void CheckHierarchy(bool variable,bool owned=false)
 {
   // The variable fixture has 20 real patches, so the production pack/map/add
   // path also sees a partial 16-column tile. Both meshes scramble element
   // order before topology reconstruction; geometric neighbors are not e+/-1.
-  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(variable?5:4,4,mfem::Element::QUADRILATERAL,true,1.0,1.0);
+  // The larger smoother sees six genuine 4x4 owned blocks on an 8x12 mesh,
+  // exercising partial 16-column warp tiles and partial 64-column CTAs.
+  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(owned?8:variable?5:4,owned?12:4,
+    mfem::Element::QUADRILATERAL,true,1.0,1.0);
   // The periodic variable coefficients are sampled on a translated domain;
   // reference averaging must use physical geometry, including wrapped faces.
-  if(variable)for(int v=0;v<box.GetNV();++v)
+  if(variable||owned)for(int v=0;v<box.GetNV();++v)
   {double* vertex=box.GetVertex(v);vertex[0]+=.125;vertex[1]-=.0625;}
   mfem::Array<int> element_order(box.GetNE());
   for(int e=0;e<box.GetNE();++e)element_order[e]=(7*e+3)%box.GetNE();
@@ -187,7 +193,7 @@ void CheckHierarchy(bool variable)
   }
   exact.UseDevice(true);probe.UseDevice(true);current.SpMat().Mult(exact,rhs);
   std::array<mfem::Vector,3> separable_reference;
-  for(const Configuration config:{
+  std::vector<Configuration> configurations={
       Configuration{Precision::FP64,Smoother::Separable,1,1},
       Configuration{Precision::FP32,Smoother::Separable,1,1},
       Configuration{Precision::TF32,Smoother::Separable,1,1},
@@ -197,7 +203,14 @@ void CheckHierarchy(bool variable)
       Configuration{Precision::FP64,Smoother::Separable,1,1,OperatorMode::Shared},
       Configuration{Precision::FP64,Smoother::Center,1,1,OperatorMode::Shared},
       Configuration{Precision::FP32,Smoother::Center,4,2,OperatorMode::Shared},
-      Configuration{Precision::TF32,Smoother::Center,4,4,OperatorMode::Shared}})
+      Configuration{Precision::TF32,Smoother::Center,4,4,OperatorMode::Shared},
+      Configuration{Precision::TF32,Smoother::Center,1,1,OperatorMode::Shared,1,ResidualMode::FP32}};
+  if(owned)configurations={
+      Configuration{Precision::FP64,Smoother::Center,1,1,OperatorMode::Shared,4},
+      Configuration{Precision::FP32,Smoother::Center,1,1,OperatorMode::Shared,4},
+      Configuration{Precision::TF32,Smoother::Center,1,1,OperatorMode::Shared,4},
+      Configuration{Precision::TF32,Smoother::Center,1,1,OperatorMode::Shared,4,ResidualMode::FP32}};
+  for(const Configuration config:configurations)
   {
     const Precision precision=config.precision;
     const int precision_index=precision==Precision::FP64?0:precision==Precision::FP32?1:2;
@@ -205,15 +218,17 @@ void CheckHierarchy(bool variable)
     {
       mfem::BilinearForm frozen(&fes);Assemble(frozen,reaction,diffusion);
       preconditioner=igrlab::igr_internal::MakeTensorMultigridPreconditioner(
-        frozen.SpMat(),fes,precision,config.smoother,config.warps,config.split_k,config.operator_mode);
+        frozen.SpMat(),fes,precision,config.smoother,config.warps,config.split_k,config.operator_mode,
+        config.owned_tile,config.residual_mode);
     } // A0 lifetime ends: the preconditioner must own its coefficient snapshot.
     preconditioner->SetOperator(current.SpMat());
     preconditioner->Mult(probe,result);
     double action_error=0;
     const bool sampled=config.operator_mode==OperatorMode::Sampled;
-    const bool equivalent=sampled||!variable;
-    if(sampled&&config.smoother==Smoother::Separable)separable_reference[precision_index]=result;
-    if(sampled&&config.smoother==Smoother::Separable&&precision==Precision::FP64)reference=result;
+    const bool equivalent=!owned&&(sampled||!variable);
+    if(!owned&&sampled&&config.smoother==Smoother::Separable)separable_reference[precision_index]=result;
+    if((!owned&&sampled&&config.smoother==Smoother::Separable&&precision==Precision::FP64)||
+       (owned&&precision==Precision::FP64))reference=result;
     else
     {
       action_error=Relative(result,reference);
@@ -221,7 +236,10 @@ void CheckHierarchy(bool variable)
         "Tensor MG real patch batch control mismatch: "<<Name(precision)<<" smoother="<<Name(config.smoother)
         <<" relative="<<action_error);
     }
-    const double separable_error=Relative(result,separable_reference[precision_index]);
+    // Changing the owned region changes the mathematical preconditioner. Its
+    // tests use a separate staged map oracle and current-A convergence, with
+    // no equivalence gate against the old one-element center smoother.
+    const double separable_error=owned?0.0:Relative(result,separable_reference[precision_index]);
     MFEM_VERIFY(!equivalent||separable_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?8e-5:3e-2),
       "Tensor MG center/separable V-cycle mismatch: "<<Name(precision)<<" relative="<<separable_error);
     // Dynamic power-of-two input scaling must preserve tiny and huge useful
@@ -253,8 +271,10 @@ void CheckHierarchy(bool variable)
       solver->Mult(rhs,x);current.SpMat().Mult(x,action);
       const double residual=Relative(action,rhs),error=Relative(x,exact);
       std::cout<<"tensor_mg_current_A_test variable="<<variable<<" precision="<<Name(precision)
-        <<" translated_periodic_domain="<<variable
+        <<" translated_periodic_domain="<<(variable||owned)
         <<" operator_mode="<<Name(config.operator_mode)<<" sampled_action_equivalence_required="<<equivalent
+        <<" owned_tile="<<config.owned_tile<<" owned_real_columns="<<(owned?fes.GetNE()/16:0)
+        <<" residual_mode="<<(config.residual_mode==ResidualMode::Auto?"auto":"fp32")
         <<" smoother="<<Name(config.smoother)<<" center_warps="<<config.warps<<" center_split_k="<<config.split_k
         <<" elements="<<fes.GetNE()
         <<" repeat="<<repeat<<" iterations="<<solver->GetNumIterations()<<" true_residual="<<residual
@@ -262,6 +282,155 @@ void CheckHierarchy(bool variable)
         <<" separable_action_control_error="<<separable_error<<'\n';
       MFEM_VERIFY(solver->GetConverged()&&residual<=1e-10&&error<1e-7,
         "Tensor MG original-current-A convergence failed: "<<Name(precision)<<" residual="<<residual<<" error="<<error);
+    }
+  }
+}
+
+void CheckSpectral(bool variable)
+{
+  // A rectangular 48x72 global modal tensor exposes x/y swaps and incorrect
+  // GEMM leading dimensions. Element indices carry no Cartesian ordering.
+  constexpr int nx=8,ny=12,d=6;
+  constexpr double pi=3.14159265358979323846;
+  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(nx,ny,mfem::Element::QUADRILATERAL,true,1.0,1.0);
+  for(int v=0;v<box.GetNV();++v)
+  {double* vertex=box.GetVertex(v);vertex[0]+=.125;vertex[1]-=.0625;}
+  mfem::Array<int> ordering(box.GetNE());
+  for(int e=0;e<box.GetNE();++e)ordering[e]=(37*e+11)%box.GetNE();
+  box.ReorderElements(ordering,false);
+  mfem::Vector dx(2),dy(2);dx=0.0;dy=0.0;dx(0)=1;dy(1)=1;
+  const std::vector<mfem::Vector> shifts{dx,dy};
+  mfem::Mesh mesh=mfem::Mesh::MakePeriodic(box,box.CreatePeriodicVertexMapping(shifts));
+  mfem::ParMesh pmesh(MPI_COMM_WORLD,mesh);
+  mfem::L2_FECollection collection(5,2,mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(&pmesh,&collection);
+  const int n=fes.GetVSize();
+  mfem::FunctionCoefficient reaction([=](const mfem::Vector& x)
+    {return 1.0+(variable?.15*std::cos(2*pi*x(0))*.5*(1+std::sin(2*pi*x(1))):0.0);});
+  mfem::FunctionCoefficient diffusion([=](const mfem::Vector& x)
+    {return .01*(1.0+(variable?.12*std::sin(2*pi*x(0))*std::cos(2*pi*x(1)):0.0));});
+  mfem::FunctionCoefficient changed_reaction([=](const mfem::Vector& x)
+    {return 1.1+.07*std::sin(2*pi*x(1));});
+  mfem::FunctionCoefficient changed_diffusion([=](const mfem::Vector& x)
+    {return .012*(1.0+.08*std::cos(2*pi*x(0)));});
+  // The oracle is separately assembled and outlives the source operator passed
+  // to the factory. A retained pointer into that temporary source is invalid.
+  mfem::BilinearForm frozen_oracle(&fes),current(&fes);
+  Assemble(frozen_oracle,reaction,diffusion);Assemble(current,changed_reaction,changed_diffusion);
+  mfem::Vector exact(n),probe(n),rhs(n),x(n),result(n),action(n),scaled(n),scaled_result(n);
+  mfem::Array<int> dofs;
+  for(int e=0;e<fes.GetNE();++e)
+  {
+    fes.GetElementDofs(e,dofs);const auto& nodes=fes.GetFE(e)->GetNodes();
+    auto* tr=fes.GetElementTransformation(e);mfem::Vector point(2);
+    for(int i=0;i<d*d;++i)
+    {
+      const auto& node=nodes.IntPoint(i);tr->Transform(node,point);
+      exact(dofs[i])=.7+.13*std::sin(2*pi*point(0))-.09*std::cos(4*pi*point(1))+
+        .06*node.x*node.y+.02*std::sin(.53*e);
+      probe(dofs[i])=.31+std::sin(.19*(1+e*d*d+i))+.17*std::cos(.37*(2*i+e));
+    }
+  }
+  exact.UseDevice(true);probe.UseDevice(true);
+  double condition_bound=0,inverse_limit=0;
+  if(!variable)
+  {
+    // For this SIPG operator diffusion is positive semidefinite, so the
+    // minimum collocated reaction mass bounds lambda_min(A0) from below.
+    // Symmetry gives lambda_max(A0)<=max absolute row sum. Keep the resulting
+    // FP64 inverse gate bounded even if the fixture unexpectedly changes.
+    double minimum_mass=std::numeric_limits<double>::infinity(),row_norm=0;
+    const auto& rule=mfem::IntRules.Get(mfem::Geometry::SQUARE,10);
+    for(int e=0;e<fes.GetNE();++e)for(int q=0;q<rule.GetNPoints();++q)
+    {
+      auto* tr=fes.GetElementTransformation(e);const auto& point=rule.IntPoint(q);
+      tr->SetIntPoint(&point);minimum_mass=std::min(minimum_mass,point.weight*tr->Weight());
+    }
+    const int* rows=frozen_oracle.SpMat().HostReadI();
+    const double* values=frozen_oracle.SpMat().HostReadData();
+    for(int i=0;i<n;++i)
+    {
+      double sum=0;for(int j=rows[i];j<rows[i+1];++j)sum+=std::abs(values[j]);
+      row_norm=std::max(row_norm,sum);
+    }
+    MFEM_VERIFY(std::isfinite(minimum_mass)&&minimum_mass>0&&std::isfinite(row_norm)&&row_norm>0,
+                "Invalid spectral inverse condition bound.");
+    condition_bound=row_norm/minimum_mass;
+    inverse_limit=std::min(1e-7,std::max(5e-10,128*std::numeric_limits<double>::epsilon()*condition_bound));
+  }
+  for(Precision precision:{Precision::FP64,Precision::FP32,Precision::TF32,Precision::TF32x3})
+  {
+    std::unique_ptr<mfem::Solver> inverse;
+    {
+      mfem::BilinearForm frozen(&fes);Assemble(frozen,reaction,diffusion);
+      inverse=igrlab::igr_internal::MakeTensorMultigridPreconditioner(
+        frozen.SpMat(),fes,precision,Smoother::Separable,1,1,OperatorMode::Spectral);
+    }
+    inverse->SetOperator(current.SpMat());
+    if(!variable)
+    {
+      for(int kind=0;kind<3;++kind)
+      {
+        if(kind==0)rhs=1.0;
+        else if(kind==1){rhs=0.0;rhs.HostReadWrite()[n/3+5]=1.0;}
+        else rhs=probe;
+        rhs.UseDevice(true);inverse->Mult(rhs,result);
+        frozen_oracle.SpMat().Mult(result,action);
+        const double residual=Relative(action,rhs);
+        std::cout<<"tensor_spectral_inverse_test precision="<<Name(precision)<<" kind="<<kind
+          <<" modal_nx="<<d*nx<<" modal_ny="<<d*ny<<" original_A0_residual="<<residual
+          <<" condition_bound="<<condition_bound<<" fp64_limit="<<inverse_limit
+          <<" exact_inverse_required="<<(precision==Precision::FP64)<<'\n';
+        MFEM_VERIFY(precision!=Precision::FP64||residual<=inverse_limit,
+          "FP64 spectral inverse failed the independent original constant-A0 residual gate: "<<residual);
+      }
+    }
+    inverse->Mult(probe,result);
+    for(double scale:{1e-200,-1e-200,1e200})
+    {
+      const double* p=probe.HostRead();double* values=scaled.HostWrite();
+      for(int i=0;i<n;++i)values[i]=scale*p[i];scaled.UseDevice(true);
+      inverse->Mult(scaled,scaled_result);
+      double* values_out=scaled_result.HostReadWrite();for(int i=0;i<n;++i)values_out[i]/=scale;
+      const double relative=Relative(scaled_result,result);
+      MFEM_VERIFY(relative<(precision==Precision::FP64?5e-10:2e-3),
+        "Spectral inverse lost scaled-input homogeneity: "<<Name(precision)<<" scale="<<scale
+        <<" relative="<<relative);
+    }
+    scaled=0.0;inverse->Mult(scaled,scaled_result);
+    MFEM_VERIFY(scaled_result.Norml2()==0.0,"Spectral zero RHS produced a nonzero correction.");
+    for(double bad:{std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::infinity()})
+    {
+      scaled=probe;scaled.HostReadWrite()[n/4+7]=bad;scaled.UseDevice(true);
+      inverse->Mult(scaled,scaled_result);
+      const double* values=scaled_result.HostRead();
+      MFEM_VERIFY(std::all_of(values,values+n,[](double value){return std::isnan(value);}),
+        "Spectral nonfinite input did not poison the complete correction for original-A rejection.");
+    }
+    inverse->Mult(probe,scaled_result);
+    MFEM_VERIFY(Relative(scaled_result,result)<(precision==Precision::FP64?5e-10:2e-3),
+                "Spectral inverse retained nonfinite workspace state after a new finite input.");
+    current.SpMat().Mult(exact,rhs);
+    auto solver=igrlab::igr_internal::MakeDeviceFGMRESSolver(MPI_COMM_WORLD,50);
+    solver->SetOperator(current.SpMat());solver->SetPreconditioner(*inverse);
+    solver->SetRelTol(1e-10);solver->SetAbsTol(0);solver->SetMaxIter(400);solver->SetPrintLevel(0);
+    for(int repeat=0;repeat<2;++repeat)
+    {
+      if(repeat==0){x=0.0;solver->iterative_mode=false;}
+      else
+      {
+        double* values=exact.HostReadWrite();for(int i=0;i<n;++i)values[i]+=.043*std::cos(.23*i);
+        current.SpMat().Mult(exact,rhs);solver->iterative_mode=true;
+      }
+      solver->Mult(rhs,x);current.SpMat().Mult(x,action);
+      const double residual=Relative(action,rhs),error=Relative(x,exact);
+      std::cout<<"tensor_spectral_current_A_test variable="<<variable<<" precision="<<Name(precision)
+        <<" modal_nx="<<d*nx<<" modal_ny="<<d*ny<<" repeat="<<repeat
+        <<" iterations="<<solver->GetNumIterations()<<" true_residual="<<residual
+        <<" solution_error="<<error<<" old_mg_equivalence_required=false\n";
+      MFEM_VERIFY(solver->GetConverged()&&residual<=1e-10&&error<1e-7,
+        "Spectral inverse did not converge against current original FP64 A: "<<Name(precision)
+        <<" residual="<<residual<<" error="<<error);
     }
   }
 }
@@ -274,11 +443,17 @@ int main(int argc,char** argv)
   MFEM_VERIFY(cudaGetDevice(&ordinal)==cudaSuccess&&cudaGetDeviceProperties(&properties,ordinal)==cudaSuccess,"CUDA property query failed.");
   if(properties.major<8){std::cout<<"tensor_mg_test skipped: nativeSM80+ required\n";return 77;}
   CheckSharedResidualAdmission();CheckHierarchy(false);CheckHierarchy(true);
+  CheckHierarchy(false,true);CheckHierarchy(true,true);
+  CheckSpectral(false);CheckSpectral(true);
   std::cout<<"tensor_mg_test passed multiplicative_vcycle=true hierarchy=5,3,1"
     <<" original_A_certificate=true changed_coefficients=true real_patch_columns=true"
     <<" precision_controls=true center_controls=true center_layouts=1x1,4x2,4x4"
     <<" reordered_topology=true patch_tail=true scaled_rhs=true snapshot_lifetime=true"
     <<" shared_constant_equivalence=true shared_variable_current_A=true shared_residual_tails=true"
-    <<" shared_large_layout=true cancellation_forward_error=true\n";
+    <<" shared_large_layout=true cancellation_forward_error=true owned_tile_4x4=true"
+    <<" owned_changed_current_A=true owned_tail_columns=6 old_smoother_equivalence=false"
+    <<" hybrid_residual_tile1=true hybrid_residual_tile4=true spectral_rectangular_48x72=true"
+    <<" spectral_constant_inverse=true spectral_variable_current_A=true spectral_lifetime=true"
+    <<" spectral_tf32x3=true spectral_nonfinite_poison=true spectral_finite_recovery=true\n";
   return 0;
 }

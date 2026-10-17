@@ -2,9 +2,13 @@
 #include "IGR_tensor_multigrid.hpp"
 #include "IGR_tensor_center.hpp"
 #include "IGR_tensor_reference.hpp"
+#include "IGR_tensor_owned.hpp"
+#include "IGR_tensor_spectral.hpp"
 #include "IGR_device_krylov.hpp"
 #include "IGR_shared_patch_cuda.cuh" // Reuse checked periodic face-slot topology.
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
+#include <cublas_v2.h>
 #include <mma.h>
 #include <math_constants.h>
 #include <climits>
@@ -12,9 +16,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -26,12 +32,17 @@ void CUDA(cudaError_t status)
 { MFEM_VERIFY(status == cudaSuccess, "Tensor multigrid CUDA: " << cudaGetErrorString(status)); }
 
 const char* Name(TensorMultigridPrecision p)
-{ return p == TensorMultigridPrecision::FP64 ? "fp64" : p == TensorMultigridPrecision::FP32 ? "fp32" : "tf32"; }
+{ return p == TensorMultigridPrecision::FP64 ? "fp64" : p == TensorMultigridPrecision::FP32 ? "fp32" :
+    p == TensorMultigridPrecision::TF32x3 ? "tf32x3" : "tf32"; }
 
-const char* SmootherName(TensorMultigridSmoother smoother)
-{ return smoother==TensorMultigridSmoother::Center ? "restricted-overlap-3x3-center" : "restricted-overlap-3x3-separable"; }
+const char* SmootherName(TensorMultigridSmoother smoother,int owned_tile=1)
+{ return owned_tile==4 ? "restricted-overlap-6x6-owned-4x4" :
+    smoother==TensorMultigridSmoother::Center ? "restricted-overlap-3x3-center" : "restricted-overlap-3x3-separable"; }
 const char* OperatorName(TensorMultigridOperator mode)
-{ return mode==TensorMultigridOperator::Shared ? "shared" : "sampled"; }
+{ return mode==TensorMultigridOperator::Spectral ? "spectral" :
+    mode==TensorMultigridOperator::Shared ? "shared" : "sampled"; }
+const char* ResidualPolicyName(TensorMultigridResidual mode)
+{ return mode==TensorMultigridResidual::FP32 ? "fp32" : "auto"; }
 
 std::size_t Entry(int e, int slot, int i, int j, int n)
 { return ((std::size_t(e) * 5 + slot) * n + j) * n + i; }
@@ -543,6 +554,15 @@ template<typename T> __global__ void PackPatch(int ne,int d,const int* patches,c
   const int e=row/(s*s),xy=row%(s*s),x=xy%s,y=xy/s;
   const int element=patches[9*e+3*(y/d)+x/d];p[row]=r[element*d*d+(x%d)+d*(y%d)];
 }
+template<typename T> __global__ void PackOwnedPatch(int tiles,int d,
+    const int* patches,const T* r,T* packed)
+{
+  const int s=6*d,k=s*s,row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=tiles*k)return;
+  const int tile=row/k,i=row%k,x=i%s,y=i/s;
+  const int e=patches[36*tile+x/d+6*(y/d)];
+  packed[row]=r[e*d*d+x%d+d*(y%d)];
+}
 template<typename T> __global__ void TransposePatch(int ne,int s,const T* a,T* b)
 {
   const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=ne*s*s)return;
@@ -679,6 +699,122 @@ template<typename T> __global__ void IGRTensorMultigridAddCenterKernel(
   x[row]=isfinite(sum)&&isfinite(scale)&&isfinite(updated)?updated:static_cast<T>(CUDART_NAN);
 }
 
+template<typename T> __device__ __forceinline__ void StoreOwnedResponse(
+    int tile,int row,int d,const int* owned,const T* factor,T sum,T* x)
+{
+  const int t=4*d,xx=row%t,yy=row/t;
+  const int element=owned[16*tile+xx/d+4*(yy/d)];
+  const int target=element*d*d+xx%d+d*(yy%d);
+  const T scale=factor[element],updated=x[target]+T(.8)*scale*sum;
+  x[target]=isfinite(sum)&&isfinite(scale)&&isfinite(updated)?updated:static_cast<T>(CUDART_NAN);
+}
+
+// Matched SIMT control: a 64x64 output tile per CTA, shared A/B panels, and a
+// fused uniquely owned scatter. Each thread accumulates sixteen real outputs.
+template<typename T> __global__ void IGRTensorMultigridOwnedSIMTKernel(
+    int tiles,int d,const int* owned,const T* response,const T* packed,
+    const T* factor,T* x)
+{
+  const int t=4*d,s=6*d,m=t*t,k=s*s,tiles_m=m/64;
+  const int row0=64*(blockIdx.x%tiles_m),col0=64*(blockIdx.x/tiles_m);
+  const int row=threadIdx.x%64,column_group=threadIdx.x/64;
+  __shared__ __align__(32) T sa[8*72],sb[64*16];
+  T sums[16];
+  #pragma unroll
+  for(int j=0;j<16;++j)sums[j]=0;
+  for(int k0=0;k0<k;k0+=8)
+  {
+    for(int i=threadIdx.x;i<8*72;i+=256)if(i%72<64)
+      sa[i]=response[row0+i%72+m*(k0+i/72)];
+    for(int i=threadIdx.x;i<64*16;i+=256)if(i%16<8)
+    {
+      const int column=col0+i/16;
+      sb[i]=column<tiles?packed[k0+i%16+k*column]:T(0);
+    }
+    __syncthreads();
+    for(int inner=0;inner<8;++inner)
+    {
+      const T left=sa[row+72*inner];
+      #pragma unroll
+      for(int j=0;j<16;++j)sums[j]+=left*sb[inner+16*(column_group+4*j)];
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int j=0;j<16;++j)
+  {
+    const int tile=col0+column_group+4*j;
+    if(tile<tiles)StoreOwnedResponse(tile,row0+row,d,owned,factor,sums[j],x);
+  }
+}
+
+// Standard WMMA only. Four warps each own a 32x32 region (four accumulator
+// fragments) of a 64x64 output tile. Each staged 64x8 A / 8x64 B panel is
+// reused across both M and N warp regions before the CTA advances K.
+// Every warp reaches every barrier; incomplete real-column batches zero-fill.
+__global__ void IGRTensorMultigridOwnedTF32Kernel(int tiles,int d,
+    const int* owned,const float* response,const float* packed,
+    const float* factor,float* x)
+{
+#if __CUDA_ARCH__ >= 800
+  const int t=4*d,s=6*d,m=t*t,k=s*s,tiles_m=m/64;
+  const int row0=64*(blockIdx.x%tiles_m),col0=64*(blockIdx.x/tiles_m);
+  const int warp=threadIdx.x/32;
+  const int warp_row=32*(warp%2),warp_column=32*(warp/2);
+  __shared__ __align__(32) float sa[8*72],sb[64*16],sc[64*72];
+  using namespace nvcuda;
+  wmma::fragment<wmma::accumulator,16,16,8,float> accum[2][2];
+  #pragma unroll
+  for(int i=0;i<2;++i)
+  {
+    #pragma unroll
+    for(int j=0;j<2;++j)wmma::fill_fragment(accum[i][j],0.0f);
+  }
+  for(int k0=0;k0<k;k0+=8)
+  {
+    for(int i=threadIdx.x;i<8*72;i+=128)if(i%72<64)
+      sa[i]=wmma::__float_to_tf32(response[row0+i%72+m*(k0+i/72)]);
+    for(int i=threadIdx.x;i<64*16;i+=128)if(i%16<8)
+    {
+      const int column=col0+i/16;
+      sb[i]=wmma::__float_to_tf32(column<tiles?packed[k0+i%16+k*column]:0.0f);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::col_major> a[2];
+    wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> b[2];
+    #pragma unroll
+    for(int i=0;i<2;++i)wmma::load_matrix_sync(a[i],sa+warp_row+16*i,72);
+    #pragma unroll
+    for(int j=0;j<2;++j)wmma::load_matrix_sync(b[j],sb+16*(warp_column+16*j),16);
+    #pragma unroll
+    for(int i=0;i<2;++i)
+    {
+      #pragma unroll
+      for(int j=0;j<2;++j)wmma::mma_sync(accum[i][j],a[i],b[j],accum[i][j]);
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int i=0;i<2;++i)
+  {
+    #pragma unroll
+    for(int j=0;j<2;++j)
+      wmma::store_matrix_sync(sc+warp_row+16*i+72*(warp_column+16*j),
+          accum[i][j],72,wmma::mem_col_major);
+  }
+  __syncthreads();
+  for(int i=threadIdx.x;i<64*72;i+=128)if(i%72<64)
+  {
+    const int tile=col0+i/72;
+    if(tile<tiles)StoreOwnedResponse(tile,row0+i%72,d,owned,factor,sc[i],x);
+  }
+#else
+  const int t=4*d,m=t*t;
+  for(int row=blockIdx.x*blockDim.x+threadIdx.x;row<tiles*m;row+=gridDim.x*blockDim.x)
+    StoreOwnedResponse(row/m,row%m,d,owned,factor,CUDART_NAN_F,x);
+#endif
+}
+
 void CheckCenterLayout(int ne,int d,int warps,int split_k)
 {
   MFEM_VERIFY(ne>0 && (d==4||d==6) && (warps==1||warps==4) &&
@@ -707,9 +843,10 @@ struct PatchReference
 };
 
 PatchReference Reference(const Stencil& a,int ne,int d,
-    const std::vector<double>* traces=nullptr)
+    const std::vector<double>* traces=nullptr,int patch_elements=3)
 {
-  const int n=d*d,s=3*d,np=s*s;PatchReference result;
+  MFEM_VERIFY(patch_elements==3 || patch_elements==6,"Invalid tensor reference patch width.");
+  const int n=d*d,s=patch_elements*d,np=s*s;PatchReference result;
   std::vector<double> average(5*n*n,0.0);
   for(int slot=0;slot<5;++slot)for(int j=0;j<n;++j)for(int i=0;i<n;++i)
   {
@@ -721,10 +858,11 @@ PatchReference Reference(const Stencil& a,int ne,int d,
     }
   }
   std::vector<double> patch(np*np,0.0);
-  for(int cell=0;cell<9;++cell)for(int slot=0;slot<5;++slot)
+  for(int cell=0;cell<patch_elements*patch_elements;++cell)for(int slot=0;slot<5;++slot)
   {
-    const int x=cell%3,y=cell/3,xx=x+(slot==1?-1:slot==2?1:0),yy=y+(slot==3?-1:slot==4?1:0);
-    if(xx<0||xx>=3||yy<0||yy>=3)continue;
+    const int x=cell%patch_elements,y=cell/patch_elements;
+    const int xx=x+(slot==1?-1:slot==2?1:0),yy=y+(slot==3?-1:slot==4?1:0);
+    if(xx<0||xx>=patch_elements||yy<0||yy>=patch_elements)continue;
     for(int j=0;j<n;++j)for(int i=0;i<n;++i)
     {
       const int row=x*d+i%d+s*(y*d+i/d),col=xx*d+j%d+s*(yy*d+j/d);
@@ -793,14 +931,126 @@ template<typename T> struct Level
   mutable mfem::Array<T> rhs,x,residual,patch_a,patch_b;
 };
 
+void SpectralBLAS(cublasStatus_t status)
+{MFEM_VERIFY(status==CUBLAS_STATUS_SUCCESS,"Spectral cuBLAS status="<<status);}
+void SpectralSolver(cusolverStatus_t status)
+{MFEM_VERIFY(status==CUSOLVER_STATUS_SUCCESS,"Spectral cuSolver status="<<status);}
+
+__global__ void BuildSpectralMatrix(int n,const double* blocks,double* matrix)
+{
+  const int entry=blockIdx.x*blockDim.x+threadIdx.x;if(entry>=n*n)return;
+  const int row=entry%n,col=entry/n,cell=row/6,cells=n/6,neighbor=col/6;
+  const int i=row%6,j=col%6;
+  double value=neighbor==cell?blocks[i+6*j]:0.0;
+  if(neighbor==(cell+cells-1)%cells)value+=blocks[36+i+6*j];
+  if(neighbor==(cell+1)%cells)value+=blocks[72+i+6*j];
+  matrix[entry]=value;
+}
+
+__global__ void CheckSpectralEigenKernel(int n,const double* blocks,
+    const double* q,const double* lambda,double* partial,int* invalid)
+{
+  __shared__ double errors[256],scales[256];double error=0,scale=0;
+  const int cells=n/6;
+  for(long long entry=blockIdx.x*blockDim.x+threadIdx.x;entry<static_cast<long long>(n)*n;
+      entry+=blockDim.x*gridDim.x)
+  {
+    const int row=entry%n,column=entry/n,cell=row/6,i=row%6;
+    double action=0;
+    for(int slot=0;slot<3;++slot)
+    {
+      const int neighbor=slot==0?cell:slot==1?(cell+cells-1)%cells:(cell+1)%cells;
+      for(int j=0;j<6;++j)action+=blocks[slot*36+i+6*j]*q[6*neighbor+j+n*column];
+    }
+    const double value=q[entry],eigenvalue=lambda[column],delta=action-eigenvalue*value;
+    if(!isfinite(value)||!isfinite(eigenvalue)||!isfinite(delta)||
+        (column>0 && eigenvalue<lambda[column-1]))atomicExch(invalid,1);
+    error+=delta*delta;scale+=action*action;
+  }
+  errors[threadIdx.x]=error;scales[threadIdx.x]=scale;__syncthreads();
+  for(int step=128;step;step/=2)
+  {
+    if(threadIdx.x<step){errors[threadIdx.x]+=errors[threadIdx.x+step];scales[threadIdx.x]+=scales[threadIdx.x+step];}
+    __syncthreads();
+  }
+  if(threadIdx.x==0){partial[2*blockIdx.x]=errors[0];partial[2*blockIdx.x+1]=scales[0];}
+}
+
+__global__ void CheckSpectralOrthogonalKernel(int n,const double* gram,double* partial)
+{
+  __shared__ double values[256];double sum=0;
+  for(long long entry=blockIdx.x*blockDim.x+threadIdx.x;entry<static_cast<long long>(n)*n;
+      entry+=blockDim.x*gridDim.x)
+  {
+    const double delta=gram[entry]-(entry%n==entry/n?1.0:0.0);sum+=delta*delta;
+  }
+  values[threadIdx.x]=sum;__syncthreads();
+  for(int step=128;step;step/=2)
+  {if(threadIdx.x<step)values[threadIdx.x]+=values[threadIdx.x+step];__syncthreads();}
+  if(threadIdx.x==0)partial[blockIdx.x]=values[0];
+}
+
+template<typename T> __global__ void SpectralInverseKernel(int nx,int ny,
+    const double* lx,const double* ly,double mean,double mass,T* inverse,int* status)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=nx*ny)return;
+  const double value=lx[row%nx]+ly[row/nx]-mean;
+  if(value<mass)atomicAdd(status+1,1);
+  const T inv=static_cast<T>(1.0/fmax(mass,value));inverse[row]=inv;
+  if(!isfinite(value)||!(inv>0)||!isfinite(inv))atomicExch(status,1);
+}
+
+template<typename T> __global__ void ToSpectralKernel(int nx,int ny,
+    const int* elements,const int* map,const double* nodal,const double* x,
+    const int* exponent,T* result)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=nx*ny)return;
+  if(*exponent==INT_MAX){result[row]=static_cast<T>(CUDART_NAN);return;}
+  const int gx=row%nx,gy=row/nx,e=elements[gx/6+(nx/6)*(gy/6)],i=gx%6+6*(gy%6);
+  double sum=0;
+  for(int j=0;j<36;++j)sum+=nodal[j+36*i]*scalbn(x[map[36*e+j]],-*exponent);
+  result[row]=static_cast<T>(sum);
+}
+
+template<typename T> __global__ void FromSpectralKernel(int nx,int ny,
+    const int* elements,const int* map,const double* nodal,const T* x,
+    const int* exponent,double scale,double* result)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=nx*ny)return;
+  const int gx=row%nx,gy=row/nx,cx=gx/6,cy=gy/6,e=elements[cx+(nx/6)*cy],i=gx%6+6*(gy%6);
+  if(*exponent==INT_MAX){result[map[36*e+i]]=CUDART_NAN;return;}
+  double sum=0;
+  for(int j=0;j<36;++j)sum+=nodal[i+36*j]*static_cast<double>(x[6*cx+j%6+nx*(6*cy+j/6)]);
+  result[map[36*e+i]]=scalbn(sum/scale,*exponent);
+}
+
+template<typename T> __global__ void ScaleSpectralKernel(int n,const T* inverse,T* x)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row<n)x[row]*=inverse[row];
+}
+
+__global__ void SplitSpectralTF32Kernel(int n,const float* source,float* hi,float* lo)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=n)return;
+#if __CUDA_ARCH__ >= 800
+  const float value=source[row];
+  const float high=nvcuda::wmma::__float_to_tf32(value);
+  hi[row]=high;lo[row]=isfinite(value)?value-high:CUDART_NAN_F;
+#else
+  hi[row]=lo[row]=CUDART_NAN_F;
+#endif
+}
+
 template<typename T> class TensorMultigrid final:public mfem::Solver
 {
 public:
   TensorMultigrid(const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,
       TensorMultigridPrecision precision,TensorMultigridSmoother smoother,
-      int center_warps,int center_split_k,TensorMultigridOperator operator_mode)
+      int center_warps,int center_split_k,TensorMultigridOperator operator_mode,int owned_tile,
+      TensorMultigridResidual residual_mode)
     :mfem::Solver(op.Height()),ne_(sfes.GetNE()),precision_(precision),smoother_(smoother),
-     operator_mode_(operator_mode),center_warps_(center_warps),center_split_k_(center_split_k)
+     operator_mode_(operator_mode),residual_mode_(residual_mode),
+     center_warps_(center_warps),center_split_k_(center_split_k),owned_tile_(owned_tile)
   {
     const auto start=std::chrono::steady_clock::now();
     CheckCenterLayout(ne_,6,center_warps_,center_split_k_);
@@ -814,11 +1064,25 @@ public:
     if(precision_==TensorMultigridPrecision::TF32)
     {MFEM_VERIFY(prop.major>=8,"Tensor MG TF32 requires nativeSM80+.");}
     const bool shared=operator_mode_==TensorMultigridOperator::Shared;
-    const auto topology=SharedPatchTopology(sfes);const auto patch=PatchMap(topology);
+    const auto topology=SharedPatchTopology(sfes);
     if(shared)CheckTranslationTopology(topology);
-    neighbors_.SetSize(ne_*5);patches_.SetSize(ne_*9);
+    neighbors_.SetSize(ne_*5);
     for(int e=0;e<ne_;++e)for(int s=0;s<5;++s)neighbors_[5*e+s]=topology[e][s];
-    std::copy(patch.begin(),patch.end(),patches_.HostWrite());
+    if(owned_tile_==4)
+    {
+      const auto layout=BuildTensorOwnedPatchMap(topology);
+      owned_tiles_=ne_/16;owned_nx_=layout.nx;owned_ny_=layout.ny;
+      MFEM_VERIFY(TensorOwnedLayoutValid(owned_tiles_,ne_,6),"Owned tensor multigrid layout exceeds integer bounds.");
+      owned_inputs_.SetSize(static_cast<int>(layout.input.size()));
+      owned_outputs_.SetSize(static_cast<int>(layout.owned.size()));
+      std::copy(layout.input.begin(),layout.input.end(),owned_inputs_.HostWrite());
+      std::copy(layout.owned.begin(),layout.owned.end(),owned_outputs_.HostWrite());
+    }
+    else
+    {
+      const auto patch=PatchMap(topology);patches_.SetSize(ne_*9);
+      std::copy(patch.begin(),patch.end(),patches_.HostWrite());
+    }
     std::vector<int> map;std::vector<double> nodal;int probes=0,colors=0;
     SharedSnapshotData reference;Stencil fine;
     if(shared)
@@ -853,18 +1117,20 @@ public:
       if(l<2)
       {
         if(shared)for(double& value:reference.traces[l])value/=operator_scale_;
-        const auto ref=Reference(matrices[l],ne_,level.d,shared?&reference.traces[l]:nullptr);
+        const auto ref=Reference(matrices[l],ne_,level.d,shared?&reference.traces[l]:nullptr,
+            owned_tile_==4?6:3);
         Store(level.scale,ref.scales);
-        const int size=ne_*9*n;level.patch_a.SetSize(size);
+        const int size=owned_tile_==4?owned_tiles_*36*n:ne_*9*n;level.patch_a.SetSize(size);
         if(smoother_==TensorMultigridSmoother::Center)
         {
           const auto center_start=std::chrono::steady_clock::now();
-          const auto response=ComposeTensorCenterResponse(level.d,ref.forward_x,ref.forward_y,
-              ref.back_x,ref.back_y,ref.inverse);
+          const auto response=owned_tile_==4?
+            ComposeTensorOwnedResponse(level.d,ref.forward_x,ref.forward_y,ref.back_x,ref.back_y,ref.inverse):
+            ComposeTensorCenterResponse(level.d,ref.forward_x,ref.forward_y,ref.back_x,ref.back_y,ref.inverse);
           Store(level.center_response,response);
           center_setup_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-center_start).count();
           center_bytes+=response.size()*sizeof(T);
-          level.patch_b.SetSize(center_split_k_*ne_*n);
+          if(owned_tile_==1)level.patch_b.SetSize(center_split_k_*ne_*n);
         }
         else
         {
@@ -921,18 +1187,26 @@ public:
     coarse_solver_->SetPrintLevel(0);coarse_solver_->iterative_mode=false;
     coarse_rhs_.SetSize(4*ne_);coarse_x_.SetSize(4*ne_);coarse_rhs_.UseDevice(true);coarse_x_.UseDevice(true);
     norm_blocks_=std::min(4096,(height+255)/256);norm_partial_.SetSize(norm_blocks_);norm_partial_.UseDevice(true);exponent_.SetSize(1);
-    (void)neighbors_.Read();(void)patches_.Read();(void)element_map_.Read();(void)nodal_.Read();
+    (void)neighbors_.Read();
+    if(owned_tile_==4){(void)owned_inputs_.Read();(void)owned_outputs_.Read();}
+    else (void)patches_.Read();
+    (void)element_map_.Read();(void)nodal_.Read();
     CUDA(cudaDeviceSynchronize());
     const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     std::cout<<"[igr-tensor-mg] event=setup precision="<<Name(precision_)<<" hierarchy=5,3,1 cycle=multiplicative-v"
-      <<" pre_sweeps=1 post_sweeps=1 smoother="<<SmootherName(smoother_)<<" damping=0.8"
+      <<" pre_sweeps=1 post_sweeps=1 smoother="<<SmootherName(smoother_,owned_tile_)<<" damping=0.8"
       <<" operator="<<OperatorName(operator_mode_)
+      <<" owned_tile="<<owned_tile_
+      <<" residual_precision_policy="<<ResidualPolicyName(residual_mode_)
+      <<" residual_arithmetic="<<(precision_==TensorMultigridPrecision::FP64?"fp64-simt":
+          shared && precision_==TensorMultigridPrecision::TF32 && residual_mode_==TensorMultigridResidual::Auto?
+            "tf32-wmma":"fp32-simt")
       <<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
       <<" elements="<<ne_<<" n="<<height<<" coarse_n="<<4*ne_<<" coarse_precision=fp64 coarse_rtol=0.01 coarse_maxiter=100"
       <<" coarse_backend=cuda-fp64 coarse_execution="<<(cooperative_?"cooperative":"host-polled")
       <<" vectors="<<(std::is_same<T,double>::value?"fp64":"fp32")
-      <<" real_columns_p5="<<(smoother_==TensorMultigridSmoother::Center?ne_:18*ne_)
-      <<" real_columns_p3="<<(smoother_==TensorMultigridSmoother::Center?ne_:12*ne_)
+      <<" real_columns_p5="<<(owned_tile_==4?owned_tiles_:smoother_==TensorMultigridSmoother::Center?ne_:18*ne_)
+      <<" real_columns_p3="<<(owned_tile_==4?owned_tiles_:smoother_==TensorMultigridSmoother::Center?ne_:12*ne_)
       <<" operator_probes="<<probes<<" colors="<<colors
       <<" center_map_bytes="<<center_bytes<<" patch_workspace_bytes="<<patch_bytes
       <<" center_setup_seconds="<<center_setup_seconds
@@ -941,6 +1215,10 @@ public:
       <<" original_galerkin_check=not-applicable reference_model=translation-averaged-frozen-coefficients"
       <<" reference_diagonal_scaling=per-element-trace residual_pack=direct-gather residual_restrict=fused";
     else std::cout<<" probe_rel="<<probe_error;
+    if(owned_tile_==4)std::cout<<" owned_tiles="<<owned_tiles_<<" owned_nx="<<owned_nx_<<" owned_ny="<<owned_ny_
+      <<" owned_input_elements=36 owned_output_elements=16 owned_halo=1"
+      <<" owned_matrix_m_p5=576 owned_matrix_k_p5=1296 owned_matrix_m_p3=256 owned_matrix_k_p3=576"
+      <<" owned_output_cta=64x64 owned_tf32_warps=4 owned_simt_threads=256 owned_scatter=fused owned_split_k=1";
     std::cout<<" separable_reference_rel="<<separable_error<<" eigen_residual="<<eigen_error<<" clipped_eigenvalues="<<clipped
       <<" setup_seconds="<<seconds<<" frozen_operator="<<(shared?"shared-reference-approximate":"sampled-original-galerkin")
       <<" alpha=inherited-fine"
@@ -949,8 +1227,10 @@ public:
   ~TensorMultigrid() override
   {
     std::cout<<"[igr-tensor-mg] event=summary precision="<<Name(precision_)<<" applications="<<applications_
-      <<" smoother="<<SmootherName(smoother_)<<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
+      <<" smoother="<<SmootherName(smoother_,owned_tile_)<<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
       <<" operator="<<OperatorName(operator_mode_)
+      <<" owned_tile="<<owned_tile_<<" owned_submissions="<<owned_submissions_
+      <<" residual_precision_policy="<<ResidualPolicyName(residual_mode_)
       <<" coarse_iterations="<<coarse_iterations_<<" coarse_failures="<<coarse_failures_<<" coarse_cap_hits="<<coarse_cap_hits_
       <<" transform_submissions="<<transforms_<<" center_submissions="<<centers_
       <<" center_pack_submissions="<<center_packs_<<" center_add_submissions="<<center_adds_
@@ -985,6 +1265,18 @@ private:
   }
   void Smooth(int l,const mfem::Array<T>& r) const
   {
+    if(owned_tile_==4)
+    {
+      const auto& v=levels_[l];const int size=owned_tiles_*36*v.d*v.d;
+      PackOwnedPatch<<<(size+255)/256,256>>>(owned_tiles_,v.d,owned_inputs_.Read(),r.Read(),v.patch_a.Write());
+      if constexpr(std::is_same<T,float>::value)
+        ApplyTensorOwnedResponse(owned_tiles_,ne_,v.d,owned_outputs_.Read(),v.center_response.Read(),
+            v.patch_a.Read(),v.scale.Read(),v.x.ReadWrite(),precision_==TensorMultigridPrecision::TF32);
+      else
+        ApplyTensorOwnedResponse(owned_tiles_,ne_,v.d,owned_outputs_.Read(),v.center_response.Read(),
+            v.patch_a.Read(),v.scale.Read(),v.x.ReadWrite());
+      ++owned_submissions_;return;
+    }
     const auto& v=levels_[l];const int d=v.d,s=3*d,size=ne_*s*s;
     PackPatch<<<(size+255)/256,256>>>(ne_,d,patches_.Read(),r.Read(),v.patch_a.Write());
     if(smoother_==TensorMultigridSmoother::Center)
@@ -1014,7 +1306,8 @@ private:
     T* out=restrict_rows?levels_[l+1].rhs.Write():v.residual.Write();
     if constexpr(std::is_same<T,float>::value)
       ApplyTensorSharedResidual(ne_,v.d,neighbors_.Read(),v.a.Read(),v.rhs.Read(),
-          v.x.Read(),out,precision_==TensorMultigridPrecision::TF32,restricted_d);
+          v.x.Read(),out,precision_==TensorMultigridPrecision::TF32 &&
+            residual_mode_==TensorMultigridResidual::Auto,restricted_d);
     else
       ApplyTensorSharedResidual(ne_,v.d,neighbors_.Read(),v.a.Read(),v.rhs.Read(),
           v.x.Read(),out,restricted_d);
@@ -1062,9 +1355,11 @@ private:
   }
   int ne_,norm_blocks_=0;TensorMultigridPrecision precision_;TensorMultigridSmoother smoother_;
   TensorMultigridOperator operator_mode_;
-  int center_warps_,center_split_k_;double operator_scale_=1;
+  TensorMultigridResidual residual_mode_;
+  int center_warps_,center_split_k_,owned_tile_,owned_tiles_=0,owned_nx_=0,owned_ny_=0;
+  double operator_scale_=1;
   std::array<Level<T>,3> levels_;
-  mfem::Array<int> neighbors_,patches_,element_map_,essential_;
+  mfem::Array<int> neighbors_,patches_,owned_inputs_,owned_outputs_,element_map_,essential_;
   mfem::Vector nodal_;
   mutable mfem::Array<int> exponent_;
   mutable mfem::Vector norm_partial_,coarse_rhs_,coarse_x_;
@@ -1075,8 +1370,266 @@ private:
   mutable unsigned long long applications_=0,coarse_iterations_=0,coarse_failures_=0,coarse_cap_hits_=0,transforms_=0;
   mutable unsigned long long centers_=0,center_packs_=0,center_adds_=0;
   mutable unsigned long long shared_residuals_=0,shared_restricted_residuals_=0;
+  mutable unsigned long long owned_submissions_=0;
+};
+
+template<typename T> class TensorSpectral final:public mfem::Solver
+{
+public:
+  TensorSpectral(const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,
+      TensorMultigridPrecision precision)
+    :mfem::Solver(op.Height()),precision_(precision)
+  {
+    const auto start=std::chrono::steady_clock::now();int ranks=0;
+    MPI_Comm_size(sfes.GetComm(),&ranks);
+    MFEM_VERIFY(ranks==1 && mfem::Device::Allows(mfem::Backend::CUDA) &&
+        dynamic_cast<const mfem::L2_FECollection*>(sfes.FEColl()) && sfes.GetVDim()==1 &&
+        sfes.GetMesh()->Dimension()==2 && op.Width()==height && sfes.GetVSize()==height &&
+        sfes.GetTrueVSize()==height && std::size_t(sfes.GetNE())*36==std::size_t(height),
+        "Spectral tensor inverse requires rank-one CUDA scalar p5 nodal L2.");
+    int device=0;cudaDeviceProp properties{};
+    CUDA(cudaGetDevice(&device));CUDA(cudaGetDeviceProperties(&properties,device));
+    if(precision_==TensorMultigridPrecision::TF32 || precision_==TensorMultigridPrecision::TF32x3)
+    {
+      MFEM_VERIFY(properties.major>=8,"Spectral TF32 requires native SM80+.");
+      const char* override_value=std::getenv("NVIDIA_TF32_OVERRIDE");
+      MFEM_VERIFY(!override_value || std::string(override_value)!="0",
+                  "NVIDIA_TF32_OVERRIDE=0 disables the requested spectral TF32 execution.");
+    }
+    const auto topology=SharedPatchTopology(sfes);CheckTranslationTopology(topology);
+    const auto coordinates=BuildTensorSpectralTopology(topology);
+    MFEM_VERIFY(TensorSpectralLayoutValid(coordinates.nx,coordinates.ny),
+                "Spectral dimensions exceed cuSolver/int matrix bounds.");
+    nx_=6*coordinates.nx;ny_=6*coordinates.ny;
+    MFEM_VERIFY(std::size_t(nx_)*ny_==std::size_t(height),"Spectral Cartesian field size mismatch.");
+    const std::size_t matrices=std::size_t(nx_)*nx_+std::size_t(ny_)*ny_;
+    const std::size_t fields=std::size_t(height)*(precision_==TensorMultigridPrecision::TF32x3?5:3);
+    std::size_t free_bytes=0,total_bytes=0;CUDA(cudaMemGetInfo(&free_bytes,&total_bytes));
+    const std::size_t map_bytes=(std::size_t(height)+sfes.GetNE())*sizeof(int)+
+        (std::size_t(36*36)+4096)*sizeof(double)+sizeof(int);
+    MFEM_VERIFY((matrices*(precision_==TensorMultigridPrecision::TF32x3?2:1)+fields)*sizeof(T)+map_bytes<free_bytes,
+                "Spectral persistent basis/field storage exceeds free device memory.");
+    mfem::Array<int> neighbors(5*sfes.GetNE());
+    int* neighbor=neighbors.HostWrite();
+    for(int e=0;e<sfes.GetNE();++e)for(int s=0;s<5;++s)neighbor[5*e+s]=topology[e][s];
+    std::vector<int> map;std::vector<double> nodal;int probes=0,colors=0;
+    auto sampled=SharedSnapshot(op,sfes,topology,neighbors,map,nodal,probes,colors);
+    operator_scale_=sampled.maximum_diagonal;
+    MFEM_VERIFY(operator_scale_>0 && std::isfinite(operator_scale_),"Invalid spectral operator scale.");
+    for(double& value:sampled.average)value/=operator_scale_;
+    const auto reference=BuildTensorSpectralReference(sampled.average);
+    elements_.SetSize(sfes.GetNE());element_map_.SetSize(height);
+    std::copy(coordinates.elements.begin(),coordinates.elements.end(),elements_.HostWrite());
+    std::copy(map.begin(),map.end(),element_map_.HostWrite());
+    Store(nodal_,nodal);
+    SpectralBLAS(cublasCreate(&blas_));SpectralBLAS(cublasSetStream(blas_,nullptr));
+    SpectralBLAS(cublasSetPointerMode(blas_,CUBLAS_POINTER_MODE_HOST));
+    SpectralBLAS(cublasSetMathMode(blas_,precision_==TensorMultigridPrecision::FP64 ||
+        precision_==TensorMultigridPrecision::FP32?CUBLAS_PEDANTIC_MATH:CUBLAS_DEFAULT_MATH));
+    SpectralSolver(cusolverDnCreate(&solver_));SpectralSolver(cusolverDnSetStream(solver_,nullptr));
+    mfem::Array<double> lambda_x,lambda_y;
+    Eigensystem(reference.x,nx_,qx_,lambda_x);
+    Eigensystem(reference.y,ny_,qy_,lambda_y);
+    const double* lx=lambda_x.HostRead();const double* ly=lambda_y.HostRead();
+    const double raw_min=lx[0]+ly[0]-reference.mean;
+    const double raw_max=lx[nx_-1]+ly[ny_-1]-reference.mean;
+    const double eigen_scale=std::max({reference.mass,std::abs(reference.mean)+
+        std::abs(lx[0])+std::abs(ly[0]),std::abs(reference.mean)+std::abs(lx[nx_-1])+std::abs(ly[ny_-1])});
+    const double screen_roundoff=256*std::numeric_limits<double>::epsilon()*std::max(nx_,ny_)*eigen_scale;
+    MFEM_VERIFY(std::isfinite(raw_min) && std::isfinite(raw_max) && raw_min>0 && raw_max>=raw_min &&
+        std::isfinite(screen_roundoff) && raw_min>=reference.mass-screen_roundoff,
+        "Spectral reference loses positive screening: min="<<raw_min<<" mass="<<reference.mass
+          <<" roundoff="<<screen_roundoff);
+    inverse_.SetSize(height);mfem::Array<int> inverse_status(2);
+    CUDA(cudaMemsetAsync(inverse_status.Write(),0,2*sizeof(int)));
+    SpectralInverseKernel<<<(height+255)/256,256>>>(nx_,ny_,lambda_x.Read(),lambda_y.Read(),
+        reference.mean,reference.mass,inverse_.Write(),inverse_status.ReadWrite());
+    CUDA(cudaGetLastError());const int* status=inverse_status.HostRead();
+    MFEM_VERIFY(status[0]==0,"Spectral inverse denominator or selected storage is nonfinite/nonpositive.");
+    const int clipped=status[1];
+    if constexpr(std::is_same<T,float>::value)
+    {
+      if(precision_==TensorMultigridPrecision::TF32x3)
+      {
+        qx_low_.SetSize(qx_.Size());qy_low_.SetSize(qy_.Size());
+        float* qx=qx_.ReadWrite();float* qy=qy_.ReadWrite();
+        SplitSpectralTF32Kernel<<<(qx_.Size()+255)/256,256>>>(qx_.Size(),qx,qx,qx_low_.Write());
+        SplitSpectralTF32Kernel<<<(qy_.Size()+255)/256,256>>>(qy_.Size(),qy,qy,qy_low_.Write());
+        high_.SetSize(height);low_.SetSize(height);
+        (void)high_.Write();(void)low_.Write();
+      }
+    }
+    field_.SetSize(height);temporary_.SetSize(height);
+    (void)field_.Write();(void)temporary_.Write();
+    norm_blocks_=std::min(4096,(height+255)/256);
+    norm_partial_.SetSize(norm_blocks_);norm_partial_.UseDevice(true);exponent_.SetSize(1);
+    (void)norm_partial_.Write();(void)exponent_.Write();(void)elements_.Read();(void)element_map_.Read();
+    CUDA(cudaDeviceSynchronize());
+    const std::size_t basis_bytes=(std::size_t(qx_.Size())+qy_.Size()+qx_low_.Size()+qy_low_.Size())*sizeof(T);
+    const std::size_t field_bytes=(std::size_t(field_.Size())+temporary_.Size()+inverse_.Size()+high_.Size()+low_.Size())*sizeof(T);
+    std::cout<<"[igr-tensor-spectral] event=setup precision="<<Name(precision_)
+      <<" operator=spectral cycle=global-reference-inverse coarse_execution=none"
+      <<" elements="<<sfes.GetNE()<<" n="<<height<<" cells_x="<<coordinates.nx<<" cells_y="<<coordinates.ny
+      <<" matrix_rows="<<nx_<<" matrix_columns="<<ny_<<" operator_probes="<<probes<<" colors="<<colors
+      <<" basis_bytes="<<basis_bytes<<" field_workspace_bytes="<<field_bytes
+      <<" eigen_workspace_bound_bytes="<<eigen_workspace_peak_bytes_
+      <<" shared_symmetry_rel="<<sampled.symmetry_error<<" separable_reference_rel="<<reference.relative_defect
+      <<" eigen_residual="<<eigen_error_<<" eigen_orthogonality="<<orthogonal_error_
+      <<" screen_mass="<<reference.mass<<" spectral_mean="<<reference.mean
+      <<" raw_eigen_min="<<raw_min<<" raw_eigen_max="<<raw_max
+      <<" screen_roundoff_tolerance="<<screen_roundoff<<" inverse_floor=screen-mass-roundoff-only clipped_eigenvalues="<<clipped
+      <<" basis_setup=fp64-cusolver-dsyevd basis_orthogonal_check_gemms=2"
+      <<" gemms_per_application="<<(precision_==TensorMultigridPrecision::TF32x3?12:4)
+      <<" gemm_compute="<<(precision_==TensorMultigridPrecision::FP64?"fp64":
+          precision_==TensorMultigridPrecision::FP32?"fp32-pedantic":"tf32-explicit")
+      <<" low_low_term="<<(precision_==TensorMultigridPrecision::TF32x3?"omitted":"not-applicable")
+      <<" alpha=inherited-fine acceptance=original-current-fp64 fallback=none"
+      <<" tensor_execution="<<(precision_==TensorMultigridPrecision::TF32 || precision_==TensorMultigridPrecision::TF32x3?
+          "requires-profile-proof":"none")
+      <<" setup_seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<'\n';
+  }
+  ~TensorSpectral() override
+  {
+    if(solver_)SpectralSolver(cusolverDnDestroy(solver_));
+    if(blas_)SpectralBLAS(cublasDestroy(blas_));
+    std::cout<<"[igr-tensor-spectral] event=summary precision="<<Name(precision_)
+      <<" applications="<<applications_<<" basis_products="<<4*applications_<<" gemm_calls="<<gemm_calls_
+      <<" cycle=global-reference-inverse coarse_execution=none fallback=none\n";
+  }
+  void SetOperator(const mfem::Operator& op) override
+  {MFEM_VERIFY(op.Height()==height && op.Width()==width,"Spectral frozen reference dimensions changed; rebuild required.");}
+  mfem::MemoryClass GetMemoryClass() const override{return mfem::MemoryClass::DEVICE;}
+  void Mult(const mfem::Vector& b,mfem::Vector& x) const override
+  {
+    MFEM_VERIFY(b.Size()==height && &b!=&x,"Invalid/aliased spectral input.");
+    x.SetSize(height);x.UseDevice(true);
+    InputMaximum<<<norm_blocks_,256>>>(height,b.Read(),norm_partial_.Write());
+    InputExponent<<<1,1>>>(norm_blocks_,norm_partial_.Read(),exponent_.Write());
+    ToSpectralKernel<<<(height+255)/256,256>>>(nx_,ny_,elements_.Read(),element_map_.Read(),
+        nodal_.Read(),b.Read(),exponent_.Read(),field_.Write());
+    Product(true,true,qx_,qx_low_,field_,temporary_);
+    Product(false,false,qy_,qy_low_,temporary_,field_);
+    ScaleSpectralKernel<<<(height+255)/256,256>>>(height,inverse_.Read(),field_.ReadWrite());
+    Product(true,false,qx_,qx_low_,field_,temporary_);
+    Product(false,true,qy_,qy_low_,temporary_,field_);
+    FromSpectralKernel<<<(height+255)/256,256>>>(nx_,ny_,elements_.Read(),element_map_.Read(),
+        nodal_.Read(),field_.Read(),exponent_.Read(),operator_scale_,x.Write());
+    CUDA(cudaGetLastError());++applications_;
+  }
+private:
+  void Eigensystem(const std::vector<double>& host_blocks,int n,mfem::Array<T>& q,
+      mfem::Array<double>& lambda)
+  {
+    const int square=n*n;std::size_t available=0,total=0;
+    CUDA(cudaMemGetInfo(&available,&total));
+    MFEM_VERIFY(std::size_t(square)*(2*sizeof(double)+sizeof(T))<available,
+                "Spectral eigensystem basis/validation storage exceeds free device memory.");
+    mfem::Array<double> blocks,matrix(square);Store(blocks,host_blocks);lambda.SetSize(n);
+    BuildSpectralMatrix<<<(square+255)/256,256>>>(n,blocks.Read(),matrix.Write());
+    CUDA(cudaGetLastError());
+    int workspace=0;
+    SpectralSolver(cusolverDnDsyevd_bufferSize(solver_,CUSOLVER_EIG_MODE_VECTOR,CUBLAS_FILL_MODE_LOWER,
+        n,matrix.ReadWrite(),n,lambda.Write(),&workspace));
+    MFEM_VERIFY(workspace>0,"Invalid spectral cuSolver workspace size.");
+    CUDA(cudaMemGetInfo(&available,&total));
+    const std::size_t needed=std::size_t(workspace)*sizeof(double)+std::size_t(square)*(sizeof(double)+sizeof(T));
+    MFEM_VERIFY(needed<available,"Spectral cuSolver workspace exceeds free device memory.");
+    eigen_workspace_peak_bytes_=std::max(eigen_workspace_peak_bytes_,needed+std::size_t(square)*sizeof(double));
+    {
+      mfem::Array<double> work(workspace);mfem::Array<int> info(1);
+      SpectralSolver(cusolverDnDsyevd(solver_,CUSOLVER_EIG_MODE_VECTOR,CUBLAS_FILL_MODE_LOWER,
+          n,matrix.ReadWrite(),n,lambda.Write(),work.Write(),workspace,info.Write()));
+      MFEM_VERIFY(info.HostRead()[0]==0,"Spectral cuSolver eigensystem did not converge.");
+    }
+    const int groups=std::min(4096,(square+255)/256);
+    mfem::Array<double> partial(2*groups),gram(square);mfem::Array<int> invalid(1);
+    CUDA(cudaMemsetAsync(invalid.Write(),0,sizeof(int)));
+    CheckSpectralEigenKernel<<<groups,256>>>(n,blocks.Read(),matrix.Read(),lambda.Read(),partial.Write(),invalid.ReadWrite());
+    CUDA(cudaGetLastError());
+    MFEM_VERIFY(invalid.HostRead()[0]==0,"Spectral eigensystem contains a nonfinite value or unordered eigenvalue.");
+    const double* residual=partial.HostRead();double error=0,scale=0;
+    for(int i=0;i<groups;++i){error+=residual[2*i];scale+=residual[2*i+1];}
+    const double eigen=std::sqrt(error/std::max(scale,1e-300));
+    MFEM_VERIFY(scale>0 && std::isfinite(eigen) && eigen<1e-10,"Spectral eigen residual failed: "<<eigen);
+    const double one=1,zero=0;
+    SpectralBLAS(cublasDgemm(blas_,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,&one,matrix.Read(),n,
+        matrix.Read(),n,&zero,gram.Write(),n));
+    CheckSpectralOrthogonalKernel<<<groups,256>>>(n,gram.Read(),partial.Write());
+    CUDA(cudaGetLastError());
+    const double* orthogonal=partial.HostRead();double orthogonal_sum=0;
+    for(int i=0;i<groups;++i)orthogonal_sum+=orthogonal[i];
+    const double orthogonal_norm=std::sqrt(orthogonal_sum/n);
+    MFEM_VERIFY(std::isfinite(orthogonal_norm) && orthogonal_norm<1e-10,
+                "Spectral basis orthogonality failed: "<<orthogonal_norm);
+    eigen_error_=std::max(eigen_error_,eigen);orthogonal_error_=std::max(orthogonal_error_,orthogonal_norm);
+    q.SetSize(square);Convert<<<(square+255)/256,256>>>(square,matrix.Read(),q.Write());
+    CUDA(cudaGetLastError());
+  }
+  void FloatProduct(bool left,bool transpose,const float* q,const float* source,
+      float* target,float beta,cublasComputeType_t compute) const
+  {
+    const float one=1;
+    SpectralBLAS(cublasGemmEx(blas_,left && transpose?CUBLAS_OP_T:CUBLAS_OP_N,
+        !left && transpose?CUBLAS_OP_T:CUBLAS_OP_N,nx_,ny_,left?nx_:ny_,&one,
+        left?q:source,CUDA_R_32F,nx_,left?source:q,CUDA_R_32F,left?nx_:ny_,&beta,
+        target,CUDA_R_32F,nx_,compute,CUBLAS_GEMM_DEFAULT));
+    ++gemm_calls_;
+  }
+  void Product(bool left,bool transpose,const mfem::Array<T>& q,const mfem::Array<T>& q_low,
+      const mfem::Array<T>& source,mfem::Array<T>& target) const
+  {
+    if constexpr(std::is_same<T,double>::value)
+    {
+      const double one=1,zero=0;
+      SpectralBLAS(cublasDgemm(blas_,left && transpose?CUBLAS_OP_T:CUBLAS_OP_N,
+          !left && transpose?CUBLAS_OP_T:CUBLAS_OP_N,nx_,ny_,left?nx_:ny_,&one,
+          left?q.Read():source.Read(),nx_,left?source.Read():q.Read(),left?nx_:ny_,&zero,target.Write(),nx_));
+      ++gemm_calls_;
+    }
+    else if(precision_==TensorMultigridPrecision::TF32x3)
+    {
+      SplitSpectralTF32Kernel<<<(height+255)/256,256>>>(height,source.Read(),high_.Write(),low_.Write());
+      FloatProduct(left,transpose,q.Read(),high_.Read(),target.Write(),0,CUBLAS_COMPUTE_32F_FAST_TF32);
+      FloatProduct(left,transpose,q.Read(),low_.Read(),target.ReadWrite(),1,CUBLAS_COMPUTE_32F_FAST_TF32);
+      FloatProduct(left,transpose,q_low.Read(),high_.Read(),target.ReadWrite(),1,CUBLAS_COMPUTE_32F_FAST_TF32);
+    }
+    else FloatProduct(left,transpose,q.Read(),source.Read(),target.Write(),0,
+        precision_==TensorMultigridPrecision::FP32?CUBLAS_COMPUTE_32F_PEDANTIC:CUBLAS_COMPUTE_32F_FAST_TF32);
+  }
+  int nx_=0,ny_=0,norm_blocks_=0;TensorMultigridPrecision precision_;
+  double operator_scale_=1,eigen_error_=0,orthogonal_error_=0;
+  std::size_t eigen_workspace_peak_bytes_=0;
+  cublasHandle_t blas_=nullptr;cusolverDnHandle_t solver_=nullptr;
+  mfem::Array<int> elements_,element_map_;
+  mfem::Array<double> nodal_;
+  mfem::Array<T> qx_,qy_,qx_low_,qy_low_,inverse_;
+  mutable mfem::Array<T> field_,temporary_,high_,low_;
+  mutable mfem::Vector norm_partial_;
+  mutable mfem::Array<int> exponent_;
+  mutable unsigned long long applications_=0,gemm_calls_=0;
 };
 } // namespace
+
+void ApplyTensorOwnedResponse(int tiles,int ne,int d,const int* owned,
+    const double* response,const double* packed,const double* factor,double* x)
+{
+  MFEM_VERIFY(TensorOwnedLayoutValid(tiles,ne,d) && owned && response && packed && factor && x &&
+      x!=response && x!=packed && x!=factor,"Invalid owned tensor response layout/storage.");
+  const int m=16*d*d,blocks=(m/64)*((tiles+63)/64);
+  IGRTensorMultigridOwnedSIMTKernel<<<blocks,256>>>(tiles,d,owned,response,packed,factor,x);
+  CUDA(cudaGetLastError());
+}
+
+void ApplyTensorOwnedResponse(int tiles,int ne,int d,const int* owned,
+    const float* response,const float* packed,const float* factor,float* x,bool tf32)
+{
+  MFEM_VERIFY(TensorOwnedLayoutValid(tiles,ne,d) && owned && response && packed && factor && x &&
+      x!=response && x!=packed && x!=factor,"Invalid owned tensor response layout/storage.");
+  const int m=16*d*d,blocks=(m/64)*((tiles+63)/64);
+  if(tf32)IGRTensorMultigridOwnedTF32Kernel<<<blocks,128>>>(tiles,d,owned,response,packed,factor,x);
+  else IGRTensorMultigridOwnedSIMTKernel<<<blocks,256>>>(tiles,d,owned,response,packed,factor,x);
+  CUDA(cudaGetLastError());
+}
 
 void ApplyTensorSharedResidual(int ne,int d,const int* neighbors,
     const double* stencil,const double* rhs,const double* x,double* residual,
@@ -1163,8 +1716,27 @@ void AddTensorCenterResponse(int ne,int d,const float* factor,
 std::unique_ptr<mfem::Solver> MakeTensorMultigridPreconditioner(
     const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,TensorMultigridPrecision precision,
     TensorMultigridSmoother smoother,int center_warps,int center_split_k,
-    TensorMultigridOperator operator_mode)
+    TensorMultigridOperator operator_mode,int owned_tile,TensorMultigridResidual residual_mode)
 {
+  if(operator_mode==TensorMultigridOperator::Spectral)
+  {
+    MFEM_VERIFY(smoother==TensorMultigridSmoother::Separable && center_warps==1 &&
+        center_split_k==1 && owned_tile==1 && residual_mode==TensorMultigridResidual::Auto,
+        "Spectral tensor inverse requires default MG-only smoother/layout/residual controls.");
+    if(precision==TensorMultigridPrecision::FP64)
+      return std::make_unique<TensorSpectral<double>>(op,sfes,precision);
+    MFEM_VERIFY(precision==TensorMultigridPrecision::FP32 || precision==TensorMultigridPrecision::TF32 ||
+        precision==TensorMultigridPrecision::TF32x3,"Invalid spectral tensor precision.");
+    return std::make_unique<TensorSpectral<float>>(op,sfes,precision);
+  }
+  MFEM_VERIFY((residual_mode==TensorMultigridResidual::Auto || residual_mode==TensorMultigridResidual::FP32) &&
+      (residual_mode==TensorMultigridResidual::Auto ||
+        (operator_mode==TensorMultigridOperator::Shared && precision==TensorMultigridPrecision::TF32)),
+      "Tensor MG FP32 residual placement requires shared TF32 multigrid.");
+  MFEM_VERIFY((owned_tile==1 || owned_tile==4) &&
+      (owned_tile==1 || (operator_mode==TensorMultigridOperator::Shared &&
+        smoother==TensorMultigridSmoother::Center && center_warps==1 && center_split_k==1)),
+      "Tensor MG owned_tile=4 requires shared operator, center smoother and default center layout controls.");
   MFEM_VERIFY(operator_mode==TensorMultigridOperator::Sampled||operator_mode==TensorMultigridOperator::Shared,
               "Invalid tensor MG operator mode.");
   MFEM_VERIFY(smoother==TensorMultigridSmoother::Separable||smoother==TensorMultigridSmoother::Center,
@@ -1173,8 +1745,9 @@ std::unique_ptr<mfem::Solver> MakeTensorMultigridPreconditioner(
   MFEM_VERIFY(smoother==TensorMultigridSmoother::Center||(center_warps==1&&center_split_k==1),
               "Tensor center layout options require the center smoother.");
   if(precision==TensorMultigridPrecision::FP64)
-    return std::make_unique<TensorMultigrid<double>>(op,sfes,precision,smoother,center_warps,center_split_k,operator_mode);
-  MFEM_VERIFY(precision==TensorMultigridPrecision::FP32||precision==TensorMultigridPrecision::TF32,"Invalid tensor MG precision.");
-  return std::make_unique<TensorMultigrid<float>>(op,sfes,precision,smoother,center_warps,center_split_k,operator_mode);
+    return std::make_unique<TensorMultigrid<double>>(op,sfes,precision,smoother,center_warps,center_split_k,operator_mode,owned_tile,residual_mode);
+  MFEM_VERIFY(precision==TensorMultigridPrecision::FP32||precision==TensorMultigridPrecision::TF32,
+              "Tensor MG precision must be FP64, FP32 or TF32; TF32x3 requires spectral mode.");
+  return std::make_unique<TensorMultigrid<float>>(op,sfes,precision,smoother,center_warps,center_split_k,operator_mode,owned_tile,residual_mode);
 }
 } }

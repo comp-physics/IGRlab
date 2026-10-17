@@ -2396,14 +2396,19 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     ReadEnvInt("DG_IGR_IGR_TENSOR_MG_CENTER_WARPS", 1);
   const int tensor_mg_center_split_k =
     ReadEnvInt("DG_IGR_IGR_TENSOR_MG_CENTER_SPLIT_K", 1);
+  const int tensor_mg_owned_tile = ReadEnvInt("DG_IGR_IGR_TENSOR_MG_OWNED_TILE", 1);
+  const char* tensor_mg_residual_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_MG_RESIDUAL");
+  const std::string tensor_mg_residual = tensor_mg_residual_env ? tensor_mg_residual_env : "auto";
   const char* tensor_volume_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_VOLUME");
   const std::string tensor_volume_mode = tensor_volume_env ? tensor_volume_env : "off";
   const bool using_tensor_volume = tensor_volume_mode != "off";
   MFEM_VERIFY(tensor_mg_precision == "off" || tensor_mg_precision == "fp64" ||
-                tensor_mg_precision == "fp32" || tensor_mg_precision == "tf32",
-              "IGRLAB_IGR_TENSOR_MG must be off|fp64|fp32|tf32.");
-  MFEM_VERIFY(tensor_mg_operator == "sampled" || tensor_mg_operator == "shared",
-              "IGRLAB_IGR_TENSOR_MG_OPERATOR must be sampled|shared.");
+                tensor_mg_precision == "fp32" || tensor_mg_precision == "tf32" || tensor_mg_precision == "tf32x3",
+              "IGRLAB_IGR_TENSOR_MG must be off|fp64|fp32|tf32|tf32x3.");
+  MFEM_VERIFY(tensor_mg_operator == "sampled" || tensor_mg_operator == "shared" || tensor_mg_operator == "spectral",
+              "IGRLAB_IGR_TENSOR_MG_OPERATOR must be sampled|shared|spectral.");
+  MFEM_VERIFY(tensor_mg_precision != "tf32x3" || tensor_mg_operator == "spectral",
+              "TF32x3 precision requires IGRLAB_IGR_TENSOR_MG_OPERATOR=spectral.");
   MFEM_VERIFY(using_tensor_mg || tensor_mg_operator == "sampled",
               "A shared tensor MG operator requires IGRLAB_IGR_TENSOR_MG.");
   MFEM_VERIFY(tensor_volume_mode == "off" || tensor_volume_mode == "simt" ||
@@ -2423,6 +2428,20 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY((using_tensor_mg && tensor_mg_smoother == "center") ||
                 (tensor_mg_center_warps == 1 && tensor_mg_center_split_k == 1),
               "Nondefault center layout controls require the center smoother.");
+  MFEM_VERIFY((tensor_mg_owned_tile == 1 || tensor_mg_owned_tile == 4) &&
+                (tensor_mg_owned_tile == 1 ||
+                  (using_tensor_mg && tensor_mg_operator == "shared" && tensor_mg_smoother == "center" &&
+                    tensor_mg_center_warps == 1 && tensor_mg_center_split_k == 1)),
+              "IGRLAB_IGR_TENSOR_MG_OWNED_TILE must be 1|4; 4 requires shared operator, center smoother and default center layout controls.");
+  MFEM_VERIFY((tensor_mg_residual == "auto" || tensor_mg_residual == "fp32") &&
+                (tensor_mg_residual == "auto" ||
+                  (using_tensor_mg && tensor_mg_operator == "shared" && tensor_mg_precision == "tf32")),
+              "IGRLAB_IGR_TENSOR_MG_RESIDUAL must be auto|fp32; fp32 requires shared TF32 multigrid.");
+  MFEM_VERIFY(tensor_mg_operator != "spectral" ||
+                (using_tensor_mg && tensor_mg_smoother == "separable" &&
+                  tensor_mg_center_warps == 1 && tensor_mg_center_split_k == 1 &&
+                  tensor_mg_owned_tile == 1 && tensor_mg_residual == "auto"),
+              "Spectral inverse requires default MG-only smoother/layout/residual controls.");
   MFEM_VERIFY(!(using_tensor_mg || using_tensor_volume) ||
                 (using_cuda && is_dg && exact_face_sum_op &&
                  direct_identity_system_ && ess_tdof_list_.Size() == 0 &&
@@ -2432,11 +2451,12 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "exact faces, current device coefficients, direct identity layout, "
               "no essential constraints, and CUDA FP64 FGMRES.");
   MFEM_VERIFY(!using_tensor_mg || spd_ok,
-              "Tensor multigrid requires symmetric SIPG for its FP64 coarse CG solve.");
+              "Tensor reference preconditioning requires symmetric SIPG.");
   const std::string tensor_mg_key = tensor_mg_precision + ":" +
     std::to_string(tensor_mg_rebuild_interval) + ":" + tensor_mg_smoother + ":" +
     std::to_string(tensor_mg_center_warps) + ":" +
-    std::to_string(tensor_mg_center_split_k) + ":" + tensor_mg_operator;
+    std::to_string(tensor_mg_center_split_k) + ":" + tensor_mg_operator + ":" +
+    std::to_string(tensor_mg_owned_tile) + ":" + tensor_mg_residual;
   const char* dense_inverse_env = ::igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
@@ -2708,23 +2728,30 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
           (tensor_mg_rebuild_interval > 0 &&
            (solve_call - 1) % tensor_mg_rebuild_interval == 0))
       {
-        const TensorMultigridPrecision precision = tensor_mg_precision == "tf32"
+        const TensorMultigridPrecision precision = tensor_mg_precision == "tf32x3"
+          ? TensorMultigridPrecision::TF32x3 : (tensor_mg_precision == "tf32"
           ? TensorMultigridPrecision::TF32 : (tensor_mg_precision == "fp32"
-            ? TensorMultigridPrecision::FP32 : TensorMultigridPrecision::FP64);
+            ? TensorMultigridPrecision::FP32 : TensorMultigridPrecision::FP64));
         const TensorMultigridSmoother smoother = tensor_mg_smoother == "center"
           ? TensorMultigridSmoother::Center : TensorMultigridSmoother::Separable;
-        const TensorMultigridOperator operator_mode = tensor_mg_operator == "shared"
-          ? TensorMultigridOperator::Shared : TensorMultigridOperator::Sampled;
+        const TensorMultigridOperator operator_mode = tensor_mg_operator == "spectral"
+          ? TensorMultigridOperator::Spectral : (tensor_mg_operator == "shared"
+          ? TensorMultigridOperator::Shared : TensorMultigridOperator::Sampled);
+        const TensorMultigridResidual residual_mode = tensor_mg_residual == "fp32"
+          ? TensorMultigridResidual::FP32 : TensorMultigridResidual::Auto;
         tensor_multigrid_preconditioner_ = MakeTensorMultigridPreconditioner(
           *A_op, sfes_, precision, smoother,
-          tensor_mg_center_warps, tensor_mg_center_split_k, operator_mode);
+          tensor_mg_center_warps, tensor_mg_center_split_k, operator_mode, tensor_mg_owned_tile, residual_mode);
         tensor_multigrid_key_ = tensor_mg_key;
         if (mfem::Mpi::Root())
         {
           std::cout << "[igr-tensor-pipeline] event=setup solve_call=" << solve_call
                     << " precision=" << tensor_mg_precision
-                    << " smoother=" << tensor_mg_smoother
+                    << " smoother=" << (tensor_mg_operator == "spectral" ? "none" : tensor_mg_smoother)
                     << " operator=" << tensor_mg_operator
+                    << " cycle=" << (tensor_mg_operator == "spectral" ? "global-reference-inverse" : "multiplicative-v")
+                    << " owned_tile=" << tensor_mg_owned_tile
+                    << " residual_precision_policy=" << tensor_mg_residual
                     << " center_warps=" << tensor_mg_center_warps
                     << " center_split_k=" << tensor_mg_center_split_k
                     << " rebuild_interval=" << tensor_mg_rebuild_interval
@@ -3535,7 +3562,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                                    : PrecondTypeName(prec_choice)));
   if (using_tensor_mg)
   {
-    last_precond_name_ = "tensor-multigrid-" + tensor_mg_precision;
+    last_precond_name_ = (tensor_mg_operator == "spectral" ? "tensor-spectral-" : "tensor-multigrid-") + tensor_mg_precision;
   }
   if (using_dense_inverse)
   {
