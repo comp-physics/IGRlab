@@ -17,6 +17,10 @@ At n64 over 100 steps, the full candidate is **1.95× faster for DG and 1.56× f
 
 At n32 over 1000 steps, the full candidate is **4.76× faster for DG and 3.84× for DGSEM**.
 
+The [2026-10-17 Nsight Compute follow-up](igr_tensor_pipeline_deltaai_ncu.md)
+measures selected kernel hardware counters on the same executable and develops
+a center-response patch-map proposal from the remaining bottlenecks.
+
 ## Pipeline and precision boundaries
 
 ```mermaid
