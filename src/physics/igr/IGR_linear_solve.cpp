@@ -2386,6 +2386,14 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool using_tensor_mg = tensor_mg_precision != "off";
   const int tensor_mg_rebuild_interval =
     ReadEnvInt("DG_IGR_IGR_TENSOR_MG_REBUILD_INTERVAL", 0);
+  const char* tensor_mg_smoother_env =
+    ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_MG_SMOOTHER");
+  const std::string tensor_mg_smoother =
+    tensor_mg_smoother_env ? tensor_mg_smoother_env : "separable";
+  const int tensor_mg_center_warps =
+    ReadEnvInt("DG_IGR_IGR_TENSOR_MG_CENTER_WARPS", 1);
+  const int tensor_mg_center_split_k =
+    ReadEnvInt("DG_IGR_IGR_TENSOR_MG_CENTER_SPLIT_K", 1);
   const char* tensor_volume_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_VOLUME");
   const std::string tensor_volume_mode = tensor_volume_env ? tensor_volume_env : "off";
   const bool using_tensor_volume = tensor_volume_mode != "off";
@@ -2397,6 +2405,18 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "IGRLAB_IGR_TENSOR_VOLUME must be off|simt|wmma.");
   MFEM_VERIFY(tensor_mg_rebuild_interval >= 0,
               "IGRLAB_IGR_TENSOR_MG_REBUILD_INTERVAL must be nonnegative.");
+  MFEM_VERIFY(tensor_mg_smoother == "separable" || tensor_mg_smoother == "center",
+              "IGRLAB_IGR_TENSOR_MG_SMOOTHER must be separable|center.");
+  MFEM_VERIFY(tensor_mg_center_warps == 1 || tensor_mg_center_warps == 4,
+              "IGRLAB_IGR_TENSOR_MG_CENTER_WARPS must be 1|4.");
+  MFEM_VERIFY(tensor_mg_center_split_k == 1 || tensor_mg_center_split_k == 2 ||
+                tensor_mg_center_split_k == 4,
+              "IGRLAB_IGR_TENSOR_MG_CENTER_SPLIT_K must be 1|2|4.");
+  MFEM_VERIFY(using_tensor_mg || tensor_mg_smoother == "separable",
+              "The center smoother requires IGRLAB_IGR_TENSOR_MG to be enabled.");
+  MFEM_VERIFY((using_tensor_mg && tensor_mg_smoother == "center") ||
+                (tensor_mg_center_warps == 1 && tensor_mg_center_split_k == 1),
+              "Nondefault center layout controls require the center smoother.");
   MFEM_VERIFY(!(using_tensor_mg || using_tensor_volume) ||
                 (using_cuda && is_dg && exact_face_sum_op &&
                  direct_identity_system_ && ess_tdof_list_.Size() == 0 &&
@@ -2408,7 +2428,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(!using_tensor_mg || spd_ok,
               "Tensor multigrid requires symmetric SIPG for its FP64 coarse CG solve.");
   const std::string tensor_mg_key = tensor_mg_precision + ":" +
-    std::to_string(tensor_mg_rebuild_interval);
+    std::to_string(tensor_mg_rebuild_interval) + ":" + tensor_mg_smoother + ":" +
+    std::to_string(tensor_mg_center_warps) + ":" +
+    std::to_string(tensor_mg_center_split_k);
   const char* dense_inverse_env = ::igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
@@ -2683,13 +2705,19 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
         const TensorMultigridPrecision precision = tensor_mg_precision == "tf32"
           ? TensorMultigridPrecision::TF32 : (tensor_mg_precision == "fp32"
             ? TensorMultigridPrecision::FP32 : TensorMultigridPrecision::FP64);
+        const TensorMultigridSmoother smoother = tensor_mg_smoother == "center"
+          ? TensorMultigridSmoother::Center : TensorMultigridSmoother::Separable;
         tensor_multigrid_preconditioner_ = MakeTensorMultigridPreconditioner(
-          *A_op, sfes_, precision);
+          *A_op, sfes_, precision, smoother,
+          tensor_mg_center_warps, tensor_mg_center_split_k);
         tensor_multigrid_key_ = tensor_mg_key;
         if (mfem::Mpi::Root())
         {
           std::cout << "[igr-tensor-pipeline] event=setup solve_call=" << solve_call
                     << " precision=" << tensor_mg_precision
+                    << " smoother=" << tensor_mg_smoother
+                    << " center_warps=" << tensor_mg_center_warps
+                    << " center_split_k=" << tensor_mg_center_split_k
                     << " rebuild_interval=" << tensor_mg_rebuild_interval
                     << " volume=" << tensor_volume_mode
                     << " acceptance=original-current-fp64" << std::endl;

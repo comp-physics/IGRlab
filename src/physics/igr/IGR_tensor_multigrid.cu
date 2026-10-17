@@ -1,5 +1,6 @@
 #include "igrlab/compat.hpp"
 #include "IGR_tensor_multigrid.hpp"
+#include "IGR_tensor_center.hpp"
 #include "IGR_device_krylov.hpp"
 #include "IGR_shared_patch_cuda.cuh" // Reuse checked periodic face-slot topology.
 #include <cuda_runtime.h>
@@ -26,6 +27,9 @@ void CUDA(cudaError_t status)
 
 const char* Name(TensorMultigridPrecision p)
 { return p == TensorMultigridPrecision::FP64 ? "fp64" : p == TensorMultigridPrecision::FP32 ? "fp32" : "tf32"; }
+
+const char* SmootherName(TensorMultigridSmoother smoother)
+{ return smoother==TensorMultigridSmoother::Center ? "restricted-overlap-3x3-center" : "restricted-overlap-3x3-separable"; }
 
 std::size_t Entry(int e, int slot, int i, int j, int n)
 { return ((std::size_t(e) * 5 + slot) * n + j) * n + i; }
@@ -340,6 +344,97 @@ __global__ void IGRTensorMultigridTF32TransformKernel(int s,int columns,
 #endif
 }
 
+// Each SIMT thread owns one genuine element-center output, for one K slice.
+// Split boundaries coincide with the TF32 kernel's eight-entry K panels.
+template<typename T> __global__ void IGRTensorMultigridCenterSIMTKernel(
+    int ne,int d,const T* response,const T* packed,T* partial,int split_k)
+{
+  const int n=d*d,k=9*n,row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=ne*n)return;
+  const int part=blockIdx.y,panels=(k+7)/8;
+  const int begin=8*((panels*part)/split_k);
+  const int end=min(k,8*((panels*(part+1))/split_k));
+  const int element=row/n,center=row%n;T sum=0;
+  for(int j=begin;j<end;++j)sum+=response[center+n*j]*packed[j+k*element];
+  partial[part*ne*n+row]=isfinite(sum)?sum:static_cast<T>(CUDART_NAN);
+}
+
+// Warps share one converted response panel and each own 16 distinct real
+// patch columns. The skewed leading dimensions (24,16,24) replace the tightly
+// packed, independently restaged panels of the separable control. All warps
+// participate in CTA barriers, including M/N tails; tails are only zero fill.
+// Scalar shared transfers traverse physical padded offsets, skipping padding,
+// so active lanes in a warp access distinct banks in each transfer.
+template<int Warps> __global__ void IGRTensorMultigridCenterTF32Kernel(
+    int ne,int d,const float* response,const float* packed,float* partial,int split_k)
+{
+#if __CUDA_ARCH__ >= 800
+  const int n=d*d,k=9*n,tiles_m=(n+15)/16;
+  const int warp=threadIdx.x/32,lane=threadIdx.x%32;
+  const int row0=16*(blockIdx.x%tiles_m);
+  const int col0=16*(Warps*(blockIdx.x/tiles_m)+warp);
+  const int part=blockIdx.y,panels=(k+7)/8;
+  const int first=(panels*part)/split_k,last=(panels*(part+1))/split_k;
+  __shared__ __align__(32) float sa[8*24],sb[Warps][16*16],sc[Warps][16*24];
+  using namespace nvcuda;
+  wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::col_major> fa;
+  wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> fb;
+  wmma::fragment<wmma::accumulator,16,16,8,float> fc;wmma::fill_fragment(fc,0.0f);
+  for(int panel=first;panel<last;++panel)
+  {
+    const int k0=8*panel;
+    for(int i=threadIdx.x;i<8*24;i+=32*Warps) if(i%24<16)
+    {
+      const int row=row0+i%24,column=k0+i/24;
+      const float value=wmma::__float_to_tf32(row<n && column<k?response[row+n*column]:0.0f);
+      sa[i]=isfinite(value)?value:CUDART_NAN_F;
+    }
+    for(int i=lane;i<16*16;i+=32) if(i%16<8)
+    {
+      const int row=k0+i%16,column=col0+i/16;
+      const float value=wmma::__float_to_tf32(row<k && column<ne?packed[row+k*column]:0.0f);
+      sb[warp][i]=isfinite(value)?value:CUDART_NAN_F;
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(fa,sa,24);wmma::load_matrix_sync(fb,sb[warp],16);
+    wmma::mma_sync(fc,fa,fb,fc);
+    __syncthreads();
+  }
+  wmma::store_matrix_sync(sc[warp],fc,24,wmma::mem_col_major);__syncwarp();
+  for(int i=lane;i<16*24;i+=32) if(i%24<16)
+  {
+    const int row=row0+i%24,column=col0+i/24;
+    if(row<n && column<ne)
+    {
+      const float value=sc[warp][i];
+      partial[(part*ne+column)*n+row]=isfinite(value)?value:CUDART_NAN_F;
+    }
+  }
+#else
+  // A TF32 request is never silently replaced by a SIMT implementation.
+  const int n=d*d;
+  for(int row=blockIdx.x*blockDim.x+threadIdx.x;row<ne*n;row+=gridDim.x*blockDim.x)
+    partial[blockIdx.y*ne*n+row]=CUDART_NAN_F;
+#endif
+}
+
+template<typename T> __global__ void IGRTensorMultigridAddCenterKernel(
+    int ne,int d,const T* factor,const T* partial,T* x,int split_k)
+{
+  const int n=d*d,row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=ne*n)return;
+  T sum=0;for(int part=0;part<split_k;++part)sum+=partial[part*ne*n+row];
+  const T scale=factor[row/n],updated=x[row]+T(.8)*scale*sum;
+  x[row]=isfinite(sum)&&isfinite(scale)&&isfinite(updated)?updated:static_cast<T>(CUDART_NAN);
+}
+
+void CheckCenterLayout(int ne,int d,int warps,int split_k)
+{
+  MFEM_VERIFY(ne>0 && (d==4||d==6) && (warps==1||warps==4) &&
+    (split_k==1||split_k==2||split_k==4),"Invalid tensor center response layout.");
+  MFEM_VERIFY(std::size_t(ne)*9*d*d<=INT_MAX && std::size_t(ne)*d*d*split_k<=INT_MAX,
+              "Tensor center response layout exceeds integer indexing.");
+}
+
 template<typename From,typename To> __global__ void Convert(int n,const From* x,To* y)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=static_cast<To>(x[i]);}
 
@@ -434,15 +529,18 @@ PatchReference Reference(const Stencil& a,int ne,int d)
 template<typename T> struct Level
 {
   int d=0;
-  mfem::Array<T> a,forward_x,forward_y,back_x,back_y,inverse,scale;
+  mfem::Array<T> a,forward_x,forward_y,back_x,back_y,inverse,center_response,scale;
   mutable mfem::Array<T> rhs,x,residual,patch_a,patch_b;
 };
 
 template<typename T> class TensorMultigrid final:public mfem::Solver
 {
 public:
-  TensorMultigrid(const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,TensorMultigridPrecision precision)
-    :mfem::Solver(op.Height()),ne_(sfes.GetNE()),precision_(precision)
+  TensorMultigrid(const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,
+      TensorMultigridPrecision precision,TensorMultigridSmoother smoother,
+      int center_warps,int center_split_k)
+    :mfem::Solver(op.Height()),ne_(sfes.GetNE()),precision_(precision),smoother_(smoother),
+     center_warps_(center_warps),center_split_k_(center_split_k)
   {
     const auto start=std::chrono::steady_clock::now();
     int ranks=0;MPI_Comm_size(sfes.GetComm(),&ranks);
@@ -468,7 +566,8 @@ public:
     MFEM_VERIFY(operator_scale_>0 && std::isfinite(operator_scale_),"Invalid tensor MG operator scale.");
     element_map_.SetSize(height);std::copy(map.begin(),map.end(),element_map_.HostWrite());
     nodal_.SetSize(36*36);std::copy(nodal.begin(),nodal.end(),nodal_.HostWrite());nodal_.UseDevice(true);
-    std::size_t bytes=0;int clipped=0;double separable_error=0,eigen_error=0;
+    std::size_t bytes=0,center_bytes=0,patch_bytes=0;int clipped=0;
+    double separable_error=0,eigen_error=0,center_setup_seconds=0;
     for(int l=0;l<3;++l)
     {
       auto& level=levels_[l];level.d=l==0?6:l==1?4:2;const int n=level.d*level.d;
@@ -478,10 +577,25 @@ public:
       if(l<2)
       {
         const auto ref=Reference(matrices[l],ne_,level.d);
-        Store(level.forward_x,ref.forward_x);Store(level.forward_y,ref.forward_y);
-        Store(level.back_x,ref.back_x);Store(level.back_y,ref.back_y);
-        Store(level.inverse,ref.inverse);Store(level.scale,ref.scales);
-        const int size=ne_*9*n;level.patch_a.SetSize(size);level.patch_b.SetSize(size);
+        Store(level.scale,ref.scales);
+        const int size=ne_*9*n;level.patch_a.SetSize(size);
+        if(smoother_==TensorMultigridSmoother::Center)
+        {
+          const auto center_start=std::chrono::steady_clock::now();
+          const auto response=ComposeTensorCenterResponse(level.d,ref.forward_x,ref.forward_y,
+              ref.back_x,ref.back_y,ref.inverse);
+          Store(level.center_response,response);
+          center_setup_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-center_start).count();
+          center_bytes+=response.size()*sizeof(T);
+          level.patch_b.SetSize(center_split_k_*ne_*n);
+        }
+        else
+        {
+          Store(level.forward_x,ref.forward_x);Store(level.forward_y,ref.forward_y);
+          Store(level.back_x,ref.back_x);Store(level.back_y,ref.back_y);
+          Store(level.inverse,ref.inverse);level.patch_b.SetSize(size);
+        }
+        patch_bytes+=std::size_t(level.patch_a.Size()+level.patch_b.Size())*sizeof(T);
         clipped+=ref.clipped;separable_error=std::max(separable_error,ref.relative_error);eigen_error=std::max(eigen_error,ref.eigen_error);
       }
     }
@@ -508,11 +622,16 @@ public:
     CUDA(cudaDeviceSynchronize());
     const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     std::cout<<"[igr-tensor-mg] event=setup precision="<<Name(precision_)<<" hierarchy=5,3,1 cycle=multiplicative-v"
-      <<" pre_sweeps=1 post_sweeps=1 smoother=restricted-overlap-3x3-separable damping=0.8"
+      <<" pre_sweeps=1 post_sweeps=1 smoother="<<SmootherName(smoother_)<<" damping=0.8"
+      <<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
       <<" elements="<<ne_<<" n="<<height<<" coarse_n="<<4*ne_<<" coarse_precision=fp64 coarse_rtol=0.01 coarse_maxiter=100"
       <<" coarse_backend=cuda-fp64 coarse_execution="<<(cooperative_?"cooperative":"host-polled")
       <<" vectors="<<(std::is_same<T,double>::value?"fp64":"fp32")
-      <<" real_columns_p5="<<18*ne_<<" real_columns_p3="<<12*ne_<<" operator_probes="<<probes<<" colors="<<colors
+      <<" real_columns_p5="<<(smoother_==TensorMultigridSmoother::Center?ne_:18*ne_)
+      <<" real_columns_p3="<<(smoother_==TensorMultigridSmoother::Center?ne_:12*ne_)
+      <<" operator_probes="<<probes<<" colors="<<colors
+      <<" center_map_bytes="<<center_bytes<<" patch_workspace_bytes="<<patch_bytes
+      <<" center_setup_seconds="<<center_setup_seconds
       <<" stencil_bytes="<<bytes<<" coarse_nnz="<<coarse_->NumNonZeroElems()<<" probe_rel="<<probe_error
       <<" separable_reference_rel="<<separable_error<<" eigen_residual="<<eigen_error<<" clipped_eigenvalues="<<clipped
       <<" setup_seconds="<<seconds<<" frozen_operator=sampled-original-galerkin alpha=inherited-fine"
@@ -521,8 +640,11 @@ public:
   ~TensorMultigrid() override
   {
     std::cout<<"[igr-tensor-mg] event=summary precision="<<Name(precision_)<<" applications="<<applications_
+      <<" smoother="<<SmootherName(smoother_)<<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
       <<" coarse_iterations="<<coarse_iterations_<<" coarse_failures="<<coarse_failures_<<" coarse_cap_hits="<<coarse_cap_hits_
-      <<" transform_submissions="<<transforms_<<" cycle=multiplicative-v fallback=none\n";
+      <<" transform_submissions="<<transforms_<<" center_submissions="<<centers_
+      <<" center_pack_submissions="<<center_packs_<<" center_add_submissions="<<center_adds_
+      <<" cycle=multiplicative-v fallback=none\n";
   }
   void SetOperator(const mfem::Operator& op) override
   {MFEM_VERIFY(op.Height()==height&&op.Width()==width,"Tensor MG frozen hierarchy dimension changed; rebuild required.");}
@@ -554,6 +676,17 @@ private:
   {
     const auto& v=levels_[l];const int d=v.d,s=3*d,size=ne_*s*s;
     PackPatch<<<(size+255)/256,256>>>(ne_,d,patches_.Read(),r.Read(),v.patch_a.Write());
+    if(smoother_==TensorMultigridSmoother::Center)
+    {
+      if constexpr(std::is_same<T,float>::value)
+        ApplyTensorCenterResponse(ne_,d,v.center_response.Read(),v.patch_a.Read(),v.patch_b.Write(),
+            precision_==TensorMultigridPrecision::TF32,center_warps_,center_split_k_);
+      else
+        ApplyTensorCenterResponse(ne_,d,v.center_response.Read(),v.patch_a.Read(),v.patch_b.Write(),
+            center_warps_,center_split_k_);
+      AddTensorCenterResponse(ne_,d,v.scale.Read(),v.patch_b.Read(),v.x.ReadWrite(),center_split_k_);
+      ++centers_;++center_packs_;++center_adds_;return;
+    }
     Transform(s,v.forward_x,v.patch_a,v.patch_b);
     TransposePatch<<<(size+255)/256,256>>>(ne_,s,v.patch_b.Read(),v.patch_a.Write());
     Transform(s,v.forward_y,v.patch_a,v.patch_b);
@@ -597,7 +730,8 @@ private:
     Residual<<<(n+255)/256,256>>>(v.d*v.d,ne_,neighbors_.Read(),v.a.Read(),v.rhs.Read(),v.x.Read(),v.residual.Write());
     Smooth(l,v.residual);
   }
-  int ne_,norm_blocks_=0;TensorMultigridPrecision precision_;double operator_scale_=1;
+  int ne_,norm_blocks_=0;TensorMultigridPrecision precision_;TensorMultigridSmoother smoother_;
+  int center_warps_,center_split_k_;double operator_scale_=1;
   std::array<Level<T>,3> levels_;
   mfem::Array<int> neighbors_,patches_,element_map_,essential_;
   mfem::Vector nodal_;
@@ -608,15 +742,72 @@ private:
   std::unique_ptr<mfem::IterativeSolver> coarse_solver_;
   bool cooperative_=false;
   mutable unsigned long long applications_=0,coarse_iterations_=0,coarse_failures_=0,coarse_cap_hits_=0,transforms_=0;
+  mutable unsigned long long centers_=0,center_packs_=0,center_adds_=0;
 };
 } // namespace
 
-std::unique_ptr<mfem::Solver> MakeTensorMultigridPreconditioner(
-    const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,TensorMultigridPrecision precision)
+void ApplyTensorCenterResponse(int ne,int d,const double* response,
+    const double* packed,double* partial,int warps,int split_k)
 {
+  CheckCenterLayout(ne,d,warps,split_k);
+  MFEM_VERIFY(response&&packed&&partial,"Null tensor center response storage.");
+  const int threads=32*warps;
+  IGRTensorMultigridCenterSIMTKernel<<<dim3((ne*d*d+threads-1)/threads,split_k),threads>>>(
+      ne,d,response,packed,partial,split_k);
+  CUDA(cudaGetLastError());
+}
+
+void ApplyTensorCenterResponse(int ne,int d,const float* response,
+    const float* packed,float* partial,bool tf32,int warps,int split_k)
+{
+  CheckCenterLayout(ne,d,warps,split_k);
+  MFEM_VERIFY(response&&packed&&partial,"Null tensor center response storage.");
+  if(tf32)
+  {
+    const int tiles_m=(d*d+15)/16,groups=((ne+15)/16+warps-1)/warps;
+    const dim3 grid(tiles_m*groups,split_k);
+    if(warps==1)IGRTensorMultigridCenterTF32Kernel<1><<<grid,32>>>(ne,d,response,packed,partial,split_k);
+    else IGRTensorMultigridCenterTF32Kernel<4><<<grid,128>>>(ne,d,response,packed,partial,split_k);
+  }
+  else
+  {
+    const int threads=32*warps;
+    IGRTensorMultigridCenterSIMTKernel<<<dim3((ne*d*d+threads-1)/threads,split_k),threads>>>(
+        ne,d,response,packed,partial,split_k);
+  }
+  CUDA(cudaGetLastError());
+}
+
+void AddTensorCenterResponse(int ne,int d,const double* factor,
+    const double* partial,double* x,int split_k)
+{
+  CheckCenterLayout(ne,d,1,split_k);
+  MFEM_VERIFY(factor&&partial&&x,"Null tensor center add storage.");
+  IGRTensorMultigridAddCenterKernel<<<(ne*d*d+255)/256,256>>>(ne,d,factor,partial,x,split_k);
+  CUDA(cudaGetLastError());
+}
+
+void AddTensorCenterResponse(int ne,int d,const float* factor,
+    const float* partial,float* x,int split_k)
+{
+  CheckCenterLayout(ne,d,1,split_k);
+  MFEM_VERIFY(factor&&partial&&x,"Null tensor center add storage.");
+  IGRTensorMultigridAddCenterKernel<<<(ne*d*d+255)/256,256>>>(ne,d,factor,partial,x,split_k);
+  CUDA(cudaGetLastError());
+}
+
+std::unique_ptr<mfem::Solver> MakeTensorMultigridPreconditioner(
+    const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,TensorMultigridPrecision precision,
+    TensorMultigridSmoother smoother,int center_warps,int center_split_k)
+{
+  MFEM_VERIFY(smoother==TensorMultigridSmoother::Separable||smoother==TensorMultigridSmoother::Center,
+              "Invalid tensor MG smoother.");
+  CheckCenterLayout(sfes.GetNE(),6,center_warps,center_split_k);
+  MFEM_VERIFY(smoother==TensorMultigridSmoother::Center||(center_warps==1&&center_split_k==1),
+              "Tensor center layout options require the center smoother.");
   if(precision==TensorMultigridPrecision::FP64)
-    return std::make_unique<TensorMultigrid<double>>(op,sfes,precision);
+    return std::make_unique<TensorMultigrid<double>>(op,sfes,precision,smoother,center_warps,center_split_k);
   MFEM_VERIFY(precision==TensorMultigridPrecision::FP32||precision==TensorMultigridPrecision::TF32,"Invalid tensor MG precision.");
-  return std::make_unique<TensorMultigrid<float>>(op,sfes,precision);
+  return std::make_unique<TensorMultigrid<float>>(op,sfes,precision,smoother,center_warps,center_split_k);
 }
 } }

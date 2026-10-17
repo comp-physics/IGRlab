@@ -15,6 +15,9 @@ and device quadrature coefficients are required.
 | Environment variable | Values | Purpose |
 | --- | --- | --- |
 | `IGRLAB_IGR_TENSOR_MG` | `off`, `fp64`, `fp32`, `tf32` | Select the p-multigrid preconditioner. |
+| `IGRLAB_IGR_TENSOR_MG_SMOOTHER` | `separable` (default), `center` | Select the original four transforms or the reusable center-response map. |
+| `IGRLAB_IGR_TENSOR_MG_CENTER_WARPS` | `1` (default), `4` | Threads per center SIMT block are 32 times this value; each TF32 warp owns 16 real patch columns. |
+| `IGRLAB_IGR_TENSOR_MG_CENTER_SPLIT_K` | `1` (default), `2`, `4` | Partition the center-map inner dimension; reduce partial sums in the final center update. |
 | `IGRLAB_IGR_TENSOR_MG_REBUILD_INTERVAL` | nonnegative integer, default `0` | Rebuild coefficient-dependent frozen preconditioner data every N solves; `0` reuses the first setup. |
 | `IGRLAB_IGR_TENSOR_VOLUME` | `off`, `simt`, `wmma` | Use the original volume operator or the fused FP64 volume implementation with ordinary arithmetic or FP64 WMMA. |
 | `IGRLAB_SHARED_OPERATOR_PRECISION` | `off`, `fp64`, `fp32`, `tf32` | Independently select shared Euler spatial contractions. TF32 uses WMMA; state, nonlinear flux and faces remain FP64. |
@@ -45,6 +48,19 @@ lines. The mixed modes store level work in FP32; TF32 mode uses actual WMMA
 products with FP32 accumulation. The lowest sparse solve remains FP64.
 Galerkin coarsening preserves the fine equation's physical alpha; it does
 not replace it with an alpha computed from a coarser mesh length.
+
+The optional center smoother composes the same clipped separable inverse in
+FP64 during setup and retains only the owning element's correction rows.
+Its maps have shapes 36 × 324 at p5 and 16 × 144 at p3. Each input column is
+one real 3 × 3 residual patch. Packing, one map application, and a scaled
+center update replace the nine launches of a separable smoothing sweep.
+Element scaling, damping, the coarse solve, and current-operator acceptance
+are unchanged. Composition changes rounding; equivalence is mathematical,
+not bitwise. FP32 uses ordinary multiply-adds, while TF32 uses ordinary WMMA
+with FP32 accumulation and padded tails. Both store the FP64-composed map
+in FP32. Nondefault center layout controls require the center smoother.
+Split-K adds partial-sum storage and changes summation order, so layouts
+require accuracy and complete-solver timing comparisons independently.
 
 The first prototype is intentionally limited to one CUDA rank, uniform
 axis-aligned periodic quadrilaterals, scalar nodal L2 spaces, and the admitted

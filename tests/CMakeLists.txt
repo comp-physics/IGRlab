@@ -1958,7 +1958,7 @@ endif()
 
 # Experimental tensor IGR pipeline: independent operator and solve oracles.
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MPI)
-  foreach(component IN ITEMS volume multigrid)
+  foreach(component IN ITEMS volume multigrid center_map)
     add_executable(dg_igr_tensor_${component}_test test_igr_tensor_${component}_cuda.cu)
     target_link_libraries(dg_igr_tensor_${component}_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
     target_compile_options(dg_igr_tensor_${component}_test PRIVATE

@@ -3,6 +3,7 @@
 #include "../src/physics/igr/IGR_device_krylov.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -11,6 +12,14 @@
 
 namespace {
 using Precision=igrlab::igr_internal::TensorMultigridPrecision;
+using Smoother=igrlab::igr_internal::TensorMultigridSmoother;
+
+struct Configuration
+{
+  Precision precision;
+  Smoother smoother;
+  int warps,split_k;
+};
 
 void Assemble(mfem::BilinearForm& form,mfem::Coefficient& reaction,mfem::Coefficient& diffusion)
 {
@@ -34,10 +43,18 @@ double Relative(const mfem::Vector& a,const mfem::Vector& b)
 
 const char* Name(Precision p)
 {return p==Precision::FP64?"fp64":p==Precision::FP32?"fp32":"tf32";}
+const char* Name(Smoother s)
+{return s==Smoother::Separable?"separable":"center";}
 
 void CheckHierarchy(bool variable)
 {
-  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(4,4,mfem::Element::QUADRILATERAL,true,1.0,1.0);
+  // The variable fixture has 20 real patches, so the production pack/map/add
+  // path also sees a partial 16-column tile. Both meshes scramble element
+  // order before topology reconstruction; geometric neighbors are not e+/-1.
+  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(variable?5:4,4,mfem::Element::QUADRILATERAL,true,1.0,1.0);
+  mfem::Array<int> element_order(box.GetNE());
+  for(int e=0;e<box.GetNE();++e)element_order[e]=(7*e+3)%box.GetNE();
+  box.ReorderElements(element_order,false);
   mfem::Vector dx(2),dy(2);dx=0.0;dy=0.0;dx(0)=1;dy(1)=1;
   std::vector<mfem::Vector> shifts{dx,dy};
   mfem::Mesh mesh=mfem::Mesh::MakePeriodic(box,box.CreatePeriodicVertexMapping(shifts));
@@ -69,26 +86,41 @@ void CheckHierarchy(bool variable)
     }
   }
   exact.UseDevice(true);probe.UseDevice(true);current.SpMat().Mult(exact,rhs);
-  for(Precision precision:{Precision::FP64,Precision::FP32,Precision::TF32})
+  std::array<mfem::Vector,3> separable_reference;
+  for(const Configuration config:{
+      Configuration{Precision::FP64,Smoother::Separable,1,1},
+      Configuration{Precision::FP32,Smoother::Separable,1,1},
+      Configuration{Precision::TF32,Smoother::Separable,1,1},
+      Configuration{Precision::FP64,Smoother::Center,1,1},
+      Configuration{Precision::FP32,Smoother::Center,4,2},
+      Configuration{Precision::TF32,Smoother::Center,4,4}})
   {
+    const Precision precision=config.precision;
+    const int precision_index=precision==Precision::FP64?0:precision==Precision::FP32?1:2;
     std::unique_ptr<mfem::Solver> preconditioner;
     {
       mfem::BilinearForm frozen(&fes);Assemble(frozen,reaction,diffusion);
-      preconditioner=igrlab::igr_internal::MakeTensorMultigridPreconditioner(frozen.SpMat(),fes,precision);
+      preconditioner=igrlab::igr_internal::MakeTensorMultigridPreconditioner(
+        frozen.SpMat(),fes,precision,config.smoother,config.warps,config.split_k);
     } // A0 lifetime ends: the preconditioner must own its coefficient snapshot.
     preconditioner->SetOperator(current.SpMat());
     preconditioner->Mult(probe,result);
     double action_error=0;
-    if(precision==Precision::FP64) reference=result;
+    if(config.smoother==Smoother::Separable)separable_reference[precision_index]=result;
+    if(config.smoother==Smoother::Separable&&precision==Precision::FP64)reference=result;
     else
     {
       action_error=Relative(result,reference);
-      MFEM_VERIFY(action_error<(precision==Precision::FP32?5e-5:2e-2),
-        "Tensor MG real patch batch control mismatch: "<<Name(precision)<<" relative="<<action_error);
+      MFEM_VERIFY(action_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?5e-5:2e-2),
+        "Tensor MG real patch batch control mismatch: "<<Name(precision)<<" smoother="<<Name(config.smoother)
+        <<" relative="<<action_error);
     }
+    const double separable_error=Relative(result,separable_reference[precision_index]);
+    MFEM_VERIFY(separable_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?8e-5:3e-2),
+      "Tensor MG center/separable V-cycle mismatch: "<<Name(precision)<<" relative="<<separable_error);
     // Dynamic power-of-two input scaling must preserve tiny and huge useful
-    // residuals. Long-double comparison intentionally has no1e-300 norm floor.
-    for(double scale:{1e-200,1e200})
+    // residuals. Long-double comparison intentionally has no 1e-300 norm floor.
+    for(double scale:{1e-200,-1e-200,1e200})
     {
       const double* p=probe.HostRead();double* s=scaled.HostWrite();
       for(int i=0;i<n;++i)s[i]=scale*p[i];scaled.UseDevice(true);
@@ -96,7 +128,8 @@ void CheckHierarchy(bool variable)
       double* v=scaled_result.HostReadWrite();for(int i=0;i<n;++i)v[i]/=scale;
       const double error=Relative(scaled_result,result);
       MFEM_VERIFY(error<(precision==Precision::FP64?5e-10:2e-3),
-        "Tensor MG scaled residual lost homogeneity: "<<Name(precision)<<" scale="<<scale<<" relative="<<error);
+        "Tensor MG scaled residual lost homogeneity: "<<Name(precision)<<" smoother="<<Name(config.smoother)
+        <<" scale="<<scale<<" relative="<<error);
     }
     scaled=0.0;preconditioner->Mult(scaled,scaled_result);
     MFEM_VERIFY(scaled_result.Norml2()==0.0,"Tensor MG zero RHS must produce zero correction.");
@@ -114,8 +147,11 @@ void CheckHierarchy(bool variable)
       solver->Mult(rhs,x);current.SpMat().Mult(x,action);
       const double residual=Relative(action,rhs),error=Relative(x,exact);
       std::cout<<"tensor_mg_current_A_test variable="<<variable<<" precision="<<Name(precision)
+        <<" smoother="<<Name(config.smoother)<<" center_warps="<<config.warps<<" center_split_k="<<config.split_k
+        <<" elements="<<fes.GetNE()
         <<" repeat="<<repeat<<" iterations="<<solver->GetNumIterations()<<" true_residual="<<residual
-        <<" solution_error="<<error<<" patch_action_control_error="<<action_error<<'\n';
+        <<" solution_error="<<error<<" patch_action_control_error="<<action_error
+        <<" separable_action_control_error="<<separable_error<<'\n';
       MFEM_VERIFY(solver->GetConverged()&&residual<=1e-10&&error<1e-7,
         "Tensor MG original-current-A convergence failed: "<<Name(precision)<<" residual="<<residual<<" error="<<error);
     }
@@ -132,6 +168,7 @@ int main(int argc,char** argv)
   CheckHierarchy(false);CheckHierarchy(true);
   std::cout<<"tensor_mg_test passed multiplicative_vcycle=true hierarchy=5,3,1"
     <<" original_A_certificate=true changed_coefficients=true real_patch_columns=true"
-    <<" precision_controls=true scaled_rhs=true snapshot_lifetime=true\n";
+    <<" precision_controls=true center_controls=true center_layouts=1x1,4x2,4x4"
+    <<" reordered_topology=true patch_tail=true scaled_rhs=true snapshot_lifetime=true\n";
   return 0;
 }
