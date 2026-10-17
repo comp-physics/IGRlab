@@ -1,5 +1,10 @@
 # DG/DGSEM tensor-pipeline hardware counters on DeltaAI
 
+> These hardware counters describe the earlier small prototype workload.
+> They do not establish bottlenecks or speedups at HPC scale. See the
+> [fixed large DG investigation](igr_large_dg_tensor_optimization.md) for
+> the large-case profiles and subsequent code changes.
+
 Date: 2026-10-17. This supplements [the end-to-end and physical results](igr_tensor_pipeline_deltaai_results.md); it changes no application source or defaults.
 
 The sampled kernels support prioritizing the patch smoother and coarse solve.

@@ -1484,8 +1484,8 @@ public:
           precision_==TensorMultigridPrecision::FP32?"fp32-pedantic":"tf32-explicit")
       <<" low_low_term="<<(precision_==TensorMultigridPrecision::TF32x3?"omitted":"not-applicable")
       <<" alpha=inherited-fine acceptance=original-current-fp64 fallback=none"
-      <<" tensor_execution="<<(precision_==TensorMultigridPrecision::TF32 || precision_==TensorMultigridPrecision::TF32x3?
-          "requires-profile-proof":"none")
+      // cuBLAS can select IEEE FP64 tensor cores even with pedantic arithmetic.
+      <<" tensor_execution=requires-profile-proof"
       <<" setup_seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<'\n';
   }
   ~TensorSpectral() override

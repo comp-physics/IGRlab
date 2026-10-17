@@ -1,5 +1,10 @@
 # DeltaAI results: DG/DGSEM tensor pipeline
 
+> Scope update: the n32/n64 runs below are small prototype and correctness
+> experiments, not evidence of performance for a GPU-filling HPC workload.
+> Use the [fixed large DG investigation](igr_large_dg_tensor_optimization.md)
+> for current optimization decisions and matched precision comparisons.
+
 The prototype integrates tensor p-multigrid, fused FP64 IGR volume application,
 and shared Euler contractions into the existing DG/DGSEM application. All modes
 remain opt-in. The completed comparisons below measure full application process
