@@ -2384,6 +2384,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const char* tensor_mg_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_MG");
   const std::string tensor_mg_precision = tensor_mg_env ? tensor_mg_env : "off";
   const bool using_tensor_mg = tensor_mg_precision != "off";
+  const char* tensor_mg_operator_env = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_MG_OPERATOR");
+  const std::string tensor_mg_operator = tensor_mg_operator_env ? tensor_mg_operator_env : "sampled";
   const int tensor_mg_rebuild_interval =
     ReadEnvInt("DG_IGR_IGR_TENSOR_MG_REBUILD_INTERVAL", 0);
   const char* tensor_mg_smoother_env =
@@ -2400,6 +2402,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(tensor_mg_precision == "off" || tensor_mg_precision == "fp64" ||
                 tensor_mg_precision == "fp32" || tensor_mg_precision == "tf32",
               "IGRLAB_IGR_TENSOR_MG must be off|fp64|fp32|tf32.");
+  MFEM_VERIFY(tensor_mg_operator == "sampled" || tensor_mg_operator == "shared",
+              "IGRLAB_IGR_TENSOR_MG_OPERATOR must be sampled|shared.");
+  MFEM_VERIFY(using_tensor_mg || tensor_mg_operator == "sampled",
+              "A shared tensor MG operator requires IGRLAB_IGR_TENSOR_MG.");
   MFEM_VERIFY(tensor_volume_mode == "off" || tensor_volume_mode == "simt" ||
                 tensor_volume_mode == "wmma",
               "IGRLAB_IGR_TENSOR_VOLUME must be off|simt|wmma.");
@@ -2430,7 +2436,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const std::string tensor_mg_key = tensor_mg_precision + ":" +
     std::to_string(tensor_mg_rebuild_interval) + ":" + tensor_mg_smoother + ":" +
     std::to_string(tensor_mg_center_warps) + ":" +
-    std::to_string(tensor_mg_center_split_k);
+    std::to_string(tensor_mg_center_split_k) + ":" + tensor_mg_operator;
   const char* dense_inverse_env = ::igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
@@ -2707,15 +2713,18 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
             ? TensorMultigridPrecision::FP32 : TensorMultigridPrecision::FP64);
         const TensorMultigridSmoother smoother = tensor_mg_smoother == "center"
           ? TensorMultigridSmoother::Center : TensorMultigridSmoother::Separable;
+        const TensorMultigridOperator operator_mode = tensor_mg_operator == "shared"
+          ? TensorMultigridOperator::Shared : TensorMultigridOperator::Sampled;
         tensor_multigrid_preconditioner_ = MakeTensorMultigridPreconditioner(
           *A_op, sfes_, precision, smoother,
-          tensor_mg_center_warps, tensor_mg_center_split_k);
+          tensor_mg_center_warps, tensor_mg_center_split_k, operator_mode);
         tensor_multigrid_key_ = tensor_mg_key;
         if (mfem::Mpi::Root())
         {
           std::cout << "[igr-tensor-pipeline] event=setup solve_call=" << solve_call
                     << " precision=" << tensor_mg_precision
                     << " smoother=" << tensor_mg_smoother
+                    << " operator=" << tensor_mg_operator
                     << " center_warps=" << tensor_mg_center_warps
                     << " center_split_k=" << tensor_mg_center_split_k
                     << " rebuild_interval=" << tensor_mg_rebuild_interval

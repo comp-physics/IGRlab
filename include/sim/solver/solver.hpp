@@ -76,7 +76,45 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
   mfem::Vector local(components);
   local = 0.0;
   double local_measure = 0.0;
-  mfem::Vector value(components);
+  mfem::DenseMatrix values;
+  mfem::Array<int> vdofs;
+  mfem::Vector element_values, shape, nodal_scale;
+  const mfem::FiniteElement* cached_fe = nullptr;
+  const mfem::IntegrationRule* nodal_rule = nullptr;
+  const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(fes->FEColl());
+  // Read the owning state once. Component views and repeated point queries
+  // otherwise cross this same host/device boundary implicitly.
+  (void)state.HostRead();
+  const auto affine_quad_weight = [](mfem::ElementTransformation& tr,
+                                     double& weight)
+  {
+    const auto* iso = dynamic_cast<const mfem::IsoparametricTransformation*>(&tr);
+    if (!iso || !iso->GetFE() || iso->GetFE()->GetOrder() != 1 ||
+        iso->GetFE()->GetGeomType() != mfem::Geometry::SQUARE ||
+        tr.GetSpaceDim() != 2)
+    { return false; }
+    mfem::IntegrationPoint center;
+    center.Set2(0.5, 0.5);
+    tr.SetIntPoint(&center);
+    const mfem::DenseMatrix& initial = tr.Jacobian();
+    const double jacobian[4] = {initial(0, 0), initial(1, 0), initial(0, 1), initial(1, 1)};
+    weight = tr.Weight();
+    if (!std::isfinite(weight) || weight <= 0.0) { return false; }
+    // A Q1 quadrilateral has an affine map exactly when its Jacobian is
+    // constant. Compare all entries at its corners without a geometry tolerance.
+    for (int corner = 0; corner < 4; ++corner)
+    {
+      mfem::IntegrationPoint point;
+      point.Set2(corner % 2, corner / 2);
+      tr.SetIntPoint(&point);
+      const mfem::DenseMatrix& current = tr.Jacobian();
+      for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i)
+      {
+        if (current(i, j) != jacobian[i + 2 * j]) { return false; }
+      }
+    }
+    return true;
+  };
   for (int element = 0; element < fes->GetNE(); ++element)
   {
     const mfem::FiniteElement* fe = fes->GetFE(element);
@@ -84,6 +122,66 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
       fes->GetElementTransformation(element);
     MFEM_VERIFY(fe != nullptr && transformation != nullptr,
                 "Euler conservation integration is missing element data.");
+    if (fe != cached_fe)
+    {
+      cached_fe = fe;
+      nodal_rule = nullptr;
+      if (l2 && fe->GetGeomType() == mfem::Geometry::SQUARE &&
+          fe->GetMapType() == mfem::FiniteElement::VALUE &&
+          ((backend == DGBackend::DG && l2->GetBasisType() == mfem::BasisType::GaussLegendre) ||
+           (backend == DGBackend::DGSEM && l2->GetBasisType() == mfem::BasisType::GaussLobatto)))
+      {
+        static mfem::IntegrationRules nodal_lgl_rules(0, mfem::Quadrature1D::GaussLobatto);
+        const mfem::IntegrationRule& candidate = backend == DGBackend::DGSEM
+          ? nodal_lgl_rules.Get(fe->GetGeomType(), std::max(1, 2 * fe->GetOrder() - 1))
+          : mfem::IntRules.Get(fe->GetGeomType(), 2 * fe->GetOrder());
+        const int dof = fe->GetDof();
+        bool collocated = candidate.GetNPoints() == dof && fe->GetNodes().GetNPoints() == dof;
+        shape.SetSize(dof);
+        nodal_scale.SetSize(dof);
+        for (int q = 0; collocated && q < dof; ++q)
+        {
+          const auto& point = candidate.IntPoint(q);
+          const auto& node = fe->GetNodes().IntPoint(q);
+          collocated = point.x == node.x && point.y == node.y;
+          fe->CalcShape(point, shape);
+          for (int j = 0; collocated && j < dof; ++j)
+          {
+            collocated = std::isfinite(shape(j)) && (j == q || shape(j) == 0.0);
+          }
+          nodal_scale(q) = shape(q);
+        }
+        if (collocated) { nodal_rule = &candidate; }
+      }
+    }
+    double affine_weight = 0.0;
+    if (nodal_rule && affine_quad_weight(*transformation, affine_weight))
+    {
+      mfem::DofTransformation dof_transformation;
+      fes->GetElementVDofs(element, vdofs, dof_transformation);
+      state.GetSubVector(vdofs, element_values);
+      dof_transformation.InvTransformPrimal(element_values);
+      bool finite = true;
+      for (int i = 0; finite && i < element_values.Size(); ++i)
+      { finite = std::isfinite(element_values(i)); }
+      if (finite)
+      {
+        const int dof = fe->GetDof();
+        for (int q = 0; q < dof; ++q)
+        {
+          const double weight = nodal_rule->IntPoint(q).weight * affine_weight;
+          MFEM_VERIFY(std::isfinite(weight) && weight >= 0.0,
+                      "Euler conservation integration produced an invalid nodal weight.");
+          local_measure += weight;
+          for (int component = 0; component < components; ++component)
+          {
+            local(component) += weight *
+                (nodal_scale(q) * element_values(component * dof + q));
+          }
+        }
+        continue;
+      }
+    }
     const mfem::IntegrationRule* rule = nullptr;
     if (backend == DGBackend::DGSEM)
     {
@@ -103,18 +201,20 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
         2 * fe->GetOrder() + transformation->OrderW() + 2;
       rule = &mfem::IntRules.Get(fe->GetGeomType(), integration_order);
     }
+    // Preserve the original quadrature for curved, continuous, noncollocated,
+    // and exceptional states. Gather each element once instead of per point.
+    state.GetVectorValues(*transformation, *rule, values);
     for (int q = 0; q < rule->GetNPoints(); ++q)
     {
       const mfem::IntegrationPoint& point = rule->IntPoint(q);
       transformation->SetIntPoint(&point);
-      state.GetVectorValue(*transformation, point, value);
       const double weight = point.weight * transformation->Weight();
       MFEM_VERIFY(std::isfinite(weight) && weight >= 0.0,
                   "Euler conservation integration produced an invalid weight.");
       local_measure += weight;
       for (int component = 0; component < components; ++component)
       {
-        local(component) += weight * value(component);
+        local(component) += weight * values(component, q);
       }
     }
   }

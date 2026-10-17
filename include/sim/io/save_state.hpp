@@ -39,10 +39,13 @@ inline void SaveInitialEulerState(ExampleContext& ctx,
   mesh_ofs.precision(precision);
   mesh_ofs << ctx.Mesh();
 
+  // The component aliases do not inherit the parent's device-validity flags.
+  // Synchronize the parent before constructing host-only output views.
+  const mfem::real_t* saved_state = sol.HostRead();
   for (int k = 0; k < ctx.num_equations; k++)
   {
     mfem::ParGridFunction uk(&ctx.spaces.fes,
-                             sol.GetData() + k * ctx.spaces.fes.GetNDofs());
+      const_cast<mfem::real_t*>(saved_state + k * ctx.spaces.fes.GetNDofs()));
     std::ostringstream sol_name;
     sol_name << field_prefix << "-" << k << "-init." << std::setfill('0')
              << std::setw(6) << communicator_rank;
@@ -76,10 +79,11 @@ SaveFinalEulerState(ExampleContext& ctx,
   mesh_ofs.precision(precision);
   mesh_ofs << ctx.Mesh();
 
+  const mfem::real_t* saved_state = sol.HostRead();
   for (int k = 0; k < ctx.num_equations; k++)
   {
     mfem::ParGridFunction uk(&ctx.spaces.fes,
-                             sol.GetData() + k * ctx.spaces.fes.GetNDofs());
+      const_cast<mfem::real_t*>(saved_state + k * ctx.spaces.fes.GetNDofs()));
     std::ostringstream sol_name;
     sol_name << field_prefix << "-" << k << "-final." << std::setfill('0')
              << std::setw(6) << communicator_rank;

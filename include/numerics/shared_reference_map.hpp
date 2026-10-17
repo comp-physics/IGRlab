@@ -27,18 +27,31 @@ public:
   ~Map();
   void Configure(const mfem::DenseMatrix& matrix, int columns,
                  Precision precision, const char* method);
+  // Conventional DG only: factor an admitted affine Gauss-Legendre weak
+  // divergence into its one-dimensional derivative/mass tensor lines.
+  // Input/output keep the dense map's original local-node ordering.
+  void ConfigureDGTensorLines(const mfem::DenseMatrix& matrix, int columns,
+                            Precision precision, const mfem::FiniteElement& fe,
+                            const mfem::DenseMatrix& adjugate);
   void Apply();
   bool Ready() const { return precision_ != Precision::Off; }
   Precision GetPrecision() const { return precision_; }
+  bool UsesDGTensorLines() const { return tensor_n1d_ != 0; }
   mfem::DenseMatrix& Input() { return input_; }
   const mfem::DenseMatrix& Input() const { return input_; }
   const mfem::DenseMatrix& Output() const { return output_; }
   const mfem::DenseMatrix& Matrix() const { return matrix_; }
 
 private:
+  void ConfigureStorage(const mfem::DenseMatrix& matrix, int columns,
+                        Precision precision, const char* method);
+  void LogConfiguration() const;
   Precision precision_ = Precision::Off;
   std::string method_;
   mfem::DenseMatrix matrix_, input_, output_;
+  int tensor_n1d_ = 0;
+  mfem::Array<int> tensor_lex_to_local_;
+  mfem::Vector tensor_derivative_, tensor_weights_, tensor_adjugate_;
   std::uint64_t applications_ = 0;
 };
 

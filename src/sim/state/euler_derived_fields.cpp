@@ -1,4 +1,5 @@
 #include "sim/state/detail/euler_derived_fields.hpp"
+#include "physics/euler/eos.hpp"
 
 #include <cfenv>
 #include <cmath>
@@ -36,16 +37,49 @@ struct EulerDerivedFieldPlan
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
 namespace
 {
-bool NativeArithmetic()
+enum class NativeArithmeticMode { Declined, Separate, FusedMomentum };
+
+NativeArithmeticMode NativeArithmetic()
 {
 #if defined(__SSE2__) && !defined(__FAST_MATH__) && !defined(__FMA__)
   const unsigned int csr = _mm_getcsr();
-  return sizeof(mfem::real_t) == sizeof(double) &&
+  const bool supported = sizeof(mfem::real_t) == sizeof(double) &&
     std::numeric_limits<mfem::real_t>::is_iec559 &&
     std::fegetround() == FE_TONEAREST && (csr & 0xe040u) == 0 &&
     (csr & 0x1f80u) == 0x1f80u;
+  return supported ? NativeArithmeticMode::Separate : NativeArithmeticMode::Declined;
+#elif defined(__aarch64__) && !defined(__FAST_MATH__)
+  unsigned long fpcr = 0;
+  asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+  // The default Arm FPCR selects round-to-nearest, gradual underflow, ordinary
+  // NaNs, and masked exceptions. Reject every nondefault control, including
+  // flush modes and directed rounding, before launching CUDA arithmetic.
+  if (fpcr != 0 || sizeof(mfem::real_t) != sizeof(double) ||
+      !std::numeric_limits<mfem::real_t>::is_iec559 ||
+      std::fegetround() != FE_TONEAREST)
+  { return NativeArithmeticMode::Declined; }
+  static const NativeArithmeticMode compiled_mode = []
+  {
+    // Arm FMA is available even without an x86-style __FMA__ macro. Qualify
+    // the actual host EOS expression instead of assuming its contraction mode.
+    // These exact binary inputs distinguish separate squares/add from a fused
+    // second momentum term. Volatile products define the independent oracle.
+    const double a = 0x1.3027f08b821d1p+0, b = 0x1.11d4388ee9e79p+0;
+    volatile double aa = a * a, bb = b * b;
+    const double separate = aa + bb;
+    const double fused = std::fma(b, b, aa);
+    if (separate == fused) { return NativeArithmeticMode::Declined; }
+    mfem::Vector state(4);
+    state(0) = 0.5; state(1) = a; state(2) = b; state(3) = separate;
+    volatile int dim = 2;
+    const double pressure = mfem::EulerPressureFromConservative(state, dim, 2.0, 1e-16);
+    if (pressure == 0.0) { return NativeArithmeticMode::Separate; }
+    if (pressure == separate - fused) { return NativeArithmeticMode::FusedMomentum; }
+    return NativeArithmeticMode::Declined;
+  }();
+  return compiled_mode;
 #else
-  return false;
+  return NativeArithmeticMode::Declined;
 #endif
 }
 
@@ -150,7 +184,7 @@ template <bool Pressure>
 __global__ void EulerCollocatedDerivedFieldKernel(
   int ndofs, int dof, const mfem::real_t* nodal_scale,
   const mfem::real_t* state, double gamma, double floor,
-  mfem::real_t* output, int* declined)
+  mfem::real_t* output, int* declined, bool fused_momentum)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= ndofs) { return; }
@@ -168,7 +202,8 @@ __global__ void EulerCollocatedDerivedFieldKernel(
   if (Pressure)
   {
     double mom2 = __dadd_rn(0.0, __dmul_rn(u[1], u[1]));
-    mom2 = __dadd_rn(mom2, __dmul_rn(u[2], u[2]));
+    mom2 = fused_momentum ? __fma_rn(u[2], u[2], mom2)
+                          : __dadd_rn(mom2, __dmul_rn(u[2], u[2]));
     const double kinetic = __ddiv_rn(__dmul_rn(0.5, mom2), rho);
     const double value = __dmul_rn(__dsub_rn(gamma, 1.0), __dsub_rn(u[3], kinetic));
     if (!isfinite(value)) { atomicExch(declined, 1); return; }
@@ -194,8 +229,9 @@ bool TryProjectEulerDerivedField(
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
   const unsigned long native = static_cast<unsigned long>(mfem::Backend::CPU) |
                                static_cast<unsigned long>(mfem::Backend::CUDA);
+  const NativeArithmeticMode arithmetic = NativeArithmetic();
   if (!mfem::Device::Allows(mfem::Backend::CUDA) || mfem::Device::Allows(~native) ||
-      !NativeArithmetic() || dim != 2 || !std::isfinite(gamma) ||
+      arithmetic == NativeArithmeticMode::Declined || dim != 2 || !std::isfinite(gamma) ||
       !std::isfinite(rho_floor) || !state.OwnsData() || !output.OwnsData())
   { return false; }
   const auto* input_fes = state.ParFESpace();
@@ -220,13 +256,14 @@ bool TryProjectEulerDerivedField(
   {
     EulerCollocatedDerivedFieldKernel<true><<<blocks, 256>>>(
       plan->ndofs, plan->nodal_scale.Size(), nodal_scale,
-      input, gamma, rho_floor, values, declined);
+      input, gamma, rho_floor, values, declined,
+      arithmetic == NativeArithmeticMode::FusedMomentum);
   }
   else
   {
     EulerCollocatedDerivedFieldKernel<false><<<blocks, 256>>>(
       plan->ndofs, plan->nodal_scale.Size(), nodal_scale,
-      input, gamma, rho_floor, values, declined);
+      input, gamma, rho_floor, values, declined, false);
   }
   MFEM_GPU_CHECK(cudaGetLastError());
   // Rare exceptional values retain the host oracle's full zero*NaN behavior

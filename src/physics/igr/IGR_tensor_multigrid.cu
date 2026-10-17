@@ -1,6 +1,7 @@
 #include "igrlab/compat.hpp"
 #include "IGR_tensor_multigrid.hpp"
 #include "IGR_tensor_center.hpp"
+#include "IGR_tensor_reference.hpp"
 #include "IGR_device_krylov.hpp"
 #include "IGR_shared_patch_cuda.cuh" // Reuse checked periodic face-slot topology.
 #include <cuda_runtime.h>
@@ -14,7 +15,6 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <set>
 #include <type_traits>
 #include <vector>
 
@@ -30,6 +30,8 @@ const char* Name(TensorMultigridPrecision p)
 
 const char* SmootherName(TensorMultigridSmoother smoother)
 { return smoother==TensorMultigridSmoother::Center ? "restricted-overlap-3x3-center" : "restricted-overlap-3x3-separable"; }
+const char* OperatorName(TensorMultigridOperator mode)
+{ return mode==TensorMultigridOperator::Shared ? "shared" : "sampled"; }
 
 std::size_t Entry(int e, int slot, int i, int j, int n)
 { return ((std::size_t(e) * 5 + slot) * n + j) * n + i; }
@@ -90,13 +92,13 @@ double Legendre(int degree, double x)
 std::vector<int> Colors(const Topology& topology)
 {
   const int ne=static_cast<int>(topology.size());
-  std::vector<std::set<int>> conflict(ne);
-  for(const auto& support:topology) for(int i:support) for(int j:support)
-    if(i!=j) conflict[i].insert(j);
   std::vector<int> colors(ne,-1),used(ne,-1);
   for(int e=0;e<ne;++e)
   {
-    for(int j:conflict[e]) if(colors[j]>=0) used[colors[j]]=e;
+    // The reciprocal five-point graph's distance-two neighbors are exactly
+    // the conflicts in the former per-element sets. Keep setup storage O(ne).
+    for(int neighbor:topology[e]) for(int j:topology[neighbor])
+      if(colors[j]>=0) used[colors[j]]=e;
     int c=0;while(used[c]==e)++c;colors[e]=c;
   }
   // The coloring is a reconstruction condition, not a heuristic assumption.
@@ -134,6 +136,187 @@ std::vector<int> PatchMap(const Topology& topology)
     }
   }
   return patches;
+}
+
+void CheckTranslationTopology(const Topology& topology)
+{
+  const int ne=static_cast<int>(topology.size());
+  constexpr int opposite[5]={0,2,1,4,3};
+  for(int e=0;e<ne;++e) for(int slot=1;slot<5;++slot)
+  {
+    MFEM_VERIFY(topology[topology[e][slot]][opposite[slot]]==e,
+                "Shared tensor reference requires reciprocal Cartesian translations.");
+    for(int other=1;other<5;++other)
+      MFEM_VERIFY(topology[topology[e][slot]][other]==topology[topology[e][other]][slot],
+                  "Shared tensor reference requires commuting Cartesian translations.");
+  }
+  std::vector<char> seen(ne,0);std::vector<int> connected;connected.reserve(ne);
+  seen[0]=1;connected.push_back(0);
+  for(std::size_t i=0;i<connected.size();++i) for(int slot=1;slot<5;++slot)
+  {
+    const int next=topology[connected[i]][slot];
+    if(!seen[next]){seen[next]=1;connected.push_back(next);}
+  }
+  MFEM_VERIFY(connected.size()==topology.size(),
+              "Shared tensor reference requires one connected periodic Cartesian mesh.");
+}
+
+void SharedModalData(mfem::ParFiniteElementSpace& sfes,
+    std::vector<int>& map,std::vector<double>& nodal)
+{
+  constexpr int d=6,n=36;
+  const int ne=sfes.GetNE(),height=sfes.GetVSize();
+  map.resize(height);nodal.resize(n*n);
+  const auto& reference=sfes.GetFE(0)->GetNodes();
+  MFEM_VERIFY(reference.GetNPoints()==n,"Shared tensor reference requires p5 nodal ordering.");
+  for(int i=0;i<n;++i)for(int j=0;j<n;++j)
+    nodal[i+n*j]=Legendre(j%d,reference.IntPoint(i).x)*Legendre(j/d,reference.IntPoint(i).y);
+  std::vector<char> seen(height,0);mfem::Array<int>dofs;
+  for(int e=0;e<ne;++e)
+  {
+    const auto& fe=*sfes.GetFE(e);
+    MFEM_VERIFY(fe.GetDof()==n && fe.GetOrder()==5 && fe.GetGeomType()==mfem::Geometry::SQUARE &&
+        fe.GetMapType()==mfem::FiniteElement::VALUE && fe.GetNodes().GetNPoints()==n,
+        "Shared tensor reference requires uniform p5 nodal VALUE L2 quads.");
+    sfes.GetElementDofs(e,dofs);
+    for(int i=0;i<n;++i)
+    {
+      MFEM_VERIFY(dofs[i]>=0 && dofs[i]<height && !seen[dofs[i]],
+                  "Shared tensor reference requires unsigned disjoint L2 maps.");
+      const auto& ip=fe.GetNodes().IntPoint(i);const auto& expected=reference.IntPoint(i);
+      MFEM_VERIFY(ip.x==expected.x && ip.y==expected.y,
+                  "Shared tensor reference requires identical nodal ordering.");
+      map[e*n+i]=dofs[i];seen[dofs[i]]=1;
+    }
+  }
+}
+
+__global__ void SharedProbeInput(int ne,int color,int column,const int* colors,
+    const int* map,const double* nodal,double* x)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=ne*36)return;
+  x[map[row]]=colors[row/36]==color?nodal[row%36+36*column]:0.0;
+}
+
+__global__ void SharedProbeProject(int ne,int color,int column,const int* colors,
+    const int* map,const double* nodal,const double* y,double* modal,
+    double* diagonals,int* invalid)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=ne*36)return;
+  const int e=row/36,i=row%36;double value=0;
+  for(int j=0;j<36;++j)value+=nodal[j+36*i]*y[map[e*36+j]];
+  if(!isfinite(value))atomicExch(invalid,1);
+  modal[row]=value;
+  if(colors[e]==color && i==column)
+  {
+    if(!(value>0.0))atomicExch(invalid,1);
+    diagonals[e]+=value;
+    if(i%6<4 && i/6<4)diagonals[ne+e]+=value;
+    if(i%6<2 && i/6<2)diagonals[2*ne+e]+=value;
+    diagonals[3*ne+e]=fmax(diagonals[3*ne+e],fabs(value));
+  }
+}
+
+// Each reduction handles one (slot,modal row), for the current modal column.
+// A bounded first stage and a fixed reduction tree avoid global atomics and
+// make repeated setup deterministic for the same element ordering.
+__global__ void SharedProbePartial(int ne,int color,const int* colors,
+    const int* neighbors,const double* modal,double* partial)
+{
+  __shared__ double sum[256];
+  const int entry=blockIdx.x,slot=entry/36,i=entry%36;
+  double value=0;
+  for(int e=blockIdx.y*256+threadIdx.x;e<ne;e+=256*gridDim.y)
+    if(colors[neighbors[5*e+slot]]==color)value+=modal[e*36+i];
+  sum[threadIdx.x]=value;__syncthreads();
+  for(int step=128;step;step/=2)
+  {if(threadIdx.x<step)sum[threadIdx.x]+=sum[threadIdx.x+step];__syncthreads();}
+  if(threadIdx.x==0)partial[blockIdx.y*180+entry]=sum[0];
+}
+
+__global__ void SharedProbeFinish(int ne,int groups,int column,const double* partial,
+    double* average,int* invalid)
+{
+  __shared__ double sum[256];
+  const int entry=blockIdx.x;double value=0;
+  for(int group=threadIdx.x;group<groups;group+=256)value+=partial[group*180+entry];
+  sum[threadIdx.x]=value;__syncthreads();
+  for(int step=128;step;step/=2)
+  {if(threadIdx.x<step)sum[threadIdx.x]+=sum[threadIdx.x+step];__syncthreads();}
+  if(threadIdx.x==0)
+  {
+    const int index=((entry/36)*36+column)*36+entry%36;
+    const double updated=average[index]+sum[0]/ne;
+    average[index]=updated;if(!isfinite(updated))atomicExch(invalid,1);
+  }
+}
+
+struct SharedSnapshotData
+{
+  Stencil average;
+  std::array<std::vector<double>,3> traces;
+  double maximum_diagonal=0,symmetry_error=0;
+};
+
+SharedSnapshotData SharedSnapshot(const mfem::Operator& op,
+    mfem::ParFiniteElementSpace& sfes,const Topology& topology,
+    const mfem::Array<int>& neighbors,std::vector<int>& map,
+    std::vector<double>& nodal,int& probes,int& color_count)
+{
+  const int ne=sfes.GetNE(),height=sfes.GetVSize();
+  SharedModalData(sfes,map,nodal);
+  const auto colors=Colors(topology);color_count=1+*std::max_element(colors.begin(),colors.end());
+  mfem::Array<int> device_colors(ne),device_map(height),invalid(1);
+  std::copy(colors.begin(),colors.end(),device_colors.HostWrite());
+  std::copy(map.begin(),map.end(),device_map.HostWrite());
+  mfem::Vector transform(36*36),input(height),output(height),modal(height),diagonals(4*ne);
+  std::copy(nodal.begin(),nodal.end(),transform.HostWrite());
+  for(auto* v:{&transform,&input,&output,&modal,&diagonals})v->UseDevice(true);
+  const int groups=std::min(1024,(ne+255)/256);
+  mfem::Vector partial(groups*180),average(5*36*36);partial.UseDevice(true);average.UseDevice(true);
+  CUDA(cudaMemsetAsync(average.Write(),0,std::size_t(average.Size())*sizeof(double)));
+  CUDA(cudaMemsetAsync(diagonals.Write(),0,std::size_t(diagonals.Size())*sizeof(double)));
+  CUDA(cudaMemsetAsync(invalid.Write(),0,sizeof(int)));
+  for(int color=0;color<color_count;++color)for(int j=0;j<36;++j)
+  {
+    SharedProbeInput<<<(height+255)/256,256>>>(ne,color,j,device_colors.Read(),
+        device_map.Read(),transform.Read(),input.Write());
+    op.Mult(input,output);++probes;
+    SharedProbeProject<<<(height+255)/256,256>>>(ne,color,j,device_colors.Read(),
+        device_map.Read(),transform.Read(),output.Read(),modal.Write(),diagonals.ReadWrite(),invalid.ReadWrite());
+    SharedProbePartial<<<dim3(180,groups),256>>>(ne,color,device_colors.Read(),
+        neighbors.Read(),modal.Read(),partial.Write());
+    SharedProbeFinish<<<180,256>>>(ne,groups,j,partial.Read(),average.ReadWrite(),invalid.ReadWrite());
+  }
+  CUDA(cudaGetLastError());
+  MFEM_VERIFY(invalid.HostRead()[0]==0,"Shared tensor reference probe has a nonfinite value or nonpositive diagonal.");
+  SharedSnapshotData result;const double* a=average.HostRead();
+  result.average.assign(a,a+average.Size());
+  const double* diagonal=diagonals.HostRead();
+  for(int l=0;l<3;++l)result.traces[l].assign(diagonal+l*ne,diagonal+(l+1)*ne);
+  for(int e=0;e<ne;++e)result.maximum_diagonal=std::max(result.maximum_diagonal,diagonal[3*ne+e]);
+  // This is the group average of P_t^T A P_t over periodic translations.
+  // SPD follows from the admitted screened SIPG A, not from positive diagonals.
+  // Repair only a bounded roundoff asymmetry of opposite shared face blocks.
+  constexpr int opposite[5]={0,2,1,4,3};double error=0,magnitude=0,coefficient_scale=0;
+  for(double value:result.average)coefficient_scale=std::max(coefficient_scale,std::abs(value));
+  MFEM_VERIFY(coefficient_scale>0 && std::isfinite(coefficient_scale),"Invalid shared tensor reference scale.");
+  for(int slot=0;slot<5;++slot)for(int j=0;j<36;++j)for(int i=0;i<36;++i)
+  {
+    const double x=result.average[(slot*36+j)*36+i]/coefficient_scale;
+    const double y=result.average[(opposite[slot]*36+i)*36+j]/coefficient_scale;
+    error+=(x-y)*(x-y);magnitude+=x*x;
+  }
+  result.symmetry_error=std::sqrt(error/std::max(magnitude,1e-300));
+  MFEM_VERIFY(result.symmetry_error<1e-10,"Shared tensor reference is not symmetric: "<<result.symmetry_error);
+  for(int slot:{0,1,3})for(int j=0;j<36;++j)for(int i=0;i<36;++i)
+  {
+    if(slot==0 && i>j)continue;
+    double& x=result.average[(slot*36+j)*36+i];
+    double& y=result.average[(opposite[slot]*36+i)*36+j];
+    const double value=.5*x+.5*y;x=value;y=value;
+  }
+  return result;
 }
 
 // Exact modal Galerkin snapshot, with every exterior-face diagonal retained.
@@ -274,6 +457,75 @@ template<typename T> __global__ void Residual(int n,int ne,const int* neighbors,
   for(int s=0;s<5;++s)for(int j=0;j<n;++j)
     sum+=a[((e*5+s)*n+j)*n+i]*x[neighbors[e*5+s]*n+j];
   r[row]=b[row]-sum;
+}
+
+template<typename T> __global__ void IGRTensorMultigridSharedResidualSIMTKernel(
+    int ne,int d,int output_d,const int* neighbors,const T* a,
+    const T* b,const T* x,T* r)
+{
+  const int n=d*d,m=output_d*output_d,row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=ne*m)return;
+  const int e=row/m,i=row%m,fine_i=i%output_d+d*(i/output_d);T sum=0;
+  for(int slot=0;slot<5;++slot)for(int j=0;j<n;++j)
+    sum+=a[(slot*n+j)*n+fine_i]*x[neighbors[5*e+slot]*n+j];
+  const T value=b[e*n+fine_i]-sum;
+  r[row]=isfinite(value)?value:static_cast<T>(CUDART_NAN);
+}
+
+// One shared fixed reference matrix times different, genuine five-neighbor
+// columns. The B panels are gathered directly, so there is no global packing
+// workspace. Pre-coarse calls select only the coarse tensor rows and fuse
+// b-Ax with restriction. All CTA warps participate, including tail columns.
+__global__ void IGRTensorMultigridSharedResidualTF32Kernel(
+    int ne,int d,int output_d,const int* neighbors,const float* a,
+    const float* b,const float* x,float* r)
+{
+#if __CUDA_ARCH__ >= 800
+  constexpr int warps=4;
+  const int n=d*d,m=output_d*output_d,k=5*n,tiles_m=(m+15)/16;
+  const int warp=threadIdx.x/32,lane=threadIdx.x%32;
+  const int row0=16*(blockIdx.x%tiles_m);
+  const int col0=16*(warps*(blockIdx.x/tiles_m)+warp);
+  __shared__ __align__(32) float sa[8*24],sb[warps][16*16],sc[warps][16*24];
+  using namespace nvcuda;
+  wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::col_major> fa;
+  wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> fb;
+  wmma::fragment<wmma::accumulator,16,16,8,float> fc;wmma::fill_fragment(fc,0.0f);
+  for(int k0=0;k0<k;k0+=8)
+  {
+    for(int i=threadIdx.x;i<8*24;i+=32*warps)if(i%24<16)
+    {
+      const int row=row0+i%24,column=k0+i/24;
+      const int fine_row=row%output_d+d*(row/output_d);
+      sa[i]=wmma::__float_to_tf32(row<m && column<k?a[n*column+fine_row]:0.0f);
+    }
+    for(int i=lane;i<16*16;i+=32)if(i%16<8)
+    {
+      const int inner=k0+i%16,e=col0+i/16;
+      const float value=e<ne && inner<k?
+          x[neighbors[5*e+inner/n]*n+inner%n]:0.0f;
+      sb[warp][i]=wmma::__float_to_tf32(value);
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(fa,sa,24);wmma::load_matrix_sync(fb,sb[warp],16);
+    wmma::mma_sync(fc,fa,fb,fc);__syncthreads();
+  }
+  wmma::store_matrix_sync(sc[warp],fc,24,wmma::mem_col_major);__syncwarp();
+  for(int i=lane;i<16*24;i+=32)if(i%24<16)
+  {
+    const int row=row0+i%24,e=col0+i/24;
+    if(row<m && e<ne)
+    {
+      const int fine_row=row%output_d+d*(row/output_d);
+      const float value=b[e*n+fine_row]-sc[warp][i];
+      r[e*m+row]=isfinite(value)?value:CUDART_NAN_F;
+    }
+  }
+#else
+  const int m=output_d*output_d;
+  for(int row=blockIdx.x*blockDim.x+threadIdx.x;row<ne*m;row+=blockDim.x*gridDim.x)
+    r[row]=CUDART_NAN_F;
+#endif
 }
 template<typename T> __global__ void Restrict(int ne,int df,int dc,const T* r,T* b)
 {
@@ -431,7 +683,8 @@ void CheckCenterLayout(int ne,int d,int warps,int split_k)
 {
   MFEM_VERIFY(ne>0 && (d==4||d==6) && (warps==1||warps==4) &&
     (split_k==1||split_k==2||split_k==4),"Invalid tensor center response layout.");
-  MFEM_VERIFY(std::size_t(ne)*9*d*d<=INT_MAX && std::size_t(ne)*d*d*split_k<=INT_MAX,
+  MFEM_VERIFY(std::size_t(ne)<=std::size_t(INT_MAX-255)/(9*d*d) &&
+              std::size_t(ne)<=std::size_t(INT_MAX-255)/(d*d*split_k),
               "Tensor center response layout exceeds integer indexing.");
 }
 
@@ -453,14 +706,19 @@ struct PatchReference
   double relative_error=0, eigen_error=0;
 };
 
-PatchReference Reference(const Stencil& a,int ne,int d)
+PatchReference Reference(const Stencil& a,int ne,int d,
+    const std::vector<double>* traces=nullptr)
 {
   const int n=d*d,s=3*d,np=s*s;PatchReference result;
   std::vector<double> average(5*n*n,0.0);
   for(int slot=0;slot<5;++slot)for(int j=0;j<n;++j)for(int i=0;i<n;++i)
   {
-    double sum=0;for(int e=0;e<ne;++e)sum+=a[Entry(e,slot,i,j,n)];
-    average[(slot*n+j)*n+i]=static_cast<double>(sum/ne);
+    if(traces)average[(slot*n+j)*n+i]=a[Entry(0,slot,i,j,n)];
+    else
+    {
+      double sum=0;for(int e=0;e<ne;++e)sum+=a[Entry(e,slot,i,j,n)];
+      average[(slot*n+j)*n+i]=static_cast<double>(sum/ne);
+    }
   }
   std::vector<double> patch(np*np,0.0);
   for(int cell=0;cell<9;++cell)for(int slot=0;slot<5;++slot)
@@ -516,9 +774,11 @@ PatchReference Reference(const Stencil& a,int ne,int d)
   result.relative_error=static_cast<double>(std::sqrt(error/scale));
   double reference_diag=0;for(int i=0;i<n;++i)reference_diag+=average[i+n*i];
   result.scales.resize(ne);
+  MFEM_VERIFY(!traces || traces->size()==std::size_t(ne),"Shared tensor reference trace size mismatch.");
   for(int e=0;e<ne;++e)
   {
-    double diagonal=0;for(int i=0;i<n;++i)diagonal+=a[Entry(e,0,i,i,n)];
+    double diagonal=traces?(*traces)[e]:0.0;
+    if(!traces)for(int i=0;i<n;++i)diagonal+=a[Entry(e,0,i,i,n)];
     const double ratio=reference_diag/diagonal;
     MFEM_VERIFY(std::isfinite(ratio)&&ratio>=1.0/16&&ratio<=16,"Tensor MG patch coefficient contrast exceeds16.");
     result.scales[e]=ratio;
@@ -538,31 +798,47 @@ template<typename T> class TensorMultigrid final:public mfem::Solver
 public:
   TensorMultigrid(const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,
       TensorMultigridPrecision precision,TensorMultigridSmoother smoother,
-      int center_warps,int center_split_k)
+      int center_warps,int center_split_k,TensorMultigridOperator operator_mode)
     :mfem::Solver(op.Height()),ne_(sfes.GetNE()),precision_(precision),smoother_(smoother),
-     center_warps_(center_warps),center_split_k_(center_split_k)
+     operator_mode_(operator_mode),center_warps_(center_warps),center_split_k_(center_split_k)
   {
     const auto start=std::chrono::steady_clock::now();
+    CheckCenterLayout(ne_,6,center_warps_,center_split_k_);
     int ranks=0;MPI_Comm_size(sfes.GetComm(),&ranks);
     MFEM_VERIFY(ranks==1 && mfem::Device::Allows(mfem::Backend::CUDA) &&
       dynamic_cast<const mfem::L2_FECollection*>(sfes.FEColl()) && sfes.GetVDim()==1 &&
       sfes.GetMesh()->Dimension()==2 && sfes.GetVSize()==height && sfes.GetTrueVSize()==height &&
-      op.Width()==height && height==ne_*36,"Tensor MG requires rank-one CUDA scalar p5 L2.");
+      op.Width()==height && std::size_t(height)==std::size_t(ne_)*36,
+      "Tensor MG requires rank-one CUDA scalar p5 L2.");
     int device=0;cudaDeviceProp prop{};CUDA(cudaGetDevice(&device));CUDA(cudaGetDeviceProperties(&prop,device));
     if(precision_==TensorMultigridPrecision::TF32)
     {MFEM_VERIFY(prop.major>=8,"Tensor MG TF32 requires nativeSM80+.");}
+    const bool shared=operator_mode_==TensorMultigridOperator::Shared;
     const auto topology=SharedPatchTopology(sfes);const auto patch=PatchMap(topology);
+    if(shared)CheckTranslationTopology(topology);
     neighbors_.SetSize(ne_*5);patches_.SetSize(ne_*9);
     for(int e=0;e<ne_;++e)for(int s=0;s<5;++s)neighbors_[5*e+s]=topology[e][s];
     std::copy(patch.begin(),patch.end(),patches_.HostWrite());
     std::vector<int> map;std::vector<double> nodal;int probes=0,colors=0;
-    auto fine=Snapshot(op,sfes,topology,map,nodal,probes,colors);
+    SharedSnapshotData reference;Stencil fine;
+    if(shared)
+    {
+      reference=SharedSnapshot(op,sfes,topology,neighbors_,map,nodal,probes,colors);
+      fine=std::move(reference.average);operator_scale_=reference.maximum_diagonal;
+    }
+    else fine=Snapshot(op,sfes,topology,map,nodal,probes,colors);
     double probe_error=0;std::array<Stencil,3> matrices;
     for(int l=0;l<3;++l)
-    {const int d=l==0?6:l==1?4:2;matrices[l]=l==0?fine:Galerkin(fine,ne_,d);
-     probe_error=std::max(probe_error,CheckGalerkin(op,topology,map,nodal,matrices[l],d,probes));}
-    operator_scale_=0;
-    for(int e=0;e<ne_;++e)for(int i=0;i<36;++i)operator_scale_=std::max(operator_scale_,std::abs(fine[Entry(e,0,i,i,36)]));
+    {
+      const int d=l==0?6:l==1?4:2;matrices[l]=l==0?fine:Galerkin(fine,shared?1:ne_,d);
+      if(!shared)probe_error=std::max(probe_error,CheckGalerkin(op,topology,map,nodal,matrices[l],d,probes));
+    }
+    if(!shared)
+    {
+      operator_scale_=0;
+      for(int e=0;e<ne_;++e)for(int i=0;i<36;++i)
+        operator_scale_=std::max(operator_scale_,std::abs(fine[Entry(e,0,i,i,36)]));
+    }
     MFEM_VERIFY(operator_scale_>0 && std::isfinite(operator_scale_),"Invalid tensor MG operator scale.");
     element_map_.SetSize(height);std::copy(map.begin(),map.end(),element_map_.HostWrite());
     nodal_.SetSize(36*36);std::copy(nodal.begin(),nodal.end(),nodal_.HostWrite());nodal_.UseDevice(true);
@@ -576,7 +852,8 @@ public:
       level.rhs.SetSize(ne_*n);level.x.SetSize(ne_*n);level.residual.SetSize(ne_*n);
       if(l<2)
       {
-        const auto ref=Reference(matrices[l],ne_,level.d);
+        if(shared)for(double& value:reference.traces[l])value/=operator_scale_;
+        const auto ref=Reference(matrices[l],ne_,level.d,shared?&reference.traces[l]:nullptr);
         Store(level.scale,ref.scales);
         const int size=ne_*9*n;level.patch_a.SetSize(size);
         if(smoother_==TensorMultigridSmoother::Center)
@@ -595,14 +872,40 @@ public:
           Store(level.back_x,ref.back_x);Store(level.back_y,ref.back_y);
           Store(level.inverse,ref.inverse);level.patch_b.SetSize(size);
         }
-        patch_bytes+=std::size_t(level.patch_a.Size()+level.patch_b.Size())*sizeof(T);
+        patch_bytes+=(std::size_t(level.patch_a.Size())+level.patch_b.Size())*sizeof(T);
         clipped+=ref.clipped;separable_error=std::max(separable_error,ref.relative_error);eigen_error=std::max(eigen_error,ref.eigen_error);
       }
     }
-    coarse_=std::make_unique<mfem::SparseMatrix>(4*ne_);
-    for(int e=0;e<ne_;++e)for(int s=0;s<5;++s)for(int j=0;j<4;++j)for(int i=0;i<4;++i)
-      coarse_->Add(4*e+i,4*topology[e][s]+j,matrices[2][Entry(e,s,i,j,4)]);
-    coarse_->Finalize();
+    if(shared)
+    {
+      // The graph is known: construct sorted CSR directly, avoiding 80*ne
+      // linked-list insertions and their transient allocation at large ne.
+      const int rows=4*ne_;
+      // Allocate through MFEM so its configured HOST/UMPIRE memory policy owns
+      // and releases these buffers. Wrapping new[] with the raw CSR constructor
+      // incorrectly registers that pointer as the configured host memory type.
+      coarse_=std::make_unique<mfem::SparseMatrix>(rows,rows,20);
+      int* columns=coarse_->HostWriteJ();
+      mfem::real_t* values=coarse_->HostWriteData();
+      for(int e=0;e<ne_;++e)
+      {
+        std::array<int,5> order{{0,1,2,3,4}};
+        std::sort(order.begin(),order.end(),[&](int a,int b){return topology[e][a]<topology[e][b];});
+        for(int i=0;i<4;++i)for(int block=0;block<5;++block)for(int j=0;j<4;++j)
+        {
+          const int slot=order[block],entry=20*(4*e+i)+4*block+j;
+          columns[entry]=4*topology[e][slot]+j;
+          values[entry]=matrices[2][Entry(0,slot,i,j,4)];
+        }
+      }
+    }
+    else
+    {
+      coarse_=std::make_unique<mfem::SparseMatrix>(4*ne_);
+      for(int e=0;e<ne_;++e)for(int s=0;s<5;++s)for(int j=0;j<4;++j)for(int i=0;i<4;++i)
+        coarse_->Add(4*e+i,4*topology[e][s]+j,matrices[2][Entry(e,s,i,j,4)]);
+      coarse_->Finalize();
+    }
     mfem::Vector diagonal(4*ne_);coarse_->GetDiag(diagonal);
     // SparseMatrix::GetDiag writes through the device backend; Vector::operator()
     // does not synchronize host validity. Validate the actual computed entries.
@@ -623,6 +926,7 @@ public:
     const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     std::cout<<"[igr-tensor-mg] event=setup precision="<<Name(precision_)<<" hierarchy=5,3,1 cycle=multiplicative-v"
       <<" pre_sweeps=1 post_sweeps=1 smoother="<<SmootherName(smoother_)<<" damping=0.8"
+      <<" operator="<<OperatorName(operator_mode_)
       <<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
       <<" elements="<<ne_<<" n="<<height<<" coarse_n="<<4*ne_<<" coarse_precision=fp64 coarse_rtol=0.01 coarse_maxiter=100"
       <<" coarse_backend=cuda-fp64 coarse_execution="<<(cooperative_?"cooperative":"host-polled")
@@ -632,18 +936,25 @@ public:
       <<" operator_probes="<<probes<<" colors="<<colors
       <<" center_map_bytes="<<center_bytes<<" patch_workspace_bytes="<<patch_bytes
       <<" center_setup_seconds="<<center_setup_seconds
-      <<" stencil_bytes="<<bytes<<" coarse_nnz="<<coarse_->NumNonZeroElems()<<" probe_rel="<<probe_error
-      <<" separable_reference_rel="<<separable_error<<" eigen_residual="<<eigen_error<<" clipped_eigenvalues="<<clipped
-      <<" setup_seconds="<<seconds<<" frozen_operator=sampled-original-galerkin alpha=inherited-fine"
+      <<" stencil_bytes="<<bytes<<" coarse_nnz="<<coarse_->NumNonZeroElems();
+    if(shared)std::cout<<" shared_symmetry_rel="<<reference.symmetry_error
+      <<" original_galerkin_check=not-applicable reference_model=translation-averaged-frozen-coefficients"
+      <<" reference_diagonal_scaling=per-element-trace residual_pack=direct-gather residual_restrict=fused";
+    else std::cout<<" probe_rel="<<probe_error;
+    std::cout<<" separable_reference_rel="<<separable_error<<" eigen_residual="<<eigen_error<<" clipped_eigenvalues="<<clipped
+      <<" setup_seconds="<<seconds<<" frozen_operator="<<(shared?"shared-reference-approximate":"sampled-original-galerkin")
+      <<" alpha=inherited-fine"
       <<" tensor_execution="<<(precision_==TensorMultigridPrecision::TF32?"requires-profile-proof":"none")<<" fallback=none\n";
   }
   ~TensorMultigrid() override
   {
     std::cout<<"[igr-tensor-mg] event=summary precision="<<Name(precision_)<<" applications="<<applications_
       <<" smoother="<<SmootherName(smoother_)<<" center_warps="<<center_warps_<<" center_split_k="<<center_split_k_
+      <<" operator="<<OperatorName(operator_mode_)
       <<" coarse_iterations="<<coarse_iterations_<<" coarse_failures="<<coarse_failures_<<" coarse_cap_hits="<<coarse_cap_hits_
       <<" transform_submissions="<<transforms_<<" center_submissions="<<centers_
       <<" center_pack_submissions="<<center_packs_<<" center_add_submissions="<<center_adds_
+      <<" shared_residual_submissions="<<shared_residuals_<<" shared_restricted_residual_submissions="<<shared_restricted_residuals_
       <<" cycle=multiplicative-v fallback=none\n";
   }
   void SetOperator(const mfem::Operator& op) override
@@ -696,6 +1007,19 @@ private:
     Transform(s,v.back_x,v.patch_b,v.patch_a);
     AddCenter<<<(ne_*d*d+255)/256,256>>>(ne_,d,v.scale.Read(),v.patch_a.Read(),v.x.ReadWrite());
   }
+  void SharedResidual(int l,bool restrict_rows) const
+  {
+    const auto& v=levels_[l];
+    const int restricted_d=restrict_rows?levels_[l+1].d:0;
+    T* out=restrict_rows?levels_[l+1].rhs.Write():v.residual.Write();
+    if constexpr(std::is_same<T,float>::value)
+      ApplyTensorSharedResidual(ne_,v.d,neighbors_.Read(),v.a.Read(),v.rhs.Read(),
+          v.x.Read(),out,precision_==TensorMultigridPrecision::TF32,restricted_d);
+    else
+      ApplyTensorSharedResidual(ne_,v.d,neighbors_.Read(),v.a.Read(),v.rhs.Read(),
+          v.x.Read(),out,restricted_d);
+    ++shared_residuals_;if(restrict_rows)++shared_restricted_residuals_;
+  }
   void Cycle(int l) const
   {
     const auto& v=levels_[l];const int n=ne_*v.d*v.d;
@@ -723,14 +1047,21 @@ private:
     }
     CUDA(cudaMemsetAsync(v.x.Write(),0,std::size_t(n)*sizeof(T)));
     Smooth(l,v.rhs);
-    Residual<<<(n+255)/256,256>>>(v.d*v.d,ne_,neighbors_.Read(),v.a.Read(),v.rhs.Read(),v.x.Read(),v.residual.Write());
     const auto& c=levels_[l+1];const int nc=ne_*c.d*c.d;
-    Restrict<<<(nc+255)/256,256>>>(ne_,v.d,c.d,v.residual.Read(),c.rhs.Write());Cycle(l+1);
+    if(operator_mode_==TensorMultigridOperator::Shared)SharedResidual(l,true);
+    else
+    {
+      Residual<<<(n+255)/256,256>>>(v.d*v.d,ne_,neighbors_.Read(),v.a.Read(),v.rhs.Read(),v.x.Read(),v.residual.Write());
+      Restrict<<<(nc+255)/256,256>>>(ne_,v.d,c.d,v.residual.Read(),c.rhs.Write());
+    }
+    Cycle(l+1);
     ProlongAdd<<<(nc+255)/256,256>>>(ne_,v.d,c.d,c.x.Read(),v.x.ReadWrite());
-    Residual<<<(n+255)/256,256>>>(v.d*v.d,ne_,neighbors_.Read(),v.a.Read(),v.rhs.Read(),v.x.Read(),v.residual.Write());
+    if(operator_mode_==TensorMultigridOperator::Shared)SharedResidual(l,false);
+    else Residual<<<(n+255)/256,256>>>(v.d*v.d,ne_,neighbors_.Read(),v.a.Read(),v.rhs.Read(),v.x.Read(),v.residual.Write());
     Smooth(l,v.residual);
   }
   int ne_,norm_blocks_=0;TensorMultigridPrecision precision_;TensorMultigridSmoother smoother_;
+  TensorMultigridOperator operator_mode_;
   int center_warps_,center_split_k_;double operator_scale_=1;
   std::array<Level<T>,3> levels_;
   mfem::Array<int> neighbors_,patches_,element_map_,essential_;
@@ -743,8 +1074,41 @@ private:
   bool cooperative_=false;
   mutable unsigned long long applications_=0,coarse_iterations_=0,coarse_failures_=0,coarse_cap_hits_=0,transforms_=0;
   mutable unsigned long long centers_=0,center_packs_=0,center_adds_=0;
+  mutable unsigned long long shared_residuals_=0,shared_restricted_residuals_=0;
 };
 } // namespace
+
+void ApplyTensorSharedResidual(int ne,int d,const int* neighbors,
+    const double* stencil,const double* rhs,const double* x,double* residual,
+    int restricted_d)
+{
+  MFEM_VERIFY(TensorSharedResidualLayoutValid(ne,d,restricted_d) &&
+      neighbors && stencil && rhs && x && residual && residual!=rhs && residual!=x && residual!=stencil,
+      "Invalid shared tensor residual layout/storage.");
+  const int output_d=restricted_d?restricted_d:d,m=output_d*output_d;
+  IGRTensorMultigridSharedResidualSIMTKernel<<<(ne*m+255)/256,256>>>(
+      ne,d,output_d,neighbors,stencil,rhs,x,residual);
+  CUDA(cudaGetLastError());
+}
+
+void ApplyTensorSharedResidual(int ne,int d,const int* neighbors,
+    const float* stencil,const float* rhs,const float* x,float* residual,
+    bool tf32,int restricted_d)
+{
+  MFEM_VERIFY(TensorSharedResidualLayoutValid(ne,d,restricted_d) &&
+      neighbors && stencil && rhs && x && residual && residual!=rhs && residual!=x && residual!=stencil,
+      "Invalid shared tensor residual layout/storage.");
+  const int output_d=restricted_d?restricted_d:d,m=output_d*output_d;
+  if(tf32)
+  {
+    const int tiles_m=(m+15)/16,groups=(ne+63)/64;
+    IGRTensorMultigridSharedResidualTF32Kernel<<<tiles_m*groups,128>>>(
+        ne,d,output_d,neighbors,stencil,rhs,x,residual);
+  }
+  else IGRTensorMultigridSharedResidualSIMTKernel<<<(ne*m+255)/256,256>>>(
+      ne,d,output_d,neighbors,stencil,rhs,x,residual);
+  CUDA(cudaGetLastError());
+}
 
 void ApplyTensorCenterResponse(int ne,int d,const double* response,
     const double* packed,double* partial,int warps,int split_k)
@@ -798,16 +1162,19 @@ void AddTensorCenterResponse(int ne,int d,const float* factor,
 
 std::unique_ptr<mfem::Solver> MakeTensorMultigridPreconditioner(
     const mfem::Operator& op,mfem::ParFiniteElementSpace& sfes,TensorMultigridPrecision precision,
-    TensorMultigridSmoother smoother,int center_warps,int center_split_k)
+    TensorMultigridSmoother smoother,int center_warps,int center_split_k,
+    TensorMultigridOperator operator_mode)
 {
+  MFEM_VERIFY(operator_mode==TensorMultigridOperator::Sampled||operator_mode==TensorMultigridOperator::Shared,
+              "Invalid tensor MG operator mode.");
   MFEM_VERIFY(smoother==TensorMultigridSmoother::Separable||smoother==TensorMultigridSmoother::Center,
               "Invalid tensor MG smoother.");
   CheckCenterLayout(sfes.GetNE(),6,center_warps,center_split_k);
   MFEM_VERIFY(smoother==TensorMultigridSmoother::Center||(center_warps==1&&center_split_k==1),
               "Tensor center layout options require the center smoother.");
   if(precision==TensorMultigridPrecision::FP64)
-    return std::make_unique<TensorMultigrid<double>>(op,sfes,precision,smoother,center_warps,center_split_k);
+    return std::make_unique<TensorMultigrid<double>>(op,sfes,precision,smoother,center_warps,center_split_k,operator_mode);
   MFEM_VERIFY(precision==TensorMultigridPrecision::FP32||precision==TensorMultigridPrecision::TF32,"Invalid tensor MG precision.");
-  return std::make_unique<TensorMultigrid<float>>(op,sfes,precision,smoother,center_warps,center_split_k);
+  return std::make_unique<TensorMultigrid<float>>(op,sfes,precision,smoother,center_warps,center_split_k,operator_mode);
 }
 } }

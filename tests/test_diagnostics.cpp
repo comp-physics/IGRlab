@@ -6,6 +6,7 @@
 #include "utils/diagnostics/non_finite.hpp"
 
 #include <cmath>
+#include <cfenv>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -285,6 +286,55 @@ int RunDiagnosticsTests(TestContext& ctx)
       "Collocated p5 GL/LGL CUDA projections exactly match generic coefficients.");
     check_current_projection(true,
       "Warm collocation plans still read the current device state exactly.");
+
+    // This pair makes a contracted second square differ by one ULP from the
+    // separate momentum sum. The small pressure exposes that distinction.
+    {
+      const double a = 0x1.3027f08b821d1p+0, b = 0x1.11d4388ee9e79p+0;
+      volatile double aa = a * a, bb = b * b;
+      auto* values = bundle.sol.HostReadWrite();
+      for (int i = 0; i < ndofs; ++i)
+      {
+        values[i] = 0.5; values[ndofs + i] = a; values[2 * ndofs + i] = b;
+        values[3 * ndofs + i] = aa + bb;
+      }
+      check_current_projection(true,
+        "Collocated projection matches the host EOS momentum contraction exactly.");
+    }
+    if (cuda)
+    {
+      std::fenv_t saved_environment;
+      ctx.Check(std::fegetenv(&saved_environment) == 0,
+                "Derived projection can save the host floating-point environment.");
+      ctx.Check(std::fesetround(FE_DOWNWARD) == 0,
+                "Derived projection can select directed host rounding.");
+      check_current_projection(false,
+        "Directed host rounding retains the generic derived-field projection.");
+      ctx.Check(std::fesetenv(&saved_environment) == 0,
+                "Derived projection restores the host floating-point environment.");
+#if defined(__aarch64__)
+      unsigned long original_fpcr = 0;
+      asm volatile("mrs %0, fpcr" : "=r"(original_fpcr));
+      // Exercise both a flush control and a trap control, with finite values
+      // that do not trigger the selected invalid-operation exception.
+      for (unsigned long control : {1ul << 24, 1ul << 8})
+      {
+        const unsigned long changed_fpcr = original_fpcr | control;
+        asm volatile("msr fpcr, %0" : : "r"(changed_fpcr) : "memory");
+        unsigned long actual_fpcr = 0;
+        asm volatile("mrs %0, fpcr" : "=r"(actual_fpcr));
+        const bool applied = (actual_fpcr & control) != 0;
+        ctx.Check(control != (1ul << 24) || applied,
+                  "Arm flush-to-zero control is applied for the fallback test.");
+        // Some Arm CPUs implement exception-trap enables as read-as-zero,
+        // write-ignored bits. Route expectations follow the actual FPCR.
+        check_current_projection(actual_fpcr == 0,
+          applied ? "Applied Arm flush/trap controls retain the host projection."
+                  : "Ignored Arm trap control retains the admitted projection.");
+        asm volatile("msr fpcr, %0" : : "r"(original_fpcr) : "memory");
+      }
+#endif
+    }
 
     auto* edge_state = bundle.sol.HostReadWrite();
     for (int i = 0; i < ndofs; ++i)

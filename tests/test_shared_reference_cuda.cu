@@ -96,6 +96,77 @@ void MatrixOracle(int m, int k, int columns, Precision precision)
   MFEM_VERIFY(nonfinite, "Shared map hid nonfinite/FP32-overflow input instead of exposing failure.");
 }
 
+void TensorLineOracle(int order, Precision precision, bool sheared)
+{
+  mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+    1,1,mfem::Element::QUADRILATERAL,false,1.0,1.0,false);
+  if (sheared)
+    for (int v = 0; v < mesh.GetNV(); ++v)
+    {
+      double* point = mesh.GetVertex(v);
+      point[0] = 0.75*point[0]+0.25*point[1]; point[1] *= 1.25;
+    }
+  mfem::L2_FECollection fec(order,2,mfem::BasisType::GaussLegendre);
+  const auto& fe = *fec.FiniteElementForGeometry(mfem::Geometry::SQUARE);
+  auto* transformation = mesh.GetElementTransformation(0);
+  mfem::TransposeIntegrator weak(new mfem::GradientIntegrator());
+  DenseMatrix assembled;
+  weak.AssembleElementMatrix2(fe,fe,*transformation,assembled);
+  const int dof = fe.GetDof(), k = 2*dof, columns = k+3;
+  DenseMatrix matrix(dof,k), saved;
+  for (int i = 0; i < dof; ++i) for (int j = 0; j < dof; ++j)
+    for (int d = 0; d < 2; ++d) { matrix(i,2*j+d) = assembled(i,d*dof+j); }
+  saved = matrix;
+  transformation->SetIntPoint(&mfem::Geometries.GetCenter(mfem::Geometry::SQUARE));
+  DenseMatrix adjugate(2); mfem::CalcAdjugate(transformation->Jacobian(),adjugate);
+  Map map;
+  map.ConfigureDGTensorLines(matrix,columns,precision,fe,adjugate);
+  matrix = 17.0;
+  const auto* input_address = map.Input().Read();
+  const auto* output_address = map.Output().Read();
+  for (int phase = 0; phase < 3; ++phase)
+  {
+    const double scale = std::ldexp(1.0,phase == 0 ? 0 : phase == 1 ? -80 : 80);
+    double* input = map.Input().HostWrite();
+    for (int column = 0; column < columns; ++column) for (int j = 0; j < k; ++j)
+      input[j+k*column] = phase == 0 && column < k ? (column == j ? scale : 0.0) :
+        scale*std::cos(0.31*j-0.17*column+phase);
+    map.Apply();
+    const double* output = map.Output().HostRead();
+    long double error = 0.0L, bound = 0.0L;
+    for (int column = 0; column < columns; ++column) for (int i = 0; i < dof; ++i)
+    {
+      long double expected = 0.0L, row_bound = 0.0L;
+      for (int j = 0; j < k; ++j)
+      {
+        const long double product = static_cast<long double>(saved(i,j))*input[j+k*column];
+        expected += product; row_bound += std::abs(product);
+      }
+      MFEM_VERIFY(std::isfinite(output[i+dof*column]),"Nonfinite DG tensor-line result.");
+      error = std::max(error,std::abs(output[i+dof*column]-expected));
+      bound = std::max(bound,row_bound);
+    }
+    const double tolerance = precision == Precision::FP64 ? 2e-12 : AlgebraTolerance(precision);
+    MFEM_VERIFY(bound > 0.0L && error <= tolerance*bound,
+      "DG tensor lines failed independent assembled-matrix oracle: p=" << order
+      << " phase=" << phase << " sheared=" << sheared << " relative="
+      << static_cast<double>(error/bound));
+    MFEM_VERIFY(input_address == map.Input().Read() && output_address == map.Output().Read(),
+                "DG tensor lines resized a live workspace.");
+  }
+  double* input = map.Input().HostWrite(); std::fill(input,input+k*columns,0.0);
+  map.Apply();
+  const double* output = map.Output().HostRead();
+  for (int i = 0; i < dof*columns; ++i)
+    MFEM_VERIFY(output[i] == 0.0,"Zero DG tensor-line input did not produce exact zero.");
+  input = map.Input().HostWrite();
+  input[0] = precision == Precision::FP64 ? std::numeric_limits<double>::quiet_NaN() : 1e100;
+  map.Apply(); output = map.Output().HostRead();
+  bool nonfinite = false;
+  for (int i = 0; i < dof; ++i) { nonfinite = nonfinite || !std::isfinite(output[i]); }
+  MFEM_VERIFY(nonfinite,"DG tensor lines hid nonfinite/FP32-overflow input.");
+}
+
 void CentralLineOracle(int order, Precision precision)
 {
   const int n = order + 1, dof = n * n, ne = 5, rows = ne * dof;
@@ -164,11 +235,21 @@ void FillEuler(mfem::ParFiniteElementSpace& fes, Vector& state,
   }
 }
 
-void DGProductionOracle(int order, Precision precision)
+void DGProductionOracle(int order, Precision precision, const char* layout = "dense",
+                        bool sheared = false)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
     4, 4, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
   std::vector<Vector> translations = {Vector({1.0, 0.0}), Vector({0.0, 1.0})};
+  if (sheared)
+  {
+    for (int v = 0; v < serial.GetNV(); ++v)
+    {
+      double* point = serial.GetVertex(v);
+      point[0] = 0.75*point[0]+0.25*point[1]; point[1] *= 1.25;
+    }
+    translations = {Vector({0.75,0.0}),Vector({0.25,1.25})};
+  }
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
     serial, serial.CreatePeriodicVertexMapping(translations));
   mfem::ParMesh mesh(MPI_COMM_SELF, periodic);
@@ -182,12 +263,28 @@ void DGProductionOracle(int order, Precision precision)
   physical.SetInvariantDomainFlux(true);
   physical.SetSigmaAwareCFL(true); physical.SetSigmaAwareRusanov(true);
   mfem::RusanovFluxWithSides flux(physical);
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
+  setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
   mfem::DGHyperbolicConservationLaws baseline(fes, flux, 2, true);
+  const bool tensor_lines = std::string(layout) == "tensor-lines";
+  // Build an independent full-storage control before enabling the constructor
+  // opt-in. Both controls subsequently execute the identical tensor-line map.
+  std::unique_ptr<mfem::DGHyperbolicConservationLaws> full_setup;
+  if (tensor_lines)
+    full_setup = std::make_unique<mfem::DGHyperbolicConservationLaws>(fes,flux,2,true);
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", layout, 1);
+  setenv("IGRLAB_SHARED_OPERATOR_PRECISION", igrlab::shared_reference::PrecisionName(precision), 1);
   mfem::DGHyperbolicConservationLaws candidate(fes, flux, 2, true);
   baseline.SetDGSEMGamma(1.4); candidate.SetDGSEMGamma(1.4);
   baseline.SetInvariantDomainVolumeSpeedTracking(true);
   candidate.SetInvariantDomainVolumeSpeedTracking(true);
+  if (full_setup)
+  {
+    full_setup->SetDGSEMGamma(1.4);
+    full_setup->SetInvariantDomainVolumeSpeedTracking(true);
+  }
   Vector state(fes.GetVSize()), expected(fes.GetVSize()), actual(fes.GetVSize());
+  Vector full_result(fes.GetVSize());
   // Assemble the physical mass independently of the production inverse and
   // its cached correction weights. The conserved cell moment is (M 1)^T du/dt,
   // not an unweighted sum of the strong nodal residual.
@@ -211,21 +308,41 @@ void DGProductionOracle(int order, Precision precision)
   for (int phase = 0; phase < 3; ++phase)
   {
     FillEuler(fes, state, sigma, phase);
+    setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
     setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
     baseline.Mult(state, expected);
+    if (phase == 2 && full_setup)
+    {
+      full_setup->Update(); // still dense/off: preserve its per-element setup
+    }
+    setenv("IGRLAB_SHARED_EULER_LAYOUT", layout, 1);
     setenv("IGRLAB_SHARED_OPERATOR_PRECISION", igrlab::shared_reference::PrecisionName(precision), 1);
+    if (phase == 2 && full_setup) { candidate.Update(); }
+    if (full_setup) { full_setup->Mult(state, full_result); }
     candidate.Mult(state, actual);
     MFEM_VERIFY(std::isfinite(candidate.GetMaxCharSpeed()) &&
                   candidate.GetMaxCharSpeed() == baseline.GetMaxCharSpeed(),
                 "Shared derivative changed the FP64 characteristic-speed policy.");
     const double* a = actual.HostRead(); const double* b = expected.HostRead();
+    const double* full = full_setup ? full_result.HostRead() : nullptr;
     double error = 0.0, scale = 0.0;
+    double setup_error = 0.0, setup_scale = 0.0;
     for (int i = 0; i < state.Size(); ++i)
     {
       MFEM_VERIFY(std::isfinite(a[i]) && std::isfinite(b[i]), "Nonfinite DG production oracle.");
       error = std::max(error, std::abs(a[i] - b[i]));
       scale = std::max(scale, std::abs(b[i]));
+      if (full)
+      {
+        MFEM_VERIFY(std::isfinite(full[i]), "Nonfinite full-storage tensor-line control.");
+        setup_error = std::max(setup_error,std::abs(a[i]-full[i]));
+        setup_scale = std::max(setup_scale,std::abs(full[i]));
+      }
     }
+    MFEM_VERIFY(!full || setup_error <= 2e-11*std::max(1.0,setup_scale),
+                "Reference-only setup changed the matched tensor-line RHS: p=" << order
+                << " phase=" << phase << " sheared=" << sheared
+                << " error=" << setup_error << " scale=" << setup_scale);
     if (phase == 0)
     {
       MFEM_VERIFY(error <= 5e-11, "Shared DG changed the constant-state residual.");
@@ -247,6 +364,7 @@ void DGProductionOracle(int order, Precision precision)
       for (int equation = 0; equation < 4; ++equation)
       {
         long double reference_moment = 0.0L, candidate_moment = 0.0L, bound = 0.0L;
+        long double full_moment = 0.0L;
         for (int i = 0; i < dofs.Size(); ++i)
         {
           const int index = fes.DofToVDof(dofs[i], equation);
@@ -254,6 +372,7 @@ void DGProductionOracle(int order, Precision precision)
           reference_moment += weight * b[index];
           candidate_moment += weight * a[index];
           bound += weight * (std::abs(a[index]) + std::abs(b[index]));
+          if (full) { full_moment += weight*full[index]; }
         }
         largest_cell_moment = std::max(largest_cell_moment, std::abs(reference_moment));
         const long double moment_tolerance =
@@ -264,6 +383,8 @@ void DGProductionOracle(int order, Precision precision)
                     << " phase=" << phase << " element=" << e << " equation=" << equation
                     << " error=" << static_cast<double>(candidate_moment - reference_moment)
                     << " tolerance=" << static_cast<double>(moment_tolerance));
+        MFEM_VERIFY(!full || std::abs(candidate_moment-full_moment) <= moment_tolerance,
+                    "Reference-only setup changed the matched tensor-line cell moment.");
       }
     }
     if (phase > 0)
@@ -274,6 +395,41 @@ void DGProductionOracle(int order, Precision precision)
                   "Cell-moment regression lacks a nontrivial physical moment.");
     }
   }
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
+  setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
+}
+
+void ReferenceSetupRejection()
+{
+#ifdef MFEM_USE_EXCEPTIONS
+  for (bool nonaffine : {false,true})
+  {
+    mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      2,2,mfem::Element::QUADRILATERAL,false,1.0,1.0,false);
+    for (int v = 0; v < serial.GetNV(); ++v)
+    {
+      double* point = serial.GetVertex(v);
+      if (point[0] == 0.5 && (!nonaffine || point[1] == 0.5)) { point[0] += 0.0625; }
+    }
+    mfem::ParMesh mesh(MPI_COMM_SELF,serial);
+    mfem::L2_FECollection fec(5,2,mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace fes(&mesh,&fec,4,mfem::Ordering::byNODES);
+    mfem::EulerFlux euler(2,1.4); mfem::RusanovFluxWithSides flux(euler);
+    setenv("IGRLAB_SHARED_EULER_LAYOUT", "tensor-lines", 1);
+    setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "fp64", 1);
+    const auto previous = mfem::get_error_action();
+    mfem::set_error_action(mfem::MFEM_ERROR_THROW);
+    bool rejected = false;
+    try { mfem::DGHyperbolicConservationLaws candidate(fes,flux,2,true); }
+    catch (const mfem::ErrorException&) { rejected = true; }
+    mfem::set_error_action(previous);
+    MFEM_VERIFY(rejected,"Reference-only DG setup admitted nonuniform/non-affine cells.");
+  }
+  std::cout << "shared_reference_setup_rejection nonuniform=true nonaffine=true passed\n";
+#else
+  std::cout << "shared_reference_setup_rejection skipped=no-mfem-exceptions\n";
+#endif
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
 }
 } // namespace
@@ -283,21 +439,30 @@ int main(int argc, char** argv)
   mfem::Mpi::Init(argc, argv);
   mfem::Device device("cuda");
   unsetenv("DG_IGR_SHARED_OPERATOR_PRECISION");
+  unsetenv("DG_IGR_SHARED_EULER_LAYOUT");
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
+  ReferenceSetupRejection();
   for (Precision precision : {Precision::FP64, Precision::FP32, Precision::TF32})
   {
     MatrixOracle(6, 6, 37, precision);
     MatrixOracle(36, 98, 71, precision);
     MatrixOracle(17, 13, 19, precision);
+    for (int order = 1; order <= 7; ++order)
+      for (bool sheared : {false,true}) { TensorLineOracle(order,precision,sheared); }
     for (int order : {1, 3, 5, 7})
     {
       CentralLineOracle(order, precision);
       DGProductionOracle(order, precision);
+      DGProductionOracle(order, precision, "tensor-lines");
+      DGProductionOracle(order, precision, "tensor-lines", true);
     }
   }
   std::cout << "shared_reference_test passed real_columns=true padded_tails=true "
                "immutable_matrix=true reused_workspace=true centered_constant=true "
                "dg_original_rhs=true dg_original_cell_moment=true "
+               "dg_tensor_lines_original_matrix=true dg_tensor_lines_shear=true "
+               "dg_reference_setup_rhs=true dg_reference_setup_moment=true dg_reference_setup_update=true "
                "dgsem_original_split=true nonfinite_exposed=true\n";
   return 0;
 }

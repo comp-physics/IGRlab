@@ -1,6 +1,7 @@
 #include "igrlab/compat.hpp"
 #include "../src/physics/igr/IGR_tensor_multigrid.hpp"
 #include "../src/physics/igr/IGR_device_krylov.hpp"
+#include "../src/physics/igr/IGR_tensor_reference.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -8,17 +9,20 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace {
 using Precision=igrlab::igr_internal::TensorMultigridPrecision;
 using Smoother=igrlab::igr_internal::TensorMultigridSmoother;
+using OperatorMode=igrlab::igr_internal::TensorMultigridOperator;
 
 struct Configuration
 {
   Precision precision;
   Smoother smoother;
   int warps,split_k;
+  OperatorMode operator_mode=OperatorMode::Sampled;
 };
 
 void Assemble(mfem::BilinearForm& form,mfem::Coefficient& reaction,mfem::Coefficient& diffusion)
@@ -45,6 +49,98 @@ const char* Name(Precision p)
 {return p==Precision::FP64?"fp64":p==Precision::FP32?"fp32":"tf32";}
 const char* Name(Smoother s)
 {return s==Smoother::Separable?"separable":"center";}
+const char* Name(OperatorMode mode)
+{return mode==OperatorMode::Sampled?"sampled":"shared";}
+
+template<typename T> void CheckSharedResidual(int d,int restricted_d,bool tf32)
+{
+  using igrlab::igr_internal::ApplyTensorSharedResidual;
+  constexpr int nx=5,ny=4,ne=nx*ny,tail=19;
+  const int n=d*d,rd=restricted_d?restricted_d:d,nr=rd*rd;
+  // Twenty actual elements exercise the final partial WMMA column tile. The
+  // five-neighbor map is independently scrambled, including periodic wraps.
+  std::array<int,ne> permutation{};
+  for(int e=0;e<ne;++e)permutation[e]=(7*e+3)%ne;
+  mfem::Array<int> neighbors(5*ne);
+  int* neighbor=neighbors.HostWrite();
+  for(int y=0;y<ny;++y)for(int x=0;x<nx;++x)
+  {
+    const int e=permutation[y*nx+x];
+    neighbor[5*e]=e;
+    neighbor[5*e+1]=permutation[y*nx+(x+nx-1)%nx];
+    neighbor[5*e+2]=permutation[y*nx+(x+1)%nx];
+    neighbor[5*e+3]=permutation[((y+ny-1)%ny)*nx+x];
+    neighbor[5*e+4]=permutation[((y+1)%ny)*nx+x];
+  }
+  mfem::Array<T> stencil(n*5*n),rhs(ne*n),state(ne*n),output(ne*nr+tail);
+  T* a=stencil.HostWrite();T* x=state.HostWrite();T* b=rhs.HostWrite();
+  for(int column=0;column<5*n;++column)for(int row=0;row<n;++row)
+  {
+    const double sign=(column+3*row)%2?-1.:1.;
+    a[row+n*column]=static_cast<T>((column==row?1.+.01*row:0.)+
+      sign*.004*std::cos(.17*(1+column+2*row)));
+  }
+  for(int e=0;e<ne;++e)for(int j=0;j<n;++j)
+    x[e*n+j]=static_cast<T>(.3+std::sin(.23*(1+e*n+j))-.2*std::cos(.31*j));
+  // Almost-canceling b-A*x makes a relative-to-residual check misleading.
+  // Certify forward error against independently accumulated |b|+|A|*|x|.
+  for(int e=0;e<ne;++e)for(int row=0;row<n;++row)
+  {
+    long double sum=0;
+    for(int slot=0;slot<5;++slot)for(int j=0;j<n;++j)
+      sum+=static_cast<long double>(a[row+n*(slot*n+j)])*x[neighbor[5*e+slot]*n+j];
+    b[e*n+row]=static_cast<T>(sum+1e-5*std::sin(.41*(row+e)));
+  }
+  T* values=output.HostWrite();std::fill(values,values+output.Size(),static_cast<T>(12345.));
+  if constexpr(std::is_same<T,double>::value)
+    ApplyTensorSharedResidual(ne,d,neighbors.Read(),stencil.Read(),rhs.Read(),state.Read(),output.ReadWrite(),restricted_d);
+  else
+    ApplyTensorSharedResidual(ne,d,neighbors.Read(),stencil.Read(),rhs.Read(),state.Read(),output.ReadWrite(),tf32,restricted_d);
+  MFEM_VERIFY(cudaGetLastError()==cudaSuccess&&cudaDeviceSynchronize()==cudaSuccess,
+              "Shared tensor residual launch failed.");
+  const T* result=output.HostRead();long double worst=0;
+  for(int e=0;e<ne;++e)for(int row=0;row<nr;++row)
+  {
+    const int fine_row=row%rd+d*(row/rd);
+    long double sum=0,bound=std::abs(static_cast<long double>(b[e*n+fine_row]));
+    for(int slot=0;slot<5;++slot)for(int j=0;j<n;++j)
+    {
+      const long double product=static_cast<long double>(a[fine_row+n*(slot*n+j)])*x[neighbor[5*e+slot]*n+j];
+      sum+=product;bound+=std::abs(product);
+    }
+    const long double expected=static_cast<long double>(b[e*n+fine_row])-sum;
+    MFEM_VERIFY(std::isfinite(static_cast<double>(result[e*nr+row])),"Nonfinite shared tensor residual.");
+    worst=std::max(worst,std::abs(static_cast<long double>(result[e*nr+row])-expected)/bound);
+  }
+  for(int i=ne*nr;i<output.Size();++i)
+    MFEM_VERIFY(result[i]==static_cast<T>(12345.),"Shared residual wrote beyond real output columns.");
+  const double tolerance=std::is_same<T,double>::value?2e-13:tf32?3e-3:5e-6;
+  MFEM_VERIFY(worst<tolerance,"Shared tensor residual forward error failed: d="<<d
+    <<" restricted_d="<<restricted_d<<" tf32="<<tf32<<" error="<<static_cast<double>(worst));
+  std::cout<<"tensor_shared_residual_test d="<<d<<" restricted_d="<<restricted_d
+    <<" precision="<<(std::is_same<T,double>::value?"fp64":tf32?"tf32":"fp32")
+    <<" real_columns="<<ne<<" cancellation_forward_error="<<static_cast<double>(worst)<<'\n';
+}
+
+void CheckSharedResidualAdmission()
+{
+  using igrlab::igr_internal::TensorSharedResidualLayoutValid;
+  using igrlab::igr_internal::TensorSharedStencilEntries;
+  MFEM_VERIFY(TensorSharedResidualLayoutValid(512*512,6)&&
+              TensorSharedResidualLayoutValid(512*512,6,4)&&
+              TensorSharedStencilEntries(6)==std::size_t(5)*36*36,
+              "Shared tensor operator must admit the fixed n512 p5 workload.");
+  MFEM_VERIFY(!TensorSharedResidualLayoutValid(std::numeric_limits<int>::max(),6)&&
+              !TensorSharedResidualLayoutValid(0,6)&&
+              !TensorSharedResidualLayoutValid(20,6,3),
+              "Shared tensor residual failed invalid/overflow layout admission.");
+  for(int d:{6,4})for(int restricted_d:{0,d==6?4:2})
+  {
+    CheckSharedResidual<double>(d,restricted_d,false);
+    CheckSharedResidual<float>(d,restricted_d,false);
+    CheckSharedResidual<float>(d,restricted_d,true);
+  }
+}
 
 void CheckHierarchy(bool variable)
 {
@@ -52,6 +148,10 @@ void CheckHierarchy(bool variable)
   // path also sees a partial 16-column tile. Both meshes scramble element
   // order before topology reconstruction; geometric neighbors are not e+/-1.
   mfem::Mesh box=mfem::Mesh::MakeCartesian2D(variable?5:4,4,mfem::Element::QUADRILATERAL,true,1.0,1.0);
+  // The periodic variable coefficients are sampled on a translated domain;
+  // reference averaging must use physical geometry, including wrapped faces.
+  if(variable)for(int v=0;v<box.GetNV();++v)
+  {double* vertex=box.GetVertex(v);vertex[0]+=.125;vertex[1]-=.0625;}
   mfem::Array<int> element_order(box.GetNE());
   for(int e=0;e<box.GetNE();++e)element_order[e]=(7*e+3)%box.GetNE();
   box.ReorderElements(element_order,false);
@@ -93,7 +193,11 @@ void CheckHierarchy(bool variable)
       Configuration{Precision::TF32,Smoother::Separable,1,1},
       Configuration{Precision::FP64,Smoother::Center,1,1},
       Configuration{Precision::FP32,Smoother::Center,4,2},
-      Configuration{Precision::TF32,Smoother::Center,4,4}})
+      Configuration{Precision::TF32,Smoother::Center,4,4},
+      Configuration{Precision::FP64,Smoother::Separable,1,1,OperatorMode::Shared},
+      Configuration{Precision::FP64,Smoother::Center,1,1,OperatorMode::Shared},
+      Configuration{Precision::FP32,Smoother::Center,4,2,OperatorMode::Shared},
+      Configuration{Precision::TF32,Smoother::Center,4,4,OperatorMode::Shared}})
   {
     const Precision precision=config.precision;
     const int precision_index=precision==Precision::FP64?0:precision==Precision::FP32?1:2;
@@ -101,22 +205,24 @@ void CheckHierarchy(bool variable)
     {
       mfem::BilinearForm frozen(&fes);Assemble(frozen,reaction,diffusion);
       preconditioner=igrlab::igr_internal::MakeTensorMultigridPreconditioner(
-        frozen.SpMat(),fes,precision,config.smoother,config.warps,config.split_k);
+        frozen.SpMat(),fes,precision,config.smoother,config.warps,config.split_k,config.operator_mode);
     } // A0 lifetime ends: the preconditioner must own its coefficient snapshot.
     preconditioner->SetOperator(current.SpMat());
     preconditioner->Mult(probe,result);
     double action_error=0;
-    if(config.smoother==Smoother::Separable)separable_reference[precision_index]=result;
-    if(config.smoother==Smoother::Separable&&precision==Precision::FP64)reference=result;
+    const bool sampled=config.operator_mode==OperatorMode::Sampled;
+    const bool equivalent=sampled||!variable;
+    if(sampled&&config.smoother==Smoother::Separable)separable_reference[precision_index]=result;
+    if(sampled&&config.smoother==Smoother::Separable&&precision==Precision::FP64)reference=result;
     else
     {
       action_error=Relative(result,reference);
-      MFEM_VERIFY(action_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?5e-5:2e-2),
+      MFEM_VERIFY(!equivalent||action_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?5e-5:2e-2),
         "Tensor MG real patch batch control mismatch: "<<Name(precision)<<" smoother="<<Name(config.smoother)
         <<" relative="<<action_error);
     }
     const double separable_error=Relative(result,separable_reference[precision_index]);
-    MFEM_VERIFY(separable_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?8e-5:3e-2),
+    MFEM_VERIFY(!equivalent||separable_error<(precision==Precision::FP64?5e-10:precision==Precision::FP32?8e-5:3e-2),
       "Tensor MG center/separable V-cycle mismatch: "<<Name(precision)<<" relative="<<separable_error);
     // Dynamic power-of-two input scaling must preserve tiny and huge useful
     // residuals. Long-double comparison intentionally has no 1e-300 norm floor.
@@ -147,6 +253,8 @@ void CheckHierarchy(bool variable)
       solver->Mult(rhs,x);current.SpMat().Mult(x,action);
       const double residual=Relative(action,rhs),error=Relative(x,exact);
       std::cout<<"tensor_mg_current_A_test variable="<<variable<<" precision="<<Name(precision)
+        <<" translated_periodic_domain="<<variable
+        <<" operator_mode="<<Name(config.operator_mode)<<" sampled_action_equivalence_required="<<equivalent
         <<" smoother="<<Name(config.smoother)<<" center_warps="<<config.warps<<" center_split_k="<<config.split_k
         <<" elements="<<fes.GetNE()
         <<" repeat="<<repeat<<" iterations="<<solver->GetNumIterations()<<" true_residual="<<residual
@@ -165,10 +273,12 @@ int main(int argc,char** argv)
   int ordinal=0;cudaDeviceProp properties{};
   MFEM_VERIFY(cudaGetDevice(&ordinal)==cudaSuccess&&cudaGetDeviceProperties(&properties,ordinal)==cudaSuccess,"CUDA property query failed.");
   if(properties.major<8){std::cout<<"tensor_mg_test skipped: nativeSM80+ required\n";return 77;}
-  CheckHierarchy(false);CheckHierarchy(true);
+  CheckSharedResidualAdmission();CheckHierarchy(false);CheckHierarchy(true);
   std::cout<<"tensor_mg_test passed multiplicative_vcycle=true hierarchy=5,3,1"
     <<" original_A_certificate=true changed_coefficients=true real_patch_columns=true"
     <<" precision_controls=true center_controls=true center_layouts=1x1,4x2,4x4"
-    <<" reordered_topology=true patch_tail=true scaled_rhs=true snapshot_lifetime=true\n";
+    <<" reordered_topology=true patch_tail=true scaled_rhs=true snapshot_lifetime=true"
+    <<" shared_constant_equivalence=true shared_variable_current_A=true shared_residual_tails=true"
+    <<" shared_large_layout=true cancellation_forward_error=true\n";
   return 0;
 }

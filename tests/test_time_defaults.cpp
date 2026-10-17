@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -36,6 +37,78 @@ namespace dg_igr_tests
 int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
+
+  // Conservation integration must preserve the original physical/discrete
+  // measure for affine GL/GLL, curved geometry, and continuous fallback spaces.
+  // The point-query oracle intentionally retains the former general algorithm.
+  for (int fixture = 0; fixture < 5; ++fixture)
+  {
+    const bool dgsem = fixture == 1 || fixture == 3;
+    const bool curved = fixture == 2 || fixture == 3;
+    const bool continuous = fixture == 4;
+    mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      4, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+    if (curved)
+    {
+      mesh.SetCurvature(2);
+      mfem::VectorFunctionCoefficient mapping(2, [](const mfem::Vector& x, mfem::Vector& y)
+      {
+        y.SetSize(2);
+        y(0) = x(0) + 0.04 * std::sin(3.14159265358979323846 * x(0)) *
+                                std::sin(3.14159265358979323846 * x(1));
+        y(1) = x(1) + 0.03 * std::sin(6.28318530717958647692 * x(0)) *
+                                std::sin(3.14159265358979323846 * x(1));
+      });
+      mesh.Transform(mapping);
+    }
+    std::unique_ptr<mfem::FiniteElementCollection> collection;
+    if (continuous) { collection = std::make_unique<mfem::H1_FECollection>(2, 2); }
+    else
+    {
+      collection = std::make_unique<mfem::L2_FECollection>(5, 2,
+        dgsem ? mfem::BasisType::GaussLobatto : mfem::BasisType::GaussLegendre);
+    }
+    mfem::ParFiniteElementSpace fes(&mesh, collection.get(), 4, mfem::Ordering::byNODES);
+    mfem::ParGridFunction state(&fes);
+    auto* nodal = state.HostWrite();
+    for (int i = 0; i < state.Size(); ++i)
+    { nodal[i] = 1.0 + 0.17 * std::sin(0.13 * i) + 0.09 * std::cos(0.21 * i); }
+    mfem::Vector local(5), expected(5), value(4);
+    local = 0.0;
+    static mfem::IntegrationRules lgl(0, mfem::Quadrature1D::GaussLobatto);
+    for (int e = 0; e < fes.GetNE(); ++e)
+    {
+      const auto* fe = fes.GetFE(e);
+      auto* tr = fes.GetElementTransformation(e);
+      const auto& rule = dgsem
+        ? lgl.Get(fe->GetGeomType(), std::max(1, 2 * fe->GetOrder() - 1))
+        : mfem::IntRules.Get(fe->GetGeomType(), 2 * fe->GetOrder() + tr->OrderW() + 2);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const auto& point = rule.IntPoint(q);
+        tr->SetIntPoint(&point);
+        state.GetVectorValue(*tr, point, value);
+        const double weight = point.weight * tr->Weight();
+        for (int c = 0; c < 4; ++c) { local(c) += weight * value(c); }
+        local(4) += weight;
+      }
+    }
+    MPI_Allreduce(local.GetData(), expected.GetData(), 5,
+                  mfem::MPITypeMap<mfem::real_t>::mpi_type, MPI_SUM, fes.GetComm());
+    if (mfem::Device::Allows(mfem::Backend::CUDA))
+    { state.UseDevice(true); (void)state.ReadWrite(); }
+    const auto actual = dg_sim::detail::IntegrateEulerConservedState(
+      state, dgsem ? dg_sim::DGBackend::DGSEM : dg_sim::DGBackend::DG);
+    for (int c = 0; c < 4; ++c)
+    {
+      ctx.CheckNear(actual.components(c), expected(c), 5e-12,
+                    "Conservation optimized integral matches point queries for fixture " +
+                      std::to_string(fixture) + " component " + std::to_string(c));
+    }
+    ctx.CheckNear(actual.domain_measure, expected(4), 5e-12,
+                  "Conservation optimized measure retains the selected quadrature.");
+  }
 
   // Canonical runtime names must coexist with older case-launch scripts.
   {

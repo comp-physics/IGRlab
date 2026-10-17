@@ -362,6 +362,9 @@ private:
   std::vector<DenseMatrix> invmass; ///< inverse local mass matrices (dof × dof)
   std::vector<DenseMatrix>
     weakdiv; ///< local weak-divergence (dof × (dof*dim); columns grouped by node then dim)
+  /// Tensor-line opt-in stores one genuinely assembled reference matrix after
+  /// proving identical affine geometry and local Gauss-Legendre bases.
+  bool weakdiv_reference_only_ = false;
 
   // --- Runtime state ---
   mutable real_t max_char_speed =
@@ -427,6 +430,8 @@ private:
   /// Preassemble the weak-divergence operator on each element (optional).
   /// The layout is (test dof) × (trial node × dim), i.e. ByDim grouped per node.
   void ComputeWeakDivergence();
+  /// Admit every cell before replacing per-element weak-divergence storage.
+  void ValidateSharedWeakDivTensorGeometry_() const;
 
   /// Build packed data required by the inverse-mass apply path.
   void BuildInvMassApplyData_();

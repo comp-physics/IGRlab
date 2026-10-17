@@ -11,7 +11,8 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   weakdiv_apply_ready_ = false;
   face_data_dirty_ = true;
   weakdiv_elem_dof_ = 0;
-  weakdiv_data_flat_.SetSize(0);
+  if (weakdiv_reference_only_) { weakdiv_data_flat_.Destroy(); }
+  else { weakdiv_data_flat_.SetSize(0); }
   weakdiv_shared_map_.reset();
   weakdiv_shared_row_sums_.SetSize(0);
   weakdiv_shared_column_sums_.SetSize(0);
@@ -34,30 +35,41 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
     return;
   }
 
-  for (int e = 0; e < ne; ++e)
+  const int matrix_count = weakdiv_reference_only_ ? 1 : ne;
+  MFEM_VERIFY(weakdiv.size() == static_cast<std::size_t>(matrix_count),
+              "Invalid weak-divergence matrix storage policy.");
+  for (int e = 0; e < matrix_count; ++e)
   {
     MFEM_VERIFY(weakdiv[e].Height() == dof && weakdiv[e].Width() == dof * dim,
                 "Invalid weak-divergence block size for element " << e << ".");
   }
 
-  weakdiv_data_flat_.SetSize(ne * dof * dof * dim);
-  real_t* weak_flat = weakdiv_data_flat_.HostWrite();
-  for (int e = 0; e < ne; ++e)
+  if (!weakdiv_reference_only_)
   {
-    const int eoff = e * dof * dof * dim;
-    for (int i = 0; i < dof; ++i)
+    weakdiv_data_flat_.SetSize(ne * dof * dof * dim);
+    real_t* weak_flat = weakdiv_data_flat_.HostWrite();
+    for (int e = 0; e < ne; ++e)
     {
-      const int ioff = eoff + i * dof * dim;
-      for (int j = 0; j < dof; ++j)
+      const int eoff = e * dof * dof * dim;
+      for (int i = 0; i < dof; ++i)
       {
-        const int joff = ioff + j * dim;
-        for (int d = 0; d < dim; ++d)
+        const int ioff = eoff + i * dof * dim;
+        for (int j = 0; j < dof; ++j)
         {
-          weak_flat[joff + d] = weakdiv[e](i, j * dim + d);
+          const int joff = ioff + j * dim;
+          for (int d = 0; d < dim; ++d)
+          {
+            weak_flat[joff + d] = weakdiv[e](i, j * dim + d);
+          }
         }
       }
     }
   }
+  else
+    std::cout << "[dg-weakdiv-setup] storage=shared-reference matrix_instances=1 elements=" << ne
+              << " matrix_bytes=" << std::size_t(dof)*dof*dim*sizeof(real_t)
+              << " flat_entries=" << weakdiv_data_flat_.Size()
+              << " geometry=identical-affine local_basis=gauss-legendre" << std::endl;
 
   weakdiv_elem_dof_ = dof;
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(
@@ -199,14 +211,23 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
   const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  const char* layout = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_LAYOUT");
+  const bool tensor_lines = layout && std::string(layout) == "tensor-lines";
+  MFEM_VERIFY(!layout || std::string(layout) == "dense" || tensor_lines,
+              "SHARED_EULER_LAYOUT must be dense or tensor-lines.");
+  MFEM_VERIFY(!tensor_lines || shared,
+              "DG tensor lines require SHARED_OPERATOR_PRECISION=fp64, fp32, or tf32.");
+  MFEM_VERIFY(!weakdiv_reference_only_ || (shared && tensor_lines),
+              "Reference-only DG setup requires the tensor-lines shared Euler layout; "
+              "rebuild the operator before selecting a full-matrix backend.");
   if (shared && !weakdiv_shared_map_)
   {
     MFEM_VERIFY(dim == 2 && neq == 4 && dof <= 256 &&
                   Device::Allows(Backend::CUDA_MASK),
                 "Shared DG weak divergence requires CUDA 2D Euler.");
-    // Share only one identical affine geometry, never a representative cell.
-    // Assembly at translated coordinates may differ by ordinary roundoff;
-    // bound that difference against the actual FP64 operator norm explicitly.
+    // Reference-only setup already checked every geometry and local basis.
+    // Its exact reference integral is identical on every admitted cell. The
+    // legacy full-storage path additionally measures per-cell assembly roundoff.
     real_t reference_edges[4] = {0.0, 0.0, 0.0, 0.0};
     real_t reference_norm = 0.0, difference_norm = 0.0;
     for (int i = 0; i < dof; ++i)
@@ -215,12 +236,29 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       for (int j = 0; j < dof * dim; ++j) { sum += std::abs(weakdiv[0](i, j)); }
       reference_norm = std::max(reference_norm, sum);
     }
-    for (int e = 0; e < ne; ++e)
+    if (!weakdiv_reference_only_) for (int e = 0; e < ne; ++e)
     {
       const FiniteElement& fe = *vfes.GetFE(e);
       ElementTransformation* tr = vfes.GetElementTransformation(e);
       MFEM_VERIFY(fe.GetGeomType() == Geometry::SQUARE && tr->Order() == 1,
                   "Shared DG weak divergence requires affine quadrilaterals.");
+      if (tensor_lines)
+      {
+        const auto* tensor = dynamic_cast<const TensorBasisElement*>(&fe);
+        const auto& reference = *vfes.GetFE(0);
+        MFEM_VERIFY(tensor && tensor->GetBasisType() == BasisType::GaussLegendre &&
+                      fe.GetOrder() == reference.GetOrder() &&
+                      fe.GetNodes().GetNPoints() == dof &&
+                      reference.GetNodes().GetNPoints() == dof,
+                    "DG tensor lines require a uniform Gauss-Legendre nodal grid.");
+        for (int i = 0; i < dof; ++i)
+        {
+          const auto& point = fe.GetNodes().IntPoint(i);
+          const auto& original = reference.GetNodes().IntPoint(i);
+          MFEM_VERIFY(point.x == original.x && point.y == original.y,
+                      "DG tensor lines require identical local nodal ordering.");
+        }
+      }
       // Bilinear quads are affine iff their mixed corner difference is zero.
       // Evaluate corners (exact 0/1 shape values), rather than comparing
       // Jacobians recomputed at irrational high-order reference nodes.
@@ -255,7 +293,8 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       }
     }
     const real_t roundoff_limit = 64.0 * dof * std::numeric_limits<real_t>::epsilon();
-    MFEM_VERIFY(reference_norm > 0.0 && difference_norm <= roundoff_limit * reference_norm,
+    MFEM_VERIFY(reference_norm > 0.0 &&
+                  (weakdiv_reference_only_ || difference_norm <= roundoff_limit * reference_norm),
                 "Shared DG element matrices differ beyond the assembly-roundoff bound.");
     // For a nodal weak divergence, sum_i grad(phi_i)=0. Preserve the actual
     // assembled FP64 column sums, including their quadrature roundoff, rather
@@ -312,10 +351,15 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     weakdiv_shared_column_sums_.Read();
     weakdiv_shared_mass_fractions_.Read();
     weakdiv_shared_moment_correction_.Write();
-    std::cout << "[shared-reference-map] event=operator-equivalence method=dg-weakdiv"
-              << " geometry=identical-affine-parallelograms matrix_relative_inf_error="
-              << difference_norm / reference_norm << " limit=" << roundoff_limit
-              << std::endl;
+    if (weakdiv_reference_only_)
+      std::cout << "[shared-reference-map] event=operator-equivalence method=dg-weakdiv"
+                << " geometry=identical-affine-parallelograms proof=identical-reference-integrals"
+                << " matrix_instances=1 per_cell_matrix_comparison=not-assembled" << std::endl;
+    else
+      std::cout << "[shared-reference-map] event=operator-equivalence method=dg-weakdiv"
+                << " geometry=identical-affine-parallelograms matrix_relative_inf_error="
+                << difference_norm / reference_norm << " limit=" << roundoff_limit
+                << std::endl;
     std::cout << "[shared-reference-map] event=moment-policy method=dg-weakdiv"
               << " target=original-fp64-weak-moment distribution=assembled-M1"
               << " precision=fp64 correction=centered-product"
@@ -339,13 +383,25 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       }
     }
     weakdiv_shared_map_ = std::make_unique<::igrlab::shared_reference::Map>();
-    weakdiv_shared_map_->Configure(weakdiv[0], ne * neq, shared_precision, "dg-weakdiv");
+    if (tensor_lines)
+    {
+      auto* transformation = vfes.GetElementTransformation(0);
+      transformation->SetIntPoint(&Geometries.GetCenter(Geometry::SQUARE));
+      DenseMatrix adjugate(2);
+      CalcAdjugate(transformation->Jacobian(), adjugate);
+      weakdiv_shared_map_->ConfigureDGTensorLines(
+        weakdiv[0], ne * neq, shared_precision, *vfes.GetFE(0), adjugate);
+    }
+    else
+      weakdiv_shared_map_->Configure(weakdiv[0], ne * neq, shared_precision, "dg-weakdiv");
     weakdiv_shared_flux_.SetSize(ne * neq * dof * dim);
     weakdiv_shared_flux_.UseDevice(true);
     weakdiv_shared_flux_.Write();
   }
   MFEM_VERIFY(!shared || weakdiv_shared_map_->GetPrecision() == shared_precision,
               "Shared reference precision cannot change on a live DG operator.");
+  MFEM_VERIFY(!shared || weakdiv_shared_map_->UsesDGTensorLines() == tensor_lines,
+              "Shared Euler layout cannot change on a live DG operator.");
 
   const int* sigma_map = nullptr;
   const real_t* sigma_interp = nullptr;
@@ -600,6 +656,8 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
   {
     return 0.0;
   }
+  MFEM_VERIFY(!weakdiv_reference_only_ || Device::Allows(Backend::CUDA_MASK),
+              "Reference-only DG weak divergence requires its CUDA tensor-line backend.");
 
   const FluxFunction& fluxFunction = formIntegrator->GetFluxFunction();
 
@@ -913,12 +971,28 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
 //
 void DGHyperbolicConservationLaws::ComputeWeakDivergence()
 {
+  const char* layout = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_LAYOUT");
+  const bool reference_only = layout && std::string(layout) == "tensor-lines";
+  if (reference_only)
+  {
+    MFEM_VERIFY(::igrlab::shared_reference::RequestedPrecision() !=
+                  ::igrlab::shared_reference::Precision::Off,
+                "DG tensor lines require SHARED_OPERATOR_PRECISION=fp64, fp32, or tf32.");
+    ValidateSharedWeakDivTensorGeometry_();
+  }
   TransposeIntegrator weak_div(new GradientIntegrator());
   DenseMatrix tmp;
 
-  weakdiv.resize(vfes.GetNE());
+  weakdiv_reference_only_ = reference_only;
+  const int matrix_count = reference_only ? 1 : vfes.GetNE();
+  if (reference_only)
+  {
+    // Also release old per-element matrices when Update changes the setup mode.
+    std::vector<DenseMatrix> reference(1); weakdiv.swap(reference);
+  }
+  else { weakdiv.resize(matrix_count); }
 
-  for (int i = 0; i < vfes.GetNE(); i++)
+  for (int i = 0; i < matrix_count; i++)
   {
     const FiniteElement& fe = *vfes.GetFE(i);
     int dof = fe.GetDof();
@@ -940,6 +1014,73 @@ void DGHyperbolicConservationLaws::ComputeWeakDivergence()
       }
     }
   }
+}
+
+void DGHyperbolicConservationLaws::ValidateSharedWeakDivTensorGeometry_() const
+{
+#ifndef DG_IGR_HAS_ACCEL_FORALL
+  MFEM_ABORT("Reference-only DG weak divergence requires CUDA-compiled kernels.");
+#endif
+  const int ne = vfes.GetNE();
+  MFEM_VERIFY(Device::Allows(Backend::CUDA_MASK) && dim == 2 && num_equations == 4 &&
+                vfes.GetMesh()->Dimension() == 2 && ne > 0 &&
+                dynamic_cast<const L2_FECollection*>(vfes.FEColl()) && invmass_apply_ready_,
+              "Reference-only DG weak divergence requires CUDA 2D Euler with a nodal L2 layout.");
+  const auto& reference = *vfes.GetFE(0);
+  const auto* reference_tensor = dynamic_cast<const TensorBasisElement*>(&reference);
+  const int n = reference.GetOrder()+1, dof = n*n;
+  MFEM_VERIFY(reference_tensor && reference_tensor->GetBasisType() == BasisType::GaussLegendre &&
+                n >= 2 && n <= 8 && reference.GetDof() == dof &&
+                reference.GetNodes().GetNPoints() == dof &&
+                invmass_data_flat_.Size() == ne*dof,
+              "Reference-only DG weak divergence requires a uniform p1 through p7 "
+              "Gauss-Legendre basis and the original diagonal mass.");
+  const auto& flux = formIntegrator->GetFluxFunction();
+  const auto* igr_flux = dynamic_cast<const FluxWithIGR*>(&flux);
+  MFEM_VERIFY(dynamic_cast<const EulerFlux*>(&flux) || (igr_flux && igr_flux->HasEulerBase()),
+              "Reference-only DG weak divergence requires Euler or Euler+IGR flux.");
+  real_t edges[4] = {0.0,0.0,0.0,0.0};
+  Vector corners[4] = {Vector(2),Vector(2),Vector(2),Vector(2)};
+  for (int e = 0; e < ne; ++e)
+  {
+    const auto& fe = *vfes.GetFE(e);
+    const auto* tensor = dynamic_cast<const TensorBasisElement*>(&fe);
+    auto* transformation = vfes.GetElementTransformation(e);
+    MFEM_VERIFY(tensor && tensor->GetBasisType() == BasisType::GaussLegendre &&
+                  fe.GetGeomType() == Geometry::SQUARE && fe.GetMapType() == FiniteElement::VALUE &&
+                  fe.GetOrder() == reference.GetOrder() && fe.GetDof() == dof &&
+                  fe.GetNodes().GetNPoints() == dof && transformation->Order() == 1,
+                "Reference-only DG weak divergence requires uniform affine Gauss-Legendre VALUE quads.");
+    for (int i = 0; i < dof; ++i)
+    {
+      const auto& point = fe.GetNodes().IntPoint(i);
+      const auto& original = reference.GetNodes().IntPoint(i);
+      MFEM_VERIFY(point.x == original.x && point.y == original.y,
+                  "Reference-only DG weak divergence requires identical local nodal ordering.");
+    }
+    for (int q = 0; q < 4; ++q)
+    {
+      IntegrationPoint point; point.Set2(q%2,q/2);
+      transformation->Transform(point,corners[q]);
+    }
+    for (int d = 0; d < 2; ++d)
+    {
+      MFEM_VERIFY(corners[3][d]-corners[1][d] == corners[2][d]-corners[0][d],
+                  "Reference-only DG weak divergence rejects non-affine geometry.");
+      for (int direction = 0; direction < 2; ++direction)
+      {
+        const real_t edge = corners[direction+1][d]-corners[0][d];
+        if (e == 0) { edges[d+2*direction] = edge; }
+        MFEM_VERIFY(std::isfinite(edge) && edge == edges[d+2*direction],
+                    "Reference-only DG weak divergence requires identical affine element geometry.");
+      }
+    }
+  }
+  // For VALUE elements GradientIntegrator depends only on the reference basis,
+  // its fixed quadrature and adj(J). Translation does not enter the integral.
+  const real_t determinant = edges[0]*edges[3]-edges[1]*edges[2];
+  MFEM_VERIFY(std::isfinite(determinant) && determinant > 0.0,
+              "Reference-only DG weak divergence requires positive finite affine Jacobians.");
 }
 
 } // namespace mfem
