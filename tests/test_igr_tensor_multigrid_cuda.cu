@@ -286,13 +286,15 @@ void CheckHierarchy(bool variable,bool owned=false)
   }
 }
 
-void CheckSpectral(bool variable)
+void CheckSpectral(bool variable,bool natural=false)
 {
-  // A rectangular 48x72 global modal tensor exposes x/y swaps and incorrect
-  // GEMM leading dimensions. Element indices carry no Cartesian ordering.
-  constexpr int nx=8,ny=12,d=6;
+  // Both rectangles expose x/y swaps and incorrect GEMM leading dimensions.
+  // Unequal physical widths also distinguish x/y face scaling on open edges.
+  // Element indices carry no Cartesian ordering.
+  constexpr int d=6;const int nx=natural?5:8,ny=natural?7:12;
+  const double width_x=natural?1.25:1.0,width_y=natural?.75:1.0;
   constexpr double pi=3.14159265358979323846;
-  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(nx,ny,mfem::Element::QUADRILATERAL,true,1.0,1.0);
+  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(nx,ny,mfem::Element::QUADRILATERAL,true,width_x,width_y);
   for(int v=0;v<box.GetNV();++v)
   {double* vertex=box.GetVertex(v);vertex[0]+=.125;vertex[1]-=.0625;}
   mfem::Array<int> ordering(box.GetNE());
@@ -300,7 +302,8 @@ void CheckSpectral(bool variable)
   box.ReorderElements(ordering,false);
   mfem::Vector dx(2),dy(2);dx=0.0;dy=0.0;dx(0)=1;dy(1)=1;
   const std::vector<mfem::Vector> shifts{dx,dy};
-  mfem::Mesh mesh=mfem::Mesh::MakePeriodic(box,box.CreatePeriodicVertexMapping(shifts));
+  mfem::Mesh mesh=natural?mfem::Mesh(box):
+    mfem::Mesh::MakePeriodic(box,box.CreatePeriodicVertexMapping(shifts));
   mfem::ParMesh pmesh(MPI_COMM_WORLD,mesh);
   mfem::L2_FECollection collection(5,2,mfem::BasisType::GaussLegendre);
   mfem::ParFiniteElementSpace fes(&pmesh,&collection);
@@ -315,9 +318,18 @@ void CheckSpectral(bool variable)
     {return .012*(1.0+.08*std::cos(2*pi*x(0)));});
   // The oracle is separately assembled and outlives the source operator passed
   // to the factory. A retained pointer into that temporary source is invalid.
-  mfem::BilinearForm frozen_oracle(&fes),current(&fes);
+  mfem::BilinearForm frozen_oracle(&fes),current(&fes),mass_oracle(&fes);
   Assemble(frozen_oracle,reaction,diffusion);Assemble(current,changed_reaction,changed_diffusion);
+  if(natural)
+  {
+    // With no boundary integrator the diffusion part annihilates a physical
+    // constant. This load independently tests the screened natural mode.
+    mass_oracle.AddDomainIntegrator(new mfem::MassIntegrator(reaction));
+    mass_oracle.Assemble();mass_oracle.Finalize();
+  }
   mfem::Vector exact(n),probe(n),rhs(n),x(n),result(n),action(n),scaled(n),scaled_result(n);
+  std::array<int,4> corner_dofs{};
+  std::array<double,4> corner_distance;corner_distance.fill(std::numeric_limits<double>::infinity());
   mfem::Array<int> dofs;
   for(int e=0;e<fes.GetNE();++e)
   {
@@ -329,6 +341,14 @@ void CheckSpectral(bool variable)
       exact(dofs[i])=.7+.13*std::sin(2*pi*point(0))-.09*std::cos(4*pi*point(1))+
         .06*node.x*node.y+.02*std::sin(.53*e);
       probe(dofs[i])=.31+std::sin(.19*(1+e*d*d+i))+.17*std::cos(.37*(2*i+e));
+      if(natural)for(int corner=0;corner<4;++corner)
+      {
+        const double dx=point(0)-(.125+(corner%2?width_x:0.0));
+        const double dy=point(1)-(-.0625+(corner/2?width_y:0.0));
+        const double distance=dx*dx+dy*dy;
+        if(distance<corner_distance[corner])
+        {corner_distance[corner]=distance;corner_dofs[corner]=dofs[i];}
+      }
     }
   }
   exact.UseDevice(true);probe.UseDevice(true);
@@ -358,7 +378,10 @@ void CheckSpectral(bool variable)
     condition_bound=row_norm/minimum_mass;
     inverse_limit=std::min(1e-7,std::max(5e-10,128*std::numeric_limits<double>::epsilon()*condition_bound));
   }
-  for(Precision precision:{Precision::FP64,Precision::FP32,Precision::TF32,Precision::TF32x3})
+  const std::vector<Precision> precisions=natural?
+    std::vector<Precision>{Precision::FP64,Precision::TF32}:
+    std::vector<Precision>{Precision::FP64,Precision::FP32,Precision::TF32,Precision::TF32x3};
+  for(Precision precision:precisions)
   {
     std::unique_ptr<mfem::Solver> inverse;
     {
@@ -369,20 +392,43 @@ void CheckSpectral(bool variable)
     inverse->SetOperator(current.SpMat());
     if(!variable)
     {
-      for(int kind=0;kind<3;++kind)
+      for(int kind=0;kind<(natural?4:3);++kind)
       {
         if(kind==0)rhs=1.0;
-        else if(kind==1){rhs=0.0;rhs.HostReadWrite()[n/3+5]=1.0;}
-        else rhs=probe;
+        else if(kind==1)
+        {
+          rhs=0.0;double* values=rhs.HostReadWrite();
+          if(natural)
+          {
+            // Geometric corners survive element reordering. Unequal signed
+            // loads excite both ends of both axes without corner symmetry.
+            constexpr double loads[4]={1.0,-.31,.23,-.17};
+            for(int corner=0;corner<4;++corner)values[corner_dofs[corner]]=loads[corner];
+          }
+          else values[n/3+5]=1.0;
+        }
+        else if(kind==2)rhs=probe;
+        else
+        {
+          scaled=1.0;scaled.UseDevice(true);mass_oracle.SpMat().Mult(scaled,rhs);
+          frozen_oracle.SpMat().Mult(scaled,action);
+          MFEM_VERIFY(Relative(action,rhs)<=inverse_limit,
+            "Natural SIPG diffusion does not annihilate a physical constant.");
+        }
         rhs.UseDevice(true);inverse->Mult(rhs,result);
         frozen_oracle.SpMat().Mult(result,action);
         const double residual=Relative(action,rhs);
+        const double constant_error=natural&&kind==3?Relative(result,scaled):0.0;
         std::cout<<"tensor_spectral_inverse_test precision="<<Name(precision)<<" kind="<<kind
+          <<" boundary="<<(natural?"natural":"periodic")
           <<" modal_nx="<<d*nx<<" modal_ny="<<d*ny<<" original_A0_residual="<<residual
+          <<" physical_constant_error="<<constant_error
           <<" condition_bound="<<condition_bound<<" fp64_limit="<<inverse_limit
           <<" exact_inverse_required="<<(precision==Precision::FP64)<<'\n';
-        MFEM_VERIFY(precision!=Precision::FP64||residual<=inverse_limit,
-          "FP64 spectral inverse failed the independent original constant-A0 residual gate: "<<residual);
+        MFEM_VERIFY(precision!=Precision::FP64||
+          (residual<=inverse_limit&&constant_error<=inverse_limit),
+          "FP64 spectral inverse failed the independent original constant-A0 gate: boundary="
+          <<(natural?"natural":"periodic")<<" residual="<<residual<<" constant_error="<<constant_error);
       }
     }
     inverse->Mult(probe,result);
@@ -425,6 +471,7 @@ void CheckSpectral(bool variable)
       solver->Mult(rhs,x);current.SpMat().Mult(x,action);
       const double residual=Relative(action,rhs),error=Relative(x,exact);
       std::cout<<"tensor_spectral_current_A_test variable="<<variable<<" precision="<<Name(precision)
+        <<" boundary="<<(natural?"natural":"periodic")
         <<" modal_nx="<<d*nx<<" modal_ny="<<d*ny<<" repeat="<<repeat
         <<" iterations="<<solver->GetNumIterations()<<" true_residual="<<residual
         <<" solution_error="<<error<<" old_mg_equivalence_required=false\n";
@@ -444,7 +491,7 @@ int main(int argc,char** argv)
   if(properties.major<8){std::cout<<"tensor_mg_test skipped: nativeSM80+ required\n";return 77;}
   CheckSharedResidualAdmission();CheckHierarchy(false);CheckHierarchy(true);
   CheckHierarchy(false,true);CheckHierarchy(true,true);
-  CheckSpectral(false);CheckSpectral(true);
+  CheckSpectral(false);CheckSpectral(true);CheckSpectral(false,true);
   std::cout<<"tensor_mg_test passed multiplicative_vcycle=true hierarchy=5,3,1"
     <<" original_A_certificate=true changed_coefficients=true real_patch_columns=true"
     <<" precision_controls=true center_controls=true center_layouts=1x1,4x2,4x4"
@@ -454,6 +501,8 @@ int main(int argc,char** argv)
     <<" owned_changed_current_A=true owned_tail_columns=6 old_smoother_equivalence=false"
     <<" hybrid_residual_tile1=true hybrid_residual_tile4=true spectral_rectangular_48x72=true"
     <<" spectral_constant_inverse=true spectral_variable_current_A=true spectral_lifetime=true"
-    <<" spectral_tf32x3=true spectral_nonfinite_poison=true spectral_finite_recovery=true\n";
+    <<" spectral_tf32x3=true spectral_nonfinite_poison=true spectral_finite_recovery=true"
+    <<" spectral_natural_rectangular_30x42=true spectral_natural_corners=true"
+    <<" spectral_natural_constant_mode=true spectral_natural_current_A_fp64_tf32=true\n";
   return 0;
 }

@@ -5,7 +5,7 @@
 #include "IGR_tensor_owned.hpp"
 #include "IGR_tensor_spectral.hpp"
 #include "IGR_device_krylov.hpp"
-#include "IGR_shared_patch_cuda.cuh" // Reuse checked periodic face-slot topology.
+#include "IGR_shared_patch_cuda.cuh" // Keep the shared/MG periodic topology gate.
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 #include <cublas_v2.h>
@@ -172,6 +172,77 @@ void CheckTranslationTopology(const Topology& topology)
               "Shared tensor reference requires one connected periodic Cartesian mesh.");
 }
 
+// Spectral mode alone admits physical faces. Shared patches and MG continue
+// through SharedPatchTopology, whose periodic admission is unchanged.
+Topology SpectralFaceTopology(mfem::ParFiniteElementSpace& sfes)
+{
+  auto& mesh=*sfes.GetMesh();const int ne=sfes.GetNE();bool boundary=false;
+  for(int face=0;face<mesh.GetNumFaces();++face)
+  {int a,b;mesh.GetFaceElements(face,&a,&b);boundary=boundary || b<0;}
+  if(!boundary)return SharedPatchTopology(sfes);
+  MFEM_VERIFY(ne>=16 && mesh.Dimension()==2 && mesh.SpaceDimension()==2 &&
+      sfes.GetFE(0)->GetOrder()==5 && sfes.GetFE(0)->GetDof()==36,
+      "Boundary spectral inverse requires uniform p5 Cartesian quads with at least 16 elements.");
+  Topology topology(ne);std::vector<std::array<bool,5>> assigned(ne);
+  double hx=0,hy=0;
+  for(int e=0;e<ne;++e)
+  {
+    topology[e].fill(-1);topology[e][0]=e;assigned[e].fill(false);
+    auto* transform=mesh.GetElementTransformation(e);
+    MFEM_VERIFY(transform->Order()==1,"Boundary spectral inverse requires linear geometry.");
+    for(const auto point:std::array<std::array<double,2>,5>{{{0,0},{1,0},{0,1},{1,1},{.5,.5}}})
+    {
+      mfem::IntegrationPoint ip;ip.Set2(point[0],point[1]);transform->SetIntPoint(&ip);
+      const auto& jacobian=transform->Jacobian();
+      if(e==0 && point[0]==0 && point[1]==0){hx=jacobian(0,0);hy=jacobian(1,1);}
+      const double scale=std::max(hx,hy);
+      MFEM_VERIFY(hx>0 && hy>0 && std::abs(jacobian(0,0)-hx)<=1e-11*scale &&
+          std::abs(jacobian(1,1)-hy)<=1e-11*scale && std::abs(jacobian(0,1))<=1e-11*scale &&
+          std::abs(jacobian(1,0))<=1e-11*scale,
+          "Boundary spectral inverse requires identical positive axis-aligned affine Jacobians.");
+    }
+  }
+  mfem::IntegrationPoint midpoint;midpoint.Set1w(.5,1.0);
+  for(int face=0;face<mesh.GetNumFaces();++face)
+  {
+    int a,b;mesh.GetFaceElements(face,&a,&b);
+    MFEM_VERIFY(a>=0 && a<ne && b<ne && a!=b,"Invalid spectral Cartesian face adjacency.");
+    auto* transform=mesh.GetFaceElementTransformations(face);
+    MFEM_VERIFY(transform,"Missing spectral Cartesian face transformation.");
+    for(int side=0;side<(b<0?1:2);++side)
+    {
+      mfem::IntegrationPoint ip;
+      (side?transform->Loc2:transform->Loc1).Transform(midpoint,ip);
+      const int slot=std::abs(ip.x)<1e-12 && std::abs(ip.y-.5)<1e-12?1:
+          std::abs(ip.x-1)<1e-12 && std::abs(ip.y-.5)<1e-12?2:
+          std::abs(ip.y)<1e-12 && std::abs(ip.x-.5)<1e-12?3:
+          std::abs(ip.y-1)<1e-12 && std::abs(ip.x-.5)<1e-12?4:-1;
+      const int e=side?b:a;
+      MFEM_VERIFY(slot>0 && !assigned[e][slot],"Invalid/duplicate canonical spectral face slot.");
+      assigned[e][slot]=true;topology[e][slot]=side?a:b<0?-1:b;
+    }
+  }
+  for(int e=0;e<ne;++e)for(int slot=1;slot<5;++slot)
+    MFEM_VERIFY(assigned[e][slot],"Missing spectral Cartesian physical/interior face.");
+  return topology;
+}
+
+std::vector<int> BoundarySpectralColors(const Topology& topology)
+{
+  const int ne=static_cast<int>(topology.size());
+  std::vector<int> colors(ne,-1),used(ne,-1);
+  for(int e=0;e<ne;++e)
+  {
+    for(int neighbor:topology[e])if(neighbor>=0)for(int j:topology[neighbor])
+      if(j>=0 && colors[j]>=0)used[colors[j]]=e;
+    int color=0;while(used[color]==e)++color;colors[e]=color;
+  }
+  for(const auto& support:topology)for(int i=0;i<5;++i)if(support[i]>=0)
+    for(int j=0;j<i;++j)if(support[j]>=0)
+      MFEM_VERIFY(colors[support[i]]!=colors[support[j]],"Boundary spectral stencil coloring collision.");
+  return colors;
+}
+
 void SharedModalData(mfem::ParFiniteElementSpace& sfes,
     std::vector<int>& map,std::vector<double>& nodal)
 {
@@ -326,6 +397,133 @@ SharedSnapshotData SharedSnapshot(const mfem::Operator& op,
     double& x=result.average[(slot*36+j)*36+i];
     double& y=result.average[(opposite[slot]*36+i)*36+j];
     const double value=.5*x+.5*y;x=value;y=value;
+  }
+  return result;
+}
+
+// Classes have separate short element lists. First-stage groups cover those
+// lists without allocating a dense stencil per element or scanning ne nine times.
+__global__ void BoundarySpectralProbePartial(int color,const int* colors,
+    const int* neighbors,const int* elements,const int* offsets,const int* group_offsets,
+    const double* modal,double* partial)
+{
+  __shared__ double sum[256];
+  const int entry=blockIdx.x,slot=entry/36,i=entry%36,group=blockIdx.y;
+  int cls=0;while(group>=group_offsets[cls+1])++cls;
+  const int groups=group_offsets[cls+1]-group_offsets[cls];double value=0;
+  for(int index=offsets[cls]+(group-group_offsets[cls])*256+threadIdx.x;
+      index<offsets[cls+1];index+=256*groups)
+  {
+    const int e=elements[index],source=neighbors[5*e+slot];
+    if(source>=0 && colors[source]==color)value+=modal[e*36+i];
+  }
+  sum[threadIdx.x]=value;__syncthreads();
+  for(int step=128;step;step/=2)
+  {if(threadIdx.x<step)sum[threadIdx.x]+=sum[threadIdx.x+step];__syncthreads();}
+  if(threadIdx.x==0)partial[group*180+entry]=sum[0];
+}
+
+__global__ void BoundarySpectralProbeFinish(int column,const int* offsets,
+    const int* group_offsets,const double* partial,double* average,int* invalid)
+{
+  __shared__ double sum[256];
+  const int cls=blockIdx.x/180,entry=blockIdx.x%180;double value=0;
+  for(int group=group_offsets[cls]+threadIdx.x;group<group_offsets[cls+1];group+=256)
+    value+=partial[group*180+entry];
+  sum[threadIdx.x]=value;__syncthreads();
+  for(int step=128;step;step/=2)
+  {if(threadIdx.x<step)sum[threadIdx.x]+=sum[threadIdx.x+step];__syncthreads();}
+  if(threadIdx.x==0)
+  {
+    const int index=((cls*5+entry/36)*36+column)*36+entry%36;
+    const double updated=average[index]+sum[0]/(offsets[cls+1]-offsets[cls]);
+    average[index]=updated;if(!isfinite(updated))atomicExch(invalid,1);
+  }
+}
+
+struct BoundarySpectralSnapshotData
+{
+  std::array<Stencil,9> classes;
+  double maximum_diagonal=0,symmetry_error=0;
+};
+
+BoundarySpectralSnapshotData BoundarySpectralSnapshot(const mfem::Operator& op,
+    mfem::ParFiniteElementSpace& sfes,const Topology& topology,
+    const TensorSpectralTopology& coordinates,const mfem::Array<int>& neighbors,
+    std::vector<int>& map,std::vector<double>& nodal,int& probes,int& color_count)
+{
+  const int ne=sfes.GetNE(),height=sfes.GetVSize();SharedModalData(sfes,map,nodal);
+  const auto colors=BoundarySpectralColors(topology);
+  color_count=1+*std::max_element(colors.begin(),colors.end());
+  std::array<std::vector<int>,9> class_elements;
+  for(int y=0;y<coordinates.ny;++y)for(int x=0;x<coordinates.nx;++x)
+    class_elements[TensorSpectralBoundaryClass(x,y,coordinates.nx,coordinates.ny)].push_back(
+        coordinates.elements[x+coordinates.nx*y]);
+  mfem::Array<int> device_colors(ne),device_map(height),elements(ne),offsets(10),group_offsets(10),invalid(1);
+  std::copy(colors.begin(),colors.end(),device_colors.HostWrite());
+  std::copy(map.begin(),map.end(),device_map.HostWrite());
+  int* element=elements.HostWrite();int* offset=offsets.HostWrite();int* group_offset=group_offsets.HostWrite();
+  offset[0]=group_offset[0]=0;
+  for(int cls=0;cls<9;++cls)
+  {
+    const int count=static_cast<int>(class_elements[cls].size());
+    MFEM_VERIFY(count>0,"Boundary spectral Cartesian class is empty.");
+    std::copy(class_elements[cls].begin(),class_elements[cls].end(),element+offset[cls]);
+    offset[cls+1]=offset[cls]+count;
+    group_offset[cls+1]=group_offset[cls]+std::min(1024,(count+255)/256);
+  }
+  const int groups=group_offset[9];
+  mfem::Vector transform(36*36),input(height),output(height),modal(height),diagonals(4*ne);
+  std::copy(nodal.begin(),nodal.end(),transform.HostWrite());
+  for(auto* vector:{&transform,&input,&output,&modal,&diagonals})vector->UseDevice(true);
+  mfem::Vector partial(groups*180),average(9*5*36*36);partial.UseDevice(true);average.UseDevice(true);
+  CUDA(cudaMemsetAsync(average.Write(),0,std::size_t(average.Size())*sizeof(double)));
+  CUDA(cudaMemsetAsync(diagonals.Write(),0,std::size_t(diagonals.Size())*sizeof(double)));
+  CUDA(cudaMemsetAsync(invalid.Write(),0,sizeof(int)));
+  for(int color=0;color<color_count;++color)for(int j=0;j<36;++j)
+  {
+    SharedProbeInput<<<(height+255)/256,256>>>(ne,color,j,device_colors.Read(),
+        device_map.Read(),transform.Read(),input.Write());
+    op.Mult(input,output);++probes;
+    SharedProbeProject<<<(height+255)/256,256>>>(ne,color,j,device_colors.Read(),
+        device_map.Read(),transform.Read(),output.Read(),modal.Write(),diagonals.ReadWrite(),invalid.ReadWrite());
+    BoundarySpectralProbePartial<<<dim3(180,groups),256>>>(color,device_colors.Read(),neighbors.Read(),
+        elements.Read(),offsets.Read(),group_offsets.Read(),modal.Read(),partial.Write());
+    BoundarySpectralProbeFinish<<<9*180,256>>>(j,offsets.Read(),group_offsets.Read(),
+        partial.Read(),average.ReadWrite(),invalid.ReadWrite());
+  }
+  CUDA(cudaGetLastError());
+  MFEM_VERIFY(invalid.HostRead()[0]==0,"Boundary spectral probe has a nonfinite value or nonpositive diagonal.");
+  BoundarySpectralSnapshotData result;const double* a=average.HostRead();
+  for(int cls=0;cls<9;++cls)result.classes[cls].assign(a+cls*5*36*36,a+(cls+1)*5*36*36);
+  const double* diagonal=diagonals.HostRead();
+  for(int e=0;e<ne;++e)result.maximum_diagonal=std::max(result.maximum_diagonal,diagonal[3*ne+e]);
+  double coefficient_scale=0,error=0,magnitude=0;
+  for(const auto& stencil:result.classes)for(double value:stencil)
+    coefficient_scale=std::max(coefficient_scale,std::abs(value));
+  MFEM_VERIFY(coefficient_scale>0 && std::isfinite(coefficient_scale),"Invalid boundary spectral reference scale.");
+  constexpr int opposite[5]={0,2,1,4,3};
+  for(int cls=0;cls<9;++cls)for(int slot=0;slot<(cls==0?5:1);++slot)
+    for(int j=0;j<36;++j)for(int i=0;i<36;++i)
+    {
+      const double x=result.classes[cls][(slot*36+j)*36+i]/coefficient_scale;
+      const double y=result.classes[cls][(opposite[slot]*36+i)*36+j]/coefficient_scale;
+      error+=(x-y)*(x-y);magnitude+=x*x;
+    }
+  result.symmetry_error=std::sqrt(error/std::max(magnitude,1e-300));
+  MFEM_VERIFY(result.symmetry_error<1e-10,"Boundary spectral reference is not symmetric: "<<result.symmetry_error);
+  // Repair only admitted roundoff. Class separability and the complete open
+  // eigensystems are checked afterwards; averaging itself does not prove SPD.
+  for(int cls=0;cls<9;++cls)for(int slot:{0,1,3})
+  {
+    if(cls!=0 && slot!=0)continue;
+    for(int j=0;j<36;++j)for(int i=0;i<36;++i)
+    {
+      if(slot==0 && i>j)continue;
+      double& x=result.classes[cls][(slot*36+j)*36+i];
+      double& y=result.classes[cls][(opposite[slot]*36+i)*36+j];
+      const double value=.5*x+.5*y;x=value;y=value;
+    }
   }
   return result;
 }
@@ -936,18 +1134,23 @@ void SpectralBLAS(cublasStatus_t status)
 void SpectralSolver(cusolverStatus_t status)
 {MFEM_VERIFY(status==CUSOLVER_STATUS_SUCCESS,"Spectral cuSolver status="<<status);}
 
-__global__ void BuildSpectralMatrix(int n,const double* blocks,double* matrix)
+__global__ void BuildSpectralMatrix(int n,bool periodic,const double* blocks,double* matrix)
 {
   const int entry=blockIdx.x*blockDim.x+threadIdx.x;if(entry>=n*n)return;
   const int row=entry%n,col=entry/n,cell=row/6,cells=n/6,neighbor=col/6;
   const int i=row%6,j=col%6;
   double value=neighbor==cell?blocks[i+6*j]:0.0;
-  if(neighbor==(cell+cells-1)%cells)value+=blocks[36+i+6*j];
-  if(neighbor==(cell+1)%cells)value+=blocks[72+i+6*j];
+  if(!periodic && neighbor==cell)
+  {
+    if(cell==0)value+=blocks[108+i+6*j];
+    if(cell==cells-1)value+=blocks[144+i+6*j];
+  }
+  if(neighbor==(periodic?(cell+cells-1)%cells:cell-1))value+=blocks[36+i+6*j];
+  if(neighbor==(periodic?(cell+1)%cells:cell+1))value+=blocks[72+i+6*j];
   matrix[entry]=value;
 }
 
-__global__ void CheckSpectralEigenKernel(int n,const double* blocks,
+__global__ void CheckSpectralEigenKernel(int n,bool periodic,const double* blocks,
     const double* q,const double* lambda,double* partial,int* invalid)
 {
   __shared__ double errors[256],scales[256];double error=0,scale=0;
@@ -959,8 +1162,19 @@ __global__ void CheckSpectralEigenKernel(int n,const double* blocks,
     double action=0;
     for(int slot=0;slot<3;++slot)
     {
-      const int neighbor=slot==0?cell:slot==1?(cell+cells-1)%cells:(cell+1)%cells;
-      for(int j=0;j<6;++j)action+=blocks[slot*36+i+6*j]*q[6*neighbor+j+n*column];
+      const int neighbor=slot==0?cell:slot==1?
+          (periodic?(cell+cells-1)%cells:cell-1):(periodic?(cell+1)%cells:cell+1);
+      if(neighbor<0 || neighbor>=cells)continue;
+      for(int j=0;j<6;++j)
+      {
+        double coefficient=blocks[slot*36+i+6*j];
+        if(!periodic && slot==0)
+        {
+          if(cell==0)coefficient+=blocks[108+i+6*j];
+          if(cell==cells-1)coefficient+=blocks[144+i+6*j];
+        }
+        action+=coefficient*q[6*neighbor+j+n*column];
+      }
     }
     const double value=q[entry],eigenvalue=lambda[column],delta=action-eigenvalue*value;
     if(!isfinite(value)||!isfinite(eigenvalue)||!isfinite(delta)||
@@ -1396,8 +1610,9 @@ public:
       MFEM_VERIFY(!override_value || std::string(override_value)!="0",
                   "NVIDIA_TF32_OVERRIDE=0 disables the requested spectral TF32 execution.");
     }
-    const auto topology=SharedPatchTopology(sfes);CheckTranslationTopology(topology);
+    const auto topology=SpectralFaceTopology(sfes);
     const auto coordinates=BuildTensorSpectralTopology(topology);
+    if(coordinates.periodic)CheckTranslationTopology(topology);
     MFEM_VERIFY(TensorSpectralLayoutValid(coordinates.nx,coordinates.ny),
                 "Spectral dimensions exceed cuSolver/int matrix bounds.");
     nx_=6*coordinates.nx;ny_=6*coordinates.ny;
@@ -1413,11 +1628,23 @@ public:
     int* neighbor=neighbors.HostWrite();
     for(int e=0;e<sfes.GetNE();++e)for(int s=0;s<5;++s)neighbor[5*e+s]=topology[e][s];
     std::vector<int> map;std::vector<double> nodal;int probes=0,colors=0;
-    auto sampled=SharedSnapshot(op,sfes,topology,neighbors,map,nodal,probes,colors);
-    operator_scale_=sampled.maximum_diagonal;
-    MFEM_VERIFY(operator_scale_>0 && std::isfinite(operator_scale_),"Invalid spectral operator scale.");
-    for(double& value:sampled.average)value/=operator_scale_;
-    const auto reference=BuildTensorSpectralReference(sampled.average);
+    TensorSpectralReference reference;double symmetry_error=0;
+    if(coordinates.periodic)
+    {
+      auto sampled=SharedSnapshot(op,sfes,topology,neighbors,map,nodal,probes,colors);
+      operator_scale_=sampled.maximum_diagonal;symmetry_error=sampled.symmetry_error;
+      MFEM_VERIFY(operator_scale_>0 && std::isfinite(operator_scale_),"Invalid spectral operator scale.");
+      for(double& value:sampled.average)value/=operator_scale_;
+      reference=BuildTensorSpectralReference(sampled.average);
+    }
+    else
+    {
+      auto sampled=BoundarySpectralSnapshot(op,sfes,topology,coordinates,neighbors,map,nodal,probes,colors);
+      operator_scale_=sampled.maximum_diagonal;symmetry_error=sampled.symmetry_error;
+      MFEM_VERIFY(operator_scale_>0 && std::isfinite(operator_scale_),"Invalid boundary spectral operator scale.");
+      for(auto& stencil:sampled.classes)for(double& value:stencil)value/=operator_scale_;
+      reference=BuildTensorSpectralReference(sampled.classes);
+    }
     elements_.SetSize(sfes.GetNE());element_map_.SetSize(height);
     std::copy(coordinates.elements.begin(),coordinates.elements.end(),elements_.HostWrite());
     std::copy(map.begin(),map.end(),element_map_.HostWrite());
@@ -1428,8 +1655,8 @@ public:
         precision_==TensorMultigridPrecision::FP32?CUBLAS_PEDANTIC_MATH:CUBLAS_DEFAULT_MATH));
     SpectralSolver(cusolverDnCreate(&solver_));SpectralSolver(cusolverDnSetStream(solver_,nullptr));
     mfem::Array<double> lambda_x,lambda_y;
-    Eigensystem(reference.x,nx_,qx_,lambda_x);
-    Eigensystem(reference.y,ny_,qy_,lambda_y);
+    Eigensystem(reference.x,nx_,coordinates.periodic,qx_,lambda_x);
+    Eigensystem(reference.y,ny_,coordinates.periodic,qy_,lambda_y);
     const double* lx=lambda_x.HostRead();const double* ly=lambda_y.HostRead();
     const double raw_min=lx[0]+ly[0]-reference.mean;
     const double raw_max=lx[nx_-1]+ly[ny_-1]-reference.mean;
@@ -1470,10 +1697,12 @@ public:
     std::cout<<"[igr-tensor-spectral] event=setup precision="<<Name(precision_)
       <<" operator=spectral cycle=global-reference-inverse coarse_execution=none"
       <<" elements="<<sfes.GetNE()<<" n="<<height<<" cells_x="<<coordinates.nx<<" cells_y="<<coordinates.ny
+      <<" topology="<<(coordinates.periodic?"periodic-cartesian":"natural-boundary-cartesian")
+      <<" reference_classes="<<(coordinates.periodic?1:9)
       <<" matrix_rows="<<nx_<<" matrix_columns="<<ny_<<" operator_probes="<<probes<<" colors="<<colors
       <<" basis_bytes="<<basis_bytes<<" field_workspace_bytes="<<field_bytes
       <<" eigen_workspace_bound_bytes="<<eigen_workspace_peak_bytes_
-      <<" shared_symmetry_rel="<<sampled.symmetry_error<<" separable_reference_rel="<<reference.relative_defect
+      <<" shared_symmetry_rel="<<symmetry_error<<" separable_reference_rel="<<reference.relative_defect
       <<" eigen_residual="<<eigen_error_<<" eigen_orthogonality="<<orthogonal_error_
       <<" screen_mass="<<reference.mass<<" spectral_mean="<<reference.mean
       <<" raw_eigen_min="<<raw_min<<" raw_eigen_max="<<raw_max
@@ -1517,7 +1746,7 @@ public:
     CUDA(cudaGetLastError());++applications_;
   }
 private:
-  void Eigensystem(const std::vector<double>& host_blocks,int n,mfem::Array<T>& q,
+  void Eigensystem(const std::vector<double>& host_blocks,int n,bool periodic,mfem::Array<T>& q,
       mfem::Array<double>& lambda)
   {
     const int square=n*n;std::size_t available=0,total=0;
@@ -1525,7 +1754,7 @@ private:
     MFEM_VERIFY(std::size_t(square)*(2*sizeof(double)+sizeof(T))<available,
                 "Spectral eigensystem basis/validation storage exceeds free device memory.");
     mfem::Array<double> blocks,matrix(square);Store(blocks,host_blocks);lambda.SetSize(n);
-    BuildSpectralMatrix<<<(square+255)/256,256>>>(n,blocks.Read(),matrix.Write());
+    BuildSpectralMatrix<<<(square+255)/256,256>>>(n,periodic,blocks.Read(),matrix.Write());
     CUDA(cudaGetLastError());
     int workspace=0;
     SpectralSolver(cusolverDnDsyevd_bufferSize(solver_,CUSOLVER_EIG_MODE_VECTOR,CUBLAS_FILL_MODE_LOWER,
@@ -1544,7 +1773,7 @@ private:
     const int groups=std::min(4096,(square+255)/256);
     mfem::Array<double> partial(2*groups),gram(square);mfem::Array<int> invalid(1);
     CUDA(cudaMemsetAsync(invalid.Write(),0,sizeof(int)));
-    CheckSpectralEigenKernel<<<groups,256>>>(n,blocks.Read(),matrix.Read(),lambda.Read(),partial.Write(),invalid.ReadWrite());
+    CheckSpectralEigenKernel<<<groups,256>>>(n,periodic,blocks.Read(),matrix.Read(),lambda.Read(),partial.Write(),invalid.ReadWrite());
     CUDA(cudaGetLastError());
     MFEM_VERIFY(invalid.HostRead()[0]==0,"Spectral eigensystem contains a nonfinite value or unordered eigenvalue.");
     const double* residual=partial.HostRead();double error=0,scale=0;
