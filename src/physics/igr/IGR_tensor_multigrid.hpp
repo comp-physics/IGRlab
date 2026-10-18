@@ -10,8 +10,9 @@ enum class TensorMultigridSmoother { Separable, Center };
 enum class TensorMultigridOperator { Sampled, Shared, Spectral };
 enum class TensorMultigridResidual { Auto, FP32 };
 
-// Experimental rank-one, uniform periodic affine-quadrilateral p5 scalar L2
-// preconditioner. Sampled owns a verified snapshot of frozen_A. Shared owns its
+// Experimental rank-one, uniform axis-aligned affine-quadrilateral p5 scalar
+// L2 preconditioners. Sampled and Shared require periodic topology. Sampled
+// owns a verified snapshot of frozen_A. Shared owns its
 // translation-averaged five-block reference, an explicit approximation to
 // variable frozen coefficients with O(1) stencil storage. Neither retains a
 // reference to frozen_A or sfes. Its 5->3->1 Galerkin V-cycle has pre/post overlapping patch
@@ -35,7 +36,9 @@ enum class TensorMultigridResidual { Auto, FP32 };
 // transforms and no MG/coarse solve. TF32x3 is restricted to Spectral and uses
 // HH+HL+LH (omitting LL) in three TF32 products for each transform. Spectral
 // requires default smoother/layout/residual controls and a checked separable
-// periodic reference; all current physical coefficients remain in the outer A.
+// reference on a periodic Cartesian product or a fully open Cartesian rectangle
+// with natural scalar boundaries. The open path checks edge/corner corrections;
+// all current physical coefficients remain in the outer A.
 std::unique_ptr<mfem::Solver> MakeTensorMultigridPreconditioner(
   const mfem::Operator& frozen_A, mfem::ParFiniteElementSpace& sfes,
   TensorMultigridPrecision precision,
