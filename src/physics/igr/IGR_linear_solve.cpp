@@ -3274,10 +3274,19 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 #ifdef DG_IGR_HAS_DEVICE_KRYLOV_CUDA
     if (!device_fgmres_)
     {
-      device_fgmres_ = MakeDeviceFGMRESSolver(comm);
+      const char* residual_scale_env =
+        ::igrlab::GetEnv("DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE");
+      const std::string residual_scale =
+        residual_scale_env && residual_scale_env[0] ? residual_scale_env : "initial";
+      MFEM_VERIFY(residual_scale == "initial" || residual_scale == "rhs",
+                  "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE must be initial|rhs.");
+      device_fgmres_ = MakeDeviceFGMRESSolver(
+        comm, 50, residual_scale == "rhs" ? KrylovResidualScale::RHS
+                                          : KrylovResidualScale::Initial);
       if (mfem::Mpi::Root())
       {
         std::cout << "[igr-device-krylov] backend=cuda-fp64 method=fgmres restart=50"
+                  << " residual-scale=" << residual_scale
                   << " orthogonalization=ordered-mgs final-gate=fp64-true-residual"
                   << " convergence-read=each-iteration workspace=cached" << std::endl;
       }

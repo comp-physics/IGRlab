@@ -42,8 +42,12 @@ inline bool CooperativeCoarseCGRequested()
 // zero initialization and an iteration budget no larger than 100.
 std::unique_ptr<mfem::IterativeSolver> MakeCooperativeCGSolver(MPI_Comm comm);
 
+// Changes recurrence scaling only; both modes retain the FP64 RHS-relative true gate.
+enum class KrylovResidualScale { Initial, RHS };
+
 std::unique_ptr<mfem::IterativeSolver> MakeDeviceFGMRESSolver(
-  MPI_Comm comm, int restart_dimension = 50);
+  MPI_Comm comm, int restart_dimension = 50,
+  KrylovResidualScale residual_scale = KrylovResidualScale::Initial);
 std::unique_ptr<mfem::IterativeSolver> MakeDeviceCGSolver(MPI_Comm comm);
 }
 }

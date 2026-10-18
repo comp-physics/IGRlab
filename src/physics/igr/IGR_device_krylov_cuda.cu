@@ -375,8 +375,9 @@ protected:
 class DeviceFGMRES final : public DeviceKrylovBase
 {
 public:
-  DeviceFGMRES(MPI_Comm comm, int restart_dimension)
-    : DeviceKrylovBase(comm), m_(restart_dimension),
+  DeviceFGMRES(MPI_Comm comm, int restart_dimension,
+               KrylovResidualScale residual_scale)
+    : DeviceKrylovBase(comm), m_(restart_dimension), residual_scale_(residual_scale),
       basis_(restart_dimension + 1), directions_(restart_dimension)
   {
     MFEM_VERIFY(m_ >= 1 && m_ <= 256, "Device FGMRES restart dimension must be 1..256.");
@@ -402,11 +403,13 @@ public:
     double status[2];
     ReadControl(status, control, 2);
     initial_norm = final_norm = status[0];
-    // Preserve pinned MFEM's initial-residual-scaled recurrence criterion.
-    // Its recurrence estimate can pass below the attainable FP64 b-A*x
-    // cancellation floor for a near-solution warm start. Certify the corrected
-    // iterate separately against the original RHS at the same configured rtol.
-    const double tolerance = std::max(abs_tol, rel_tol * initial_norm);
+    // Default to pinned MFEM's initial-residual-scaled recurrence criterion;
+    // the opt-in RHS mode uses the same target as the true-residual gate.
+    // Certify the corrected iterate separately against the original RHS, since
+    // the recurrence estimate can fall below the FP64 b-A*x cancellation floor.
+    const double reference_norm = residual_scale_ == KrylovResidualScale::RHS
+                                    ? status[1] : initial_norm;
+    const double tolerance = std::max(abs_tol, rel_tol * reference_norm);
     const double true_tolerance = std::max(abs_tol, rel_tol * status[1]);
     if (!std::isfinite(initial_norm) || !std::isfinite(status[1])) { return; }
     if (final_norm <= tolerance && final_norm <= true_tolerance)
@@ -461,7 +464,7 @@ public:
         AddCorrection<<<blocks, threads>>>(height, directions_[j].Read(),
                                             coefficients + j, control, x.ReadWrite());
       }
-      // Require both MFEM's recurrence/restart criterion and the independent
+      // Require both the selected recurrence/restart criterion and the independent
       // current-A, RHS-relative true residual. A failed certificate restarts
       // within the same iteration budget, without shrinking the true target
       // to the preceding warm-start residual.
@@ -479,6 +482,7 @@ public:
 
 private:
   int m_;
+  const KrylovResidualScale residual_scale_;
   mutable std::vector<mfem::Vector> basis_, directions_;
   mutable mfem::Vector h_, cs_, sn_, g_, coefficients_, control_;
 };
@@ -666,12 +670,12 @@ private:
 
 }
 
-std::unique_ptr<mfem::IterativeSolver> MakeDeviceFGMRESSolver(MPI_Comm comm,
-                                                            int restart_dimension)
+std::unique_ptr<mfem::IterativeSolver> MakeDeviceFGMRESSolver(
+  MPI_Comm comm, int restart_dimension, KrylovResidualScale residual_scale)
 {
   MFEM_VERIFY(restart_dimension >= 1 && restart_dimension <= 256,
               "Device FGMRES restart dimension must be 1..256.");
-  return std::make_unique<DeviceFGMRES>(comm, restart_dimension);
+  return std::make_unique<DeviceFGMRES>(comm, restart_dimension, residual_scale);
 }
 
 std::unique_ptr<mfem::IterativeSolver> MakeDeviceCGSolver(MPI_Comm comm)

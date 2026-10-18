@@ -240,6 +240,146 @@ bool CheckCooperativeCG()
   return admitted;
 }
 
+void CheckRHSRelativeFGMRES()
+{
+  constexpr int n = 65;
+  Stencil nonsymmetric(n, -0.8, 0.3), identity(n, 0.0, 0.0, 1.0),
+          zero_operator(n, 0.0, 0.0, 0.0);
+  ChangingDiagonal changing(n);
+  mfem::Vector exact(n), rhs(n), x(n), supplied(n), difference(n);
+  for (int i = 0; i < n; ++i) { exact(i) = 0.5 + std::cos(0.27 * i); }
+  auto solver = ::igrlab::igr_internal::MakeDeviceFGMRESSolver(
+    MPI_COMM_WORLD, 3, ::igrlab::igr_internal::KrylovResidualScale::RHS);
+  nonsymmetric.Mult(exact, rhs);
+  const double rhs_norm = Norm(rhs);
+  Configure(*solver, nonsymmetric, false);
+  solver->SetPreconditioner(changing);
+  x = 123.0;
+  solver->Mult(rhs, x);
+  CheckSolution(*solver, nonsymmetric, rhs, x, exact, rhs_norm);
+  MFEM_VERIFY(solver->GetNumIterations() > 3,
+              "RHS-relative flexible FGMRES test did not restart.");
+
+  constexpr double rtol = 1.0e-8;
+  Configure(*solver, nonsymmetric, true, 0);
+  solver->SetPreconditioner(changing);
+  solver->SetRelTol(rtol);
+  x = exact;
+  x *= 1.0 - 0.25 * rtol;
+  supplied = x;
+  const double accepted_initial = Residual(nonsymmetric, rhs, x);
+  MFEM_VERIFY(accepted_initial > 0.0 && accepted_initial < 0.5 * rtol * rhs_norm,
+              "RHS-relative test did not supply a positive acceptable warm residual.");
+  solver->Mult(rhs, x);
+  difference = x;
+  difference -= supplied;
+  MFEM_VERIFY(solver->GetConverged() && solver->GetNumIterations() == 0 &&
+                Norm(difference) == 0.0 && Residual(nonsymmetric, rhs, x) <= rtol * rhs_norm &&
+                std::abs(solver->GetInitialNorm() - accepted_initial) <= 1.0e-13 * rhs_norm &&
+                std::abs(solver->GetFinalNorm() - accepted_initial) <= 1.0e-13 * rhs_norm,
+              "RHS-relative FGMRES did not accept its current warm residual with zero budget.");
+
+  // A nearby guess just outside the target must spend iterations. Check the
+  // zero-budget rejection first, then solve the same equation and workspace.
+  x = exact;
+  x *= 1.0 - 1.5 * rtol;
+  supplied = x;
+  const double insufficient_initial = Residual(nonsymmetric, rhs, x);
+  MFEM_VERIFY(insufficient_initial > 1.25 * rtol * rhs_norm &&
+                insufficient_initial < 1.75 * rtol * rhs_norm,
+              "RHS-relative test did not place its warm residual just outside the target.");
+  solver->Mult(rhs, x);
+  difference = x;
+  difference -= supplied;
+  MFEM_VERIFY(!solver->GetConverged() && solver->GetNumIterations() == 0 &&
+                Norm(difference) == 0.0,
+              "RHS-relative FGMRES ignored an exhausted iteration budget.");
+  solver->SetMaxIter(200);
+  solver->Mult(rhs, x);
+  const double warm_final = Residual(nonsymmetric, rhs, x);
+  difference = x;
+  difference -= exact;
+  MFEM_VERIFY(solver->GetConverged() && solver->GetNumIterations() > 0 &&
+                warm_final <= rtol * rhs_norm && Norm(difference) < 2.0 * rtol * Norm(exact) &&
+                std::abs(solver->GetInitialNorm() - insufficient_initial) <= 1.0e-13 * rhs_norm &&
+                std::abs(solver->GetFinalNorm() - warm_final) <= 1.0e-13 * rhs_norm,
+              "RHS-relative warm FGMRES failed its independent residual/solution gate.");
+
+  // The retained solver sees a different operator and a much smaller RHS. A
+  // stale RHS norm would incorrectly accept this deliberately insufficient x.
+  Stencil changed_operator(n, -0.05, 0.015, 0.25);
+  double* changed_exact = exact.HostWrite();
+  for (int i = 0; i < n; ++i)
+  { changed_exact[i] = 0.03 * (0.5 + std::sin(0.13 * i)) + 0.002 * std::cos(0.41 * i); }
+  changed_operator.Mult(exact, rhs);
+  const double changed_rhs_norm = Norm(rhs);
+  x = exact;
+  x *= 1.0 - 4.0 * rtol;
+  const double changed_initial = Residual(changed_operator, rhs, x);
+  MFEM_VERIFY(changed_initial > 3.0 * rtol * changed_rhs_norm &&
+                changed_initial < 0.5 * rtol * rhs_norm,
+              "Changed-equation test did not distinguish the current RHS stopping scale.");
+  Configure(*solver, changed_operator);
+  solver->SetPreconditioner(changing);
+  solver->SetRelTol(rtol);
+  solver->Mult(rhs, x);
+  const double changed_final = Residual(changed_operator, rhs, x);
+  difference = x;
+  difference -= exact;
+  MFEM_VERIFY(solver->GetConverged() && solver->GetNumIterations() > 0 &&
+                changed_final <= rtol * changed_rhs_norm &&
+                Norm(difference) < 2.0 * rtol * Norm(exact) &&
+                std::abs(solver->GetInitialNorm() - changed_initial) <= 1.0e-13 * changed_rhs_norm &&
+                std::abs(solver->GetFinalNorm() - changed_final) <= 1.0e-13 * changed_rhs_norm,
+              "RHS-relative FGMRES used stale operator/RHS data after reconfiguration.");
+
+  auto unpreconditioned = ::igrlab::igr_internal::MakeDeviceFGMRESSolver(
+    MPI_COMM_WORLD, 3, ::igrlab::igr_internal::KrylovResidualScale::RHS);
+  Configure(*unpreconditioned, identity, false, 0);
+  rhs = 0.0;
+  x = 123.0;
+  unpreconditioned->Mult(rhs, x);
+  MFEM_VERIFY(unpreconditioned->GetConverged() && unpreconditioned->GetNumIterations() == 0 && Norm(x) == 0.0,
+              "RHS-relative FGMRES zero RHS/reset failed.");
+  constexpr double atol = 1.0e-10;
+  Configure(*unpreconditioned, identity, true, 0);
+  unpreconditioned->SetAbsTol(atol);
+  x.HostReadWrite()[n - 1] = 0.5 * atol;
+  supplied = x;
+  unpreconditioned->Mult(rhs, x);
+  difference = x;
+  difference -= supplied;
+  MFEM_VERIFY(unpreconditioned->GetConverged() && unpreconditioned->GetNumIterations() == 0 &&
+                Norm(difference) == 0.0 && Residual(identity, rhs, x) == 0.5 * atol,
+              "RHS-relative FGMRES failed its absolute tolerance with zero RHS.");
+  unpreconditioned->SetAbsTol(0.0);
+  unpreconditioned->Mult(rhs, x);
+  MFEM_VERIFY(!unpreconditioned->GetConverged() && unpreconditioned->GetNumIterations() == 0 &&
+                Residual(identity, rhs, x) == 0.5 * atol,
+              "RHS-relative FGMRES accepted a nonzero residual with zero RHS/tolerance.");
+  unpreconditioned->SetMaxIter(2);
+  unpreconditioned->Mult(rhs, x);
+  MFEM_VERIFY(unpreconditioned->GetConverged() && unpreconditioned->GetNumIterations() == 1 &&
+                Residual(identity, rhs, x) == 0.0 && unpreconditioned->GetFinalNorm() == 0.0,
+              "RHS-relative FGMRES failed a zero-RHS happy breakdown.");
+
+  Configure(*solver, zero_operator, false, 5);
+  rhs = exact;
+  solver->Mult(rhs, x);
+  MFEM_VERIFY(!solver->GetConverged() && solver->GetNumIterations() == 1 &&
+                Norm(x) == 0.0 && Residual(zero_operator, rhs, x) == Norm(rhs),
+              "RHS-relative FGMRES accepted an inconsistent Arnoldi breakdown.");
+  Configure(*solver, nonsymmetric, false, 1);
+  solver->SetPreconditioner(changing);
+  nonsymmetric.Mult(exact, rhs);
+  solver->Mult(rhs, x);
+  const double capped_final = Residual(nonsymmetric, rhs, x);
+  MFEM_VERIFY(!solver->GetConverged() && solver->GetNumIterations() == 1 &&
+                capped_final > 1.0e-11 * Norm(rhs) &&
+                std::abs(solver->GetFinalNorm() - capped_final) <= 1.0e-13 * Norm(rhs),
+              "RHS-relative FGMRES violated its one-iteration budget/residual certificate.");
+}
+
 }
 
 int main(int argc, char** argv)
@@ -347,6 +487,8 @@ int main(int argc, char** argv)
   MFEM_VERIFY(!gmres->GetConverged() && gmres->GetNumIterations() == 1,
               "Device FGMRES ignored its iteration budget.");
 
+  CheckRHSRelativeFGMRES();
+
   auto cg = ::igrlab::igr_internal::MakeDeviceCGSolver(MPI_COMM_WORLD);
   spd.Mult(exact, rhs);
   Configure(*cg, spd);
@@ -399,6 +541,8 @@ int main(int argc, char** argv)
             << " cooperative_csr_jacobi_certificate=true cooperative_size_reset=true"
                " cooperative_failure_paths=true restarted_flexible_mgs=true"
                " true_residual=true cached_reconfigure=true repeated_near_warm=true"
+               " rhs_relative_fgmres=true rhs_relative_warm_budget=true rhs_relative_current_equation=true"
+               " rhs_relative_zero_rhs_atol=true rhs_relative_breakdown=true"
                " inconsistent_operator_rejected=true happy_breakdown=true"
                " zero_rhs=true iteration_cap=true cg_mfem_parity=true preconditioned_cg=true nonpositive_curvature=true nonfinite_curvature=true\n";
   return 0;
