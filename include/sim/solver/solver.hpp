@@ -862,6 +862,7 @@ RunEulerCase(ExampleContext& ctx,
                         &bundle,
                         &rk3,
                         &op,
+                        nan_scan = run_cfg.opts.nan_scan,
                         sigma_certification_supported,
                         &final_sigma_prepared,
                         &final_sigma_certification_skipped_nonfinite,
@@ -884,7 +885,7 @@ RunEulerCase(ExampleContext& ctx,
       {
         return SigmaOutputPreparation{0.0, false};
       }
-      if (is_final)
+      if (is_final && nan_scan)
       {
         ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
         const mfem::igrlab::NonFiniteSummary final_nonfinite =
@@ -1029,21 +1030,25 @@ RunEulerCase(ExampleContext& ctx,
   // the conservative state and IGR cadence provenance; certification must not
   // depend on whether a final VTK hook ran. Never replace a typed nonfinite
   // transport failure with an algebraic-solver abort.
-  bool final_state_finite = true;
+  // With diagnostics disabled, a nonfinite scalar failure supplies no
+  // evidence that the conservative state can enter final reconstruction.
+  const bool unscanned_nonfinite_failure =
+    !run_cfg.opts.nan_scan &&
+    result.termination_reason.compare(0, 10, "nonfinite-") == 0;
   if (sigma_provider && !final_sigma_prepared &&
-      !final_sigma_certification_skipped_nonfinite)
+      !final_sigma_certification_skipped_nonfinite && run_cfg.opts.nan_scan)
   {
     ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
     const mfem::igrlab::NonFiniteSummary final_nonfinite =
       mfem::igrlab::ScanNonFinite(bundle.sol);
-    final_state_finite = final_nonfinite.global_non_finite == 0;
+    if (final_nonfinite.global_non_finite != 0)
+    {
+      final_sigma_certification_skipped_nonfinite = true;
+    }
   }
-  if (sigma_provider && !final_sigma_prepared && !final_state_finite)
-  {
-    final_sigma_certification_skipped_nonfinite = true;
-  }
-  if (sigma_provider && !final_sigma_prepared && final_state_finite &&
-      !final_sigma_certification_skipped_nonfinite)
+  if (sigma_provider && !final_sigma_prepared &&
+      !final_sigma_certification_skipped_nonfinite &&
+      !unscanned_nonfinite_failure)
   {
     ::igrlab::NVTXRange range("Solver/final-sigma-preparation");
     final_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
@@ -1945,15 +1950,42 @@ struct Solver
         static_source->UseDevice(
           run_cfg.device_backend == DeviceBackend::CUDA);
         static_source->ProjectCoefficient(*static_source_coefficient);
-        const mfem::igrlab::NonFiniteSummary source_scan =
-          mfem::igrlab::ScanNonFinite(*static_source);
-        MFEM_VERIFY(source_scan.global_non_finite == 0,
-                    "Projected CaseSpec static source contains non-finite "
-                    "values.");
-        const double source_max_abs =
-          std::max(std::abs(source_scan.global_min),
-                   std::abs(source_scan.global_max));
-        if (source_max_abs == 0.0)
+        bool source_is_zero = false;
+        if (run_cfg.opts.nan_scan)
+        {
+          const mfem::igrlab::NonFiniteSummary source_scan =
+            mfem::igrlab::ScanNonFinite(*static_source);
+          MFEM_VERIFY(source_scan.global_non_finite == 0,
+                      "Projected CaseSpec static source contains non-finite "
+                      "values.");
+          const double source_max_abs =
+            std::max(std::abs(source_scan.global_min),
+                     std::abs(source_scan.global_max));
+          source_is_zero = source_max_abs == 0.0;
+        }
+        else
+        {
+          // Source-free dispatch needs an exact zero test even when optional
+          // diagnostics are off. NaNs and tiny nonzero values cannot pass it.
+          int source_has_nonzero = 0;
+          const auto* source_data = static_source->HostRead();
+          for (int i = 0; i < static_source->Size(); ++i)
+          {
+            if (source_data[i] != 0.0)
+            {
+              source_has_nonzero = 1;
+              break;
+            }
+          }
+          MPI_Allreduce(MPI_IN_PLACE,
+                        &source_has_nonzero,
+                        1,
+                        mfem::MPITypeMap<int>::mpi_type,
+                        MPI_MAX,
+                        ctx.Mesh().GetComm());
+          source_is_zero = source_has_nonzero == 0;
+        }
+        if (source_is_zero)
         {
           // Preserve the source-free operator path exactly: no retained field,
           // RHS branch body, device vector add, or memory traffic.

@@ -38,6 +38,50 @@ int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
 
+  // --- Diagnostic state scans are opt-in and have paired CLI controls ---
+  {
+    const dg_sim::CommonOptions defaults;
+    const dg_sim::TimeLoopConfig loop_defaults;
+    ctx.Check(!defaults.nan_scan && !defaults.admissibility_scan &&
+                !loop_defaults.nan_scan,
+              "diagnostic scans: runtime and time-loop defaults are disabled");
+
+    for (const bool enable_scans : {false, true})
+    {
+      char program_name[] = "test";
+      char nan_enable_name[] = "--nan-scan";
+      char nan_disable_name[] = "--no-nan-scan";
+      char admissibility_enable_name[] = "--admissibility-scan";
+      char admissibility_disable_name[] = "--no-admissibility-scan";
+      char* scan_argv[] = {
+        program_name,
+        enable_scans ? nan_enable_name : nan_disable_name,
+        enable_scans ? admissibility_enable_name : admissibility_disable_name};
+      dg_sim::CommonOptions opts;
+      opts.nan_scan = !enable_scans;
+      opts.admissibility_scan = !enable_scans;
+      mfem::OptionsParser parser(3, scan_argv);
+      dg_sim::AddCommonOptions(parser, opts, "Test mesh.");
+      parser.Parse();
+      ctx.Check(parser.Good() && opts.nan_scan == enable_scans &&
+                  opts.admissibility_scan == enable_scans,
+                enable_scans
+                  ? "diagnostic scans: explicit enable flags opt in"
+                  : "diagnostic scans: explicit off flags override enabled values");
+
+      const dg_sim::RunConfig parsed_run = dg_sim::MakeRunConfig(
+        dg_sim::CaseConfig{}, opts, dg_sim::IGROptions{});
+      const dg_sim::TimeLoopConfig parsed_loop =
+        dg_sim::MakeTimeLoopConfig(parsed_run);
+      ctx.Check(parsed_run.opts.nan_scan == enable_scans &&
+                  parsed_run.opts.admissibility_scan == enable_scans &&
+                  parsed_loop.nan_scan == enable_scans,
+                enable_scans
+                  ? "diagnostic scans: enabled CLI policy reaches the run and loop"
+                  : "diagnostic scans: disabled CLI policy reaches the run and loop");
+    }
+  }
+
   // Conservation integration must preserve the original physical/discrete
   // measure for affine GL/GLL, curved geometry, and continuous fallback spaces.
   // The point-query oracle intentionally retains the former general algorithm.
@@ -2703,7 +2747,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "time loop failure output: restart save retains checkpoint time");
   }
 
-  // --- non-finite post-accept CFL dt emits the finite committed state ---
+  // --- Non-finite CFL dt scans and failure snapshots require opt-in ---
+  for (const bool nan_scan : {false, true})
   {
     TimeLoopOverflowDtOperator op;
     TimeLoopCountingStepper stepper;
@@ -2713,9 +2758,11 @@ int RunTimeDefaultsTests(TestContext& ctx)
     cfg.dt_min = 0.0;
     cfg.cfl = 0.3;
     cfg.order = 1;
+    cfg.nan_scan = nan_scan;
     cfg.vtk_save = true;
     cfg.dt_save = 100.0;
 
+    int save_calls = 0;
     int final_save_calls = 0;
     int final_save_step = -1;
     mfem::real_t final_save_time = -1.0;
@@ -2725,6 +2772,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
                         int,
                         bool is_final)
     {
+      ++save_calls;
       if (is_final)
       {
         ++final_save_calls;
@@ -2737,14 +2785,38 @@ int RunTimeDefaultsTests(TestContext& ctx)
       op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
     ctx.Check(!result.success &&
                 result.termination_reason == "nonfinite-cfl-dt" &&
-                result.steps == 1 && stepper.calls == 1,
-              "time loop failure output: overflowed CFL update is typed");
-    ctx.Check(final_save_calls == 1 && final_save_step == result.steps,
-              "time loop failure output: post-accept state is saved once");
-    ctx.CheckNear(final_save_time,
-                  result.final_time,
-                  0.0,
-                  "time loop failure output: saved time is committed time");
+                result.steps == 1 && result.segment_steps == 1 &&
+                result.accepted_attempts == 1 && stepper.calls == 1 &&
+                result.final_time > 0.0 && result.final_time < cfg.t_final,
+              nan_scan
+                ? "time loop diagnostics: overflowed CFL update is typed with scans on"
+                : "time loop diagnostics: overflowed CFL update is typed with scans off");
+    if (nan_scan)
+    {
+      ctx.Check(result.non_finite_count == 1 &&
+                  std::isfinite(result.non_finite_min) &&
+                  std::isfinite(result.non_finite_max) &&
+                  result.non_finite_min <= result.non_finite_max,
+                "time loop diagnostics: enabled failure scan records finite extrema");
+      ctx.Check(save_calls == 1 && final_save_calls == 1 &&
+                  final_save_step == result.steps,
+                "time loop failure output: scanned post-accept state is saved once");
+      ctx.CheckNear(final_save_time,
+                    result.final_time,
+                    0.0,
+                    "time loop failure output: saved time is committed time");
+    }
+    else
+    {
+      ctx.Check(result.non_finite_count == 0 &&
+                  result.non_finite_min ==
+                    std::numeric_limits<double>::infinity() &&
+                  result.non_finite_max ==
+                    -std::numeric_limits<double>::infinity(),
+                "time loop diagnostics: disabled scans leave state evidence unobserved");
+      ctx.Check(save_calls == 0,
+                "time loop failure output: disabled scan emits no failure snapshot");
+    }
   }
 
   // --- clipped/snap dt_real below dt_min is allowed (bookkeeping policy) ---

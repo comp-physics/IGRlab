@@ -739,20 +739,23 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     {
       std::cout << "[dt-check] Non-finite dt before time loop: " << dt << "\n";
     }
-    const mfem::igrlab::NonFiniteSummary summary =
-      mfem::igrlab::ScanNonFinite(sol);
-    result.non_finite_count =
-      summary.global_non_finite > 0 ? summary.global_non_finite : 1;
-    result.non_finite_min = summary.global_min;
-    result.non_finite_max = summary.global_max;
     result.termination_reason = "nonfinite-initial-dt";
-    if (summary.global_non_finite == 0)
+    if (cfg.nan_scan)
     {
-      EmitSave(result.steps,
-               t,
-               save_idx,
-               /*is_final=*/true,
-               /*suppress_duplicate_time=*/true);
+      const mfem::igrlab::NonFiniteSummary summary =
+        mfem::igrlab::ScanNonFinite(sol);
+      result.non_finite_count =
+        summary.global_non_finite > 0 ? summary.global_non_finite : 1;
+      result.non_finite_min = summary.global_min;
+      result.non_finite_max = summary.global_max;
+      if (summary.global_non_finite == 0)
+      {
+        EmitSave(result.steps,
+                 t,
+                 save_idx,
+                 /*is_final=*/true,
+                 /*suppress_duplicate_time=*/true);
+      }
     }
     if (communicator_root)
     {
@@ -836,20 +839,23 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
         std::cout << "[dt-check] Non-finite dt during time loop: " << dt_real
                   << " at t=" << t << "\n";
       }
-      const mfem::igrlab::NonFiniteSummary summary =
-        mfem::igrlab::ScanNonFinite(sol);
-      result.non_finite_count =
-        summary.global_non_finite > 0 ? summary.global_non_finite : 1;
-      result.non_finite_min = summary.global_min;
-      result.non_finite_max = summary.global_max;
       result.termination_reason = "nonfinite-attempt-dt";
-      if (summary.global_non_finite == 0)
+      if (cfg.nan_scan)
       {
-        EmitSave(result.steps,
-                 t,
-                 save_idx,
-                 /*is_final=*/true,
-                 /*suppress_duplicate_time=*/true);
+        const mfem::igrlab::NonFiniteSummary summary =
+          mfem::igrlab::ScanNonFinite(sol);
+        result.non_finite_count =
+          summary.global_non_finite > 0 ? summary.global_non_finite : 1;
+        result.non_finite_min = summary.global_min;
+        result.non_finite_max = summary.global_max;
+        if (summary.global_non_finite == 0)
+        {
+          EmitSave(result.steps,
+                   t,
+                   save_idx,
+                   /*is_final=*/true,
+                   /*suppress_duplicate_time=*/true);
+        }
       }
       break;
     }
@@ -1121,23 +1127,26 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
             std::cout << "[dt-check] Non-finite dt after CFL update: " << dt
                       << " at t=" << t << "\n";
           }
-          const mfem::igrlab::NonFiniteSummary summary =
-            mfem::igrlab::ScanNonFinite(sol);
-          result.non_finite_count =
-            summary.global_non_finite > 0 ? summary.global_non_finite : 1;
-          result.non_finite_min = summary.global_min;
-          result.non_finite_max = summary.global_max;
           result.segment_steps = segment_step + 1;
           result.steps = cfg.initial_step + result.segment_steps;
           result.final_time = t;
           result.termination_reason = "nonfinite-cfl-dt";
-          if (summary.global_non_finite == 0)
+          if (cfg.nan_scan)
           {
-            EmitSave(result.steps,
-                     t,
-                     save_idx,
-                     /*is_final=*/true,
-                     /*suppress_duplicate_time=*/true);
+            const mfem::igrlab::NonFiniteSummary summary =
+              mfem::igrlab::ScanNonFinite(sol);
+            result.non_finite_count =
+              summary.global_non_finite > 0 ? summary.global_non_finite : 1;
+            result.non_finite_min = summary.global_min;
+            result.non_finite_max = summary.global_max;
+            if (summary.global_non_finite == 0)
+            {
+              EmitSave(result.steps,
+                       t,
+                       save_idx,
+                       /*is_final=*/true,
+                       /*suppress_duplicate_time=*/true);
+            }
           }
           break;
         }
