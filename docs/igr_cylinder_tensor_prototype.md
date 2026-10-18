@@ -266,3 +266,31 @@ Both DG (GL Euler/Sigma) and DGSEM (GLL Euler/Sigma) separately completed
 10-step VTK pilots in job 3402533. The longer run here is DGSEM only; DG has
 not been qualified through t=0.1. An attempted p5 VTK restart was rejected by
 the existing restart path's p1–p4 support gate; the actual run used no restart.
+
+
+## Matched direct DG attempt
+
+At the user's request, job 3402619 ran ordinary DG from t=0 toward t=0.1
+with the same p5/ref0 mesh, physical alpha=0.0004 (max-length policy),
+modal rate80000, dt=1e-5, no positivity limiter, FP32 RAS, FP64 tensor IGR
+volume, and VTK cadence0.005. DG uses GL Euler/Sigma nodes and its packed CUDA
+Euler operator. Optional admissibility/conservation diagnostics remained off;
+no extra test runs were performed.
+
+DG also failed near the same physical time: solve_call9564 at RK step3187,
+stage2, t=0.03187500000000013. The IGR solve started with nonfinite residual
+norms and performed zero iterations; its one residual-replacement retry also
+failed. The preceding solve converged in120 iterations with a current-A
+relative residual2.514e-13. This is not an iteration-budget exhaustion, and
+the available logs do not by themselves establish the initiating cause.
+
+Application wall time was305.395s versus243.661s for DGSEM; Slurm reserved
+313s (0.08694GH200-hours). At step3000, reported average step time was0.08791s
+versus0.06931s for DGSEM. This single attempt gave no practical stability or
+runtime improvement from switching to DG.
+
+Seven DG VTK frames survive through t=0.03. At that last saved time, sampled
+pressure minima were0.0191990 (DG) and0.0183241 (DGSEM), both still positive;
+those saved frames precede the failures. DG output is retained under the
+local bundle as `results/vtk-t0p1-v4-dg-nu80000/`,
+`cylinder-dg-t0p03.png`, and `cylinder-dg-p5-t0-to-0p03.zip`.
