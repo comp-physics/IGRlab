@@ -1944,6 +1944,10 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
     COMMAND dg_igr_shared_reference_test --dg-volume-memory-only)
   set_tests_properties(dg_igr_dg_volume_memory_cuda PROPERTIES
     LABELS "cuda;dg;shared-reference;volume-memory" TIMEOUT 120 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_dg_tensor_face_cuda
+    COMMAND dg_igr_shared_reference_test --dg-tensor-face-only)
+  set_tests_properties(dg_igr_dg_tensor_face_cuda PROPERTIES
+    LABELS "cuda;dg;tensor-face" TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
 # Shared-reference patch GEMM: actual patch columns and current-A acceptance.

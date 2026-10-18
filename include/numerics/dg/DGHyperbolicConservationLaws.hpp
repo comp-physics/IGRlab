@@ -37,6 +37,10 @@
 
 namespace mfem
 {
+namespace dg_igr_detail
+{
+struct TensorFaceData;
+}
 namespace dgsem
 {
 class DGSEMOperator;
@@ -453,6 +457,12 @@ private:
   /// Build packed interior/boundary face data for device DG surface assembly.
   void BuildFaceApplyData_();
 
+  /// Try the opt-in FP64 reference-tensor trace/flux/lift face layout.
+  bool BuildTensorFaceApplyData_();
+  bool AddTensorFaceContributions_(const Vector& x_in, Vector& z_out,
+                                   real_t& max_face_speed,
+                                   bool capture_boundary_flux) const;
+
   /// Build interpolation data for sigma(e, face-qpoint) sampling on device.
   bool BuildFaceSigmaData_(const ParGridFunction& sigma) const;
 
@@ -541,6 +551,10 @@ private:
   int face_int_order_offset_ = 1;
   /// Packed DG face apply is ready when all required metadata exists.
   bool face_apply_ready_ = false;
+  /// Keep storage private to the face translation unit while preserving the
+  /// operator's existing out-of-line default move and destructor definitions.
+  mutable std::shared_ptr<dg_igr_detail::TensorFaceData> face_tensor_data_;
+  bool face_tensor_requested_ = false;
   /// Only the standard constructor establishes sign/quadrature equivalence.
   bool standard_face_integrator_ = false;
   const NumericalFlux* standard_face_flux_ = nullptr;

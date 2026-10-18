@@ -6,8 +6,8 @@ It preserves one fixed physical case and measures complete application runs.
 The volume prototype reduces full application time by 11.4% on the fixed
 large case, saves 2,594 MiB of sampled peak GPU memory, and changes the final
 conserved fields by at most 1.97e-9 in relative L2 norm. The face prototype
-has passed independent source review and awaits native validation. No face
-speedup is claimed yet.
+has passed independent source review and native CUDA validation; its full-case
+comparison is running. No face speedup is claimed yet.
 
 ## Fixed comparison
 
@@ -133,11 +133,20 @@ input. No extra always-on nonfinite scans are introduced solely to reproduce
 that footprint; intrinsic boundary rejection is preserved.
 
 Independent source review found no remaining finite-state blocker.
-Native build 3406629 follows the volume comparison and runs both
-focused volume and face suites. The face suite compares full RHS and
-conservation against the original path, including boundary flux capture,
-sigma changes, orientation and quadrature/space fallbacks. Native results
-and large-case measurements are pending.
+Native build 3406821 passed the focused volume and face CUDA suites in
+2.94 and 1.38 seconds. The face suite compares full RHS and conservation
+against the original path, including boundary flux capture, sigma changes,
+orientation and quadrature/space fallbacks. Native validation exposed and
+resolved retained periodic boundary records: MFEM returns null boundary
+transformations for joined interior seams, which are skipped like the
+legacy route while complete element-side coverage remains mandatory.
+
+The frozen executable SHA256 is
+`b2828014dd1b464658836cbab22bf2ec3c718a44a02581edfbe342c27b3f5664`.
+Its receipt retains 771 source-file hashes. Job 3406831 compares the original
+control with the combined volume and face path sequentially on the same GPU.
+This measures cumulative end-to-end improvement directly; it must not be
+presented as an isolated face-only percentage. Full-case results are pending.
 
 ## Retained evidence
 

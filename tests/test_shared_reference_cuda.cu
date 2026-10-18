@@ -859,6 +859,308 @@ void DGVolumeMemoryOracles()
                "sigma_space_rebind=true update=true\n";
 }
 
+mfem::Mesh TensorFaceMesh(int cells, bool sheared, bool rotated)
+{
+  mfem::Mesh mesh(2, (cells + 1) * (cells + 1), cells * cells, 4 * cells, 2);
+  for (int j = 0; j <= cells; ++j) for (int i = 0; i <= cells; ++i)
+  {
+    const double x = double(i) / cells, y = double(j) / cells;
+    const double point[2] = {sheared ? 0.75 * x + 0.25 * y : x, sheared ? 1.25 * y : y};
+    mesh.AddVertex(point);
+  }
+  for (int j = 0; j < cells; ++j) for (int i = 0; i < cells; ++i)
+  {
+    const int v[4] = {i + j * (cells + 1), i + 1 + j * (cells + 1),
+      i + 1 + (j + 1) * (cells + 1), i + (j + 1) * (cells + 1)};
+    const int shift = rotated ? (i + 2 * j) % 4 : 0;
+    int element[4];
+    for (int k = 0; k < 4; ++k) { element[k] = v[(k + shift) % 4]; }
+    mesh.AddQuad(element);
+  }
+  for (int i = 0; i < cells; ++i)
+  {
+    mesh.AddBdrSegment(i, i + 1, 1);
+    mesh.AddBdrSegment(cells + i * (cells + 1), cells + (i + 1) * (cells + 1), 2);
+    mesh.AddBdrSegment(i + 1 + cells * (cells + 1), i + cells * (cells + 1), 3);
+    mesh.AddBdrSegment((i + 1) * (cells + 1), i * (cells + 1), 4);
+  }
+  mesh.FinalizeQuadMesh(1, 0, true);
+  return mesh;
+}
+
+void FillTensorFaceBlast(mfem::ParFiniteElementSpace& fes, Vector& state)
+{
+  double* values = state.HostWrite();
+  Vector point(2);
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(e, dofs);
+    const auto& nodes = fes.GetFE(e)->GetNodes();
+    auto& transformation = *fes.GetElementTransformation(e);
+    for (int i = 0; i < dofs.Size(); ++i)
+    {
+      transformation.Transform(nodes.IntPoint(i), point);
+      const double x = point[0], y = point[1];
+      const double rho = 1.0 + 0.03 * x;
+      const double vx = 0.18 * (x - 0.4), vy = 0.12 * (y - 0.45);
+      const double radius2 = (x - 0.35) * (x - 0.35) + (y - 0.4) * (y - 0.4);
+      const double pressure = 0.12 + 0.9 * std::exp(-18.0 * radius2) + 0.02 * x + 0.03 * y;
+      const double u[4] = {rho, rho * vx, rho * vy,
+        pressure / 0.4 + 0.5 * rho * (vx * vx + vy * vy)};
+      for (int c = 0; c < 4; ++c) { values[fes.DofToVDof(dofs[i], c)] = u[c]; }
+    }
+  }
+}
+
+struct TensorFaceControl
+{
+  mfem::EulerFlux euler;
+  mfem::FluxWithIGR physical;
+  mfem::RusanovFluxWithSides numerical;
+  std::unique_ptr<mfem::DGHyperbolicConservationLaws> op;
+
+  TensorFaceControl(mfem::ParFiniteElementSpace& fes, const mfem::ParGridFunction& sigma,
+                    int face_order_offset)
+    : euler(2, 1.4), physical(euler, 1.4), numerical(physical)
+  {
+    physical.SetSigmaField(&sigma);
+    physical.SetInvariantDomainFlux(true);
+    physical.SetInvariantDomainFloors(1e-12, 1e-12);
+    Select();
+    // Offset 1 is the Sedov GL(p+1) rule. The offset-2 control must retain
+    // its original higher quadrature through the legacy fallback.
+    op = std::make_unique<mfem::DGHyperbolicConservationLaws>(
+      fes, numerical, face_order_offset, true);
+    op->SetDGSEMGamma(1.4);
+  }
+  void Select() const { VolumeMemoryMode("dense", "element", false); }
+};
+
+std::string ApplyTensorFace(TensorFaceControl& control, const char* mode,
+                            const Vector& state, Vector& residual)
+{
+  control.Select();
+  setenv("IGRLAB_DG_TENSOR_FACE", mode, 1);
+  std::ostringstream output;
+  {
+    struct RestoreOutput
+    {
+      std::streambuf* previous;
+      ~RestoreOutput() { std::cout.rdbuf(previous); }
+    } restore{std::cout.rdbuf(output.rdbuf())};
+    control.op->Mult(state, residual);
+  }
+  std::cout << output.str();
+  return output.str();
+}
+
+void CheckTensorFaceMoments(mfem::ParFiniteElementSpace& fes,
+                            const std::vector<Vector>& cell_mass,
+                            const Vector& actual, const Vector& legacy,
+                            const Vector& boundary_flux, const std::string& label)
+{
+  const double* a = actual.HostRead(); const double* b = legacy.HostRead();
+  const double* outward = boundary_flux.HostRead();
+  long double total[4] = {}, total_bound[4] = {};
+  long double largest_cell_moment = 0.0L;
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(e, dofs);
+    for (int c = 0; c < 4; ++c)
+    {
+      long double moment = 0.0L, reference = 0.0L, bound = 0.0L;
+      for (int i = 0; i < dofs.Size(); ++i)
+      {
+        const int index = fes.DofToVDof(dofs[i], c);
+        const long double weight = cell_mass[e][i];
+        moment += weight * a[index];
+        reference += weight * b[index];
+        bound += weight * (std::abs(a[index]) + std::abs(b[index]));
+      }
+      const long double tolerance = 256.0L * std::numeric_limits<double>::epsilon() *
+        dofs.Size() * std::max(1.0L, bound);
+      MFEM_VERIFY(std::abs(moment - reference) <= tolerance,
+                  "Tensor face changed a conserved cell moment: " << label
+                  << " element=" << e << " equation=" << c
+                  << " error=" << static_cast<double>(moment - reference));
+      total[c] += moment;
+      total_bound[c] += bound;
+      largest_cell_moment = std::max(largest_cell_moment, std::abs(reference));
+    }
+  }
+  MFEM_VERIFY(largest_cell_moment > 1e-4L,
+              "Tensor face fixture lacks nontrivial cell moments: " << label);
+  for (int c = 0; c < 4; ++c)
+  {
+    const long double tolerance = 512.0L * std::numeric_limits<double>::epsilon() *
+      fes.GetNDofs() * std::max(1.0L, total_bound[c] + std::abs(outward[c]));
+    MFEM_VERIFY(std::abs(total[c] + outward[c]) <= tolerance,
+                "Tensor face residual does not close the boundary-flux balance: " << label
+                << " equation=" << c << " residual=" << static_cast<double>(total[c])
+                << " outward_flux=" << outward[c] << " tolerance=" << static_cast<double>(tolerance));
+  }
+}
+
+void DGTensorFaceOracle(bool periodic, bool sheared, bool rotated,
+                        bool mismatched_sigma = false, int face_order_offset = 1)
+{
+  constexpr int order = 5;
+  mfem::Mesh serial = TensorFaceMesh(periodic ? 4 : 2, sheared, rotated);
+  mfem::Mesh topology;
+  if (periodic)
+  {
+    const std::vector<Vector> translations = sheared
+      ? std::vector<Vector>{Vector({0.75, 0.0}), Vector({0.25, 1.25})}
+      : std::vector<Vector>{Vector({1.0, 0.0}), Vector({0.0, 1.0})};
+    topology = mfem::Mesh::MakePeriodic(serial, serial.CreatePeriodicVertexMapping(translations));
+  }
+  else { topology = std::move(serial); }
+  mfem::ParMesh mesh(MPI_COMM_SELF, topology);
+  mfem::L2_FECollection fec(order, 2, mfem::BasisType::GaussLegendre);
+  mfem::L2_FECollection sfec(order, 2, mismatched_sigma
+    ? mfem::BasisType::GaussLobatto : mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(&mesh, &fec, 4, mfem::Ordering::byNODES);
+  mfem::ParFiniteElementSpace sfes(&mesh, &sfec);
+  mfem::ParGridFunction sigma(&sfes);
+  Vector state(fes.GetVSize()), first_legacy(fes.GetVSize());
+  if (periodic && face_order_offset == 1) { FillVolumeMemoryEuler(fes, state); }
+  else { FillTensorFaceBlast(fes, state); }
+  // Independent M*1 weights convert the strong RHS to conserved cell moments.
+  std::vector<Vector> cell_mass(mesh.GetNE());
+  mfem::MassIntegrator mass_integrator;
+  for (int e = 0; e < mesh.GetNE(); ++e)
+  {
+    DenseMatrix mass;
+    const auto& fe = *fes.GetFE(e);
+    mass_integrator.AssembleElementMatrix(fe, *fes.GetElementTransformation(e), mass);
+    Vector one(fe.GetDof()); one = 1.0;
+    cell_mass[e].SetSize(fe.GetDof());
+    mass.Mult(one, cell_mass[e]);
+  }
+  std::vector<std::unique_ptr<TensorFaceControl>> controls;
+  for (const char* mode : {"off", "fp64"})
+  {
+    setenv("IGRLAB_DG_TENSOR_FACE", mode, 1);
+    controls.emplace_back(std::make_unique<TensorFaceControl>(fes, sigma, face_order_offset));
+    if (!periodic)
+    {
+      mfem::Array<int> boundaries(mesh.bdr_attributes.Max()); boundaries = 1;
+      controls.back()->op->AddBdrFaceIntegrator(
+        new mfem::BdrHyperbolicFluxIntegrator(controls.back()->numerical,
+          std::make_unique<mfem::SlipWallState>(2, 1e-12, 1e-12), face_order_offset), boundaries);
+    }
+  }
+  const std::string cohort = "periodic=" + std::to_string(periodic) +
+    " sheared=" + std::to_string(sheared) + " rotated=" + std::to_string(rotated) +
+    " mismatched_sigma=" + std::to_string(mismatched_sigma) +
+    " face_order_offset=" + std::to_string(face_order_offset);
+  // Euler coefficients remain fixed; only the current sigma values change.
+  for (int phase = 0; phase < 2; ++phase)
+  {
+    FillVolumeMemorySigma(sigma, phase);
+    Vector legacy(fes.GetVSize()), legacy_boundary_flux;
+    double legacy_speed = 0.0;
+    mfem::IGRFrozenSigmaTelemetry legacy_telemetry;
+    for (std::size_t index = 0; index < controls.size(); ++index)
+    {
+      auto& control = *controls[index];
+      const char* mode = index == 0 ? "off" : "fp64";
+      const std::string label = cohort + " phase=" + std::to_string(phase) + " mode=" + mode;
+      MFEM_VERIFY(!control.op->GetInvariantDomainVolumeSpeedTracking(),
+                  "Tensor face fixture must compare face-only characteristic speeds.");
+      Vector actual(fes.GetVSize()), without_capture;
+      if (phase == 0)
+      {
+        const std::string log = ApplyTensorFace(control, mode, state, actual);
+        MFEM_VERIFY(!control.op->HasLastPhysicalBoundaryFluxIntegral(),
+                    "Unarmed tensor face application manufactured boundary capture: " << label);
+        if (index == 0)
+        {
+          MFEM_VERIFY(log.find("[dg-tensor-face] event=setup selected=fp64") == std::string::npos,
+                      "Tensor face off control selected fp64.");
+        }
+        else if (mismatched_sigma)
+        {
+          MFEM_VERIFY(log.find("[dg-tensor-face] event=fallback reason=sigma-layout") != std::string::npos,
+                      "Nonmatching sigma space did not dispatch to the legacy face path.");
+        }
+        else if (face_order_offset != 1)
+        {
+          MFEM_VERIFY(log.find("[dg-tensor-face] event=fallback reason=quadrature") != std::string::npos &&
+                        log.find("[dg-tensor-face] event=setup selected=fp64") == std::string::npos,
+                      "Tensor faces must preserve the original offset-2 quadrature through fallback.");
+        }
+        else
+        {
+          MFEM_VERIFY(log.find("[dg-tensor-face] event=setup selected=fp64") != std::string::npos &&
+                        log.find("dense_shape_entries=0") != std::string::npos,
+                      "Tensor face fixture did not select compact FP64 faces: " << label);
+        }
+        without_capture = actual;
+      }
+      control.op->ArmPhysicalBoundaryFluxIntegral();
+      ApplyTensorFace(control, mode, state, actual);
+      MFEM_VERIFY(control.op->HasLastPhysicalBoundaryFluxIntegral(),
+                  "Armed tensor face application did not publish boundary capture: " << label);
+      const Vector boundary_flux(control.op->GetLastPhysicalBoundaryFluxIntegral());
+      MFEM_VERIFY(boundary_flux.Size() == 4, "Tensor face capture has an invalid equation count.");
+      if (phase == 0)
+        CheckVolumeMemoryVector(actual, without_capture, label + " capture preserves RHS");
+      const double speed = control.op->GetMaxCharSpeed();
+      const auto telemetry = control.op->GetGlobalFrozenSigmaTelemetry();
+      if (index == 0)
+      {
+        legacy = actual; legacy_boundary_flux = boundary_flux;
+        legacy_speed = speed; legacy_telemetry = telemetry;
+        if (phase == 0) { first_legacy = actual; }
+        else
+        {
+          Vector change(actual); change -= first_legacy;
+          MFEM_VERIFY(change.Normlinf() > 1e-4,
+                      "Tensor face sigma mutation fixture has no residual effect: " << label);
+        }
+      }
+      CheckVolumeMemoryVector(actual, legacy, label + " full RHS versus legacy");
+      CheckVolumeMemoryVector(boundary_flux, legacy_boundary_flux, label + " boundary capture versus legacy");
+      MFEM_VERIFY(std::isfinite(speed) && std::abs(speed - legacy_speed) <=
+                    2e-12 * std::max(1.0, legacy_speed),
+                  "Tensor faces changed the characteristic-speed policy: " << label);
+      CheckVolumeMemoryTelemetry(telemetry, legacy_telemetry, label + " telemetry versus legacy");
+      CheckTensorFaceMoments(fes, cell_mass, actual, legacy, boundary_flux, label);
+      if (periodic)
+      {
+        MFEM_VERIFY(boundary_flux.Normlinf() == 0.0,
+                    "Periodic tensor face capture contains physical boundary flux.");
+      }
+      else
+      {
+        const double* flux = boundary_flux.HostRead();
+        MFEM_VERIFY(boundary_flux.Normlinf() > 1e-4 &&
+                      std::abs(flux[0]) <= 2e-12 && std::abs(flux[3]) <= 2e-12,
+                    "Slip-wall blast must have nontrivial momentum flux and zero mass/energy leakage.");
+      }
+    }
+  }
+  std::cout << "dg_tensor_face_oracle " << cohort << " passed\n";
+}
+
+void DGTensorFaceOracles()
+{
+  DGTensorFaceOracle(true, false, false);
+  DGTensorFaceOracle(true, true, true);
+  DGTensorFaceOracle(false, false, false);
+  DGTensorFaceOracle(true, false, false, true);
+  DGTensorFaceOracle(true, false, false, false, 2);
+  setenv("IGRLAB_DG_TENSOR_FACE", "off", 1);
+  VolumeMemoryMode("dense", "element", false);
+  std::cout << "dg_tensor_face_test passed periodic=true sheared_oriented=true "
+               "slip_blast=true current_sigma=true full_rhs=true cell_moments=true "
+               "boundary_capture=true canonical_conservation=true "
+               "face_speed_telemetry=true sigma_layout_fallback=true quadrature_fallback=true\n";
+}
+
 void ReferenceSetupRejection()
 {
 #ifdef MFEM_USE_EXCEPTIONS
@@ -904,6 +1206,13 @@ int main(int argc, char** argv)
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
   unsetenv("DG_IGR_WEAKDIV_SIGMA_STORAGE");
   unsetenv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
+  unsetenv("DG_IGR_DG_TENSOR_FACE");
+  setenv("IGRLAB_DG_TENSOR_FACE", "off", 1);
+  if (argc > 1 && std::string(argv[1]) == "--dg-tensor-face-only")
+  {
+    DGTensorFaceOracles();
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "--dg-volume-memory-only")
   {
     DGVolumeMemoryOracles();
