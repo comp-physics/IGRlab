@@ -1306,25 +1306,27 @@ RunEulerCase(ExampleContext& ctx,
   const bool report_q_sigma =
     run_cfg.igr_opts.igr_invariant_domain_flux ||
     report_extrapolated_q_sigma;
-  if (report_q_sigma)
+  const bool report_dgsem_admission = sigma_provider &&
+    run_cfg.dg_backend == DGBackend::DGSEM && run_cfg.opts.admissibility_scan;
+  const auto* q_sigma_provider =
+    dynamic_cast<const mfem::IGRFrozenSigmaTelemetryProvider*>(&op);
+  MFEM_VERIFY(!report_q_sigma || q_sigma_provider,
+              "Selected IGR transport is missing q_sigma telemetry.");
+  if ((report_q_sigma || report_dgsem_admission) && q_sigma_provider)
   {
-    const auto* q_sigma_provider =
-      dynamic_cast<const mfem::IGRFrozenSigmaTelemetryProvider*>(&op);
-    MFEM_VERIFY(q_sigma_provider,
-                "Selected IGR transport is missing q_sigma "
-                "telemetry.");
     const mfem::IGRFrozenSigmaTelemetry q_sigma =
       q_sigma_provider->GetGlobalFrozenSigmaTelemetry();
-    MFEM_VERIFY(q_sigma.enabled,
+    MFEM_VERIFY(!report_q_sigma || q_sigma.enabled,
                 "Selected IGR q_sigma telemetry was not enabled.");
-    if (communicator_root)
+    if (communicator_root && q_sigma.enabled)
     {
       std::cout << std::setprecision(17)
                 << "[igr-q-sigma] event=run-summary"
                 << " scope="
                 << (report_extrapolated_q_sigma
                       ? "application-total-attempted-frozen-sigma-work"
-                      : "application-total-attempted-speed-work")
+                      : (report_q_sigma ? "application-total-attempted-speed-work"
+                                        : "application-total-attempted-sigma-flux-work"))
                 << " rejected_attempts_included=1"
                 << " precision=fp64"
                 << " sample_count=" << q_sigma.sample_count
