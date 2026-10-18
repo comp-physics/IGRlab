@@ -1,13 +1,16 @@
 # Large Sedov DG transport optimization
 
-This campaign targets the Euler volume-flux preparation and face kernels
-identified by the completed [Nsight/IGR stopping investigation](igr_sedov_profile_and_stopping.md).
-It preserves one fixed physical case and measures complete application runs.
-The volume prototype reduces full application time by 11.4% on the fixed
-large case, saves 2,594 MiB of sampled peak GPU memory, and changes the final
-conserved fields by at most 1.97e-9 in relative L2 norm. The face prototype
-has passed independent source review and native CUDA validation; its full-case
-comparison is running. No face speedup is claimed yet.
+The combined volume and face changes reduce full application time by 29.9%
+(1.427x speedup) and sampled peak GPU memory by 20.3% on the fixed large
+Sedov case. The largest final conserved-field relative L2 difference is
+1.97e-9. Every original-current-FP64 residual certificate passes.
+
+The campaign targets Euler volume-flux preparation and face kernels identified
+by the completed [Nsight/IGR stopping investigation](igr_sedov_profile_and_stopping.md).
+Two matched, unprofiled comparisons isolate the volume change and measure
+the cumulative volume-plus-face result. This is one physical case and one
+observation per variant, not a repeated performance distribution or an
+analytic accuracy study. New paths remain opt-in with legacy fallback.
 
 ## Fixed comparison
 
@@ -143,10 +146,83 @@ legacy route while complete element-side coverage remains mandatory.
 
 The frozen executable SHA256 is
 `b2828014dd1b464658836cbab22bf2ec3c718a44a02581edfbe342c27b3f5664`.
-Its receipt retains 771 source-file hashes. Job 3406831 compares the original
-control with the combined volume and face path sequentially on the same GPU.
-This measures cumulative end-to-end improvement directly; it must not be
-presented as an isolated face-only percentage. Full-case results are pending.
+Its receipt retains 771 source-file hashes; the five changed production/test
+files match implementation commit `00f1245`. Job 3406831 ran the original
+control and combined volume-plus-face path sequentially on node gh003, GPU
+UUID `GPU-efe3a061-7f23-ac1e-7fe2-53e5ec24bbf0`. Physical arguments, case,
+binary/build receipts and GPU identity match. Environment differences are
+only the three optimization selectors and output paths.
+
+| Metric | Original control | Combined candidate |
+|---|---:|---:|
+| Full application wall time | 1,303.004 s | 913.302 s |
+| Accepted / rejected timesteps | 4,939 / 0 | 4,939 / 0 |
+| Converged, FP64-certified solves | 14,818 / 14,818 | 14,818 / 14,818 |
+| Total Krylov iterations | 51,742 | 51,739 |
+| Mean / maximum Krylov iterations | 3.492 / 6 | 3.492 / 6 |
+| Sampled peak process GPU memory | 28,154 MiB | 22,444 MiB |
+| Final FP64 RHS-relative residual | 3.606e-7 | 3.615e-7 |
+| Full-process ns / conserved DOF / timestep | 6.989 | 4.899 |
+
+The candidate uses 29.9080% less full-process time (1.42670x speedup) and
+5,710 MiB less sampled peak GPU memory (20.2813%). The final pre-output loop
+averages are 0.2388 and 0.1605 seconds per timestep, a 32.8% reduction.
+All residual certificates pass, with no residual-replacement retries or
+rejected steps. Linear-solve totals are 348.671 and 346.378 seconds; the gain
+does not come from substantially fewer Krylov iterations.
+
+This measures cumulative end-to-end improvement directly. It must not be
+presented as an isolated face-only percentage: the volume-only pair used a
+different allocation and executable. Retaining a fresh same-GPU control in
+each pair avoids attributing cross-node differences to the optimization.
+
+Both native final VTUs were transferred after timing ended and SHA256
+verified. The same complete Q5/GL6x6 comparison gives:
+
+| Conserved component | Relative L2 difference | Sampled relative Linf |
+|---|---:|---:|
+| Density | 6.847e-10 | 6.720e-9 |
+| x momentum | 1.965e-9 | 8.572e-9 |
+| y momentum | 1.963e-9 | 9.178e-9 |
+| Energy | 5.382e-10 | 3.718e-9 |
+
+All pass the engineering budgets. Derived pressure and speed relative L2
+norms differ by 5.286e-10 and 1.437e-9. This establishes agreement of the final
+saved fields on this case, not accuracy against an analytic Sedov solution
+or a bound at all unsaved times. Final VTU SHA256 hashes are
+`def7ed969a7b1db42556098c6f6415efc0cb2c110a4d0b811357ce4ee95246c5`
+(control) and
+`ac8b93dba31f0b9032d47decdf58b6c003cd7c14094fcd8e5e81bf69aad41c93`
+(combined).
+
+## Carry-forward choices
+
+Keep the verified configuration opt-in:
+
+```sh
+export IGRLAB_WEAKDIV_SIGMA_STORAGE=auto
+export IGRLAB_SHARED_EULER_FLUX_EXECUTION=pointwise
+export IGRLAB_DG_TENSOR_FACE=fp64
+```
+
+These selectors complement the existing TF32 spectral inverse, FP32 Euler
+volume tensor lines and RHS-relative stopping; they do not replace those
+settings. Optional diagnostic scans remain off in the measured launchers.
+
+The 29.9% improvement uses unchanged precision choices. The new face
+contractions and nonlinear fluxes stay FP64. A 2-by-6 endpoint contraction
+has little arithmetic relative to its data movement; forcing that individual
+operation into a padded WMMA tile was not selected for this round. This is a
+source-based screening decision, not a measured rejection of every possible
+fused or batched tensor-core design. More aggressive staging or precision
+changes require a new measured hypothesis.
+
+No new Nsight capture was collected for these replacement kernels. The
+original Systems/Compute results motivated the changes; the new evidence is
+native correctness, source/allocation counts, and unprofiled whole-solver
+timing. No new SM/DRAM-utilization or per-kernel speedup is claimed. Broader
+geometry, MPI, other orders and DGSEM/HDG require separate qualification before broader
+use. All campaign GPU jobs have completed; no additional run is queued.
 
 ## Retained evidence
 
@@ -158,9 +234,9 @@ case specs, launchers, and progress records. Remote artifacts are under
 The original volume-pair spec SHA256 is
 `ea1dc7a733b82037e224e4a80af9a23ddd9e41fdb84b5be92d8e0ef0932dab44`.
 
-Completed runs require target-time success, all original-FP64 residual
-certificates, unprofiled application timing, and a final native-field
-comparison at the same alpha. The GL6x6 Q5 comparison measures all saved
-conserved polynomials, with relative L2<=1e-3 and sampled Linf<=1e-2 as
+All four measured runs achieved target-time success and passed the
+original-FP64 residual certificates. Each paired comparison uses unprofiled
+application timing and final native fields at the same alpha. The GL6x6 Q5
+comparison measures all saved conserved polynomials, with relative L2<=1e-3 and sampled Linf<=1e-2 as
 engineering budgets. Observed differences and loop/full-process timing
-will be reported separately; the budgets are not measured errors.
+are reported separately; the budgets are not measured errors.
