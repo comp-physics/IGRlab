@@ -237,3 +237,32 @@ local bundle. All IGRlab DeltaAI jobs on `bdiy-dtai-gh` since October 16 total
 8.14806 GPU-hours at completion of these captures; this does not include older
 Delta jobs. One DeltaAI SU corresponds to one reserved GH200-hour, per the
 [NCSA accounting guide](https://docs.ncsa.illinois.edu/systems/deltaai/en/latest/user-guide/job-accounting.html).
+
+
+## Direct visualization run toward t=0.1
+
+Job 3402550 ran the p5, unrefined DGSEM case directly from t=0 with
+modal rate 80000, FP32 RAS, FP64 tensor volume/Euler operations, and no
+positivity limiter. Optional per-stage admissibility and per-step conservation
+diagnostics were disabled for this run; native production and nonfinite
+checks remained. VTK was saved every 0.005, with pressure evaluated from the
+conservative state at the output points.
+
+The run **did not reach t=0.1**. Native DGSEM execution rejected
+`invalid-pressure` at RK step 3182, stage 1, t=0.03183000000000012.
+The immediately preceding IGR solve converged in 117 iterations with current-A
+relative residual 7.681e-14. Application wall time was 243.661 seconds; the
+Slurm allocation lasted 251 seconds, or 0.06972 GH200-hours. Reported average
+step time rose from 0.05148 seconds at step 500 to 0.06931 at step 3000.
+These are observed case timings with VTK output, not a paired speedup study.
+
+Seven validly written VTK frames remain at t=0,0.005,...,0.03. The native
+Float64 binary series and a field preview are retained under the local bundle:
+`results/vtk-t0p1-v3fresh-dgsem-nu80000/`,
+`cylinder-dgsem-t0p03.png`, and `cylinder-dgsem-p5-t0-to-0p03.zip`.
+The archive contains the complete relative PVD/PVTU/VTU tree for ParaView.
+
+Both DG (GL Euler/Sigma) and DGSEM (GLL Euler/Sigma) separately completed
+10-step VTK pilots in job 3402533. The longer run here is DGSEM only; DG has
+not been qualified through t=0.1. An attempted p5 VTK restart was rejected by
+the existing restart path's p1–p4 support gate; the actual run used no restart.
