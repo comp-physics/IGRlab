@@ -17,6 +17,26 @@ constexpr int kFrozenSigmaNonfiniteCount_ = 2;
 constexpr int kFrozenSigmaMinimumRaw_ = 3;
 constexpr int kFrozenSigmaMinimumRatio_ = 4;
 
+// Host and device paths use the same exact-node/global-dof gather or the same
+// interpolation rows. A zero element stride selects one shared reference table.
+MFEM_HOST_DEVICE inline real_t EvalPackedWeakDivSigma_(
+  int e, int j, int sigma_ldof, int interpolation_stride, bool exact_nodes,
+  const int* sigma_map, const real_t* interpolation, const real_t* values)
+{
+  const int map_offset = e * sigma_ldof;
+  if (exact_nodes)
+  {
+    return values[sigma_map[map_offset + j]];
+  }
+  const int row_offset = e * interpolation_stride + j * sigma_ldof;
+  real_t value = 0.0;
+  for (int k = 0; k < sigma_ldof; ++k)
+  {
+    value += interpolation[row_offset + k] * values[sigma_map[map_offset + k]];
+  }
+  return value;
+}
+
 #ifdef DG_IGR_HAS_ACCEL_FORALL
 MFEM_HOST_DEVICE inline bool FiniteTelemetryValue_(const double value)
 {
@@ -297,12 +317,14 @@ struct PackedWeakDivEulerKernel
   int dim = 0;
   int ldof = 0;
   int sigma_ldof = 0;
+  int sigma_interp_stride = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
   bool invariant_domain_flux = false;
   bool track_volume_speed = false;
+  bool sigma_exact_nodes = false;
   const int* state_map = nullptr;
   const real_t* weakdiv = nullptr;
   const real_t* x = nullptr;
@@ -317,159 +339,203 @@ struct PackedWeakDivEulerKernel
   // remains identical to the existing fused weak-divergence path.
   real_t* packed_flux = nullptr;
 
-  MFEM_HOST_DEVICE void operator()(int e) const
+  // The fused scatter is still executed by one thread per element. Only the
+  // packed-flux branch may be called concurrently for different state nodes.
+  template <bool PackedOnly = false>
+  MFEM_HOST_DEVICE real_t EvalNode_(int e, int j) const
   {
     const int state_off = e * ldof;
-    const int weak_off = e * dof * dof * dim;
-    const int sigma_map_off = e * sigma_ldof;
-    const int sigma_interp_off = e * dof * sigma_ldof;
 
     const int energy_eq = 1 + dim;
     const real_t gm1 = gamma - 1.0;
-    real_t element_max_speed = 0.0;
+    real_t nodal_speed = 0.0;
 
-    for (int j = 0; j < dof; ++j)
+    const int xj0 = state_map[state_off + j * neq + 0];
+    const real_t rho = x[xj0];
+    const real_t inv_rho = 1.0 / rho;
+
+    real_t mom[3] = {0.0, 0.0, 0.0};
+    real_t mom2 = 0.0;
+    for (int d = 0; d < dim; ++d)
     {
-      const int xj0 = state_map[state_off + j * neq + 0];
-      const real_t rho = x[xj0];
-      const real_t inv_rho = 1.0 / rho;
+      const int xjd = state_map[state_off + j * neq + (1 + d)];
+      mom[d] = x[xjd];
+      mom2 += mom[d] * mom[d];
+    }
+    const real_t energy = x[state_map[state_off + j * neq + energy_eq]];
+    const real_t kinetic = 0.5 * mom2 * inv_rho;
+    const real_t pressure = gm1 * (energy - kinetic);
+    const real_t H = (energy + pressure) * inv_rho;
 
-      real_t mom[3] = {0.0, 0.0, 0.0};
-      real_t mom2 = 0.0;
+    real_t sigma_j = 0.0;
+    if (use_sigma)
+    {
+      sigma_j = EvalPackedWeakDivSigma_(
+        e, j, sigma_ldof, sigma_interp_stride, sigma_exact_nodes,
+        sigma_map, sigma_interp, sigma_vals);
+    }
+    if (use_sigma && invariant_domain_flux)
+    {
+      AccumulateFrozenSigmaTelemetry_(
+        pressure,
+        sigma_j,
+        gamma,
+        q_sigma_telemetry +
+          (e * dof + j) * kFrozenSigmaTelemetryWidth_);
+    }
+    const real_t inv_rho_sigma =
+      (use_sigma ? 1.0 / fmax(rho, sigma_rho_floor) : 0.0);
+    if (track_volume_speed)
+    {
+      const real_t transport_speed = sqrt(mom2) * inv_rho;
+      const real_t base_speed =
+        transport_speed + sqrt(gamma * pressure * inv_rho);
+      nodal_speed =
+        IGRFluxInvariantDomainSpeed(base_speed,
+                                    rho,
+                                    pressure,
+                                    transport_speed,
+                                    sigma_j,
+                                    gamma,
+                                    sigma_rho_floor,
+                                    invariant_domain_pressure_floor);
+    }
+
+    if (PackedOnly || packed_flux)
+    {
+      const int stride = dof * dim;
       for (int d = 0; d < dim; ++d)
       {
-        const int xjd = state_map[state_off + j * neq + (1 + d)];
-        mom[d] = x[xjd];
-        mom2 += mom[d] * mom[d];
-      }
-      const real_t energy = x[state_map[state_off + j * neq + energy_eq]];
-      const real_t kinetic = 0.5 * mom2 * inv_rho;
-      const real_t pressure = gm1 * (energy - kinetic);
-      const real_t H = (energy + pressure) * inv_rho;
-
-      real_t sigma_j = 0.0;
-      if (use_sigma)
-      {
-        const int interp_row_off = sigma_interp_off + j * sigma_ldof;
-        for (int k = 0; k < sigma_ldof; ++k)
-        {
-          const int sk = sigma_map[sigma_map_off + k];
-          sigma_j += sigma_interp[interp_row_off + k] * sigma_vals[sk];
-        }
-      }
-      if (use_sigma && invariant_domain_flux)
-      {
-        AccumulateFrozenSigmaTelemetry_(
-          pressure,
-          sigma_j,
-          gamma,
-          q_sigma_telemetry +
-            (e * dof + j) * kFrozenSigmaTelemetryWidth_);
-      }
-      const real_t inv_rho_sigma =
-        (use_sigma ? 1.0 / fmax(rho, sigma_rho_floor) : 0.0);
-      if (track_volume_speed)
-      {
-        const real_t transport_speed = sqrt(mom2) * inv_rho;
-        const real_t base_speed =
-          transport_speed + sqrt(gamma * pressure * inv_rho);
-        const real_t nodal_speed =
-          IGRFluxInvariantDomainSpeed(base_speed,
-                                      rho,
-                                      pressure,
-                                      transport_speed,
-                                      sigma_j,
-                                      gamma,
-                                      sigma_rho_floor,
-                                      invariant_domain_pressure_floor);
-        element_max_speed = fmax(element_max_speed, nodal_speed);
-      }
-
-      if (packed_flux)
-      {
-        const int stride = dof * dim;
-        for (int d = 0; d < dim; ++d)
-        {
-          const int row = j * dim + d;
-          packed_flux[row + stride * (e * neq)] = mom[d];
-          for (int m = 0; m < dim; ++m)
-          {
-            real_t value = mom[m] * mom[d] * inv_rho;
-            if (m == d)
-            {
-              value += pressure;
-              if (use_sigma)
-              {
-                value += ::igrlab::frozen_scalar_igr_algebra::
-                  TensorSigmaMomentumDiagonalTerm(sigma_j);
-              }
-            }
-            packed_flux[row + stride * (e * neq + 1 + m)] = value;
-          }
-          real_t value = mom[d] * H;
-          if (use_sigma)
-          {
-            value += ::igrlab::frozen_scalar_igr_algebra::
-              TensorSigmaEnergyTermFromInverseDensity(sigma_j, mom[d], inv_rho_sigma);
-          }
-          packed_flux[row + stride * (e * neq + energy_eq)] = value;
-        }
-        continue;
-      }
-
-      for (int i = 0; i < dof; ++i)
-      {
-        const int wbase = weak_off + i * (dof * dim) + j * dim;
-
-        // Continuity equation.
-        real_t sum_rho = 0.0;
-        for (int d = 0; d < dim; ++d)
-        {
-          sum_rho += weakdiv[wbase + d] * mom[d];
-        }
-        z[state_map[state_off + i * neq + 0]] += sum_rho;
-
-        // Momentum equations.
+        const int row = j * dim + d;
+        packed_flux[row + stride * (e * neq)] = mom[d];
         for (int m = 0; m < dim; ++m)
         {
-          real_t sum_m = 0.0;
-          for (int d = 0; d < dim; ++d)
+          real_t value = mom[m] * mom[d] * inv_rho;
+          if (m == d)
           {
-            real_t flux_md = mom[m] * mom[d] * inv_rho;
-            if (m == d)
+            value += pressure;
+            if (use_sigma)
             {
-              flux_md += pressure;
-              if (use_sigma)
-              {
-                flux_md += ::igrlab::frozen_scalar_igr_algebra::
-                  TensorSigmaMomentumDiagonalTerm(sigma_j);
-              }
+              value += ::igrlab::frozen_scalar_igr_algebra::
+                TensorSigmaMomentumDiagonalTerm(sigma_j);
             }
-            sum_m += weakdiv[wbase + d] * flux_md;
           }
-          z[state_map[state_off + i * neq + (1 + m)]] += sum_m;
+          packed_flux[row + stride * (e * neq + 1 + m)] = value;
         }
+        real_t value = mom[d] * H;
+        if (use_sigma)
+        {
+          value += ::igrlab::frozen_scalar_igr_algebra::
+            TensorSigmaEnergyTermFromInverseDensity(sigma_j, mom[d], inv_rho_sigma);
+        }
+        packed_flux[row + stride * (e * neq + energy_eq)] = value;
+      }
+      return nodal_speed;
+    }
 
-        // Energy equation.
-        real_t sum_e = 0.0;
+    const int weak_off = e * dof * dof * dim;
+    for (int i = 0; i < dof; ++i)
+    {
+      const int wbase = weak_off + i * (dof * dim) + j * dim;
+
+      // Continuity equation.
+      real_t sum_rho = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        sum_rho += weakdiv[wbase + d] * mom[d];
+      }
+      z[state_map[state_off + i * neq + 0]] += sum_rho;
+
+      // Momentum equations.
+      for (int m = 0; m < dim; ++m)
+      {
+        real_t sum_m = 0.0;
         for (int d = 0; d < dim; ++d)
         {
-          real_t flux_ed = mom[d] * H;
-          if (use_sigma)
+          real_t flux_md = mom[m] * mom[d] * inv_rho;
+          if (m == d)
           {
-            flux_ed += ::igrlab::frozen_scalar_igr_algebra::
-              TensorSigmaEnergyTermFromInverseDensity(
-                sigma_j, mom[d], inv_rho_sigma);
+            flux_md += pressure;
+            if (use_sigma)
+            {
+              flux_md += ::igrlab::frozen_scalar_igr_algebra::
+                TensorSigmaMomentumDiagonalTerm(sigma_j);
+            }
           }
-          sum_e += weakdiv[wbase + d] * flux_ed;
+          sum_m += weakdiv[wbase + d] * flux_md;
         }
-        z[state_map[state_off + i * neq + energy_eq]] += sum_e;
+        z[state_map[state_off + i * neq + (1 + m)]] += sum_m;
+      }
+
+      // Energy equation.
+      real_t sum_e = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        real_t flux_ed = mom[d] * H;
+        if (use_sigma)
+        {
+          flux_ed += ::igrlab::frozen_scalar_igr_algebra::
+            TensorSigmaEnergyTermFromInverseDensity(
+              sigma_j, mom[d], inv_rho_sigma);
+        }
+        sum_e += weakdiv[wbase + d] * flux_ed;
+      }
+      z[state_map[state_off + i * neq + energy_eq]] += sum_e;
+    }
+    return nodal_speed;
+  }
+
+  MFEM_HOST_DEVICE void operator()(int e) const
+  {
+    real_t element_max_speed = 0.0;
+    for (int j = 0; j < dof; ++j)
+    {
+      const real_t nodal_speed = EvalNode_(e, j);
+      if (track_volume_speed)
+      {
+        element_max_speed = fmax(element_max_speed, nodal_speed);
       }
     }
     if (track_volume_speed)
     {
       volume_speed[e] = element_max_speed;
     }
+  }
+};
+
+// Adjacent threads evaluate adjacent state nodes and gather adjacent exact
+// sigma map entries. Each thread owns all packed rows for one node, as well as
+// its telemetry slot. This functor is admitted only with packed_flux != null.
+struct PackedSharedWeakDivEulerPointKernel
+{
+  PackedWeakDivEulerKernel flux;
+  real_t* point_speed = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int point) const
+  {
+    const int e = point / flux.dof, j = point % flux.dof;
+    const real_t speed = flux.EvalNode_<true>(e, j);
+    if (flux.track_volume_speed)
+    {
+      point_speed[point] = speed;
+    }
+  }
+};
+
+struct PackedSharedWeakDivPointSpeedKernel
+{
+  int dof = 0;
+  const real_t* point_speed = nullptr;
+  real_t* element_speed = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int e) const
+  {
+    real_t speed = 0.0;
+    for (int j = 0; j < dof; ++j)
+    {
+      speed = fmax(speed, point_speed[e * dof + j]);
+    }
+    element_speed[e] = speed;
   }
 };
 

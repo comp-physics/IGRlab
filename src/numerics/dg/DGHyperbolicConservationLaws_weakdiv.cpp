@@ -9,6 +9,7 @@ namespace mfem
 void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
 {
   weakdiv_apply_ready_ = false;
+  weakdiv_volume_path_logged_ = false;
   face_data_dirty_ = true;
   weakdiv_elem_dof_ = 0;
   if (weakdiv_reference_only_) { weakdiv_data_flat_.Destroy(); }
@@ -19,9 +20,18 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   weakdiv_shared_mass_fractions_.SetSize(0);
   weakdiv_shared_moment_correction_.SetSize(0);
   weakdiv_shared_flux_.SetSize(0);
+  weakdiv_shared_flux_execution_ = -1;
   weakdiv_volume_speed_.SetSize(0);
+  weakdiv_point_speed_.SetSize(0);
   weakdiv_q_sigma_telemetry_.SetSize(0);
   weakdiv_volume_speed_reduce_workspace_.SetSize(0);
+  // Sigma metadata also depends on the packed state-node layout.
+  weakdiv_sigma_ready_ = false;
+  weakdiv_sigma_ldof_ = 0;
+  weakdiv_sigma_exact_nodes_ = false;
+  weakdiv_sigma_interp_stride_ = 0;
+  weakdiv_sigma_elem_dof_map_.SetSize(0);
+  weakdiv_sigma_interp_.Destroy();
 
   if (weakdiv.empty() || !invmass_apply_ready_)
   {
@@ -81,14 +91,6 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
       weakdiv_q_sigma_telemetry_, ne * dof);
   }
   weakdiv_apply_ready_ = true;
-
-  // Sigma interpolation cache depends on the state-node layout; invalidate.
-  weakdiv_sigma_ready_ = false;
-  weakdiv_sigma_fes_ = nullptr;
-  weakdiv_sigma_fes_sequence_ = -1;
-  weakdiv_sigma_ldof_ = 0;
-  weakdiv_sigma_elem_dof_map_.SetSize(0);
-  weakdiv_sigma_interp_.SetSize(0);
 }
 
 bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
@@ -100,60 +102,127 @@ bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
     return false;
   }
 
-  const long seq = sfes->GetSequence();
-  if (weakdiv_sigma_ready_ && weakdiv_sigma_fes_ == sfes &&
-      weakdiv_sigma_fes_sequence_ == seq)
+  const int ne = vfes.GetNE();
+  const int dof = weakdiv_elem_dof_;
+  if (ne <= 0 || sfes->GetNE() != ne || dof <= 0 || sfes->GetVDim() != 1)
+  {
+    return false;
+  }
+
+  const char* requested = ::igrlab::GetEnv("DG_IGR_WEAKDIV_SIGMA_STORAGE");
+  const bool automatic = requested && std::string(requested) == "auto";
+  MFEM_VERIFY(!requested || std::string(requested) == "dense" || automatic,
+              "WEAKDIV_SIGMA_STORAGE must be dense or auto.");
+  const Mesh* state_mesh = vfes.GetMesh();
+  const Mesh* sigma_mesh = sfes->GetMesh();
+  const FiniteElement* state_reference = vfes.GetFE(0);
+  const FiniteElement* sigma_reference = sfes->GetFE(0);
+  const std::array<const void*, 7> objects{{
+    sfes, state_mesh, sigma_mesh, state_reference, sigma_reference,
+    vfes.FEColl(), sfes->FEColl()}};
+  // These exact keys also admit a live dense/auto switch without retaining an
+  // obsolete layout. Node motion and either FES update invalidate the cache.
+  const std::array<long, 17> metadata{{
+    sfes->GetSequence(), vfes.GetSequence(),
+    state_mesh ? state_mesh->GetSequence() : -1,
+    state_mesh ? state_mesh->GetNodesSequence() : -1,
+    sigma_mesh ? sigma_mesh->GetSequence() : -1,
+    sigma_mesh ? sigma_mesh->GetNodesSequence() : -1,
+    ne, dof, sfes->GetVDim(), vfes.GetVDim(),
+    static_cast<long>(sfes->GetOrdering()),
+    static_cast<long>(vfes.GetOrdering()),
+    sfes->GetVSize(), vfes.GetVSize(), sfes->GetNDofs(), sigma.Size(),
+    automatic ? 1L : 0L}};
+  if (weakdiv_sigma_ready_ && weakdiv_sigma_cache_objects_ == objects &&
+      weakdiv_sigma_cache_metadata_ == metadata)
   {
     return true;
   }
 
   weakdiv_sigma_ready_ = false;
-  weakdiv_sigma_fes_ = nullptr;
-  weakdiv_sigma_fes_sequence_ = -1;
   weakdiv_sigma_ldof_ = 0;
+  weakdiv_sigma_exact_nodes_ = false;
+  weakdiv_sigma_interp_stride_ = 0;
   weakdiv_sigma_elem_dof_map_.SetSize(0);
-  weakdiv_sigma_interp_.SetSize(0);
-
-  const int ne = vfes.GetNE();
-  const int dof = weakdiv_elem_dof_;
-  if (sfes->GetNE() != ne || dof <= 0)
-  {
-    return false;
-  }
+  // SetSize(0) may retain a former dense host/device allocation. Release it
+  // before choosing a compact layout, including after a live policy change.
+  weakdiv_sigma_interp_.Destroy();
 
   const int sigma_ldof0 = sfes->GetFE(0)->GetDof();
   if (sigma_ldof0 <= 0)
   {
     return false;
   }
-  for (int e = 1; e < ne; ++e)
-  {
-    if (sfes->GetFE(e)->GetDof() != sigma_ldof0)
-    {
-      return false;
-    }
-  }
 
-  weakdiv_sigma_elem_dof_map_.SetSize(ne * sigma_ldof0);
-  weakdiv_sigma_interp_.SetSize(ne * dof * sigma_ldof0);
+  const auto checked_size = [](std::size_t entries)
+  {
+    MFEM_VERIFY(entries <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                "Packed weak-divergence sigma metadata exceeds native indexing.");
+    return static_cast<int>(entries);
+  };
+  weakdiv_sigma_elem_dof_map_.SetSize(
+    checked_size(std::size_t(ne) * sigma_ldof0));
   // Topology/space updates rebuild these values on the host; discard any
   // device-valid views retained by a resize before writing the new metadata.
   int* const sigma_map = weakdiv_sigma_elem_dof_map_.HostWrite();
-  real_t* const sigma_interp = weakdiv_sigma_interp_.HostWrite();
+
+  // Keep H1 and other unsupported spaces on their existing general path.
+  // Equal order/count alone cannot establish a nodal identity or shared rows.
+  const bool compact_space = automatic && state_mesh && state_mesh == sigma_mesh &&
+    dim >= 1 && dim <= 3 && state_mesh->Dimension() == dim &&
+    vfes.GetVDim() == num_equations &&
+    dynamic_cast<const L2_FECollection*>(vfes.FEColl()) &&
+    dynamic_cast<const L2_FECollection*>(sfes->FEColl());
+  const auto value_reference_pair = [&](const FiniteElement& state,
+                                        const FiniteElement& scalar)
+  {
+    return dynamic_cast<const NodalFiniteElement*>(&state) &&
+      dynamic_cast<const NodalFiniteElement*>(&scalar) &&
+      state.GetRangeType() == FiniteElement::SCALAR &&
+      scalar.GetRangeType() == FiniteElement::SCALAR &&
+      state.GetMapType() == FiniteElement::VALUE &&
+      scalar.GetMapType() == FiniteElement::VALUE &&
+      state.GetDim() == dim && scalar.GetDim() == dim &&
+      state.GetGeomType() == scalar.GetGeomType() &&
+      state.GetDof() == dof && scalar.GetDof() == sigma_ldof0 &&
+      state.GetNodes().Size() == dof &&
+      scalar.GetNodes().Size() == sigma_ldof0;
+  };
+  const auto supported_nodal_basis = [](const FiniteElement& fe)
+  {
+    // NodalFiniteElement inheritance alone also admits IntegratedGLL
+    // histopolants, whose Nodes are GL coordinates but whose coefficients
+    // are not nodal values. Other bases retain their CalcShape interpolation.
+    const auto* tensor = dynamic_cast<const TensorBasisElement*>(&fe);
+    return tensor && (tensor->GetBasisType() == BasisType::GaussLegendre ||
+                      tensor->GetBasisType() == BasisType::GaussLobatto);
+  };
+  bool exact_nodes = compact_space && sigma_ldof0 == dof;
+  bool shared_reference = compact_space;
+  Array<int> exact_node_map;
+  if (exact_nodes)
+  {
+    exact_node_map.SetSize(checked_size(std::size_t(ne) * dof));
+  }
+  int* exact_map = exact_nodes ? exact_node_map.HostWrite() : nullptr;
+  const FiniteElement* previous_state = nullptr;
+  const FiniteElement* previous_sigma = nullptr;
+  std::vector<int> node_permutation;
 
   Array<int> sigma_sdofs;
-  Vector sigma_shape;
+  Array<int> state_sdofs;
   for (int e = 0; e < ne; ++e)
   {
     const FiniteElement& state_fe = *vfes.GetFE(e);
     const FiniteElement& sigma_fe = *sfes->GetFE(e);
     const IntegrationRule& state_nodes = state_fe.GetNodes();
-    if (state_nodes.Size() != dof)
+    if (state_fe.GetDof() != dof || state_nodes.Size() != dof ||
+        sigma_fe.GetDof() != sigma_ldof0)
     {
       return false;
     }
 
-    sfes->GetElementDofs(e, sigma_sdofs);
+    const auto* sigma_transform = sfes->GetElementDofs(e, sigma_sdofs);
     if (sigma_sdofs.Size() != sigma_ldof0)
     {
       return false;
@@ -162,30 +231,125 @@ bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
     for (int k = 0; k < sigma_ldof0; ++k)
     {
       // Scalar H1/L2 spaces are expected to have non-negative element dof ids.
-      if (sigma_sdofs[k] < 0)
+      if (sigma_sdofs[k] < 0 || sigma_sdofs[k] >= sigma.Size())
       {
         return false;
       }
       sigma_map[moff + k] = sigma_sdofs[k];
     }
 
-    sigma_shape.SetSize(sigma_ldof0);
-    const int ioff = e * dof * sigma_ldof0;
-    for (int j = 0; j < dof; ++j)
+    bool compact_element = compact_space && !sigma_transform &&
+      value_reference_pair(state_fe, sigma_fe);
+    if (compact_element && (exact_nodes || shared_reference))
     {
-      sigma_fe.CalcShape(state_nodes.IntPoint(j), sigma_shape);
-      const int joff = ioff + j * sigma_ldof0;
-      for (int k = 0; k < sigma_ldof0; ++k)
+      const auto* state_transform = vfes.GetElementDofs(e, state_sdofs);
+      compact_element = !state_transform && state_sdofs.Size() == dof;
+      for (int k = 0; compact_element && k < state_sdofs.Size(); ++k)
       {
-        sigma_interp[joff + k] = sigma_shape(k);
+        compact_element = state_sdofs[k] >= 0 && state_sdofs[k] < vfes.GetNDofs();
+      }
+    }
+    // Reusing the actual FE objects proves that every shared CalcShape row is
+    // identical, including its basis, reference geometry and local ordering.
+    shared_reference = shared_reference && compact_element &&
+      &state_fe == state_reference && &sigma_fe == sigma_reference;
+    exact_nodes = exact_nodes && compact_element &&
+      supported_nodal_basis(state_fe) && supported_nodal_basis(sigma_fe);
+    if (exact_nodes && (previous_state != &state_fe || previous_sigma != &sigma_fe))
+    {
+      node_permutation.assign(static_cast<std::size_t>(dof), -1);
+      std::vector<char> seen(static_cast<std::size_t>(dof), 0);
+      for (int j = 0; exact_nodes && j < dof; ++j)
+      {
+        const IntegrationPoint& target = state_nodes.IntPoint(j);
+        int match = -1;
+        for (int k = 0; k < sigma_ldof0; ++k)
+        {
+          const IntegrationPoint& source = sigma_fe.GetNodes().IntPoint(k);
+          // Match exact coordinates of the admitted nodal bases, including
+          // every active dimension and the local ordering permutation.
+          if (target.x == source.x && (dim < 2 || target.y == source.y) &&
+              (dim < 3 || target.z == source.z))
+          {
+            match = k;
+            break;
+          }
+        }
+        if (match < 0 || seen[static_cast<std::size_t>(match)])
+        {
+          exact_nodes = false;
+          break;
+        }
+        seen[static_cast<std::size_t>(match)] = 1;
+        node_permutation[static_cast<std::size_t>(j)] = match;
+      }
+      previous_state = &state_fe;
+      previous_sigma = &sigma_fe;
+    }
+    if (exact_nodes)
+    {
+      for (int j = 0; j < dof; ++j)
+      {
+        exact_map[e * dof + j] =
+          sigma_sdofs[node_permutation[static_cast<std::size_t>(j)]];
+      }
+    }
+    else if (exact_map)
+    {
+      exact_node_map.DeleteAll();
+      exact_map = nullptr;
+    }
+  }
+
+  int interpolation_instances = 0;
+  if (exact_nodes)
+  {
+    weakdiv_sigma_elem_dof_map_.Swap(exact_node_map);
+    weakdiv_sigma_exact_nodes_ = true;
+  }
+  else
+  {
+    interpolation_instances = shared_reference ? 1 : ne;
+    const int row_stride = checked_size(std::size_t(dof) * sigma_ldof0);
+    weakdiv_sigma_interp_stride_ = shared_reference ? 0 : row_stride;
+    weakdiv_sigma_interp_.SetSize(
+      checked_size(std::size_t(interpolation_instances) * row_stride));
+    real_t* const sigma_interp = weakdiv_sigma_interp_.HostWrite();
+    Vector sigma_shape(sigma_ldof0);
+    for (int e = 0; e < interpolation_instances; ++e)
+    {
+      const FiniteElement& sigma_fe = *sfes->GetFE(e);
+      const IntegrationRule& state_nodes = vfes.GetFE(e)->GetNodes();
+      for (int j = 0; j < dof; ++j)
+      {
+        sigma_fe.CalcShape(state_nodes.IntPoint(j), sigma_shape);
+        const int joff = e * row_stride + j * sigma_ldof0;
+        for (int k = 0; k < sigma_ldof0; ++k)
+        {
+          sigma_interp[joff + k] = sigma_shape(k);
+        }
       }
     }
   }
 
-  weakdiv_sigma_fes_ = sfes;
-  weakdiv_sigma_fes_sequence_ = seq;
+  weakdiv_sigma_cache_objects_ = objects;
+  weakdiv_sigma_cache_metadata_ = metadata;
   weakdiv_sigma_ldof_ = sigma_ldof0;
   weakdiv_sigma_ready_ = true;
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[dg-weakdiv-sigma-setup] policy=" << (automatic ? "auto" : "dense")
+              << " storage=" << (exact_nodes ? "exact-nodes" :
+                                  shared_reference ? "shared-reference" : "dense")
+              << " elements=" << ne << " state_dof=" << dof
+              << " sigma_dof=" << sigma_ldof0
+              << " interpolation_instances=" << interpolation_instances
+              << " interpolation_bytes=" <<
+                   std::size_t(weakdiv_sigma_interp_.Size()) * sizeof(real_t)
+              << " map_bytes=" <<
+                   std::size_t(weakdiv_sigma_elem_dof_map_.Size()) * sizeof(int)
+              << std::endl;
+  }
   return true;
 }
 
@@ -211,6 +375,19 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
   const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  const char* execution = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
+  const bool requested_pointwise = execution && std::string(execution) == "pointwise";
+  MFEM_VERIFY(!execution || std::string(execution) == "element" || requested_pointwise,
+              "SHARED_EULER_FLUX_EXECUTION must be element or pointwise.");
+  const bool pointwise = shared && requested_pointwise;
+  if (shared)
+  {
+    MFEM_VERIFY(weakdiv_shared_flux_execution_ < 0 ||
+                  weakdiv_shared_flux_execution_ == static_cast<int>(pointwise),
+                "Shared Euler flux execution cannot change on a live DG operator; "
+                "rebuild the packed setup first.");
+    weakdiv_shared_flux_execution_ = static_cast<int>(pointwise);
+  }
   const char* layout = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_LAYOUT");
   const bool tensor_lines = layout && std::string(layout) == "tensor-lines";
   MFEM_VERIFY(!layout || std::string(layout) == "dense" || tensor_lines,
@@ -414,7 +591,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     MFEM_VERIFY(weakdiv_sigma_ready_,
                 "Device weak-divergence sigma interpolation is not ready.");
     sigma_map = weakdiv_sigma_elem_dof_map_.Read();
-    sigma_interp = weakdiv_sigma_interp_.Read();
+    sigma_interp = weakdiv_sigma_exact_nodes_ ? nullptr : weakdiv_sigma_interp_.Read();
     sigma_vals = sigma_field->Read();
     sigma_ldof = weakdiv_sigma_ldof_;
   }
@@ -441,12 +618,14 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.dim = dim;
   kernel.ldof = ldof;
   kernel.sigma_ldof = sigma_ldof;
+  kernel.sigma_interp_stride = weakdiv_sigma_interp_stride_;
   kernel.gamma = dgsem_gamma_;
   kernel.sigma_rho_floor = sigma_rho_floor;
   kernel.invariant_domain_pressure_floor = invariant_domain_pressure_floor;
   kernel.use_sigma = use_sigma;
   kernel.invariant_domain_flux = invariant_domain_flux;
   kernel.track_volume_speed = track_volume_speed;
+  kernel.sigma_exact_nodes = weakdiv_sigma_exact_nodes_;
   kernel.state_map = invmass_elem_vdof_map_.Read();
   kernel.weakdiv = shared ? nullptr : weakdiv_data_flat_.Read();
   kernel.x = x_in.Read();
@@ -459,7 +638,29 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.sigma_interp = sigma_interp;
   kernel.sigma_vals = sigma_vals;
   kernel.packed_flux = shared ? weakdiv_shared_flux_.Write() : nullptr;
-  mfem::forall(ne, kernel);
+  if (pointwise)
+  {
+    // EvalNode_ may be called concurrently only for the independent packed
+    // flux rows. The legacy fused residual scatter remains element-parallel.
+    MFEM_VERIFY(kernel.packed_flux != nullptr,
+                "Pointwise DG flux preparation requires the shared packed output.");
+    if (track_volume_speed && weakdiv_point_speed_.Size() != ne * dof)
+    {
+      weakdiv_point_speed_.SetSize(ne * dof);
+      weakdiv_point_speed_.UseDevice(true);
+    }
+    mfem::forall(ne * dof, PackedSharedWeakDivEulerPointKernel{
+      kernel, track_volume_speed ? weakdiv_point_speed_.Write() : nullptr});
+    if (track_volume_speed)
+    {
+      mfem::forall(ne, PackedSharedWeakDivPointSpeedKernel{
+        dof, weakdiv_point_speed_.Read(), weakdiv_volume_speed_.Write()});
+    }
+  }
+  else
+  {
+    mfem::forall(ne, kernel);
+  }
   if (shared)
   {
     const int k = dof * dim, columns = ne * neq;
@@ -487,7 +688,8 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   auto xh = x_in.HostRead();
   auto zh = z_inout.HostReadWrite();
   auto sigma_map_h = weakdiv_sigma_elem_dof_map_.HostRead();
-  auto sigma_interp_h = weakdiv_sigma_interp_.HostRead();
+  auto sigma_interp_h = weakdiv_sigma_exact_nodes_ ? nullptr :
+    weakdiv_sigma_interp_.HostRead();
   auto sigma_vals_h =
     use_sigma ? sigma_field->HostRead() : static_cast<const real_t*>(nullptr);
   if (track_volume_speed && weakdiv_volume_speed_.Size() != ne)
@@ -506,8 +708,6 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   {
     const int state_off = e * ldof;
     const int weak_off = e * dof * dof * dim;
-    const int sigma_map_off = e * sigma_ldof;
-    const int sigma_interp_off = e * dof * sigma_ldof;
     real_t element_max_speed = 0.0;
 
     for (int j = 0; j < dof; ++j)
@@ -529,12 +729,9 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       real_t sigma_j = 0.0;
       if (use_sigma)
       {
-        const int interp_row_off = sigma_interp_off + j * sigma_ldof;
-        for (int k = 0; k < sigma_ldof; ++k)
-        {
-          const int sk = sigma_map_h[sigma_map_off + k];
-          sigma_j += sigma_interp_h[interp_row_off + k] * sigma_vals_h[sk];
-        }
+        sigma_j = EvalPackedWeakDivSigma_(
+          e, j, sigma_ldof, weakdiv_sigma_interp_stride_, weakdiv_sigma_exact_nodes_,
+          sigma_map_h, sigma_interp_h, sigma_vals_h);
       }
       const real_t inv_rho_sigma =
         (use_sigma ? 1.0 / std::max(rho, sigma_rho_floor) : 0.0);
@@ -639,6 +836,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     std::cout << "[dg-device] event=weakdiv-volume-path"
               << " selected=" << (shared ? "shared-reference-" : "packed-mfem-forall-")
               << (use_sigma ? "euler-igr" : "euler")
+              << " flux_execution=" << (pointwise ? "pointwise" : "element")
               << " backend=device\n";
     weakdiv_volume_path_logged_ = true;
   }

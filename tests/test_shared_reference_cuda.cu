@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace
@@ -399,6 +402,463 @@ void DGProductionOracle(int order, Precision precision, const char* layout = "de
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
 }
 
+// Reverse the scalar local basis, including its node rule, so matching nodes
+// require a nonidentity permutation. This remains a native nodal L2 VALUE FE.
+class PermutedSigmaElement : public mfem::L2_QuadrilateralElement
+{
+  mfem::L2_QuadrilateralElement reference;
+public:
+  PermutedSigmaElement(int order, int basis)
+    : mfem::L2_QuadrilateralElement(order, basis), reference(order, basis)
+  {
+    for (int i = 0; i < GetDof(); ++i)
+      Nodes.IntPoint(i) = reference.GetNodes().IntPoint(GetDof() - 1 - i);
+  }
+  void CalcShape(const mfem::IntegrationPoint& point, Vector& shape) const override
+  {
+    Vector original(GetDof()); reference.CalcShape(point, original);
+    for (int i = 0; i < GetDof(); ++i) { shape[i] = original[GetDof() - 1 - i]; }
+  }
+  void CalcDShape(const mfem::IntegrationPoint& point, DenseMatrix& shape) const override
+  {
+    DenseMatrix original(GetDof(), 2); reference.CalcDShape(point, original);
+    for (int i = 0; i < GetDof(); ++i) for (int d = 0; d < 2; ++d)
+      shape(i, d) = original(GetDof() - 1 - i, d);
+  }
+};
+
+class PermutedSigmaCollection : public mfem::L2_FECollection
+{
+  PermutedSigmaElement square;
+public:
+  PermutedSigmaCollection(int order, int basis)
+    : mfem::L2_FECollection(order, 2, basis), square(order, basis) {}
+  const mfem::FiniteElement* FiniteElementForGeometry(mfem::Geometry::Type geometry) const override
+  {
+    return geometry == mfem::Geometry::SQUARE ? &square :
+      mfem::L2_FECollection::FiniteElementForGeometry(geometry);
+  }
+};
+
+// Keep the sigma and Euler fills separate: a warm operator must observe new
+// scalar coefficients even when the Euler state and both FE spaces are fixed.
+void FillVolumeMemoryEuler(mfem::ParFiniteElementSpace& fes, Vector& state)
+{
+  double* values = state.HostWrite();
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(e, dofs);
+    const auto& nodes = fes.GetFE(e)->GetNodes();
+    for (int i = 0; i < dofs.Size(); ++i)
+    {
+      const auto& ip = nodes.IntPoint(i);
+      const double rho = 1.0 + 0.013 * e + 0.05 * ip.x + 0.02 * ip.x * ip.y;
+      const double vx = 0.23 + 0.08 * ip.x - 0.004 * e;
+      const double vy = -0.11 + 0.06 * ip.y + 0.003 * e;
+      const double pressure = 1.0 + 0.04 * ip.x + 0.02 * ip.y + 0.01 * e;
+      const double u[4] = {rho, rho * vx, rho * vy,
+        pressure / 0.4 + 0.5 * rho * (vx * vx + vy * vy)};
+      for (int c = 0; c < 4; ++c) { values[fes.DofToVDof(dofs[i], c)] = u[c]; }
+    }
+  }
+}
+
+void FillVolumeMemorySigma(mfem::ParGridFunction& sigma, int phase)
+{
+  auto& fes = *sigma.ParFESpace();
+  double* values = sigma.HostWrite();
+  const double amplitude = phase % 2 ? -(phase + 1.0) : phase + 1.0;
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(e, dofs);
+    const auto& nodes = fes.GetFE(e)->GetNodes();
+    for (int i = 0; i < dofs.Size(); ++i)
+    {
+      const auto& ip = nodes.IntPoint(i);
+      values[dofs[i]] = amplitude * (0.025 + 0.005 * e +
+        0.021 * std::sin(0.17 * (e + 1) + 2.3 * ip.x + 0.9 * ip.y) +
+        0.012 * ip.x * ip.y);
+    }
+  }
+}
+
+void VolumeMemoryMode(const char* storage, const char* execution, bool shared)
+{
+  setenv("IGRLAB_WEAKDIV_SIGMA_STORAGE", storage, 1);
+  setenv("IGRLAB_SHARED_EULER_FLUX_EXECUTION", execution, 1);
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
+  setenv("IGRLAB_SHARED_OPERATOR_PRECISION", shared ? "fp64" : "off", 1);
+}
+
+struct VolumeMemoryControl
+{
+  const char* storage;
+  const char* execution;
+  bool shared;
+  mfem::EulerFlux euler;
+  mfem::FluxWithIGR physical;
+  mfem::RusanovFluxWithSides numerical;
+  std::unique_ptr<mfem::DGHyperbolicConservationLaws> op;
+
+  VolumeMemoryControl(mfem::ParFiniteElementSpace& fes,
+                      const mfem::ParGridFunction* sigma,
+                      const char* storage_, const char* execution_, bool shared_)
+    : storage(storage_), execution(execution_), shared(shared_), euler(2, 1.4),
+      physical(euler, 1.4), numerical(physical)
+  {
+    physical.SetSigmaField(sigma);
+    physical.SetInvariantDomainFlux(true);
+    physical.SetInvariantDomainFloors(1e-12, 1e-12);
+    VolumeMemoryMode(storage, execution, shared);
+    op = std::make_unique<mfem::DGHyperbolicConservationLaws>(fes, numerical, 2, true);
+    op->SetDGSEMGamma(1.4);
+  }
+
+  void Select() const { VolumeMemoryMode(storage, execution, shared); }
+};
+
+void CheckVolumeMemoryVector(const Vector& actual, const Vector& expected,
+                             const std::string& label)
+{
+  const double* a = actual.HostRead(); const double* b = expected.HostRead();
+  double error = 0.0, scale = 0.0;
+  MFEM_VERIFY(actual.Size() == expected.Size(), "Mismatched DG oracle sizes.");
+  for (int i = 0; i < actual.Size(); ++i)
+  {
+    MFEM_VERIFY(std::isfinite(a[i]) && std::isfinite(b[i]),
+                "Nonfinite DG volume-memory oracle: " << label);
+    error = std::max(error, std::abs(a[i] - b[i]));
+    scale = std::max(scale, std::abs(b[i]));
+  }
+  MFEM_VERIFY(error <= 2e-11 * std::max(1.0, scale),
+              "DG volume-memory residual differs: " << label
+              << " error=" << error << " scale=" << scale);
+}
+
+void CheckVolumeMemoryTelemetry(const mfem::IGRFrozenSigmaTelemetry& actual,
+                                const mfem::IGRFrozenSigmaTelemetry& expected,
+                                const std::string& label)
+{
+  MFEM_VERIFY(actual.enabled == expected.enabled &&
+                actual.sample_count == expected.sample_count &&
+                actual.nonpositive_count == expected.nonpositive_count &&
+                actual.nonfinite_count == expected.nonfinite_count,
+              "DG volume-memory changed telemetry counts: " << label
+              << " actual=" << actual.sample_count << " expected=" << expected.sample_count);
+  if (expected.sample_count == 0) { return; }
+  MFEM_VERIFY(std::isfinite(actual.minimum_raw_q_sigma) &&
+                std::isfinite(actual.minimum_q_sigma_over_gamma_p) &&
+                std::abs(actual.minimum_raw_q_sigma - expected.minimum_raw_q_sigma) <=
+                  4e-13 * std::max(1.0, std::abs(expected.minimum_raw_q_sigma)) &&
+                std::abs(actual.minimum_q_sigma_over_gamma_p -
+                         expected.minimum_q_sigma_over_gamma_p) <=
+                  4e-13 * std::max(1.0, std::abs(expected.minimum_q_sigma_over_gamma_p)),
+              "DG volume-memory changed telemetry minima: " << label
+              << " actual_q_sigma=" << actual.minimum_raw_q_sigma
+              << " expected_q_sigma=" << expected.minimum_raw_q_sigma
+              << " actual_ratio=" << actual.minimum_q_sigma_over_gamma_p
+              << " expected_ratio=" << expected.minimum_q_sigma_over_gamma_p);
+}
+
+// A single cell with no boundary integrator has no surface contribution.
+// This is an independent nodal-flux oracle: interpolate sigma with CalcShape,
+// evaluate Euler+sigma fluxes in FP64, then apply assembled gradient and mass
+// matrices. It never reads production metadata or calls a packed flux helper.
+mfem::IGRFrozenSigmaTelemetry AssembleVolumeMemoryReference(
+  mfem::ParFiniteElementSpace& fes, const Vector& state,
+  const mfem::ParGridFunction* sigma, Vector& expected, double& speed)
+{
+  expected = 0.0;
+  speed = 0.0;
+  mfem::IGRFrozenSigmaTelemetry telemetry;
+  telemetry.enabled = sigma != nullptr;
+  const double* values = state.HostRead();
+  const double* scalar = sigma ? sigma->HostRead() : nullptr;
+  mfem::TransposeIntegrator gradient(new mfem::GradientIntegrator());
+  mfem::IntegrationRules lobatto_rules(0, mfem::Quadrature1D::GaussLobatto);
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    const auto& fe = *fes.GetFE(e);
+    const int dof = fe.GetDof();
+    auto& transformation = *fes.GetElementTransformation(e);
+    mfem::Array<int> dofs, sdofs;
+    fes.GetElementDofs(e, dofs);
+    if (sigma) { sigma->ParFESpace()->GetElementDofs(e, sdofs); }
+    Vector shape(sigma ? sdofs.Size() : 0);
+    DenseMatrix weak, mass, nodal_flux(2 * dof, 4);
+    gradient.AssembleElementMatrix2(fe, fe, transformation, weak);
+    mfem::MassIntegrator mass_integrator;
+    const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
+    if (tensor && tensor->GetBasisType() == mfem::BasisType::GaussLobatto)
+      mass_integrator.SetIntRule(&lobatto_rules.Get(
+        fe.GetGeomType(), std::max(1, 2 * fe.GetOrder() - 1)));
+    mass_integrator.AssembleElementMatrix(fe, transformation, mass);
+    mfem::DenseMatrixInverse inverse_mass(mass);
+    for (int j = 0; j < dof; ++j)
+    {
+      double sampled_sigma = 0.0;
+      if (sigma)
+      {
+        sigma->ParFESpace()->GetFE(e)->CalcShape(fe.GetNodes().IntPoint(j), shape);
+        long double interpolated = 0.0L;
+        for (int k = 0; k < sdofs.Size(); ++k)
+          interpolated += static_cast<long double>(shape[k]) * scalar[sdofs[k]];
+        sampled_sigma = static_cast<double>(interpolated);
+      }
+      const double rho = values[fes.DofToVDof(dofs[j], 0)];
+      const double mx = values[fes.DofToVDof(dofs[j], 1)];
+      const double my = values[fes.DofToVDof(dofs[j], 2)];
+      const double energy = values[fes.DofToVDof(dofs[j], 3)];
+      const double pressure = 0.4 * (energy - 0.5 * (mx * mx + my * my) / rho);
+      const double enthalpy_density = energy + pressure + sampled_sigma;
+      nodal_flux(j, 0) = mx;
+      nodal_flux(dof + j, 0) = my;
+      nodal_flux(j, 1) = mx * mx / rho + pressure + sampled_sigma;
+      nodal_flux(dof + j, 1) = mx * my / rho;
+      nodal_flux(j, 2) = my * mx / rho;
+      nodal_flux(dof + j, 2) = my * my / rho + pressure + sampled_sigma;
+      nodal_flux(j, 3) = mx * enthalpy_density / rho;
+      nodal_flux(dof + j, 3) = my * enthalpy_density / rho;
+      if (sigma)
+      {
+        const double transport = std::sqrt(mx * mx + my * my) / rho;
+        speed = std::max(speed, mfem::IGRFluxInvariantDomainSpeed(
+          transport + std::sqrt(1.4 * pressure / rho), rho, pressure,
+          transport, sampled_sigma, 1.4, 1e-12, 1e-12));
+        const double q_sigma = 1.4 * pressure + 0.4 * sampled_sigma;
+        ++telemetry.sample_count;
+        telemetry.minimum_raw_q_sigma = std::min(telemetry.minimum_raw_q_sigma, q_sigma);
+        telemetry.minimum_q_sigma_over_gamma_p = std::min(
+          telemetry.minimum_q_sigma_over_gamma_p, q_sigma / (1.4 * pressure));
+      }
+    }
+    Vector weak_rhs(dof), strong_rhs(dof);
+    double* result = expected.HostReadWrite();
+    for (int c = 0; c < 4; ++c)
+    {
+      for (int i = 0; i < dof; ++i)
+      {
+        long double sum = 0.0L;
+        for (int j = 0; j < 2 * dof; ++j)
+          sum += static_cast<long double>(weak(i, j)) * nodal_flux(j, c);
+        weak_rhs[i] = static_cast<double>(sum);
+      }
+      inverse_mass.Mult(weak_rhs, strong_rhs);
+      for (int i = 0; i < dof; ++i)
+        result[fes.DofToVDof(dofs[i], c)] = strong_rhs[i];
+    }
+  }
+  return telemetry;
+}
+
+void DGVolumeMemoryOracle(int state_basis, int sigma_basis, int sigma_order,
+                          bool periodic = false, bool with_sigma = true,
+                          bool h1_sigma = false, bool permuted_sigma = false)
+{
+  constexpr int order = 3;
+  const int cells = periodic ? 4 : 1;
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+    cells, cells, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  for (int v = 0; v < serial.GetNV(); ++v)
+  {
+    double* point = serial.GetVertex(v);
+    point[0] = 0.75 * point[0] + 0.25 * point[1];
+    point[1] *= 1.25;
+  }
+  mfem::Mesh topology;
+  if (periodic)
+  {
+    const std::vector<Vector> translations = {Vector({0.75, 0.0}), Vector({0.25, 1.25})};
+    topology = mfem::Mesh::MakePeriodic(serial, serial.CreatePeriodicVertexMapping(translations));
+  }
+  else { topology = std::move(serial); }
+  mfem::ParMesh mesh(MPI_COMM_SELF, topology);
+  mfem::L2_FECollection fec(order, 2, state_basis);
+  mfem::ParFiniteElementSpace fes(&mesh, &fec, 4, mfem::Ordering::byNODES);
+  std::unique_ptr<mfem::FiniteElementCollection> sigma_fec;
+  if (permuted_sigma)
+    sigma_fec = std::make_unique<PermutedSigmaCollection>(sigma_order, sigma_basis);
+  else if (h1_sigma)
+    sigma_fec = std::make_unique<mfem::H1_FECollection>(sigma_order, 2, sigma_basis);
+  else
+    sigma_fec = std::make_unique<mfem::L2_FECollection>(sigma_order, 2, sigma_basis);
+  mfem::ParFiniteElementSpace sfes(&mesh, sigma_fec.get());
+  mfem::ParGridFunction sigma(&sfes);
+  if (sigma_basis == mfem::BasisType::IntegratedGLL)
+  {
+    const auto& state_nodes = fes.GetFE(0)->GetNodes();
+    const auto& scalar_fe = *sfes.GetFE(0);
+    const auto& scalar_nodes = scalar_fe.GetNodes();
+    MFEM_VERIFY(state_nodes.Size() == scalar_nodes.Size(),
+                "IntegratedGLL regression requires matching coordinate tables.");
+    Vector shape(scalar_fe.GetDof());
+    bool nonnodal = false;
+    for (int i = 0; i < state_nodes.Size(); ++i)
+    {
+      const auto& state_node = state_nodes.IntPoint(i);
+      const auto& scalar_node = scalar_nodes.IntPoint(i);
+      MFEM_VERIFY(state_node.x == scalar_node.x && state_node.y == scalar_node.y,
+                  "IntegratedGLL regression requires identical GL coordinates.");
+      scalar_fe.CalcShape(state_node, shape);
+      for (int j = 0; j < shape.Size(); ++j)
+        nonnodal = nonnodal || std::abs(shape[j] - (i == j ? 1.0 : 0.0)) > 1e-6;
+    }
+    MFEM_VERIFY(nonnodal, "IntegratedGLL regression must exercise histopolant coefficients.");
+  }
+  mfem::L2_FECollection replacement_fec(2, 2, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace replacement_fes(&mesh, &replacement_fec);
+  mfem::ParGridFunction replacement(&replacement_fes);
+  Vector state(fes.GetVSize()), assembled(fes.GetVSize()), first_result(fes.GetVSize());
+  FillVolumeMemoryEuler(fes, state);
+  std::vector<std::unique_ptr<VolumeMemoryControl>> controls;
+  const auto add_control = [&](const char* storage, const char* execution, bool shared)
+  {
+    controls.emplace_back(std::make_unique<VolumeMemoryControl>(
+      fes, with_sigma ? &sigma : nullptr, storage, execution, shared));
+  };
+  add_control("dense", "element", false);
+  add_control("auto", "element", false);
+  // The shared-reference mass policy admits GL state nodes. GLL still tests
+  // matching nodes and its ordinary packed interpolation/fallback path.
+  if (state_basis == mfem::BasisType::GaussLegendre)
+  {
+    add_control("dense", "element", true);
+    add_control("auto", "element", true);
+    add_control("auto", "pointwise", true);
+  }
+  const std::string cohort = "state_basis=" + std::to_string(state_basis) +
+    " sigma_basis=" + std::to_string(sigma_basis) + " sigma_order=" +
+    std::to_string(sigma_order) + " periodic=" + std::to_string(periodic) +
+    " h1_sigma=" + std::to_string(h1_sigma) + " permuted_sigma=" +
+    std::to_string(permuted_sigma) + " with_sigma=" + std::to_string(with_sigma);
+  const int phases = periodic ? 5 : with_sigma ? 2 : 1;
+  for (int phase = 0; phase < phases; ++phase)
+  {
+    FillVolumeMemorySigma(sigma, phase);
+    FillVolumeMemorySigma(replacement, phase + 1);
+    const mfem::ParGridFunction* current_sigma = with_sigma ? &sigma : nullptr;
+    if (periodic && phase == 2) { current_sigma = &replacement; }
+    if (periodic && phase == 3) { current_sigma = nullptr; }
+    double assembled_speed = 0.0;
+    mfem::IGRFrozenSigmaTelemetry volume_samples;
+    if (!periodic)
+      volume_samples = AssembleVolumeMemoryReference(
+        fes, state, current_sigma, assembled, assembled_speed);
+    std::vector<Vector> without_tracking(controls.size());
+    for (bool tracking : {false, true})
+    {
+      Vector legacy(fes.GetVSize());
+      double legacy_speed = 0.0;
+      mfem::IGRFrozenSigmaTelemetry legacy_telemetry;
+      for (std::size_t index = 0; index < controls.size(); ++index)
+      {
+        auto& control = *controls[index];
+        control.Select();
+        control.physical.SetSigmaField(current_sigma);
+        if (periodic && phase == 4 && !tracking) { control.op->Update(); }
+        control.op->SetInvariantDomainVolumeSpeedTracking(tracking);
+        const auto before = control.op->GetGlobalFrozenSigmaTelemetry();
+        Vector actual(fes.GetVSize());
+        std::ostringstream output;
+        {
+          struct RestoreOutput
+          {
+            std::streambuf* previous;
+            ~RestoreOutput() { std::cout.rdbuf(previous); }
+          } restore{std::cout.rdbuf(output.rdbuf())};
+          control.op->Mult(state, actual);
+        }
+        const std::string log = output.str();
+        std::cout << log;
+        const auto after = control.op->GetGlobalFrozenSigmaTelemetry();
+        const double speed = control.op->GetMaxCharSpeed();
+        const std::string label = cohort + " phase=" + std::to_string(phase) +
+          " storage=" + control.storage + " execution=" + control.execution +
+          " shared=" + std::to_string(control.shared) + " tracking=" + std::to_string(tracking);
+        if (phase == 0 && !tracking)
+        {
+          const std::string execution = control.shared ? control.execution : "element";
+          MFEM_VERIFY(log.find("flux_execution=" + execution) != std::string::npos,
+                      "DG flux fixture did not execute its selected mode: " << label);
+          if (with_sigma && !h1_sigma && state_basis == sigma_basis &&
+              sigma_order == order && std::string(control.storage) == "auto")
+            MFEM_VERIFY(log.find("policy=auto storage=exact-nodes") != std::string::npos,
+                        "Matching DG sigma nodes did not select exact gathering: " << label);
+          if (sigma_basis == mfem::BasisType::IntegratedGLL &&
+              std::string(control.storage) == "auto")
+            MFEM_VERIFY(log.find("policy=auto storage=shared-reference") != std::string::npos,
+                        "Histopolant sigma must use shape interpolation: " << label);
+        }
+        if (index == 0)
+        {
+          legacy = actual; legacy_speed = speed; legacy_telemetry = after;
+          if (phase == 0 && !tracking) { first_result = actual; }
+          if (phase == 1 && !tracking)
+          {
+            Vector sigma_change(actual); sigma_change -= first_result;
+            MFEM_VERIFY(sigma_change.Normlinf() > 1e-4,
+                        "DG sigma mutation fixture has no residual effect: " << label);
+          }
+        }
+        CheckVolumeMemoryVector(actual, legacy, label + " legacy parity");
+        MFEM_VERIFY(std::isfinite(speed) &&
+                      std::abs(speed - legacy_speed) <= 2e-12 * std::max(1.0, legacy_speed),
+                    "DG volume-memory changed characteristic speed: " << label);
+        CheckVolumeMemoryTelemetry(after, legacy_telemetry, label + " legacy parity");
+        if (!periodic)
+        {
+          CheckVolumeMemoryVector(actual, assembled, label + " assembled nonlinear flux");
+          const double expected_speed = tracking ? assembled_speed : 0.0;
+          MFEM_VERIFY(std::abs(speed - expected_speed) <= 2e-12 * std::max(1.0, expected_speed),
+                      "DG volume-memory speed differs from nodal oracle: " << label);
+          auto expected_telemetry = before;
+          // The public getter reports empty minima as NaN. Restore the
+          // accumulator identity before adding the first independent samples.
+          if (before.sample_count == 0)
+          {
+            expected_telemetry.minimum_raw_q_sigma = std::numeric_limits<double>::infinity();
+            expected_telemetry.minimum_q_sigma_over_gamma_p =
+              std::numeric_limits<double>::infinity();
+          }
+          expected_telemetry.Merge(volume_samples);
+          CheckVolumeMemoryTelemetry(after, expected_telemetry, label + " nodal samples");
+        }
+        if (!tracking) { without_tracking[index] = actual; }
+        else
+          CheckVolumeMemoryVector(actual, without_tracking[index], label + " tracking residual");
+      }
+    }
+  }
+  std::cout << "dg_volume_memory_oracle " << cohort << " passed\n";
+}
+
+void DGVolumeMemoryOracles()
+{
+  const int gl = mfem::BasisType::GaussLegendre;
+  const int gll = mfem::BasisType::GaussLobatto;
+  DGVolumeMemoryOracle(gl, gl, 3);
+  DGVolumeMemoryOracle(gl, gl, 3, false, true, false, true);
+  DGVolumeMemoryOracle(gl, gll, 3);
+  // IntegratedGLL exposes GL coordinates but its coefficients are histopolant.
+  DGVolumeMemoryOracle(gl, mfem::BasisType::IntegratedGLL, 3);
+  DGVolumeMemoryOracle(gl, gl, 2);
+  DGVolumeMemoryOracle(gll, gll, 3);
+  // H1 GLL orders its shared vertex/edge nodes differently from L2 GLL.
+  // It exercises the preserved unsupported-space fallback against CalcShape.
+  DGVolumeMemoryOracle(gll, gll, 3, false, true, true);
+  DGVolumeMemoryOracle(gl, gl, 3, false, false);
+  DGVolumeMemoryOracle(gl, gl, 3, true);
+  VolumeMemoryMode("dense", "element", false);
+  std::cout << "dg_volume_memory_test passed matching_gl=true matching_gll=true "
+               "node_permutation=true basis_interpolation=true histopolant_interpolation=true "
+               "order_interpolation=true h1_fallback=true "
+               "current_sigma=true nonlinear_volume_oracle=true pointwise_rhs=true "
+               "no_sigma=true volume_speed=true telemetry_counts=true "
+               "sigma_space_rebind=true update=true\n";
+}
+
 void ReferenceSetupRejection()
 {
 #ifdef MFEM_USE_EXCEPTIONS
@@ -442,6 +902,14 @@ int main(int argc, char** argv)
   unsetenv("DG_IGR_SHARED_EULER_LAYOUT");
   setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
+  unsetenv("DG_IGR_WEAKDIV_SIGMA_STORAGE");
+  unsetenv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
+  if (argc > 1 && std::string(argv[1]) == "--dg-volume-memory-only")
+  {
+    DGVolumeMemoryOracles();
+    return 0;
+  }
+  DGVolumeMemoryOracles();
   ReferenceSetupRejection();
   for (Precision precision : {Precision::FP64, Precision::FP32, Precision::TF32})
   {

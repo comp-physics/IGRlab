@@ -24,6 +24,7 @@
  * details, refer to the documentation of DGHyperbolicConservationLaws::Mult.
  */
 
+#include <array>
 #include <functional>
 #include <cstdint>
 #include "mfem.hpp"
@@ -677,8 +678,12 @@ private:
   mutable Vector weakdiv_shared_mass_fractions_;
   mutable Vector weakdiv_shared_moment_correction_;
   mutable Vector weakdiv_shared_flux_;
+  /// Fixed shared flux launch policy for the lifetime of the packed setup.
+  mutable int weakdiv_shared_flux_execution_ = -1;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;
+  /// Optional pointwise speed scratch for the shared Euler flux preparation.
+  mutable Vector weakdiv_point_speed_;
   /// Persistent per-volume-node q_sigma aggregates (five FP64 scalars/slot).
   mutable Array<double> weakdiv_q_sigma_telemetry_;
   /// Reduction workspace for the volume-node maximum speed.
@@ -688,16 +693,21 @@ private:
 
   /// Per-element scalar dof count for sigma interpolation.
   mutable int weakdiv_sigma_ldof_ = 0;
-  /// Per-element sigma scalar-dof map (for packed interpolation).
+  /// Sigma global-dof map, in state-node order for an exact nodal gather.
   mutable Array<int> weakdiv_sigma_elem_dof_map_;
-  /// Interpolation weights from sigma dofs to state nodes per element.
+  /// Interpolation weights, either per element or one shared reference table.
   mutable Vector weakdiv_sigma_interp_;
+  /// Exact scalar VALUE nodal identity, including the local-node permutation.
+  mutable bool weakdiv_sigma_exact_nodes_ = false;
+  /// Element stride in the interpolation table; zero for shared reference rows.
+  mutable int weakdiv_sigma_interp_stride_ = 0;
   /// Whether packed sigma interpolation data is available.
   mutable bool weakdiv_sigma_ready_ = false;
-  /// Sigma space pointer used to build interpolation data.
-  mutable const FiniteElementSpace* weakdiv_sigma_fes_ = nullptr;
-  /// Sigma FE-space sequence used to build interpolation data.
-  mutable long weakdiv_sigma_fes_sequence_ = -1;
+  /// Exact cache keys cover both spaces, mesh updates, sizes, ordering and policy.
+  /// Object entries: sigma FES, both meshes, both reference FEs, both FE collections.
+  mutable std::array<const void*, 7> weakdiv_sigma_cache_objects_{};
+  /// Scalar entries are constructed alongside the cache lookup in weakdiv.cpp.
+  mutable std::array<long, 17> weakdiv_sigma_cache_metadata_{};
 
   /// Persistent per-face-quadrature-point q_sigma aggregates.
   mutable Array<double> face_int_q_sigma_telemetry_;
