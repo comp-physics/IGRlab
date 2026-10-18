@@ -20,6 +20,7 @@ int RunLimiterTests(TestContext& ctx);
 int RunDGOperatorTests(TestContext& ctx);
 int RunBCTests(TestContext& ctx);
 int RunIGRTests(TestContext& ctx);
+int RunIGRDiagnosticScanTests(TestContext& ctx);
 int RunDGSEMBasisTests(TestContext& ctx);
 int RunDGSEMFluxTests(TestContext& ctx);
 int RunDGSEMOperatorTests(TestContext& ctx);
@@ -45,6 +46,7 @@ struct SuiteSelection
   bool dgsem_igr = false;
   bool bc = false;
   bool igr = false;
+  bool igr_diagnostic_scans = false;
   bool time_defaults = false;
   bool diagnostics = false;
   bool parity = false;
@@ -70,6 +72,7 @@ void PrintUsage()
     << "  --dgsem-igr  Run DGSEM + IGR tests.\n"
     << "  --bc         Run boundary-state policy tests.\n"
     << "  --igr        Run IGR flux decorator tests.\n"
+    << "  --igr-diagnostic-scans Run focused IGR scan policy/residual tests.\n"
     << "  --time-defaults Run time-loop callback/default wiring tests.\n"
     << "  --diagnostics Run diagnostics projection/space tests.\n"
     << "  --parity     Emit/compare MPI parity signatures (uses "
@@ -99,6 +102,7 @@ SuiteSelection ParseSuites(int argc, char** argv)
       sel.dgsem_igr = true;
       sel.bc = true;
       sel.igr = true;
+      sel.igr_diagnostic_scans = true;
       sel.time_defaults = true;
       sel.diagnostics = true;
       any_suite_flag = true;
@@ -158,6 +162,11 @@ SuiteSelection ParseSuites(int argc, char** argv)
       sel.igr = true;
       any_suite_flag = true;
     }
+    else if (arg == "--igr-diagnostic-scans")
+    {
+      sel.igr_diagnostic_scans = true;
+      any_suite_flag = true;
+    }
     else if (arg == "--time-defaults")
     {
       sel.time_defaults = true;
@@ -201,6 +210,7 @@ SuiteSelection ParseSuites(int argc, char** argv)
     sel.dgsem_igr = true;
     sel.bc = true;
     sel.igr = true;
+    sel.igr_diagnostic_scans = true;
     sel.time_defaults = true;
     sel.diagnostics = true;
   }
@@ -358,7 +368,7 @@ int main(int argc, char** argv)
     std::cout
       << "Available suites: euler, fluxes, limiters, dg-operator, dgsem-basis, "
          "dgsem-flux, dgsem-operator, dgsem-advection, dgsem-igr, bc, igr, "
-         "time-defaults, diagnostics\n";
+         "igr-diagnostic-scans, time-defaults, diagnostics\n";
     return 0;
   }
 
@@ -507,11 +517,12 @@ int main(int argc, char** argv)
       capture_parity_metric("bc", parity_before);
     }
   }
-  if (selection.igr)
+  if (selection.igr || selection.igr_diagnostic_scans)
   {
     const int before = ctx.failures;
     const double parity_before = ctx.parity_metric;
-    dg_igr_tests::RunIGRTests(ctx);
+    if (selection.igr) { dg_igr_tests::RunIGRTests(ctx); }
+    if (selection.igr_diagnostic_scans) { dg_igr_tests::RunIGRDiagnosticScanTests(ctx); }
     local_igr_failures = ctx.failures - before;
     if (selection.parity)
     {
@@ -563,7 +574,7 @@ int main(int argc, char** argv)
   const int global_bc_failures =
     selection.bc ? AllreduceSum(local_bc_failures) : 0;
   const int global_igr_failures =
-    selection.igr ? AllreduceSum(local_igr_failures) : 0;
+    (selection.igr || selection.igr_diagnostic_scans) ? AllreduceSum(local_igr_failures) : 0;
   const int global_time_defaults_failures =
     selection.time_defaults ? AllreduceSum(local_time_defaults_failures) : 0;
   const int global_diagnostics_failures =
@@ -632,6 +643,10 @@ int main(int argc, char** argv)
     if (selection.igr)
     {
       suites.emplace_back("igr");
+    }
+    if (selection.igr_diagnostic_scans)
+    {
+      suites.emplace_back("igr-diagnostic-scans");
     }
     if (selection.time_defaults)
     {
@@ -732,7 +747,7 @@ int main(int argc, char** argv)
       std::cout << "  bc:       " << (global_bc_failures == 0 ? "PASS" : "FAIL")
                 << " (" << global_bc_failures << " failure(s))\n";
     }
-    if (selection.igr)
+    if (selection.igr || selection.igr_diagnostic_scans)
     {
       std::cout << "  igr:      "
                 << (global_igr_failures == 0 ? "PASS" : "FAIL") << " ("

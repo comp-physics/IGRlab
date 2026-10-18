@@ -76,6 +76,17 @@ public:
   /// Clamp for rho to avoid division by very small numbers (default IGRDefaults::kRhoFloor).
   void SetRhoFloor(double rho_floor);
 
+  /// Opt in to routine nonfinite diagnostics without changing residual gates.
+  void SetDiagnosticNanScan(bool enabled)
+  {
+    if (enabled && !diagnostic_nan_scan_)
+    {
+      device_coeff_diagnostics_logged_ = false;
+    }
+    diagnostic_nan_scan_ = enabled;
+  }
+  bool GetDiagnosticNanScan() const { return diagnostic_nan_scan_; }
+
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
   void SetDirichletBC(const mfem::Array<int>& ess_bdr);
 
@@ -172,6 +183,7 @@ public:
     SetAlpha(cfg.alpha);
     SetAlphaLengthScalePolicy(cfg.alpha_length_scale_policy);
     SetRhoFloor(cfg.rho_floor);
+    SetDiagnosticNanScan(cfg.nan_scan);
     SetGradBackend(cfg.backend);
     SetIPKind(cfg.ip_kind);
 
@@ -612,6 +624,8 @@ private:
   // Device/QF coefficient cache.
   bool using_device_coeffs_ = false;
   bool device_coeff_logged_ = false;
+  bool diagnostic_nan_scan_ = false;
+  bool device_coeff_diagnostics_logged_ = false;
   long device_mesh_sequence_ = -1;
   long device_sfes_sequence_ = -1;
   long device_vfes_sequence_ = -1;

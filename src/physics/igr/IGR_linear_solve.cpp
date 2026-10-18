@@ -1779,8 +1779,11 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     ::igrlab::NVTXRange exchange_range("IGR/state-face-neighbor-exchange");
     const_cast<mfem::ParGridFunction&>(U).ExchangeFaceNbrData();
   }
-  MFEM_VERIFY(VectorIsFinite(U),
-              "IGR state contains non-finite values before linear assembly.");
+  if (diagnostic_nan_scan_)
+  {
+    MFEM_VERIFY(VectorIsFinite(U),
+                "IGR state contains non-finite values before linear assembly.");
+  }
 
   const bool device_backend = mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
   const bool use_device_qf = UseDeviceCoefficients_();
@@ -3080,13 +3083,18 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       }
     }
   }
-  if (!enable_warm_start || !VectorIsFinite(X_))
+  // With routine diagnostics off, the native solver's actual initial residual
+  // rejects a corrupt guess; do not add a separate full-vector norm here.
+  if (!enable_warm_start || (diagnostic_nan_scan_ && !VectorIsFinite(X_)))
   {
     X_ = 0.0;
     enable_warm_start = false;
   }
-  MFEM_VERIFY(VectorIsFinite(B_),
-              "IGR RHS contains non-finite values before Krylov solve.");
+  if (diagnostic_nan_scan_)
+  {
+    MFEM_VERIFY(VectorIsFinite(B_),
+                "IGR RHS contains non-finite values before Krylov solve.");
+  }
 
   last_warm_start_guard_rejected_ = false;
   last_warm_start_residual_norm_ =
@@ -3452,14 +3460,19 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       return relative_pass || absolute_pass;
     };
     independent_certificate_passed = certificate_passes();
-    int local_solution_finite = VectorIsFinite(X_) ? 1 : 0;
     int collective_solution_finite = 0;
-    MPI_Allreduce(&local_solution_finite,
-                  &collective_solution_finite,
-                  1,
-                  MPI_INT,
-                  MPI_MIN,
-                  comm);
+    if (!independent_certificate_passed)
+    {
+      // This is a failed-certificate recovery decision, not a routine scan of
+      // an already accepted solution. All ranks share the global norm gate.
+      const int local_solution_finite = VectorIsFinite(X_) ? 1 : 0;
+      MPI_Allreduce(&local_solution_finite,
+                    &collective_solution_finite,
+                    1,
+                    MPI_INT,
+                    MPI_MIN,
+                    comm);
+    }
     if (!independent_certificate_passed && collective_solution_finite != 0)
     {
       const int first_attempt_iters = last_linear_iters_;

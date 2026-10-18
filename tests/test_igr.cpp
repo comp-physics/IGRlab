@@ -19,6 +19,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <sstream>
 #include <vector>
 
 #include "test_utils.hpp"
@@ -725,6 +726,167 @@ private:
 };
 
 } // namespace
+
+int RunIGRDiagnosticScanTests(TestContext& ctx)
+{
+  const bool cuda = mfem::Device::Allows(mfem::Backend::CUDA_MASK);
+  ctx.Check(!::igrlab::IGRConfig{}.nan_scan,
+            "IGR diagnostic scans default to disabled");
+  ScopedEnvVar partial("IGRLAB_IGR_PARTIAL_ASSEMBLY", "1");
+  ScopedEnvVar quadrature("IGRLAB_IGR_DEVICE_QF", "1");
+  ScopedEnvVar exact_faces("IGRLAB_IGR_EXACT_DG_FACE_OPERATOR", "1");
+  ScopedEnvVar source("IGRLAB_IGR_NODAL_SOURCE", "baseline");
+  ScopedEnvVar krylov("IGRLAB_IGR_KRYLOV_BACKEND", cuda ? "cuda-fp64" : "mfem");
+  ScopedEnvVar residual_scale("IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE", "rhs");
+  ScopedEnvVar warm_guard("IGRLAB_IGR_WARM_START_GUARD", "0");
+  // Request certification through the public call, independently of optional
+  // residual-reporting and vector-scan diagnostics.
+  ScopedEnvVar residual_report("IGRLAB_IGR_TRUE_RESIDUAL", "0");
+  ScopedEnvVar initial_report("IGRLAB_IGR_TRUE_INITIAL_RESIDUAL", "0");
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+    4, 4, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_SELF, serial);
+  dg_sim::DGSpaces spaces(mesh, 2, 2, 4, mfem::BasisType::GaussLegendre,
+                         "L2", true, false);
+  mfem::ParGridFunction state(&spaces.vfes);
+  mfem::VectorFunctionCoefficient coefficient(4,
+    [](const mfem::Vector& x, mfem::Vector& u)
+    {
+      u = EulerConsFromPrim2D(1.0 + 0.1 * x[0] + 0.05 * x[1],
+        0.2 + 0.4 * std::sin(3.0 * x[0]) + 0.1 * x[1],
+        -0.1 + 0.3 * std::cos(4.0 * x[1]) + 0.07 * x[0],
+        1.0 + 0.02 * x[0] * x[1], 1.4);
+    });
+  state.ProjectCoefficient(coefficient);
+  state.ExchangeFaceNbrData();
+  const auto alpha = dg_sim::ComputeAlphaInfo(
+    mesh, 0.5, ::igrlab::IGRAlphaLengthScalePolicy::Average);
+  auto apply = [&](::igrlab::IGRSolver& solver, bool warm)
+  {
+    std::ostringstream output;
+    {
+      struct RestoreOutput
+      {
+        std::streambuf* previous;
+        ~RestoreOutput() { std::cout.rdbuf(previous); }
+      } restore{std::cout.rdbuf(output.rdbuf())};
+      solver.UpdateFromState(state, warm, ::igrlab::IGRSolvePurpose::ProductionStage,
+                             /*certify_residual=*/true);
+    }
+    std::cout << output.str();
+    return output.str();
+  };
+  auto check_certificate = [&](::igrlab::IGRSolver& solver, bool expected_pass,
+                               const std::string& label, double expected_limit = 5e-10)
+  {
+    const mfem::Operator* op = solver.GetLinearOperator();
+    MFEM_VERIFY(op != nullptr, "IGR scan fixture needs the current public operator.");
+    mfem::Vector sigma;
+    solver.GetSigma().GetTrueDofs(sigma);
+    mfem::Vector action(op->Height()), residual(solver.GetLinearRHS());
+    op->Mult(sigma, action);
+    residual -= action;
+    const double absolute = GlobalL2Norm(residual);
+    const double rhs_norm = GlobalL2Norm(solver.GetLinearRHS());
+    const double relative = absolute / std::max(rhs_norm, 1e-300);
+    ctx.Check(rhs_norm > 1e-10 && std::isfinite(relative),
+              label + " has a nontrivial finite independent current-A residual");
+    ctx.CheckNear(solver.GetLastLinearTrueResidualRelRHS(), relative,
+                  1e-12 * std::max(1.0, relative),
+                  label + " reports the independent b-A*sigma residual");
+    ctx.CheckNear(solver.GetLastIndependentCertificateRelativeLimit(), expected_limit,
+                  1e-15 * expected_limit,
+                  label + " preserves the requested production certificate threshold");
+    ctx.CheckNear(solver.GetLastIndependentCertificateAbsoluteLimit(), 0.0, 0.0,
+                  label + " retains the zero absolute-tolerance contract");
+    const bool passed = relative <= solver.GetLastIndependentCertificateRelativeLimit() ||
+                        absolute <= solver.GetLastIndependentCertificateAbsoluteLimit();
+    ctx.Check(passed == expected_pass && solver.GetLastLinearConverged() == passed,
+              label + " keeps the current-A FP64 residual authoritative");
+    if (cuda)
+    {
+      ctx.Check(solver.GetLastLinearSolverName() == "fgmres-cuda-fp64",
+                label + " executes the campaign CUDA FP64 FGMRES backend");
+    }
+  };
+  std::unique_ptr<::igrlab::IGRSolver> scan_off;
+  mfem::Vector scan_off_sigma;
+  for (const bool enabled : {false, true})
+  {
+    char program[] = "igr-scan-policy";
+    char enable[] = "--nan-scan", disable[] = "--no-nan-scan";
+    char* argv[] = {program, enabled ? enable : disable};
+    dg_sim::CommonOptions options;
+    options.device = cuda ? "cuda" : "cpu";
+    options.nan_scan = !enabled;
+    mfem::OptionsParser parser(2, argv);
+    dg_sim::AddCommonOptions(parser, options, "Test mesh.");
+    parser.Parse();
+    ctx.Check(parser.Good() && options.nan_scan == enabled,
+              "IGR diagnostic scan CLI applies the explicit on/off policy");
+    dg_sim::IGROptions igr_options;
+    igr_options.space = "L2";
+    igr_options.grad = "BrokenL2";
+    igr_options.linear_solver = "fgmres";
+    igr_options.preconditioner = "none";
+    igr_options.nonconvergence_policy = "accept";
+    igr_options.lin_rtol = 1e-10;
+    igr_options.lin_atol = 0.0;
+    igr_options.lin_maxit = 400;
+    igr_options.lin_print = 0;
+    auto run = dg_sim::MakeRunConfig(dg_sim::CaseConfig{}, options, igr_options);
+    run.case_config.igr_config.nan_scan = !enabled;
+    auto solver = dg_sim::MakeIGRSolver(spaces, 2, 4, run, 1e-12, alpha);
+    ctx.Check(solver->GetDiagnosticNanScan() == enabled,
+              "IGR factory gives the common CLI scan policy precedence over stored config");
+    const std::string label = enabled ? "IGR scans on" : "IGR scans off";
+    const std::string first_log = apply(*solver, false);
+    check_certificate(*solver, true, label + " cold solve");
+    if (mfem::Mpi::Root())
+    {
+      ctx.Check((first_log.find("event=device-qf-finite") != std::string::npos) == enabled,
+                label + " selects the optional first-use QF diagnostics");
+      ctx.Check((first_log.find("event=device-qf-range") != std::string::npos) == enabled,
+                label + " selects the optional QF extrema scan");
+    }
+    const std::string warm_log = apply(*solver, true);
+    check_certificate(*solver, true, label + " warm solve");
+    ctx.Check(solver->GetLastWarmStartEffective(),
+              label + " retains a valid warm start through scalar solve guards");
+    if (mfem::Mpi::Root())
+    {
+      ctx.Check(warm_log.find("event=device-qf-finite") == std::string::npos,
+                label + " retains lifetime-once QF diagnostics");
+    }
+    if (!enabled)
+    {
+      scan_off_sigma = solver->GetSigma();
+      scan_off = std::move(solver);
+    }
+    else
+    {
+      mfem::Vector difference(solver->GetSigma()); difference -= scan_off_sigma;
+      ctx.Check(GlobalL2Norm(scan_off_sigma) > 1e-10 && GlobalL2Norm(difference) <=
+                  1e-9 * std::max(GlobalL2Norm(scan_off_sigma), 1e-12),
+                "IGR optional scans preserve the finite certified solution");
+    }
+    // A capped finite iterate must fail the same independent certificate
+    // even under the safe accept-iterate policy and with routine scans off.
+    auto capped = dg_sim::MakeIGRSolver(spaces, 2, 4, run, 1e-12, alpha);
+    capped->SetLinearSolveParams(1e-16, 0.0, 1, 0);
+    apply(*capped, false);
+    check_certificate(*capped, false, label + " capped solve", 5e-16);
+  }
+  scan_off->SetDiagnosticNanScan(true);
+  const std::string enabled_late_log = apply(*scan_off, true);
+  check_certificate(*scan_off, true, "IGR late scan opt-in");
+  if (mfem::Mpi::Root())
+  {
+    ctx.Check(enabled_late_log.find("event=device-qf-finite") != std::string::npos,
+              "IGR diagnostics can be enabled after an earlier scan-off solve");
+  }
+  return ctx.failures;
+}
 
 int RunIGRTests(TestContext& ctx)
 {

@@ -109,6 +109,9 @@ struct IGRConfig
 {
   double alpha = mfem::igrlab::IGRDefaults::kAlpha;
   double rho_floor = mfem::igrlab::IGRDefaults::kRhoFloor;
+  // Optional routine state/RHS/quadrature finite diagnostics. Native solver
+  // residual acceptance and exceptional recovery guards remain independent.
+  bool nan_scan = false;
   IGRAlphaLengthScalePolicy alpha_length_scale_policy =
     IGRAlphaLengthScalePolicy::Average;
 

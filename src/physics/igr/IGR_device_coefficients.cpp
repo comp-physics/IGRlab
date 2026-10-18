@@ -1125,7 +1125,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     LogScalarQuadratureAudit("rhs_source", *src_qf_, solve_call, comm);
   }
 
-  if (!device_coeff_logged_)
+  if (diagnostic_nan_scan_ && !device_coeff_diagnostics_logged_)
   {
     const MPI_Comm comm = vfes_.GetComm();
     int finite[8] = {VectorIsFinite(*u_mass_qf_) ? 1 : 0,
@@ -1211,6 +1211,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
                 << " face_qorder=" << device_face_qorder_
                 << " source_mode=" << NodalSourceModeName(GetNodalSourceMode()) << "\n";
     }
+    device_coeff_diagnostics_logged_ = true;
   }
 
   // Exact faces consume their independently projected side coefficients. The

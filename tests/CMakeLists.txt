@@ -815,6 +815,18 @@ add_test(NAME dg_igr_dgsem_portability_refactor_tests
          COMMAND dg_igr_unit_tests --dgsem-operator --dgsem-igr)
 add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
+add_test(NAME dg_igr_igr_diagnostic_scans
+  COMMAND dg_igr_unit_tests --igr-diagnostic-scans)
+set_tests_properties(dg_igr_igr_diagnostic_scans PROPERTIES
+  ENVIRONMENT "IGRLAB_TEST_DEVICE=cpu"
+  LABELS "igr;diagnostics;residual" TIMEOUT 120 RUN_SERIAL TRUE)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_igr_diagnostic_scans_cuda
+    COMMAND dg_igr_unit_tests --igr-diagnostic-scans)
+  set_tests_properties(dg_igr_igr_diagnostic_scans_cuda PROPERTIES
+    ENVIRONMENT "IGRLAB_TEST_DEVICE=cuda"
+    LABELS "cuda;igr;diagnostics;residual" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)

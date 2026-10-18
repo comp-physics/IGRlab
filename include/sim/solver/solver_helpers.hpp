@@ -185,6 +185,8 @@ inline std::unique_ptr<::igrlab::IGRSolver> MakeIGRSolver(
   igr_cfg.alpha_length_scale_policy = alpha_info.policy;
   igr_cfg.rho_floor = rho_floor;
   ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
+  // The common CLI policy also controls IGR's optional routine diagnostics.
+  igr_cfg.nan_scan = run_cfg.opts.nan_scan;
 
   // Coefficients retain references to this solver's alpha/policy members.
   // Construct at its final address so returning from the factory moves only
