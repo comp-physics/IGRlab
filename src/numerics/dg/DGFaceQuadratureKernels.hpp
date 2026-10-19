@@ -1741,6 +1741,10 @@ struct InteriorFaceDGDiffusionRecord2D
 // Each side/q projection retains the original ascending-d sum, the side-pair
 // terms retain their operation order, and each output retains its ascending-q
 // sum.  The subsequent deterministic element incidence gather is unchanged.
+// Specialize the normal storage mode once at launch.  Dof/Nq remain dynamic
+// unless a common order is explicitly selected; fixed bounds remove divisions
+// and stride calculations without unrolling order-sized working sets.
+template <bool CompactNormals, int Dof = 0, int Nq = 0>
 struct InteriorFaceDGDiffusionRecord2DWarp
 {
   InteriorFaceDGDiffusionRecord2D record;
@@ -1767,39 +1771,42 @@ struct InteriorFaceDGDiffusionRecord2DWarp
   MFEM_HOST_DEVICE void operator()(int face) const
   {
 #if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
+    const int dof = Dof > 0 ? Dof : record.dof;
+    const int nq = Nq > 0 ? Nq : record.nq;
     const int lane = threadIdx.x;
     const int shape_face = shape_face_slots ? shape_face_slots[face] : face;
-    auto S = mfem::Reshape(record.shape, 2, record.nq, record.dof,
+    auto S = mfem::Reshape(record.shape, 2, nq, dof,
                            shape_face_slots ? shape_face_count : record.nf);
-    const int normal_face = normal_face_slots ? normal_face_slots[face] : face;
+    const int normal_face = CompactNormals ? normal_face_slots[face] : face;
     auto N = mfem::Reshape(
-      normal_face_slots ? normal_dshape_base : record.weighted_normal_dshape,
-      2, record.nq, record.dof,
-      normal_face_slots ? normal_face_count : record.nf);
-    auto P = mfem::Reshape(record.penalty, record.nq, record.nf);
+      CompactNormals ? normal_dshape_base : record.weighted_normal_dshape,
+      2, nq, dof,
+      CompactNormals ? normal_face_count : record.nf);
+    auto P = mfem::Reshape(record.penalty, nq, record.nf);
     auto F = mfem::Reshape(record.face_elements, 2, record.nf);
     auto D = mfem::Reshape(record.element_vdof_map,
-                           record.dof, record.vdim, record.ne);
-    auto C = mfem::Reshape(record.contribution, record.dof, 2, record.nf);
+                           dof, record.vdim, record.ne);
+    auto C = mfem::Reshape(record.contribution, dof, 2, record.nf);
 
     // Each active lane owns one side/quadrature projection.  Initialize all
     // lanes because every lane participates in each full-warp broadcast.
     mfem::real_t value = 0.0;
     mfem::real_t normal_flux = 0.0;
-    if (lane < 2 * record.nq)
+    if (lane < 2 * nq)
     {
-      const int side = lane / record.nq;
-      const int q = lane - side * record.nq;
+      const int side = lane / nq;
+      const int q = lane - side * nq;
       const int e = F(side, face);
-      const mfem::real_t coefficient = normal_face_slots
-        ? side_coefficient[side + 2 * (q + record.nq * face)] : 0.0;
-      for (int d = 0; d < record.dof; ++d)
+      const mfem::real_t coefficient = CompactNormals
+        ? side_coefficient[side + 2 * (q + nq * face)] : 0.0;
+#pragma unroll 1
+      for (int d = 0; d < dof; ++d)
       {
         const mfem::real_t dof_value = record.x[D(d, 0, e)];
         value += S(side, q, d, shape_face) * dof_value;
-        const mfem::real_t normal_value = normal_face_slots
-          ? RoundedNormalProduct(coefficient, N(side, q, d, normal_face))
-          : N(side, q, d, normal_face);
+        mfem::real_t normal_value = N(side, q, d, normal_face);
+        if constexpr (CompactNormals)
+        { normal_value = RoundedNormalProduct(coefficient, normal_value); }
         normal_flux += normal_value * dof_value;
       }
     }
@@ -1807,15 +1814,15 @@ struct InteriorFaceDGDiffusionRecord2DWarp
     // Form the side-pair terms once on each side-zero quadrature lane.
     // Every lane participates in both full-mask broadcasts; inactive lanes
     // select the last valid side-one projection even for the Q1 boundary.
-    const int other_q = lane < record.nq ? lane : record.nq - 1;
+    const int other_q = lane < nq ? lane : nq - 1;
     const mfem::real_t other_value =
-      __shfl_sync(0xffffffffu, value, other_q + record.nq);
+      __shfl_sync(0xffffffffu, value, other_q + nq);
     const mfem::real_t other_normal_flux =
-      __shfl_sync(0xffffffffu, normal_flux, other_q + record.nq);
+      __shfl_sync(0xffffffffu, normal_flux, other_q + nq);
     mfem::real_t projected_jump = 0.0;
     mfem::real_t projected_avg_flux = 0.0;
     mfem::real_t projected_penalty_jump = 0.0;
-    if (lane < record.nq)
+    if (lane < nq)
     {
       projected_jump = value - other_value;
       projected_avg_flux = normal_flux + other_normal_flux;
@@ -1827,7 +1834,8 @@ struct InteriorFaceDGDiffusionRecord2DWarp
     // growing the register working set with polynomial order.  Each output
     // still accumulates in ascending q, including the final incomplete group.
     constexpr int rows_per_lane = 2;
-    for (int row_base = 0; row_base < 2 * record.dof;
+#pragma unroll 1
+    for (int row_base = 0; row_base < 2 * dof;
          row_base += 32 * rows_per_lane)
     {
       mfem::real_t sums[rows_per_lane] = {0.0, 0.0};
@@ -1838,11 +1846,12 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       for (int i = 0; i < rows_per_lane; ++i)
       {
         const int row = row_base + lane + 32 * i;
-        owns_row[i] = row < 2 * record.dof;
-        sides[i] = row / record.dof;
-        dofs[i] = row - sides[i] * record.dof;
+        owns_row[i] = row < 2 * dof;
+        sides[i] = row / dof;
+        dofs[i] = row - sides[i] * dof;
       }
-      for (int q = 0; q < record.nq; ++q)
+#pragma unroll 1
+      for (int q = 0; q < nq; ++q)
       {
         const mfem::real_t jump =
           __shfl_sync(0xffffffffu, projected_jump, q);
@@ -1857,11 +1866,12 @@ struct InteriorFaceDGDiffusionRecord2DWarp
           {
             const int d = dofs[i];
             const int side = sides[i];
-            const mfem::real_t normal_value = normal_face_slots
-              ? RoundedNormalProduct(
-                  side_coefficient[side + 2 * (q + record.nq * face)],
-                  N(side, q, d, normal_face))
-              : N(side, q, d, normal_face);
+            mfem::real_t normal_value = N(side, q, d, normal_face);
+            if constexpr (CompactNormals)
+            {
+              normal_value = RoundedNormalProduct(
+                side_coefficient[side + 2 * (q + nq * face)], normal_value);
+            }
             if (side == 0)
             {
               const mfem::real_t y0 =
@@ -2093,19 +2103,51 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
        work.normal_coefficient_scaling == DGDiffusionFaceScaling::Sum);
     record.shape = compact_shape ? work.shape_dictionary.values.Read()
                                  : work.shape.Read();
+    const int* shape_slots =
+      compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
+    const int shape_count =
+      compact_shape ? work.shape_dictionary.slot_count : info.nf;
+    const bool p5_gl6 = info.dof == 36 && info.nq == 6;
     // The compact path must not migrate/read the full weighted normal table.
     // It remains materialized for generic applies and diagonal/oracle users.
-    if (!compact_normal)
-    { record.weighted_normal_dshape = work.weighted_normal_dshape.Read(); }
-    mfem::forall_2D_batch(
-      info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp{
-        record,
-        compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr,
-        compact_shape ? work.shape_dictionary.slot_count : info.nf,
-        compact_normal ? work.normal_dictionary.values.Read() : nullptr,
-        compact_normal ? work.normal_dictionary.face_slots.Read() : nullptr,
-        compact_normal ? work.normal_dictionary.slot_count : info.nf,
-        compact_normal ? work.side_coefficient.Read() : nullptr});
+    // Select distinct compiled kernels so inner normal loads have no mode test.
+    if (compact_normal)
+    {
+      const mfem::real_t* normal_base = work.normal_dictionary.values.Read();
+      const int* normal_slots = work.normal_dictionary.face_slots.Read();
+      const int normal_count = work.normal_dictionary.slot_count;
+      const mfem::real_t* coefficient = work.side_coefficient.Read();
+      if (p5_gl6)
+      {
+        mfem::forall_2D_batch(
+          info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<true, 36, 6>{
+            record, shape_slots, shape_count,
+            normal_base, normal_slots, normal_count, coefficient});
+      }
+      else
+      {
+        mfem::forall_2D_batch(
+          info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<true>{
+            record, shape_slots, shape_count,
+            normal_base, normal_slots, normal_count, coefficient});
+      }
+    }
+    else
+    {
+      record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
+      if (p5_gl6)
+      {
+        mfem::forall_2D_batch(
+          info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<false, 36, 6>{
+            record, shape_slots, shape_count});
+      }
+      else
+      {
+        mfem::forall_2D_batch(
+          info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<false>{
+            record, shape_slots, shape_count});
+      }
+    }
   }
   else
 #endif
