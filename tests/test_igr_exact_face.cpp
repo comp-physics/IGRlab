@@ -1,6 +1,10 @@
 #include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "mfem/general/forall.hpp"
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+#include "mfem/general/cuda.hpp"
+#include <cuda_runtime.h>
+#endif
 #include "physics/igr/IGR.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 #include "../src/physics/igr/IGR_chebyshev.hpp"
@@ -11,6 +15,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <string>
 #include <vector>
@@ -1182,6 +1187,157 @@ void CheckProductionIdentityCopies()
     }
   }
 }
+// Explicitly requested test-only selection aid. This measures record kernels
+// on one fixed large geometry, excluding setup, refresh, gather and solves.
+void BenchmarkFaceRecords512(const std::string& mesh_path)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  MFEM_VERIFY(::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA(),
+              "The large face-record benchmark requires ordinary native CUDA.");
+  constexpr int n = 512, warmups = 4, repeats = 64;
+  // Match production -rs 0 -rp 4 exactly, including mesh-file element and
+  // face ordering; direct Cartesian construction has a different packing.
+  Mesh serial(mesh_path);
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  for (int level = 0; level < 4; ++level) { mesh.UniformRefinement(); }
+  MFEM_VERIFY(mesh.Dimension() == 2 && mesh.SpaceDimension() == 2 &&
+                mesh.GetNE() == n * n,
+              "The supplied Sedov mesh plus four parallel refinements must have 512-square cells.");
+  real_t lower[2] = {1.0, 1.0}, upper[2] = {0.0, 0.0};
+  for (int vertex = 0; vertex < mesh.GetNV(); ++vertex)
+  {
+    const real_t* coordinate = mesh.GetVertex(vertex);
+    for (int d = 0; d < 2; ++d)
+    {
+      lower[d] = std::min(lower[d], coordinate[d]);
+      upper[d] = std::max(upper[d], coordinate[d]);
+    }
+  }
+  MFEM_VERIFY(std::abs(lower[0]) < 1.0e-13 && std::abs(lower[1]) < 1.0e-13 &&
+                std::abs(upper[0] - 1.0) < 1.0e-13 &&
+                std::abs(upper[1] - 1.0) < 1.0e-13,
+              "The large face benchmark requires the production unit-square domain.");
+  DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  ParFiniteElementSpace fes(&mesh, &fec, 1, Ordering::byNODES);
+  const IntegrationRule& rule = IntRules.Get(Geometry::SEGMENT, 11);
+  FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
+  Vector side_q(2 * rule.GetNPoints() * fqs.GetNE()), x(fes.GetVSize());
+  side_q.UseDevice(true);
+  x.UseDevice(true);
+  real_t* q = side_q.HostWrite();
+  for (int i = 0; i < side_q.Size(); ++i)
+  { q[i] = 0.043 / (0.9 + 0.003 * (i % 31) + 0.002 * ((i / 2) % 17)); }
+  real_t* values = x.HostWrite();
+  for (int i = 0; i < x.Size(); ++i)
+  { values[i] = 0.01 * std::sin(0.013 * (i + 1)) + 0.002 * (i % 7); }
+
+  InteriorFaceDGDiffusionApplyScratch work;
+  const auto info = BuildInteriorFaceDGDiffusionApplyData2D(
+    fes, fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
+    work.penalty, work.face_elements, work.element_vdof_map,
+    DGDiffusionFaceScaling::Arithmetic, &work.normal_dshape_base,
+    &work.penalty_metric, &work.shape_dictionary, &work.normal_dictionary);
+  MFEM_VERIFY(info.dof == 36 && info.nq == 6 && info.ne == n * n &&
+                info.nf == 2 * n * (n - 1),
+              "The face benchmark must retain the prescribed 512-square p5/Q6 case.");
+  LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+    info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+  const bool compact_shape = work.shape_dictionary.Matches(info);
+  const bool compact_normal = work.normal_dictionary.Matches(info);
+  MFEM_VERIFY(work.normal_coefficient_revision == info.connectivity_revision &&
+                work.normal_coefficient_scaling == DGDiffusionFaceScaling::Arithmetic &&
+                work.side_coefficient.Size() == 2 * info.nq * info.nf,
+              "The face benchmark must use refreshed current coefficients.");
+  std::cout << std::setprecision(17)
+            << "ExactFaceBenchmark512 cells=" << info.ne << " scalar_dofs=" << x.Size()
+            << " interior_faces=" << info.nf << " dof=" << info.dof << " nq=" << info.nq
+            << " shape_dictionary_admitted=" << compact_shape
+            << " shape_slots=" << work.shape_dictionary.slot_count
+            << " normal_dictionary_admitted=" << compact_normal
+            << " normal_slots=" << work.normal_dictionary.slot_count
+            << " mesh_path=" << std::quoted(mesh_path) << " serial_refinements=0 parallel_refinements=4"
+            << " warmups=" << warmups << " repeats=" << repeats
+            << " scope=record_kernel_only" << std::endl;
+
+  work.face_contribution.SetSize(2 * info.dof * info.nf);
+  work.face_contribution.UseDevice(true);
+  InteriorFaceDGDiffusionRecord2D record;
+  record.dof = info.dof; record.vdim = info.vdim;
+  record.nq = info.nq; record.nf = info.nf; record.ne = info.ne;
+  record.ip_sigma = -1.0;
+  record.shape = compact_shape ? work.shape_dictionary.values.Read() : work.shape.Read();
+  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
+  record.penalty = work.penalty.Read();
+  record.face_elements = work.face_elements.Read();
+  record.element_vdof_map = work.element_vdof_map.Read();
+  record.x = x.Read();
+  record.contribution = work.face_contribution.Write();
+  const int* shape_slots = compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
+  const int shape_count = compact_shape ? work.shape_dictionary.slot_count : info.nf;
+  using ::igrlab::dg_face::InteriorFaceDGDiffusionRecord2DWarp;
+  const auto dense = InteriorFaceDGDiffusionRecord2DWarp<false>{
+    record, shape_slots, shape_count};
+  mfem::forall_2D_batch(info.nf, 32, 1, 4, dense);
+  MFEM_GPU_CHECK(cudaGetLastError());
+  MFEM_GPU_CHECK(cudaDeviceSynchronize());
+  Vector reference(work.face_contribution);
+  RequireFinite(reference);
+  MFEM_VERIFY(reference.Normlinf() > 1.0e-6,
+              "Large record benchmark must exercise a nontrivial face action.");
+
+  cudaEvent_t start, stop;
+  MFEM_GPU_CHECK(cudaEventCreate(&start));
+  MFEM_GPU_CHECK(cudaEventCreate(&stop));
+  auto measure = [&](const char* name, auto kernel)
+  {
+    // Reestablish device-write authority after the preceding host comparison.
+    kernel.record.contribution = work.face_contribution.Write();
+    for (int i = 0; i < warmups; ++i)
+    { mfem::forall_2D_batch(info.nf, 32, 1, 4, kernel); }
+    MFEM_GPU_CHECK(cudaGetLastError());
+    MFEM_GPU_CHECK(cudaDeviceSynchronize());
+    MFEM_GPU_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < repeats; ++i)
+    { mfem::forall_2D_batch(info.nf, 32, 1, 4, kernel); }
+    MFEM_GPU_CHECK(cudaEventRecord(stop));
+    MFEM_GPU_CHECK(cudaEventSynchronize(stop));
+    MFEM_GPU_CHECK(cudaGetLastError());
+    float elapsed_ms = 0.0f;
+    MFEM_GPU_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    const bool same_bits = SameBits(work.face_contribution, reference);
+    std::cout << "ExactFaceBenchmark512 variant=" << name
+              << " total_ms=" << elapsed_ms
+              << " mean_record_ms=" << double(elapsed_ms) / repeats
+              << " bitwise_dense_reference=" << same_bits << std::endl;
+    MFEM_VERIFY(same_bits, "Large face-record variant differs from dense reference: " << name);
+  };
+  measure("dense_dynamic", dense);
+  measure("dense_static_36_6", InteriorFaceDGDiffusionRecord2DWarp<false, 36, 6>{
+    record, shape_slots, shape_count});
+  if (compact_normal)
+  {
+    const real_t* normal_base = work.normal_dictionary.values.Read();
+    const int* normal_slots = work.normal_dictionary.face_slots.Read();
+    const int normal_count = work.normal_dictionary.slot_count;
+    const real_t* coefficient = work.side_coefficient.Read();
+    measure("compact_dynamic", InteriorFaceDGDiffusionRecord2DWarp<true>{
+      record, shape_slots, shape_count, normal_base, normal_slots, normal_count, coefficient});
+    measure("compact_static_36_6", InteriorFaceDGDiffusionRecord2DWarp<true, 36, 6>{
+      record, shape_slots, shape_count, normal_base, normal_slots, normal_count, coefficient});
+  }
+  else
+  {
+    std::cout << "ExactFaceBenchmark512 compact_variants=skipped"
+              << " reason=normal_dictionary_declined" << std::endl;
+  }
+  MFEM_GPU_CHECK(cudaEventDestroy(start));
+  MFEM_GPU_CHECK(cudaEventDestroy(stop));
+#else
+  (void)mesh_path;
+  MFEM_ABORT("The large face-record benchmark must be compiled as native CUDA.");
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1192,6 +1348,15 @@ int main(int argc, char** argv)
   MFEM_VERIFY(backend == "cpu" || backend == "cuda", "Expected cpu or cuda.");
   mfem::Device device(backend.c_str());
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Exact face fixture is single rank.");
+  const bool benchmark = argc == 4 && std::string(argv[2]) == "--benchmark512";
+  MFEM_VERIFY(argc <= 2 || benchmark,
+              "Expected [cpu|cuda] or cuda --benchmark512 /path/to/sedov_taylor.msh.");
+  if (benchmark)
+  {
+    MFEM_VERIFY(backend == "cuda", "--benchmark512 requires the CUDA backend.");
+    BenchmarkFaceRecords512(argv[3]);
+    return 0;
+  }
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
   CheckProductionCompactNormalSelection();
