@@ -156,6 +156,12 @@ struct InteriorFaceDGDiffusionApplyScratch
   mfem::Vector penalty;
   /// Geometry-only normal derivative used to refresh state-dependent qdata.
   mfem::Vector normal_dshape_base;
+  /// Independent byte-exact slots: equal shapes need not have equal normals.
+  InteriorFaceShapeDictionary2D normal_dictionary;
+  /// Only a completed coefficient refresh admits compact normal reconstruction.
+  std::uint64_t normal_coefficient_revision = 0;
+  DGDiffusionFaceScaling normal_coefficient_scaling =
+    DGDiffusionFaceScaling::Arithmetic;
   /// Geometry-only [side][quadrature][face] penalty metric.
   mfem::Vector penalty_metric;
   /// Persistent copy of the current [side][quadrature][face] alpha/rho data.
@@ -1020,9 +1026,11 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic,
   mfem::Vector* normal_dshape_base = nullptr,
   mfem::Vector* side_penalty_metric = nullptr,
-  InteriorFaceShapeDictionary2D* shape_dictionary = nullptr)
+  InteriorFaceShapeDictionary2D* shape_dictionary = nullptr,
+  InteriorFaceShapeDictionary2D* normal_dictionary = nullptr)
 {
   if (shape_dictionary) { shape_dictionary->Reset(); }
+  if (normal_dictionary) { normal_dictionary->Reset(); }
   std::string reason;
   MFEM_VERIFY(SupportsInteriorFaceScalarTraceProjection2D(sfes, fqs, &reason),
               "Unsupported exact DG diffusion face apply: " << reason);
@@ -1205,6 +1213,11 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   BuildNativeElementVDofMap(sfes, element_vdof_map);
   if (shape_dictionary)
   { PrepareInteriorFaceShapeDictionary2D(info, shape, *shape_dictionary); }
+  if (normal_dictionary && normal_dshape_base)
+  {
+    PrepareInteriorFaceShapeDictionary2D(
+      info, *normal_dshape_base, *normal_dictionary);
+  }
   return info;
 }
 
@@ -1733,6 +1746,23 @@ struct InteriorFaceDGDiffusionRecord2DWarp
   InteriorFaceDGDiffusionRecord2D record;
   const int* shape_face_slots = nullptr;
   int shape_face_count = 0;
+  const mfem::real_t* normal_dshape_base = nullptr;
+  const int* normal_face_slots = nullptr;
+  int normal_face_count = 0;
+  const mfem::real_t* side_coefficient = nullptr;
+
+  MFEM_HOST_DEVICE static mfem::real_t RoundedNormalProduct(
+    mfem::real_t coefficient, mfem::real_t normal_base)
+  {
+    // Match the coefficient refresh's stored product before subsequent FMAs.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+    return __dmul_rn(coefficient, normal_base);
+#elif defined(__CUDA_ARCH__) && defined(MFEM_USE_SINGLE)
+    return __fmul_rn(coefficient, normal_base);
+#else
+    return coefficient * normal_base;
+#endif
+  }
 
   MFEM_HOST_DEVICE void operator()(int face) const
   {
@@ -1741,8 +1771,11 @@ struct InteriorFaceDGDiffusionRecord2DWarp
     const int shape_face = shape_face_slots ? shape_face_slots[face] : face;
     auto S = mfem::Reshape(record.shape, 2, record.nq, record.dof,
                            shape_face_slots ? shape_face_count : record.nf);
-    auto N = mfem::Reshape(record.weighted_normal_dshape,
-                           2, record.nq, record.dof, record.nf);
+    const int normal_face = normal_face_slots ? normal_face_slots[face] : face;
+    auto N = mfem::Reshape(
+      normal_face_slots ? normal_dshape_base : record.weighted_normal_dshape,
+      2, record.nq, record.dof,
+      normal_face_slots ? normal_face_count : record.nf);
     auto P = mfem::Reshape(record.penalty, record.nq, record.nf);
     auto F = mfem::Reshape(record.face_elements, 2, record.nf);
     auto D = mfem::Reshape(record.element_vdof_map,
@@ -1758,11 +1791,16 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       const int side = lane / record.nq;
       const int q = lane - side * record.nq;
       const int e = F(side, face);
+      const mfem::real_t coefficient = normal_face_slots
+        ? side_coefficient[side + 2 * (q + record.nq * face)] : 0.0;
       for (int d = 0; d < record.dof; ++d)
       {
         const mfem::real_t dof_value = record.x[D(d, 0, e)];
         value += S(side, q, d, shape_face) * dof_value;
-        normal_flux += N(side, q, d, face) * dof_value;
+        const mfem::real_t normal_value = normal_face_slots
+          ? RoundedNormalProduct(coefficient, N(side, q, d, normal_face))
+          : N(side, q, d, normal_face);
+        normal_flux += normal_value * dof_value;
       }
     }
 
@@ -1818,11 +1856,17 @@ struct InteriorFaceDGDiffusionRecord2DWarp
           if (owns_row[i])
           {
             const int d = dofs[i];
-            if (sides[i] == 0)
+            const int side = sides[i];
+            const mfem::real_t normal_value = normal_face_slots
+              ? RoundedNormalProduct(
+                  side_coefficient[side + 2 * (q + record.nq * face)],
+                  N(side, q, d, normal_face))
+              : N(side, q, d, normal_face);
+            if (side == 0)
             {
               const mfem::real_t y0 =
                 -S(0, q, d, shape_face) * avg_flux +
-                record.ip_sigma * N(0, q, d, face) * jump +
+                record.ip_sigma * normal_value * jump +
                 S(0, q, d, shape_face) * penalty_jump;
               sums[i] += y0;
             }
@@ -1830,7 +1874,7 @@ struct InteriorFaceDGDiffusionRecord2DWarp
             {
               const mfem::real_t y1 =
                 S(1, q, d, shape_face) * avg_flux +
-                record.ip_sigma * N(1, q, d, face) * jump -
+                record.ip_sigma * normal_value * jump -
                 S(1, q, d, shape_face) * penalty_jump;
               sums[i] += y1;
             }
@@ -2023,7 +2067,6 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   record.nf = info.nf;
   record.ne = info.ne;
   record.ip_sigma = ip_sigma;
-  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
   record.penalty = work.penalty.Read();
   record.face_elements = work.face_elements.Read();
   record.element_vdof_map = work.element_vdof_map.Read();
@@ -2035,18 +2078,40 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       !mfem::Device::Allows(mfem::Backend::RAJA_CUDA))
   {
     const bool compact_shape = work.shape_dictionary.Matches(info);
+    const unsigned long alternative_backends =
+      mfem::Backend::OMP_MASK | mfem::Backend::RAJA_MASK |
+      mfem::Backend::OCCA_MASK | mfem::Backend::CEED_MASK |
+      mfem::Backend::HIP_MASK | mfem::Backend::DEBUG_DEVICE;
+    const bool compact_normal =
+      !mfem::Device::Allows(alternative_backends) &&
+      work.normal_dictionary.Matches(info) &&
+      work.normal_coefficient_revision == info.connectivity_revision &&
+      std::size_t(work.side_coefficient.Size()) ==
+        2u * std::size_t(info.nq) * std::size_t(info.nf) &&
+      (work.normal_coefficient_scaling == DGDiffusionFaceScaling::Arithmetic ||
+       work.normal_coefficient_scaling == DGDiffusionFaceScaling::Max ||
+       work.normal_coefficient_scaling == DGDiffusionFaceScaling::Sum);
     record.shape = compact_shape ? work.shape_dictionary.values.Read()
                                  : work.shape.Read();
+    // The compact path must not migrate/read the full weighted normal table.
+    // It remains materialized for generic applies and diagonal/oracle users.
+    if (!compact_normal)
+    { record.weighted_normal_dshape = work.weighted_normal_dshape.Read(); }
     mfem::forall_2D_batch(
       info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp{
         record,
         compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr,
-        compact_shape ? work.shape_dictionary.slot_count : info.nf});
+        compact_shape ? work.shape_dictionary.slot_count : info.nf,
+        compact_normal ? work.normal_dictionary.values.Read() : nullptr,
+        compact_normal ? work.normal_dictionary.face_slots.Read() : nullptr,
+        compact_normal ? work.normal_dictionary.slot_count : info.nf,
+        compact_normal ? work.side_coefficient.Read() : nullptr});
   }
   else
 #endif
   {
     record.shape = work.shape.Read();
+    record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
     mfem::forall(info.nf, record);
   }
 
@@ -2447,7 +2512,8 @@ AddInteriorFaceDGDiffusionApply2D(
     DGDiffusionFaceScaling::Arithmetic,
     &work.normal_dshape_base,
     &work.penalty_metric,
-    &work.shape_dictionary);
+    &work.shape_dictionary,
+    &work.normal_dictionary);
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))

@@ -168,6 +168,8 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
                                        work.penalty,
                                        kappa,
                                        face_scaling);
+  work.normal_coefficient_revision = info.connectivity_revision;
+  work.normal_coefficient_scaling = face_scaling;
 }
 
 void LaunchSharedFaceDGDiffusionCoefficientUpdate2D(

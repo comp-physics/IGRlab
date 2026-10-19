@@ -69,20 +69,28 @@ void RequireFinite(const Vector& v)
 }
 
 void CheckDictionaryCopies(const InteriorFaceDGDiffusionApplyInfo& info,
-                           const InteriorFaceDGDiffusionApplyScratch& work)
+                           const Vector& full_table,
+                           const InteriorFaceShapeDictionary2D& dictionary)
 {
-  if (!work.shape_dictionary.Matches(info)) { return; }
+  if (!dictionary.Matches(info)) { return; }
   const int block = 2 * info.nq * info.dof;
-  const real_t* full = work.shape.HostRead();
-  const real_t* compact = work.shape_dictionary.values.HostRead();
-  const int* slots = work.shape_dictionary.face_slots.HostRead();
+  const real_t* full = full_table.HostRead();
+  const real_t* compact = dictionary.values.HostRead();
+  const int* slots = dictionary.face_slots.HostRead();
   for (int face = 0; face < info.nf; ++face)
   {
-    MFEM_VERIFY(slots[face] >= 0 && slots[face] < work.shape_dictionary.slot_count &&
+    MFEM_VERIFY(slots[face] >= 0 && slots[face] < dictionary.slot_count &&
                   std::memcmp(full + block * face, compact + block * slots[face],
                               std::size_t(block) * sizeof(real_t)) == 0,
-                "Shape dictionary must copy every original bit pattern.");
+                "Geometry dictionary must copy every original bit pattern.");
   }
+}
+
+void CheckDictionaryCopies(const InteriorFaceDGDiffusionApplyInfo& info,
+                           const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  CheckDictionaryCopies(info, work.shape, work.shape_dictionary);
+  CheckDictionaryCopies(info, work.normal_dshape_base, work.normal_dictionary);
 }
 
 void CheckDictionaryAdmission()
@@ -330,7 +338,8 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     const auto info = BuildInteriorFaceDGDiffusionApplyData2D(
       fes, fqs, side_q, kappa, work.shape, work.weighted_normal_dshape,
       work.penalty, work.face_elements, work.element_vdof_map, scaling,
-      &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary);
+      &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary,
+      &work.normal_dictionary);
     MFEM_VERIFY(info.nf == (geometry == 2 ? 24 : 7),
                 "Fixture must cover whole batches and a three-face tail.");
     MFEM_VERIFY(info.dof == (order + 1) * (order + 1) &&
@@ -345,10 +354,16 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     }
 #endif
     const Vector compact_before(work.shape_dictionary.values);
+    const Vector normal_before(work.normal_dictionary.values);
+    const Vector normal_base_before(work.normal_dshape_base);
     const auto dictionary_revision = work.shape_dictionary.geometry_revision;
+    const auto normal_revision = work.normal_dictionary.geometry_revision;
+    MFEM_VERIFY(work.normal_coefficient_revision == 0,
+                "A geometry build alone must not admit reconstructed normals.");
     for (const real_t ip_sigma : {-1.0, 1.0})
     {
       // A second coefficient pack exercises the persistent geometry refresh.
+      Vector previous_action;
       for (int refresh = 0; refresh < 2; ++refresh)
       {
         Vector current_q(side_q);
@@ -366,8 +381,14 @@ void CheckCase(int order, int face_order, int basis, int geometry,
             info, work, side_q, kappa, scaling);
         }
         MFEM_VERIFY(work.shape_dictionary.geometry_revision == dictionary_revision &&
-                      SameBits(compact_before, work.shape_dictionary.values),
-                    "Current coefficients must not change the immutable shape dictionary.");
+                      work.normal_dictionary.geometry_revision == normal_revision &&
+                      SameBits(compact_before, work.shape_dictionary.values) &&
+                      SameBits(normal_before, work.normal_dictionary.values) &&
+                      SameBits(normal_base_before, work.normal_dshape_base),
+                    "Current coefficients must not change either geometry dictionary.");
+        MFEM_VERIFY(work.normal_coefficient_revision == info.connectivity_revision &&
+                      work.normal_coefficient_scaling == scaling,
+                    "Coefficient refresh must certify the current geometry and scaling.");
         work.face_contribution.SetSize(2 * info.dof * info.nf);
         work.face_contribution.UseDevice(true);
         work.face_contribution = std::numeric_limits<real_t>::quiet_NaN();
@@ -383,6 +404,14 @@ void CheckCase(int order, int face_order, int basis, int geometry,
           MFEM_VERIFY(!work.shape.GetMemory().DeviceIsValid(),
                       "Compact fixture must start with the full S table on host only.");
         }
+        const bool compact_normals =
+          ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA() &&
+          info.nq <= 16 && work.normal_dictionary.Matches(info) &&
+          scaling != DGDiffusionFaceScaling::HarmonicWeighted;
+        // Coefficient refresh has already written dense N on the device.
+        // Make its unchanged host copy authoritative to witness whether the
+        // subsequent apply actually avoids reading that dense allocation.
+        work.weighted_normal_dshape.HostReadWrite();
 #endif
         // This internal entry point also exercises the record/gather CPU
         // fallback when this source is compiled without CUDA support.
@@ -394,6 +423,18 @@ void CheckCase(int order, int face_order, int basis, int geometry,
                         work.shape_dictionary.values.GetMemory().DeviceIsValid() &&
                         work.shape_dictionary.face_slots.GetMemory().DeviceIsValid(),
                       "Native compact apply must read its dictionary without migrating full S.");
+        }
+        if (::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+        {
+          MFEM_VERIFY(work.weighted_normal_dshape.GetMemory().DeviceIsValid() !=
+                        compact_normals,
+                      "Normal apply must select compact loads only when admitted.");
+          if (compact_normals)
+          {
+            MFEM_VERIFY(work.normal_dictionary.values.GetMemory().DeviceIsValid() &&
+                          work.normal_dictionary.face_slots.GetMemory().DeviceIsValid(),
+                        "Compact normal action must actually read its own dictionary.");
+          }
         }
 #endif
         Vector original_contribution;
@@ -410,6 +451,12 @@ void CheckCase(int order, int face_order, int basis, int geometry,
                     << " geometry=" << geometry << " basis=" << basis);
         MFEM_VERIFY(SameBits(actual, original),
                     "Exact face deterministic gathered action changed bits.");
+        if (refresh)
+        {
+          MFEM_VERIFY(!SameBits(previous_action, actual),
+                      "Refreshed coefficients must change the current face action.");
+        }
+        previous_action = actual;
 
         Vector repeat(x.Size());
         repeat.UseDevice(true);
@@ -471,33 +518,56 @@ void CheckCase(int order, int face_order, int basis, int geometry,
 
 void CheckDictionaryGeometryRebuild()
 {
-  Mesh serial = MakeMesh(0);
+  // Dyadic element dimensions ensure repeated normal blocks really are byte
+  // identical; the broader curved/rotated cases may legitimately decline.
+  Mesh serial = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL,
+                                      true, 1.0, 1.0);
   ParMesh mesh(MPI_COMM_SELF, serial);
   DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
   ParFiniteElementSpace fes(&mesh, &fec);
   IntegrationRule rule(IntRules.Get(Geometry::SEGMENT, 11));
-  Vector side_q(2 * rule.GetNPoints() * 7);
+  FaceQuadratureSpace initial_fqs(mesh, rule, FaceType::Interior);
+  Vector side_q(2 * rule.GetNPoints() * initial_fqs.GetNE());
   side_q = 0.07;
   Vector x(fes.GetVSize());
   x.UseDevice(true);
   real_t* input = x.HostWrite();
   for (int i = 0; i < x.Size(); ++i) { input[i] = 0.01 * std::sin(0.07 * (i + 1)); }
   InteriorFaceDGDiffusionApplyScratch work;
-  auto build = [&](bool compact)
+  auto build = [&](bool compact_shape, bool compact_normal)
   {
     FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
     return BuildInteriorFaceDGDiffusionApplyData2D(
       fes, fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
       work.penalty, work.face_elements, work.element_vdof_map,
       DGDiffusionFaceScaling::Arithmetic, &work.normal_dshape_base,
-      &work.penalty_metric, compact ? &work.shape_dictionary : nullptr);
+      &work.penalty_metric, compact_shape ? &work.shape_dictionary : nullptr,
+      compact_normal ? &work.normal_dictionary : nullptr);
   };
-  auto parity = [&](const InteriorFaceDGDiffusionApplyInfo& info)
+  auto parity = [&](const InteriorFaceDGDiffusionApplyInfo& info,
+                     bool compact_normal)
   {
     Vector actual(x.Size());
     actual.UseDevice(true);
     actual = 0.03125;
+    work.weighted_normal_dshape.HostReadWrite();
     AddInteriorFaceDGDiffusionApplyDevice2D(info, work, x, -1.0, actual);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+    if (::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+    {
+      MFEM_VERIFY(work.weighted_normal_dshape.GetMemory().DeviceIsValid() !=
+                    compact_normal,
+                  "Compact normals must require both current geometry and coefficients.");
+      if (compact_normal)
+      {
+        MFEM_VERIFY(work.normal_dictionary.values.GetMemory().DeviceIsValid() &&
+                      work.normal_dictionary.face_slots.GetMemory().DeviceIsValid(),
+                    "Guaranteed compact fixture must actually upload its normal dictionary.");
+      }
+    }
+#else
+    (void)compact_normal;
+#endif
     Vector original_contribution;
     const Vector original = OriginalRecordAndGather(info, work, x, -1.0,
                                                    original_contribution);
@@ -505,29 +575,142 @@ void CheckDictionaryGeometryRebuild()
     MFEM_VERIFY(SameBits(actual, original) &&
                   SameBits(work.face_contribution, original_contribution),
                 "Rebuilt or declined dictionary changed the original action.");
+    return actual;
   };
-  auto info = build(true);
-  MFEM_VERIFY(work.shape_dictionary.Matches(info), "Rebuild fixture must admit compression.");
+  auto refresh = [&](const InteriorFaceDGDiffusionApplyInfo& info)
+  {
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+    MFEM_VERIFY(work.normal_coefficient_revision == info.connectivity_revision,
+                "A coefficient refresh must certify its own geometry revision.");
+  };
+  auto info = build(true, true);
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) &&
+                work.normal_dictionary.Matches(info),
+              "Dyadic rebuild fixture must admit both geometry dictionaries.");
+  MFEM_VERIFY(work.normal_coefficient_revision == 0,
+              "An initial geometry build must use the original dense normal table.");
   const auto first_revision = info.connectivity_revision;
   const Vector old_shape(work.shape);
-  parity(info);
-  // Legacy vector-only builders can reuse the same allocations; an epoch miss
-  // must reject the old dictionary rather than lazily accepting its pointers.
-  info = build(false);
+  const Vector old_normal_base(work.normal_dshape_base);
+  parity(info, false);
+
+  // Normal slots are independent of shape slots. Reversing their numbering
+  // while preserving every block catches an accidental use of shape slots.
+  const int block = 2 * info.nq * info.dof;
+  const int normal_slots = work.normal_dictionary.slot_count;
+  MFEM_VERIFY(normal_slots > 1, "Fixture needs distinct normal orientations.");
+  const Vector original_normals(work.normal_dictionary.values);
+  real_t* compact = work.normal_dictionary.values.HostWrite();
+  const real_t* original = original_normals.HostRead();
+  for (int slot = 0; slot < normal_slots; ++slot)
+  {
+    std::copy(original + block * slot, original + block * (slot + 1),
+              compact + block * (normal_slots - 1 - slot));
+  }
+  int* slots = work.normal_dictionary.face_slots.HostReadWrite();
+  for (int face = 0; face < info.nf; ++face)
+  { slots[face] = normal_slots - 1 - slots[face]; }
+  CheckDictionaryCopies(info, work);
+  refresh(info);
+  const Vector before_refresh = parity(info, true);
+  {
+    // An assembled MFEM form independently checks the guaranteed compact
+    // p5/GL action, in addition to the bitwise old CUDA functor comparison.
+    mfem::ConstantCoefficient coefficient(0.07);
+    mfem::BilinearForm assembled_form(&fes);
+    auto* integrator = new DGDiffusionIntegrator(coefficient, -1.0, 2.75);
+    integrator->SetIntegrationRule(rule);
+    assembled_form.AddInteriorFaceIntegrator(integrator);
+    assembled_form.Assemble();
+    assembled_form.Finalize();
+    Vector assembled(x.Size());
+    assembled_form.Mult(x, assembled);
+    const double reference_norm = assembled.Norml2();
+    MFEM_VERIFY(reference_norm > 1.0e-6,
+                "Guaranteed compact assembled oracle must have nonzero action.");
+    assembled += 0.03125;
+    Vector delta(before_refresh);
+    delta -= assembled;
+    MFEM_VERIFY(delta.Normlinf() < 5.0e-13 &&
+                  delta.Norml2() / reference_norm < 5.0e-13,
+                "Guaranteed compact p5 normal action differs from assembled MFEM.");
+  }
+  // Keep the known-good dictionary while changing the scaling selector, so
+  // dense harmonic fallback cannot pass merely because geometry was declined.
+  for (const auto scaling : {DGDiffusionFaceScaling::Max,
+                             DGDiffusionFaceScaling::Sum,
+                             DGDiffusionFaceScaling::HarmonicWeighted})
+  {
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info, work, side_q, 2.75, scaling);
+    MFEM_VERIFY(work.normal_dictionary.Matches(info) &&
+                  work.normal_coefficient_revision == info.connectivity_revision &&
+                  work.normal_coefficient_scaling == scaling,
+                "Scaling fixture must retain a current admitted normal dictionary.");
+    parity(info, scaling != DGDiffusionFaceScaling::HarmonicWeighted);
+  }
+  side_q *= 1.19;
+  refresh(info);
+  const Vector after_refresh = parity(info, true);
+  MFEM_VERIFY(!SameBits(before_refresh, after_refresh) &&
+                SameBits(old_shape, work.shape) &&
+                SameBits(old_normal_base, work.normal_dshape_base),
+              "Coefficient refresh must change action without changing geometry.");
+
+  // Legacy vector-only builders can reuse the same allocations. Both the
+  // coefficient epoch and optional dictionaries must reject that fresh build.
+  const auto previous_coefficient_revision = work.normal_coefficient_revision;
+  info = build(false, false);
   MFEM_VERIFY(info.connectivity_revision != first_revision &&
-                !work.shape_dictionary.Matches(info), "Fresh geometry must reject stale slots.");
-  parity(info);
+                !work.shape_dictionary.Matches(info) &&
+                !work.normal_dictionary.Matches(info) &&
+                previous_coefficient_revision != info.connectivity_revision &&
+                work.normal_coefficient_revision != info.connectivity_revision,
+              "Same-size geometry rebuild must reject stale coefficients and slots.");
+  parity(info, false);
+  refresh(info);
+  parity(info, false); // Current coefficients cannot rescue stale dictionaries.
+
   mesh.Transform([](const Vector& point, Vector& out)
-  { out.SetSize(2); out[0] = 1.03 * point[0]; out[1] = 0.97 * point[1]; });
-  rule.IntPoint(0).x += 0.001;
-  info = build(true);
-  MFEM_VERIFY(work.shape_dictionary.Matches(info) && !SameBits(old_shape, work.shape) &&
+  { out.SetSize(2); out[0] = 2.0 * point[0]; out[1] = 0.5 * point[1]; });
+  rule.IntPoint(0).x += 0.125;
+  info = build(true, true);
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) &&
+                work.normal_dictionary.Matches(info) &&
+                !SameBits(old_shape, work.shape) &&
+                !SameBits(old_normal_base, work.normal_dshape_base) &&
                 info.connectivity_revision != first_revision,
               "Same-size changed geometry/rule must rebuild immutable slots.");
   CheckDictionaryCopies(info, work);
-  parity(info);
+  parity(info, false); // Fresh dictionaries alone do not certify current qdata.
+  refresh(info);
+  parity(info, true);
+
+  info = build(true, false);
+  refresh(info);
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) &&
+                !work.normal_dictionary.Matches(info),
+              "Missing normal dictionary must leave the shape optimization available.");
+  parity(info, false);
+  info = build(false, true);
+  refresh(info);
+  MFEM_VERIFY(!work.shape_dictionary.Matches(info) &&
+                work.normal_dictionary.Matches(info),
+              "Normal dictionary admission must be independent of shape compression.");
+  parity(info, true);
+
+  info = build(true, true);
+  refresh(info);
+  PrepareInteriorFaceShapeDictionary2D(
+    info, work.normal_dshape_base, work.normal_dictionary, 1);
+  MFEM_VERIFY(!work.normal_dictionary.Matches(info) &&
+                work.normal_dictionary.values.Size() == 0 &&
+                work.normal_dictionary.face_slots.Size() == 0,
+              "A normal dictionary budget decline must discard its old values and slots.");
+  parity(info, false);
   PrepareInteriorFaceShapeDictionary2D(info, work.shape, work.shape_dictionary, 1);
-  parity(info); // A budget decline follows the original full-S warp path.
+  parity(info, false); // Both dictionary declines retain the original dense path.
 }
 
 class ScopedEnvironment
@@ -548,6 +731,71 @@ private:
   std::string name_, value_;
   bool had_value_ = false;
 };
+
+void CheckProductionCompactNormalSelection()
+{
+  Mesh serial = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL,
+                                      true, 1.0, 1.0);
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  ParFiniteElementSpace scalar_fes(&mesh, &fec, 1, Ordering::byNODES);
+  ParFiniteElementSpace state_fes(&mesh, &fec, 4, Ordering::byNODES);
+  ParGridFunction state(&state_fes);
+  state.UseDevice(true);
+  Vector input(scalar_fes.GetVSize());
+  input.UseDevice(true);
+  real_t* x = input.HostWrite();
+  for (int d = 0; d < input.Size(); ++d)
+  { x[d] = 0.01 * std::sin(0.13 * (d + 1)); }
+  Vector dense_actions[2];
+  for (const bool compact : {false, true})
+  {
+    // This switch is sampled when the production face operator is built.
+    ScopedEnvironment selection("DG_IGR_IGR_COMPACT_FACE_NORMALS",
+                                compact ? "true" : "false");
+    ScopedEnvironment canonical_selection("IGRLAB_IGR_COMPACT_FACE_NORMALS",
+                                          compact ? "true" : "false");
+    ::igrlab::IGRSolver solver(scalar_fes, state_fes, 2, 4, 0.07);
+    solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
+    solver.SetExactDGFaceOperator(true);
+    solver.SetSolveMode(::igrlab::IGRSolveMode::SmootherSweeps);
+    solver.SetSweeps(0, 0);
+    for (int refresh = 0; refresh < 2; ++refresh)
+    {
+      const int ndofs = state_fes.GetNDofs();
+      real_t* u = state.HostWrite();
+      for (int d = 0; d < ndofs; ++d)
+      {
+        const real_t rho = (refresh ? 1.19 : 1.0) *
+          (1.0 + 0.03 * std::sin(0.17 * (d + 1)));
+        u[d] = rho;
+        u[d + ndofs] = 0.04 * rho;
+        u[d + 2 * ndofs] = -0.02 * rho;
+        u[d + 3 * ndofs] = 2.5 + 0.001 * rho;
+      }
+      solver.UpdateFromState(state, false);
+      const auto* face = solver.GetLinearFaceOperator();
+      MFEM_VERIFY(face && solver.GetLastExactFaceEffective() &&
+                    solver.GetLastExactFaceSharedFaceCount() == 0,
+                  "Compact-normal switch fixture must exercise local exact faces.");
+      Vector actual(input.Size());
+      actual.UseDevice(true);
+      face->Mult(input, actual);
+      RequireFinite(actual);
+      MFEM_VERIFY(actual.Normlinf() > 1.0e-6,
+                  "Compact-normal production fixture needs a nonzero face action.");
+      if (!compact) { dense_actions[refresh] = actual; }
+      else
+      {
+        MFEM_VERIFY(SameBits(actual, dense_actions[refresh]),
+                    "Production compact-normal opt-out changed current face action bits.");
+      }
+    }
+  }
+  MFEM_VERIFY(!SameBits(dense_actions[0], dense_actions[1]),
+              "Production compact-normal comparison must evolve its coefficients.");
+}
 
 // A test-only virtual-access witness distinguishes the production direct
 // read from the old identity-copy path, without adding a production counter.
@@ -946,6 +1194,7 @@ int main(int argc, char** argv)
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Exact face fixture is single rank.");
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
+  CheckProductionCompactNormalSelection();
   CheckProductionIdentityCopies();
   CheckGatherToBaseRounding();
   CheckChebyshevOwnedScratch();
