@@ -20,6 +20,7 @@
 #include <numeric>
 #include <string>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include "test_utils.hpp"
@@ -698,7 +699,7 @@ public:
   ScopedEnvVar(const char* name, const char* value)
     : name_(name)
   {
-    const char* prev = ::igrlab::GetEnv(name_.c_str());
+    const char* prev = std::getenv(name_.c_str());
     if (prev)
     {
       had_prev_ = true;
@@ -884,6 +885,195 @@ int RunIGRDiagnosticScanTests(TestContext& ctx)
   {
     ctx.Check(enabled_late_log.find("event=device-qf-finite") != std::string::npos,
               "IGR diagnostics can be enabled after an earlier scan-off solve");
+  }
+  // Exercise the coefficient-preparation sharing switch through current
+  // public A, b and sigma. The control always computes diagnostic gradients;
+  // the shared solver enables that optional work only after its first update.
+  std::unique_ptr<::igrlab::IGRSolver> preparation_solvers[2];
+  mfem::Vector probe(spaces.sigma_fes->GetTrueVSize());
+  probe.UseDevice(true);
+  double* probe_data = probe.HostWrite();
+  for (int i = 0; i < probe.Size(); ++i)
+  { probe_data[i] = 0.03 * std::sin(0.17 * (i + 1)) + 0.002 * (i % 5); }
+  mfem::Vector previous_rhs, previous_action;
+  std::pair<double, double> previous_audit_gradient;
+  auto audit_gradient = [&](const std::string& log, const std::string& field,
+                             const std::string& label)
+  {
+    double minimum = std::numeric_limits<double>::quiet_NaN();
+    double maximum = minimum;
+    bool finite_count = false;
+    std::istringstream lines(log);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+      if (line.find("[igr-ingestion-audit] kind=derived") == std::string::npos ||
+          line.find(" field=" + field + " ") == std::string::npos) { continue; }
+      std::istringstream words(line);
+      std::string word;
+      while (words >> word)
+      {
+        if (word.rfind("min=", 0) == 0) { minimum = std::strtod(word.c_str() + 4, nullptr); }
+        if (word.rfind("max=", 0) == 0) { maximum = std::strtod(word.c_str() + 4, nullptr); }
+        if (word == "nonfinite=0") { finite_count = true; }
+      }
+      break;
+    }
+    ctx.Check(finite_count && std::isfinite(minimum) && std::isfinite(maximum) &&
+                maximum - minimum > 1e-3,
+              label + " audits finite current nonconstant " + field);
+    return std::make_pair(minimum, maximum);
+  };
+  auto check_same_values = [&](const mfem::Vector& shared, const mfem::Vector& control,
+                                const std::string& label)
+  {
+    ctx.Check(shared.Size() == control.Size() &&
+                std::memcmp(shared.HostRead(), control.HostRead(),
+                            std::size_t(control.Size()) * sizeof(mfem::real_t)) == 0,
+              label + " preserves current FP64 bits");
+  };
+  for (int phase = 0; phase < 4; ++phase)
+  {
+    // Native p2 rules all match. Then change only RHS to Q4, followed by
+    // matching all three at Q4 on the same solvers, rebuilding stored choices.
+    const char* source_order = phase < 2 ? "0" : "6";
+    const char* operator_order = phase < 3 ? "0" : "6";
+    ScopedEnvVar source_floor("DG_IGR_IGR_SOURCE_QUADRATURE_MIN_ORDER", source_order);
+    ScopedEnvVar source_floor_alias("IGRLAB_IGR_SOURCE_QUADRATURE_MIN_ORDER", source_order);
+    ScopedEnvVar operator_floor("DG_IGR_IGR_OPERATOR_QUADRATURE_MIN_ORDER", operator_order);
+    ScopedEnvVar operator_floor_alias("IGRLAB_IGR_OPERATOR_QUADRATURE_MIN_ORDER", operator_order);
+    const mfem::FiniteElement& fe = *spaces.sigma_fes->GetFE(0);
+    const auto& native_mass = mfem::MassIntegrator::GetRule(
+      fe, fe, *mesh.GetTypicalElementTransformation());
+    const auto& native_diffusion = mfem::DiffusionIntegrator::GetRule(fe, fe);
+    const auto& mass_rule = phase < 3 ? native_mass : mfem::IntRules.Get(fe.GetGeomType(), 6);
+    const auto& diffusion_rule = phase < 3 ? native_diffusion : mfem::IntRules.Get(fe.GetGeomType(), 6);
+    const auto& rhs_rule = mfem::IntRules.Get(fe.GetGeomType(), phase < 2 ? 4 : 6);
+    ctx.Check(mass_rule.GetNPoints() == diffusion_rule.GetNPoints() &&
+                ((rhs_rule.GetNPoints() == diffusion_rule.GetNPoints()) == (phase != 2)),
+              "IGR preparation phase " + std::to_string(phase) +
+                " exercises the intended matching/nonmatching quadrature layouts");
+    mfem::VectorFunctionCoefficient evolved(4,
+      [phase](const mfem::Vector& x, mfem::Vector& u)
+      {
+        u = EulerConsFromPrim2D(
+          1.0 + 0.1 * x[0] + 0.05 * x[1] + 0.04 * phase * (1.0 + x[0] * x[1]),
+          0.2 + 0.4 * std::sin(3.0 * x[0] + 0.2 * phase) + 0.1 * x[1] +
+            0.03 * phase * x[0] * x[1],
+          -0.1 + 0.3 * std::cos(4.0 * x[1] - 0.1 * phase) + 0.07 * x[0] +
+            0.02 * phase * x[0],
+          1.0 + 0.02 * x[0] * x[1] + 0.01 * phase * x[1], 1.4);
+      });
+    state.ProjectCoefficient(evolved);
+    state.ExchangeFaceNbrData();
+    mfem::Vector rhs[2], action[2], sigma[2];
+    std::string logs[2];
+    for (int shared = 0; shared < 2; ++shared)
+    {
+      ScopedEnvVar share("DG_IGR_IGR_SHARE_STATE_INTERPOLATION", shared ? "1" : "0");
+      ScopedEnvVar share_alias("IGRLAB_IGR_SHARE_STATE_INTERPOLATION", shared ? "1" : "0");
+      const bool audit = !shared || phase > 0;
+      ScopedEnvVar ingestion("DG_IGR_IGR_INGESTION_AUDIT", audit ? "1" : "0");
+      ScopedEnvVar ingestion_alias("IGRLAB_IGR_INGESTION_AUDIT", audit ? "1" : "0");
+      auto& solver = preparation_solvers[shared];
+      if (!solver)
+      {
+        solver = std::make_unique<::igrlab::IGRSolver>(
+          *spaces.sigma_fes, spaces.vfes, 2, 4, alpha.alpha);
+        ::igrlab::IGRConfig config;
+        config.alpha = alpha.alpha;
+        config.nan_scan = false;
+        config.backend = ::igrlab::IGRGradBackend::BrokenDG;
+        config.ip_kind = ::igrlab::IGRIPKind::SIPG;
+        config.solve_mode = ::igrlab::IGRSolveMode::Krylov;
+        config.lin_solver_type = ::igrlab::IGRLinearSolverType::FGMRES;
+        config.prec_type = ::igrlab::IGRPrecondType::None;
+        config.nonconvergence_policy = ::igrlab::IGRNonconvergencePolicy::Accept;
+        config.exact_dg_face_operator = true;
+        config.lin_rtol = 1e-10;
+        config.lin_atol = 0.0;
+        config.lin_maxit = 400;
+        config.lin_print = 0;
+        solver->ApplyConfig(config);
+      }
+      else if (phase >= 2)
+      {
+        // Public setters rebuild the form as well as its quadrature objects;
+        // no stale integrator may keep an old coefficient-space reference.
+        solver->SetIPKind(::igrlab::IGRIPKind::NIPG);
+        solver->SetIPKind(::igrlab::IGRIPKind::SIPG);
+      }
+      const std::string label = "IGR preparation " + std::string(shared ? "shared" : "unshared") +
+        " phase " + std::to_string(phase);
+      logs[shared] = apply(*solver, phase > 0);
+      check_certificate(*solver, true, label);
+      ctx.Check((logs[shared].find("[igr-ingestion-audit]") != std::string::npos) == audit,
+                label + " retains opt-in ingestion diagnostics");
+      rhs[shared] = solver->GetLinearRHS();
+      solver->GetSigma().GetTrueDofs(sigma[shared]);
+      const mfem::Operator* current_operator = solver->GetLinearOperator();
+      MFEM_VERIFY(current_operator && current_operator->Width() == probe.Size(),
+                  "IGR preparation comparison requires the current public operator.");
+      action[shared].SetSize(current_operator->Height());
+      action[shared].UseDevice(true);
+      current_operator->Mult(probe, action[shared]);
+    }
+    const std::string phase_label = "IGR preparation phase " + std::to_string(phase);
+    check_same_values(rhs[1], rhs[0], phase_label + " shared RHS");
+    check_same_values(action[1], action[0], phase_label + " shared current-A action");
+    mfem::Vector sigma_difference(sigma[1]); sigma_difference -= sigma[0];
+    ctx.Check(GlobalL2Norm(sigma[0]) > 1e-10 && GlobalL2Norm(sigma_difference) <=
+                1e-9 * GlobalL2Norm(sigma[0]),
+              phase_label + " preserves the certified sigma solution");
+    if (phase > 0)
+    {
+      mfem::Vector rhs_change(rhs[1]); rhs_change -= previous_rhs;
+      mfem::Vector action_change(action[1]); action_change -= previous_action;
+      ctx.Check(GlobalL2Norm(rhs_change) > 1e-8 && GlobalL2Norm(action_change) > 1e-8,
+                phase_label + " consumes the evolving state in both current RHS and operator");
+    }
+    previous_rhs = rhs[1];
+    previous_action = action[1];
+    const auto control_gradient = audit_gradient(logs[0], "grad_diffusion", phase_label);
+    if (phase > 0)
+    {
+      const auto shared_gradient = audit_gradient(logs[1], "grad_diffusion", phase_label);
+      audit_gradient(logs[1], "grad_rhs", phase_label);
+      ctx.CheckNear(shared_gradient.first, control_gradient.first, 1e-12,
+                    phase_label + " late/current diagnostic gradient minimum matches control");
+      ctx.CheckNear(shared_gradient.second, control_gradient.second, 1e-12,
+                    phase_label + " late/current diagnostic gradient maximum matches control");
+      double minimum = std::numeric_limits<double>::infinity();
+      double maximum = -minimum;
+      mfem::DenseMatrix gradient(4, 2);
+      for (int e = 0; e < mesh.GetNE(); ++e)
+      {
+        auto* transformation = mesh.GetElementTransformation(e);
+        for (int q = 0; q < diffusion_rule.GetNPoints(); ++q)
+        {
+          transformation->SetIntPoint(&diffusion_rule.IntPoint(q));
+          state.GetVectorGradient(*transformation, gradient);
+          for (int i = 0; i < gradient.Height() * gradient.Width(); ++i)
+          {
+            minimum = std::min(minimum, gradient.Data()[i]);
+            maximum = std::max(maximum, gradient.Data()[i]);
+          }
+        }
+      }
+      // Existing audit output uses the current ostream precision (at least
+      // six significant digits); the oracle remains independent of QI storage.
+      ctx.CheckNear(shared_gradient.first, minimum, 2e-5,
+                    phase_label + " diagnostics read the current physical gradient minimum");
+      ctx.CheckNear(shared_gradient.second, maximum, 2e-5,
+                    phase_label + " diagnostics read the current physical gradient maximum");
+      if (phase == 1)
+      {
+        ctx.Check(std::abs(shared_gradient.first - previous_audit_gradient.first) +
+                    std::abs(shared_gradient.second - previous_audit_gradient.second) > 1e-3,
+                  "IGR late ingestion opt-in computes new gradients rather than stale initial data");
+      }
+    }
+    previous_audit_gradient = control_gradient;
   }
   return ctx.failures;
 }

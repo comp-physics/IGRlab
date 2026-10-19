@@ -634,6 +634,10 @@ private:
   int device_diff_qorder_ = 0;
   int device_rhs_qorder_ = 0;
   int device_face_qorder_ = 0;
+  // Cache-setup proofs for reusing current byVDIM state interpolation owners.
+  bool device_diff_values_share_mass_ = false;
+  bool device_rhs_values_share_mass_ = false;
+  bool device_rhs_values_share_diff_ = false;
 
   std::unique_ptr<mfem::QuadratureSpace> mass_qs_;
   std::unique_ptr<mfem::QuadratureSpace> sigma_qs_;
@@ -643,6 +647,7 @@ private:
   std::unique_ptr<mfem::QuadratureFunction> u_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_face_qf_;
+  // Diagnostic-only diffusion gradient, allocated on explicit demand.
   std::unique_ptr<mfem::QuadratureFunction> grad_u_qf_;
   std::unique_ptr<mfem::QuadratureFunction> grad_u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> invrho_qf_;

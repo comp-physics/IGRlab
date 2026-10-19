@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace igrlab
@@ -469,6 +470,42 @@ MakeVolumeQuadratureSpace(mfem::Mesh& mesh,
   return std::make_unique<mfem::QuadratureSpace>(&mesh, ir.GetOrder());
 }
 
+// Values are always produced in byVDIM layout with the same state vdim.
+// A volume QuadratureSpace stores entity e as mesh element e without a point
+// permutation.  Prove the remaining layout identity once per cache rebuild.
+bool SameStateQuadratureLayout(const mfem::QuadratureSpace& a,
+                               const mfem::QuadratureSpace& b)
+{
+  if (a.GetMesh() != b.GetMesh() || a.GetNE() != b.GetNE() ||
+      a.GetNE() != a.GetMesh()->GetNE() || a.GetSize() != b.GetSize())
+  { return false; }
+  bool checked_geometry[mfem::Geometry::NumGeom] = {};
+  const int dim = a.GetMesh()->Dimension();
+  for (int e = 0; e < a.GetNE(); ++e)
+  {
+    if (a.Offset(e) != b.Offset(e) || a.GetGeometry(e) != b.GetGeometry(e))
+    { return false; }
+    const int geom = static_cast<int>(a.GetGeometry(e));
+    if (checked_geometry[geom]) { continue; }
+    checked_geometry[geom] = true;
+    const auto& ar = a.GetIntRule(e);
+    const auto& br = b.GetIntRule(e);
+    if (ar.GetNPoints() != br.GetNPoints()) { return false; }
+    for (int q = 0; q < ar.GetNPoints(); ++q)
+    {
+      const auto& ap = ar.IntPoint(q);
+      const auto& bp = br.IntPoint(q);
+      if (std::memcmp(&ap.x, &bp.x, sizeof(ap.x)) ||
+          (dim > 1 && std::memcmp(&ap.y, &bp.y, sizeof(ap.y))) ||
+          (dim > 2 && std::memcmp(&ap.z, &bp.z, sizeof(ap.z))) ||
+          std::memcmp(&ap.weight, &bp.weight, sizeof(ap.weight)))
+      { return false; }
+    }
+  }
+  return a.Offset(a.GetNE()) == b.Offset(b.GetNE()) &&
+         a.Offset(a.GetNE()) == a.GetSize();
+}
+
 void LogStateQuadratureAudit(const char* name,
                              const mfem::QuadratureFunction& values,
                              const mfem::QuadratureSpace& space,
@@ -686,7 +723,7 @@ void IGRSolver::EnsureDeviceQuadrature_()
 
   const bool need_rebuild =
     (!mass_qs_ || !sigma_qs_ || !rhs_qs_ || !u_mass_qf_ || !u_qf_ ||
-     !u_rhs_qf_ || !grad_u_qf_ || !grad_u_rhs_qf_ || !invrho_qf_ ||
+     !u_rhs_qf_ || !grad_u_rhs_qf_ || !invrho_qf_ ||
      !ck_qf_ || !src_qf_ ||
      mesh_seq != device_mesh_sequence_ || sfes_seq != device_sfes_sequence_ ||
      vfes_seq != device_vfes_sequence_ ||
@@ -730,6 +767,10 @@ void IGRSolver::EnsureDeviceQuadrature_()
               << std::endl;
   }
 
+  // The diagnostic-only gradient belongs to the old diffusion space.  Keep
+  // lifetime-once scan state unchanged when rebuilding this local cache.
+  grad_u_qf_.reset();
+
   mass_qs_ = MakeVolumeQuadratureSpace(*mesh, mass_ir);
   sigma_qs_ = MakeVolumeQuadratureSpace(*mesh, diff_ir);
   rhs_qs_ = MakeVolumeQuadratureSpace(*mesh, rhs_ir);
@@ -746,18 +787,21 @@ void IGRSolver::EnsureDeviceQuadrature_()
     sigma_fqs_.reset();
   }
 
+  const bool share_state = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_IGR_SHARE_STATE_INTERPOLATION", true);
+  device_diff_values_share_mass_ = share_state &&
+    SameStateQuadratureLayout(*mass_qs_, *sigma_qs_);
+  device_rhs_values_share_mass_ = share_state &&
+    SameStateQuadratureLayout(*mass_qs_, *rhs_qs_);
+  device_rhs_values_share_diff_ = share_state &&
+    !device_rhs_values_share_mass_ && !device_diff_values_share_mass_ &&
+    SameStateQuadratureLayout(*sigma_qs_, *rhs_qs_);
   u_mass_qf_ =
     std::make_unique<mfem::QuadratureFunction>(mass_qs_.get(), num_eq_);
-  u_mass_qf_->SetVDim(num_eq_);
-  u_qf_ = std::make_unique<mfem::QuadratureFunction>(sigma_qs_.get(),
-                                                     num_eq_);
-  u_qf_->SetVDim(num_eq_);
+  u_qf_ =
+    std::make_unique<mfem::QuadratureFunction>(sigma_qs_.get(), num_eq_);
   u_rhs_qf_ =
     std::make_unique<mfem::QuadratureFunction>(rhs_qs_.get(), num_eq_);
-  u_rhs_qf_->SetVDim(num_eq_);
-  grad_u_qf_ = std::make_unique<mfem::QuadratureFunction>(sigma_qs_.get(),
-                                                          num_eq_ * dim_);
-  grad_u_qf_->SetVDim(num_eq_ * dim_);
   grad_u_rhs_qf_ =
     std::make_unique<mfem::QuadratureFunction>(rhs_qs_.get(),
                                                num_eq_ * dim_);
@@ -873,6 +917,16 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     EnsureDeviceElementAlpha_();
   }
 
+  const bool ingestion_audit =
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
+  const bool need_diff_gradient = ingestion_audit ||
+    (diagnostic_nan_scan_ && !device_coeff_diagnostics_logged_);
+  if (need_diff_gradient && !grad_u_qf_)
+  {
+    grad_u_qf_ = std::make_unique<mfem::QuadratureFunction>(
+      sigma_qs_.get(), num_eq_ * dim_);
+  }
+
   const bool debug_qf =
     ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
   if (debug_qf && mfem::Mpi::Root())
@@ -914,25 +968,39 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 
   auto project_state =
     [&](mfem::QuadratureSpace& qs,
-        mfem::QuadratureFunction& values,
+        mfem::QuadratureFunction* values,
         mfem::QuadratureFunction* derivatives)
   {
+    if (!values && !derivatives) { return; }
     const mfem::QuadratureInterpolator* qi =
       ufes.GetQuadratureInterpolator(qs);
     MFEM_VERIFY(qi,
                 "IGR device coefficients require quadrature interpolator.");
     qi->SetOutputLayout(mfem::QVectorLayout::byVDIM);
     qi->DisableTensorProducts(!use_tensor);
-    qi->Values(device_qinterp_evec_, values);
+    if (values) { qi->Values(device_qinterp_evec_, *values); }
     if (derivatives)
     {
       qi->PhysDerivatives(device_qinterp_evec_, *derivatives);
     }
   };
 
-  project_state(*mass_qs_, *u_mass_qf_, nullptr);
-  project_state(*sigma_qs_, *u_qf_, grad_u_qf_.get());
-  project_state(*rhs_qs_, *u_rhs_qf_, grad_u_rhs_qf_.get());
+  project_state(*mass_qs_, u_mass_qf_.get(), nullptr);
+  project_state(*sigma_qs_, device_diff_values_share_mass_ ? nullptr : u_qf_.get(),
+                need_diff_gradient ? grad_u_qf_.get() : nullptr);
+  project_state(*rhs_qs_,
+                (device_rhs_values_share_mass_ || device_rhs_values_share_diff_)
+                  ? nullptr : u_rhs_qf_.get(),
+                grad_u_rhs_qf_.get());
+
+  // Read the owner directly; unused wrappers never receive Values or Read
+  // and therefore need no device buffer.  These references are chosen anew for
+  // this update, with no memory aliases or persistent current-state reuse.
+  const mfem::QuadratureFunction& mass_values = *u_mass_qf_;
+  const mfem::QuadratureFunction& diff_values = device_diff_values_share_mass_
+    ? mass_values : *u_qf_;
+  const mfem::QuadratureFunction& rhs_values = device_rhs_values_share_mass_
+    ? mass_values : (device_rhs_values_share_diff_ ? diff_values : *u_rhs_qf_);
 
   const int mass_ne = mass_qs_->GetNE();
   const int mass_nq = mass_qs_->GetIntRule(0).GetNPoints();
@@ -948,9 +1016,9 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
                 "element counts.");
   }
 
-  const mfem::real_t* u_mass_data = u_mass_qf_->Read();
-  const mfem::real_t* u_diff_data = u_qf_->Read();
-  const mfem::real_t* u_rhs_data = u_rhs_qf_->Read();
+  const mfem::real_t* u_mass_data = mass_values.Read();
+  const mfem::real_t* u_diff_data = diff_values.Read();
+  const mfem::real_t* u_rhs_data = rhs_values.Read();
   const mfem::real_t* grad_rhs_data = grad_u_rhs_qf_->Read();
   mfem::real_t* invrho_data = invrho_qf_->Write();
   mfem::real_t* ck_data = ck_qf_->Write();
@@ -1084,12 +1152,12 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
       NodalSourceMirrorWalls() ? &nodal_source_slip_marker_ : nullptr);
   }
 
-  if (::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false))
+  if (ingestion_audit)
   {
     const int solve_call = linear_solve_calls_ + 1;
     const MPI_Comm comm = vfes_.GetComm();
     LogStateQuadratureAudit("mass",
-                            *u_mass_qf_,
+                            mass_values,
                             *mass_qs_,
                             num_eq,
                             dim,
@@ -1097,7 +1165,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
                             solve_call,
                             comm);
     LogStateQuadratureAudit("diffusion",
-                            *u_qf_,
+                            diff_values,
                             *sigma_qs_,
                             num_eq,
                             dim,
@@ -1105,7 +1173,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
                             solve_call,
                             comm);
     LogStateQuadratureAudit("rhs",
-                            *u_rhs_qf_,
+                            rhs_values,
                             *rhs_qs_,
                             num_eq,
                             dim,
@@ -1128,9 +1196,9 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   if (diagnostic_nan_scan_ && !device_coeff_diagnostics_logged_)
   {
     const MPI_Comm comm = vfes_.GetComm();
-    int finite[8] = {VectorIsFinite(*u_mass_qf_) ? 1 : 0,
-                     VectorIsFinite(*u_qf_) ? 1 : 0,
-                     VectorIsFinite(*u_rhs_qf_) ? 1 : 0,
+    int finite[8] = {VectorIsFinite(mass_values) ? 1 : 0,
+                     VectorIsFinite(diff_values) ? 1 : 0,
+                     VectorIsFinite(rhs_values) ? 1 : 0,
                      VectorIsFinite(*grad_u_qf_) ? 1 : 0,
                      VectorIsFinite(*grad_u_rhs_qf_) ? 1 : 0,
                      VectorIsFinite(*invrho_qf_) ? 1 : 0,
