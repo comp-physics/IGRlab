@@ -123,11 +123,12 @@ std::size_t FaceScratchDeviceResidentBytes(
     &work.shape, &shape.values, &factor.reference_dshape, &factor.normal_geometry,
     &factor.tensor_endpoint, &factor.tensor_tangent, &work.weighted_normal_dshape,
     &work.penalty, &work.normal_dshape_base, &work.penalty_metric,
-    &work.side_coefficient, &work.face_contribution};
+    &work.side_coefficient, &work.face_contribution, &work.tensor_lift};
   for (const auto* vector : vectors) { bytes += DeviceResidentBytes(inventory, *vector); }
   const Array<int>* arrays[] = {
     &shape.face_slots, &factor.face_slots, &factor.tensor_axes,
-    &factor.tensor_face_slots, &factor.tensor_lex_to_native, &work.face_elements,
+    &factor.tensor_face_slots, &factor.tensor_lex_to_native,
+    &factor.tensor_native_to_lex, &work.face_elements,
     &work.element_vdof_map, &work.element_face_offsets, &work.element_face_ids,
     &work.element_face_sides};
   for (const auto* array : arrays) { bytes += DeviceResidentBytes(inventory, *array); }
@@ -244,6 +245,107 @@ Vector OriginalRecordAndGather(const InteriorFaceDGDiffusionApplyInfo& info,
   gather.y = result.ReadWrite();
   forall(info.ne * info.dof, gather);
   return result;
+}
+
+// Test-only reconstruction of the old 72-row packet from the new 24 lifts.
+// Index with the forward map independently of the production gather's inverse.
+// Use the original device expression; native bitwise checks below verify the
+// compiler's multiply/add contraction rather than assuming it is identical.
+struct ExpandCompactFaceLifts2D
+{
+  int nf = 0, slot_count = 0;
+  const real_t* endpoint = nullptr;
+  const int* axes = nullptr;
+  const int* face_slots = nullptr;
+  const int* lex_to_native = nullptr;
+  const real_t* lift = nullptr;
+  real_t* contribution = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int face = row / 72, side = (row % 72) / 36, lex = row % 36;
+    const int slot = face_slots[face];
+    const auto E = Reshape(endpoint, 2, 6, 2, slot_count);
+    const auto A = Reshape(axes, 2, slot_count);
+    const auto L = Reshape(lift, 2, 6, 2, nf);
+    auto C = Reshape(contribution, 36, 2, nf);
+    const int normal = A(side, slot) == 0 ? lex % 6 : lex / 6;
+    const int tangent = A(side, slot) == 0 ? lex / 6 : lex % 6;
+    C(lex_to_native[lex], side, face) =
+      E(0, normal, side, slot) * L(0, tangent, side, face) +
+      E(1, normal, side, slot) * L(1, tangent, side, face);
+  }
+};
+
+Vector RecordedFaceContributions(const InteriorFaceDGDiffusionApplyInfo& info,
+                                 const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  if (work.face_contribution.Size()) { return Vector(work.face_contribution); }
+  MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) &&
+                work.tensor_lift.Size() == 24 * info.nf,
+              "Missing full records must have an admitted, complete compact packet.");
+  const auto& factors = work.normal_factorization;
+  Vector result(72 * info.nf);
+  result.UseDevice(true);
+  result = std::numeric_limits<real_t>::quiet_NaN();
+  forall(result.Size(), ExpandCompactFaceLifts2D{
+    info.nf, factors.tensor_slot_count, factors.tensor_endpoint.Read(),
+    factors.tensor_axes.Read(), factors.tensor_face_slots.Read(),
+    factors.tensor_lex_to_native.Read(), work.tensor_lift.Read(), result.Write()});
+  return result;
+}
+
+::igrlab::dg_face::InteriorFaceDGDiffusionTensorRecord2DWarp TensorRecordForTest(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work, const Vector& x,
+  real_t ip_sigma, Vector& contribution)
+{
+  InteriorFaceDGDiffusionRecord2D record;
+  record.dof = info.dof; record.vdim = info.vdim; record.nq = info.nq;
+  record.nf = info.nf; record.ne = info.ne; record.ip_sigma = ip_sigma;
+  record.penalty = work.penalty.Read();
+  record.face_elements = work.face_elements.Read();
+  record.element_vdof_map = work.element_vdof_map.Read();
+  record.x = x.Read(); record.contribution = contribution.Write();
+  const auto& factors = work.normal_factorization;
+  return {record, factors.tensor_endpoint.Read(), factors.tensor_tangent.Read(),
+    factors.tensor_axes.Read(), factors.tensor_face_slots.Read(),
+    factors.tensor_lex_to_native.Read(), factors.normal_geometry.Read(),
+    work.side_coefficient.Read(), factors.tensor_slot_count};
+}
+
+InteriorFaceDGDiffusionGather2D GatherForTest(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const Vector& contribution, Vector& y, bool add_to_base = false)
+{
+  InteriorFaceDGDiffusionGather2D gather;
+  gather.dof = info.dof; gather.vdim = info.vdim;
+  gather.ne = info.ne; gather.nf = info.nf;
+  gather.element_vdof_map = work.element_vdof_map.Read();
+  gather.element_face_offsets = work.element_face_offsets.Read();
+  gather.element_face_ids = work.element_face_ids.Read();
+  gather.element_face_sides = work.element_face_sides.Read();
+  gather.contribution = contribution.Read(); gather.y = y.ReadWrite();
+  gather.add_to_base = add_to_base;
+  return gather;
+}
+
+::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftGather2D LiftGatherForTest(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const Vector& lift, Vector& y, bool add_to_base = false)
+{
+  ::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftGather2D gather;
+  static_cast<InteriorFaceDGDiffusionGather2D&>(gather) =
+    GatherForTest(info, work, lift, y, add_to_base);
+  const auto& factors = work.normal_factorization;
+  gather.endpoint = factors.tensor_endpoint.Read();
+  gather.axes = factors.tensor_axes.Read();
+  gather.face_slots = factors.tensor_face_slots.Read();
+  gather.native_to_lex = factors.tensor_native_to_lex.Read();
+  gather.slot_count = factors.tensor_slot_count;
+  return gather;
 }
 
 // Factorization changes the order of FP64 products, so compare norm-scaled
@@ -836,6 +938,18 @@ void CheckDictionaryGeometryRebuild()
   };
   auto parity = [&](const InteriorFaceDGDiffusionApplyInfo& info, bool factorized)
   {
+    Vector old_tensor_action, old_tensor_rows;
+    if (work.compact_lift)
+    {
+      // Keep the original tensor record/gather as an independent arithmetic
+      // oracle for compact lifts with dense qdata and renumbered 1D slots.
+      work.compact_lift = false;
+      old_tensor_action.SetSize(x.Size()); old_tensor_action.UseDevice(true);
+      old_tensor_action = 0.03125;
+      LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, old_tensor_action);
+      old_tensor_rows = work.face_contribution;
+      work.compact_lift = true;
+    }
     Vector actual(x.Size());
     actual.UseDevice(true);
     actual = 0.03125;
@@ -850,11 +964,24 @@ void CheckDictionaryGeometryRebuild()
 #else
     (void)factorized;
 #endif
+    const Vector records = RecordedFaceContributions(info, work);
+    if (work.compact_lift)
+    {
+      const bool selected = factorized &&
+        ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA();
+      MFEM_VERIFY(!work.compact_qdata &&
+                    ::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == selected &&
+                    (work.face_contribution.Size() == 0) == selected &&
+                    (work.tensor_lift.Size() == 24 * info.nf) == selected,
+                  "Renumbered compact lift must exercise actual dispatch independently of compact qdata.");
+      MFEM_VERIFY(SameBits(actual, old_tensor_action) && SameBits(records, old_tensor_rows),
+                  "Renumbered compact lifts with dense qdata changed the old tensor record/gather bits.");
+    }
     Vector original_contribution;
     const Vector original = OriginalRecordAndGather(info, work, x, -1.0,
                                                    original_contribution);
     CheckFactorizationError(actual, original, "Rebuilt factorized face action");
-    CheckFactorizationError(work.face_contribution, original_contribution,
+    CheckFactorizationError(records, original_contribution,
                             "Rebuilt factorized face records");
     return actual;
   };
@@ -917,11 +1044,13 @@ void CheckDictionaryGeometryRebuild()
   for (int face = 0; face < info.nf; ++face)
   { tensor_face_slots[face] = (tensor_face_slots[face] + 1) % tensor_slots; }
   CheckTensorFacePack(info, work, fes, mesh, initial_fqs);
+  work.compact_lift = true;
   refresh(info);
   const Vector old_action = parity(info, true);
   side_q *= 1.19;
   refresh(info);
   const Vector new_action = parity(info, true);
+  work.compact_lift = false;
   const auto tensor_revision = factors.tensor_geometry_revision;
   factors.tensor_geometry_revision = 0;
   MFEM_VERIFY(factors.Matches(info) && !factors.TensorMatches(info),
@@ -1287,6 +1416,7 @@ void CheckCompactFaceQdata()
   FillEvolvingFaceQdata(mesh, unsupported_fqs, coefficient, side_q);
   InteriorFaceDGDiffusionApplyScratch unsupported, unsupported_dense;
   unsupported.compact_qdata = true;
+  unsupported.compact_lift = true;
   const auto unsupported_info = BuildInteriorFaceDGDiffusionApplyData2D(
     unsupported_fes, unsupported_fqs, side_q, 2.75, unsupported.shape,
     unsupported.weighted_normal_dshape, unsupported.penalty, unsupported.face_elements,
@@ -1353,6 +1483,337 @@ private:
   bool had_value_ = false;
 };
 
+Vector AssembledFaceAction(ParFiniteElementSpace& fes, ParMesh& mesh,
+                           const FaceQuadratureSpace& fqs,
+                           mfem::Coefficient& coefficient, const Vector& x,
+                           real_t ip_sigma)
+{
+  DGDiffusionIntegrator integrator(coefficient, ip_sigma, 2.75);
+  integrator.SetIntegrationRule(fqs.GetIntRule(0));
+  Vector result(x.Size());
+  result = 0.03125;
+  real_t* y = result.HostReadWrite();
+  const real_t* input = x.HostRead();
+  DenseMatrix matrix;
+  Vector local_x(72), local_y(72);
+  Array<int> left, right;
+  for (int face = 0; face < fqs.GetNE(); ++face)
+  {
+    auto* tr = mesh.GetFaceElementTransformations(fqs.GetMeshFaceIndex(face));
+    integrator.AssembleFaceMatrix(*fes.GetFE(tr->Elem1No),
+                                  *fes.GetFE(tr->Elem2No), *tr, matrix);
+    fes.GetElementDofs(tr->Elem1No, left);
+    fes.GetElementDofs(tr->Elem2No, right);
+    for (int d = 0; d < 36; ++d)
+    {
+      local_x[d] = input[FiniteElementSpace::DecodeDof(left[d])];
+      local_x[36 + d] = input[FiniteElementSpace::DecodeDof(right[d])];
+    }
+    matrix.Mult(local_x, local_y);
+    for (int d = 0; d < 36; ++d)
+    {
+      y[FiniteElementSpace::DecodeDof(left[d])] += local_y[d];
+      y[FiniteElementSpace::DecodeDof(right[d])] += local_y[36 + d];
+    }
+  }
+  return result;
+}
+
+void CheckCompactFaceLiftGatherRounding()
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  if (!::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA()) { return; }
+  constexpr int ne = 8, nf = 14, n = 36 * ne, tail = 19;
+  InteriorFaceDGDiffusionApplyInfo info;
+  info.dof = 36; info.vdim = 1; info.ne = ne; info.nf = nf; info.nq = 6;
+  InteriorFaceDGDiffusionApplyScratch work;
+  auto& factors = work.normal_factorization;
+  factors.tensor_slot_count = 2;
+  factors.tensor_endpoint.SetSize(48); factors.tensor_endpoint = 1.0;
+  factors.tensor_axes.SetSize(4); factors.tensor_face_slots.SetSize(nf);
+  factors.tensor_lex_to_native.SetSize(36); factors.tensor_native_to_lex.SetSize(36);
+  for (int side = 0; side < 2; ++side)
+    for (int slot = 0; slot < 2; ++slot)
+    { factors.tensor_axes[side + 2 * slot] = (side + slot) % 2; }
+  for (int face = 0; face < nf; ++face) { factors.tensor_face_slots[face] = face % 2; }
+  for (int lex = 0; lex < 36; ++lex)
+  {
+    const int native = (7 * lex + 5) % 36;
+    factors.tensor_lex_to_native[lex] = native;
+    factors.tensor_native_to_lex[native] = lex;
+  }
+  work.element_vdof_map.SetSize(n); work.element_face_offsets.SetSize(ne + 1);
+  work.element_face_ids.SetSize(nf); work.element_face_sides.SetSize(nf);
+  for (int row = 0; row < n; ++row) { work.element_vdof_map[row] = (5 * row + 3) % n; }
+  for (int e = 0; e < ne; ++e) { work.element_face_offsets[e] = 2 * e; }
+  work.element_face_offsets[ne] = nf; // One element has no incident faces.
+  for (int incidence = 0; incidence < nf; ++incidence)
+  { work.element_face_ids[incidence] = incidence; work.element_face_sides[incidence] = incidence % 2; }
+  const int* global_map = work.element_vdof_map.HostRead();
+  real_t nan1, nan2;
+  const std::uint64_t payload1 = UINT64_C(0x7ff8000000000042);
+  const std::uint64_t payload2 = UINT64_C(0x7ff8000000000017);
+  std::memcpy(&nan1, &payload1, sizeof(real_t));
+  std::memcpy(&nan2, &payload2, sizeof(real_t));
+  const real_t tiny = std::numeric_limits<real_t>::denorm_min();
+  const real_t inf = std::numeric_limits<real_t>::infinity();
+  const real_t bases[ne] = {-0.0, tiny, 1.0, 7.0, 3.0, nan1, nan1, -0.0};
+  const real_t terms[ne - 1][2] = {
+    {-0.0, -0.0}, {-tiny, 0.0}, {1.0e16, -1.0e16},
+    {nan2, 0.0}, {inf, -inf}, {2.0, 3.0}, {nan2, 0.0}};
+  Vector lifts(24 * nf), full(72 * nf), expected(n), scratch(n), padded(n + tail);
+  for (Vector* value : {&lifts, &full, &expected, &scratch, &padded}) { value->UseDevice(true); }
+  for (bool recover : {false, true})
+  {
+    auto L = Reshape(lifts.HostWrite(), 2, 6, 2, nf);
+    for (int face = 0; face < nf; ++face) for (int side = 0; side < 2; ++side)
+      for (int t = 0; t < 6; ++t)
+      { L(0, t, side, face) = recover ? 0.25 : terms[face / 2][face % 2]; L(1, t, side, face) = -0.0; }
+    forall(full.Size(), ExpandCompactFaceLifts2D{
+      nf, 2, factors.tensor_endpoint.Read(), factors.tensor_axes.Read(),
+      factors.tensor_face_slots.Read(), factors.tensor_lex_to_native.Read(),
+      lifts.Read(), full.Write()});
+    for (bool add_to_base : {false, true})
+    {
+      padded = 12345.0;
+      real_t* actual = padded.HostReadWrite();
+      real_t* original = expected.HostWrite();
+      for (int e = 0; e < ne; ++e) for (int d = 0; d < 36; ++d)
+      {
+        const int global = global_map[d + 36 * e];
+        original[global] = actual[global] = recover ? 0.125 : bases[e];
+      }
+      if (add_to_base)
+      {
+        scratch = 0.0;
+        forall(n, GatherForTest(info, work, full, scratch));
+        expected += scratch;
+      }
+      else { forall(n, GatherForTest(info, work, full, expected)); }
+      forall(n, LiftGatherForTest(info, work, lifts, padded, add_to_base));
+      Vector active;
+      active.MakeRef(padded, 0, n);
+      MFEM_VERIFY(SameBits(active, expected),
+                  "Compact gather changed rounded face/incidence/base order or nonfinite propagation.");
+      const real_t* values = padded.HostRead();
+      for (int i = n; i < n + tail; ++i)
+      { MFEM_VERIFY(values[i] == 12345.0, "Compact gather wrote into its padded output tail."); }
+      MFEM_VERIFY(values[global_map[36 * 2]] == (recover ? 0.625 : 1.0),
+                  "Cancellation must complete before the base enters the addition.");
+      if (recover) { RequireFinite(active); }
+    }
+  }
+  std::cout << "ExactFaceCompactLiftRounding parity=passed native_permutation=true"
+            << " global_permutation=true signed_zero=true nonfinite_recovery=true padded_tail=" << tail << '\n';
+#endif
+}
+
+void CheckCompactFaceLifts()
+{
+  const bool native_cuda = ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA();
+  int applications = 0, fallbacks = 0;
+  for (int geometry : {0, 3, 4})
+  {
+    // 8x7 has 97 faces: the last four-warp record batch contains one real face.
+    Mesh serial = geometry == 0 ? Mesh::MakeCartesian2D(8, 7, Element::QUADRILATERAL,
+      true, 1.0, 0.7) : MakeMesh(geometry);
+    Array<int> order(serial.GetNE());
+    for (int e = 0; e < order.Size(); ++e) { order[e] = (5 * e + 3) % order.Size(); }
+    serial.ReorderElements(order, false);
+    ParMesh mesh(MPI_COMM_SELF, serial);
+    DG_FECollection fec(5, 2, geometry == 4 ? mfem::BasisType::GaussLobatto
+                                           : mfem::BasisType::GaussLegendre);
+    ParFiniteElementSpace fes(&mesh, &fec);
+    const auto& rule = IntRules.Get(Geometry::SEGMENT, 11);
+    FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
+    EvolvingFaceCoefficient coefficient;
+    Vector side_q, x(fes.GetVSize());
+    x.UseDevice(true);
+    real_t* input = x.HostWrite();
+    for (int i = 0; i < x.Size(); ++i)
+    { input[i] = 0.01 * std::sin(0.071 * (i + 1)) + 0.001 * (i % 11); }
+    FillEvolvingFaceQdata(mesh, fqs, coefficient, side_q);
+    InteriorFaceDGDiffusionApplyScratch work, dense;
+    work.compact_qdata = true;
+    auto build = [&](InteriorFaceDGDiffusionApplyScratch& target, bool factorize,
+                      DGDiffusionFaceScaling scaling = DGDiffusionFaceScaling::Arithmetic)
+    {
+      return BuildInteriorFaceDGDiffusionApplyData2D(
+        fes, fqs, side_q, 2.75, target.shape, target.weighted_normal_dshape,
+        target.penalty, target.face_elements, target.element_vdof_map,
+        scaling, &target.normal_dshape_base,
+        &target.penalty_metric, factorize ? &target.shape_dictionary : nullptr,
+        factorize ? &target.normal_factorization : nullptr);
+    };
+    const auto info = build(work, true);
+    auto dense_info = build(dense, false);
+    auto& factors = work.normal_factorization;
+    MFEM_VERIFY(factors.TensorMatches(info) && factors.tensor_native_to_lex.Size() == 36,
+                "Focused compact-lift fixtures must have independently admitted p5/Q6 packs.");
+    CheckTensorFacePack(info, work, fes, mesh, fqs);
+    const int* initial_forward = factors.tensor_lex_to_native.HostRead();
+    const int* initial_inverse = factors.tensor_native_to_lex.HostRead();
+    for (int lex = 0; lex < 36; ++lex)
+    { MFEM_VERIFY(initial_inverse[initial_forward[lex]] == lex,
+                  "Builder inverse must invert every native tensor index."); }
+    const Vector endpoints(factors.tensor_endpoint), tangents(factors.tensor_tangent);
+    Vector previous;
+    for (int stage = 0; stage < 2; ++stage)
+    {
+      coefficient.stage = stage;
+      FillEvolvingFaceQdata(mesh, fqs, coefficient, side_q);
+      LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+        info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+      dense_info = build(dense, false);
+      MFEM_VERIFY(SameBits(endpoints, factors.tensor_endpoint) && SameBits(tangents, factors.tensor_tangent),
+                  "Coefficient refresh must preserve compact-lift geometry.");
+      for (real_t ip_sigma : {-1.0, 1.0})
+      {
+        Vector original(x.Size()), actual(x.Size()), diagonal(x.Size()), old_diagonal(x.Size());
+        original.UseDevice(true); actual.UseDevice(true);
+        original = 0.03125; actual = 0.03125;
+        work.compact_lift = false;
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, original);
+        Vector old_rows(work.face_contribution);
+        old_diagonal = 0.125;
+        ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(info, work, ip_sigma, old_diagonal);
+        work.compact_lift = true;
+        MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == native_cuda,
+                    "Compact-lift selector must agree with actual backend admission.");
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, actual);
+        const Vector rows = RecordedFaceContributions(info, work);
+        MFEM_VERIFY(SameBits(actual, original) && SameBits(rows, old_rows),
+                    "Compact lifts must preserve old tensor record and gather bits.");
+        if (native_cuda)
+        {
+          MFEM_VERIFY(work.face_contribution.Size() == 0 && work.tensor_lift.Size() == 24 * info.nf &&
+                        DeviceResidentBytes(DeviceAllocationInventory(), work.tensor_lift) >=
+                          std::size_t(24 * info.nf) * sizeof(real_t),
+                      "Selected compact apply must allocate 24 lifts and release the old full-row packet.");
+          ++applications;
+        }
+        Vector dense_rows;
+        const Vector expected = OriginalRecordAndGather(dense_info, dense, x, ip_sigma, dense_rows);
+        CheckFactorizationError(actual, expected, "Compact lift independent dense action");
+        CheckFactorizationError(rows, dense_rows, "Compact lift independent dense full records");
+        CheckFactorizationError(actual, AssembledFaceAction(fes, mesh, fqs, coefficient, x, ip_sigma),
+                                "Compact lift independently assembled MFEM action");
+        diagonal = 0.125;
+        ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(info, work, ip_sigma, diagonal);
+        MFEM_VERIFY(SameBits(diagonal, old_diagonal), "Compact lift selection changed current diagonals.");
+        CheckAssembledFaceDiagonal(fes, mesh, fqs, coefficient, ip_sigma, diagonal);
+        if (ip_sigma == -1.0)
+        {
+          if (stage) { MFEM_VERIFY(!SameBits(previous, actual), "Compact action must consume refreshed coefficients."); }
+          previous = actual;
+        }
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+        if (native_cuda && geometry == 0 && !stage && ip_sigma == -1.0)
+        {
+          constexpr int tail = 19;
+          Vector padded(24 * info.nf + tail);
+          padded.UseDevice(true); padded = 12345.0;
+          const auto record = ::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp{
+            TensorRecordForTest(info, work, x, ip_sigma, padded)};
+          mfem::forall_2D_batch(info.nf, 32, 1, 4, record);
+          const real_t* values = padded.HostRead();
+          for (int i = 24 * info.nf; i < padded.Size(); ++i)
+          { MFEM_VERIFY(values[i] == 12345.0, "Padded compact record batch wrote beyond real faces."); }
+          Vector active;
+          active.MakeRef(padded, 0, 24 * info.nf);
+          MFEM_VERIFY(SameBits(active, work.tensor_lift), "Raw compact record differs from selected production record.");
+        }
+#endif
+      }
+    }
+    Vector dense_rows;
+    const Vector dense_expected = OriginalRecordAndGather(dense_info, dense, x, -1.0, dense_rows);
+    auto fallback = [&]()
+    {
+      MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work),
+                  "Invalid compact metadata must decline before any compact gather.");
+      Vector actual(x.Size()); actual.UseDevice(true); actual = 0.03125;
+      LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, actual);
+      CheckFactorizationError(actual, dense_expected, "Compact-lift invalid-metadata fallback");
+      MFEM_VERIFY(work.tensor_lift.Size() == 0 && work.face_contribution.Size() == 72 * info.nf,
+                  "Fallback must release compact storage and publish complete original rows.");
+      ++fallbacks;
+    };
+    const Array<int> inverse(factors.tensor_native_to_lex);
+    factors.tensor_native_to_lex.SetSize(0); fallback(); factors.tensor_native_to_lex = inverse;
+    const auto inverse_revision = factors.tensor_inverse_geometry_revision;
+    factors.tensor_inverse_geometry_revision = 0; fallback();
+    factors.tensor_inverse_geometry_revision = inverse_revision;
+    const auto tensor_revision = factors.tensor_geometry_revision;
+    factors.tensor_geometry_revision = 0; fallback(); factors.tensor_geometry_revision = tensor_revision;
+    const auto coefficient_revision = factors.coefficient_revision;
+    factors.coefficient_revision = 0; fallback(); factors.coefficient_revision = coefficient_revision;
+    Vector recovered(x.Size()); recovered.UseDevice(true); recovered = 0.03125;
+    LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, recovered);
+    CheckFactorizationError(recovered, dense_expected, "Compact lift recovers after invalid metadata");
+    MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == native_cuda,
+                "Restored current inverse/geometry/coefficient metadata must recover compact admission.");
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info, work, side_q, 2.75, DGDiffusionFaceScaling::HarmonicWeighted);
+    dense_info = build(dense, false, DGDiffusionFaceScaling::HarmonicWeighted);
+    Vector harmonic(x.Size()), harmonic_rows;
+    harmonic.UseDevice(true); harmonic = 0.03125;
+    MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work),
+                "Harmonic weighting must decline compact lifts with otherwise valid tensor/inverse metadata.");
+    LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, harmonic);
+    const Vector harmonic_expected = OriginalRecordAndGather(dense_info, dense, x, -1.0, harmonic_rows);
+    CheckFactorizationError(harmonic, harmonic_expected, "Compact-lift harmonic dense fallback");
+    CheckFactorizationError(work.face_contribution, harmonic_rows, "Compact-lift harmonic full-row fallback");
+    MFEM_VERIFY(work.tensor_lift.Size() == 0, "Harmonic fallback must release compact packets.");
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+    dense_info = build(dense, false);
+    if (geometry == 0)
+    {
+      // A synthetic, explicitly consistent native packet permutation exercises
+      // the inverse independently of MFEM's normally identity L2 native map.
+      const Array<int> old_map(work.element_vdof_map);
+      Vector permuted(x.Size()), expected(x.Size());
+      real_t* input_values = permuted.HostWrite();
+      real_t* output_values = expected.HostWrite();
+      const real_t* unpermuted_input = x.HostRead();
+      const real_t* unpermuted_expected = dense_expected.HostRead();
+      for (int i = 0; i < x.Size(); ++i)
+      { input_values[(5 * i + 3) % x.Size()] = unpermuted_input[i];
+        output_values[(5 * i + 3) % x.Size()] = unpermuted_expected[i]; }
+      int* forward = factors.tensor_lex_to_native.HostWrite();
+      int* inverse_values = factors.tensor_native_to_lex.HostWrite();
+      int* permuted_map = work.element_vdof_map.HostWrite();
+      const int* original_map = old_map.HostRead();
+      for (int lex = 0; lex < 36; ++lex)
+      {
+        const int native = (7 * lex + 5) % 36;
+        forward[lex] = native; inverse_values[native] = lex;
+        for (int e = 0; e < info.ne; ++e)
+        { permuted_map[native + 36 * e] = (5 * original_map[lex + 36 * e] + 3) % x.Size(); }
+      }
+      // CPU production deliberately uses dense storage, whose native columns
+      // have not been relabeled. The synthetic tensor packet is CUDA-only.
+      if (native_cuda)
+      {
+        Vector original(x.Size()), actual(x.Size());
+        original.UseDevice(true); actual.UseDevice(true); permuted.UseDevice(true);
+        original = 0.03125; actual = 0.03125;
+        work.compact_lift = false;
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, permuted, -1.0, original);
+        Vector old_rows(work.face_contribution);
+        work.compact_lift = true;
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, permuted, -1.0, actual);
+        MFEM_VERIFY(SameBits(original, actual) && SameBits(old_rows, RecordedFaceContributions(info, work)),
+                    "Native/global permutations changed compact tensor record/gather bits.");
+        CheckFactorizationError(actual, expected, "Permuted compact action versus independent physical oracle");
+      }
+    }
+  }
+  std::cout << "ExactFaceCompactLift parity=passed geometry_cases=3 native_cuda=" << native_cuda
+            << " compact_applications=" << applications << " invalid_metadata_fallbacks=" << fallbacks << '\n';
+}
+
 void CheckProductionFactorizedDispatch()
 {
   Mesh serial = Mesh::MakeCartesian2D(8, 8, Element::QUADRILATERAL,
@@ -1369,17 +1830,19 @@ void CheckProductionFactorizedDispatch()
   for (int d = 0; d < input.Size(); ++d)
   { x[d] = 0.01 * std::sin(0.13 * (d + 1)); }
   Vector dense_actions[2], dense_diagonals[2];
-  for (const int variant : {0, 1, 2})
+  for (const int variant : {0, 1, 2, 3})
   {
     // This switch is sampled when the production face operator is built.
     ScopedEnvironment selection("DG_IGR_IGR_FACTORIZED_FACE_NORMALS",
-                                variant == 1 ? "true" : "false");
+                                variant == 1 || variant == 3 ? "true" : "false");
     ScopedEnvironment canonical_selection("IGRLAB_IGR_FACTORIZED_FACE_NORMALS",
-                                          variant == 1 ? "true" : "false");
+                                          variant == 1 || variant == 3 ? "true" : "false");
     ScopedEnvironment qdata_selection("DG_IGR_IGR_COMPACT_FACE_QDATA",
-                                      variant == 2 ? "true" : "false");
+                                      variant >= 2 ? "true" : "false");
     ScopedEnvironment canonical_qdata_selection("IGRLAB_IGR_COMPACT_FACE_QDATA",
-                                                variant == 2 ? "true" : "false");
+                                                variant >= 2 ? "true" : "false");
+    ScopedEnvironment lift_selection("DG_IGR_IGR_COMPACT_FACE_LIFT", variant == 3 ? "true" : "false");
+    ScopedEnvironment canonical_lift_selection("IGRLAB_IGR_COMPACT_FACE_LIFT", variant == 3 ? "true" : "false");
     ::igrlab::IGRSolver solver(scalar_fes, state_fes, 2, 4, 0.07);
     solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
     solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
@@ -1813,7 +2276,144 @@ void CheckProductionIdentityCopies()
 }
 // Opt-in fixed workload: preserve the record-only comparisons, then measure
 // current dense-refresh/tensor apply against compact refresh/tensor apply.
-void BenchmarkFaceRecords512(const std::string& mesh_path)
+void BenchmarkCompactFaceLifts512(const InteriorFaceDGDiffusionApplyInfo& info,
+                                  InteriorFaceDGDiffusionApplyScratch& work,
+                                  const Vector& x, const std::string& mesh_path,
+                                  int warmups, int repeats,
+                                  const std::string& profile_variant = "")
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  MFEM_VERIFY(::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA() &&
+                ::igrlab::dg_face::HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work),
+              "Compact-lift benchmark/profile requires current native CUDA tensor data.");
+  ::igrlab::dg_face::EnsureInteriorFaceElementIncidence2D(info, work);
+  Vector output(x.Size()), full_rows_reference, output_reference;
+  output.UseDevice(true);
+  cudaEvent_t start{}, stop{};
+  if (profile_variant.empty())
+  { MFEM_GPU_CHECK(cudaEventCreate(&start)); MFEM_GPU_CHECK(cudaEventCreate(&stop)); }
+  double baseline_combined_ms = 0.0;
+  for (bool compact : {false, true})
+  {
+    const char* variant = compact ? "compact_lift" : "full_rows";
+    if (!profile_variant.empty() && profile_variant != variant) { continue; }
+    work.compact_lift = compact;
+    MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == compact,
+                "Benchmark/profile selector differs from actual compact-lift admission.");
+    Vector& packet = compact ? work.tensor_lift : work.face_contribution;
+    (compact ? work.face_contribution : work.tensor_lift).Destroy();
+    packet.SetSize((compact ? 24 : 72) * info.nf);
+    packet.UseDevice(true);
+    output = 0.03125;
+    auto run = [&](auto record, auto gather)
+    {
+      auto record_only = [&]() { mfem::forall_2D_batch(info.nf, 32, 1, 4, record); };
+      auto gather_only = [&]() { forall(info.ne * info.dof, gather); };
+      auto pair = [&]() { record_only(); gather_only(); };
+      if (!profile_variant.empty())
+      {
+        // One actual pair, no warmups, timing events or oracle downloads.
+        pair();
+        MFEM_GPU_CHECK(cudaGetLastError());
+        MFEM_GPU_CHECK(cudaDeviceSynchronize());
+        std::cout << "ExactFaceCompactLiftProfile512 variant=" << variant
+                  << " cells=" << info.ne << " scalar_dofs=" << x.Size()
+                  << " interior_faces=" << info.nf << " dof=" << info.dof << " nq=" << info.nq
+                  << " mesh_path=" << std::quoted(mesh_path)
+                  << " serial_refinements=0 parallel_refinements=4"
+                  << " tensor_admitted=1 compact_lift_admitted=" << compact
+                  << " record_launches=1 gather_launches=1 natural_exit=true"
+                  << " logical_record_scratch_bytes=" << std::size_t(packet.Size()) * sizeof(real_t)
+                  << " oracle_downloads=false timing_events=false" << std::endl;
+        return;
+      }
+      auto measure_component = [&](auto launch)
+      {
+        for (int i = 0; i < warmups; ++i) { launch(); }
+        MFEM_GPU_CHECK(cudaGetLastError());
+        MFEM_GPU_CHECK(cudaDeviceSynchronize());
+        MFEM_GPU_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < repeats; ++i) { launch(); }
+        MFEM_GPU_CHECK(cudaEventRecord(stop));
+        MFEM_GPU_CHECK(cudaEventSynchronize(stop));
+        MFEM_GPU_CHECK(cudaGetLastError());
+        float elapsed_ms = 0.0f;
+        MFEM_GPU_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        return double(elapsed_ms) / repeats;
+      };
+      const double record_ms = measure_component(record_only);
+      const double gather_ms = measure_component(gather_only);
+      const double combined_ms = measure_component(pair);
+      MFEM_VERIFY(std::isfinite(record_ms) && std::isfinite(gather_ms) && std::isfinite(combined_ms) &&
+                    record_ms > 0.0 && gather_ms > 0.0 && combined_ms > 0.0,
+                  "Large compact-lift component timings must be finite and positive.");
+      if (!compact) { baseline_combined_ms = combined_ms; }
+      // Inspect actual allocations before any test-only full-packet expansion.
+      const auto inventory = DeviceAllocationInventory();
+      const auto packet_bytes = DeviceResidentBytes(inventory, packet);
+      const auto scratch_bytes = FaceScratchDeviceResidentBytes(work, inventory);
+      std::size_t free_bytes = 0, total_bytes = 0;
+      MFEM_GPU_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      // Inventory reads made the host packet valid. Reestablish device-write
+      // authority so certification cannot consume that earlier host copy.
+      record.record.contribution = packet.Write();
+      gather.contribution = packet.Read();
+      // Reestablish the original base outside timing, then certify one pair.
+      output = 0.03125;
+      gather.y = output.ReadWrite();
+      pair();
+      RequireFinite(output);
+      if (compact)
+      {
+        const Vector expanded = RecordedFaceContributions(info, work);
+        RequireFinite(expanded);
+        MFEM_VERIFY(SameBits(expanded, full_rows_reference) && SameBits(output, output_reference),
+                    "Large compact record/gather differs bitwise from the retained old tensor pair.");
+      }
+      else
+      {
+        RequireFinite(packet);
+        full_rows_reference.SetSize(packet.Size());
+        std::copy(packet.HostRead(), packet.HostRead() + packet.Size(), full_rows_reference.HostWrite());
+        output_reference.SetSize(output.Size());
+        std::copy(output.HostRead(), output.HostRead() + output.Size(), output_reference.HostWrite());
+      }
+      std::cout << "ExactFaceCompactLiftBenchmark512 variant=" << variant
+                << " parity=passed cells=" << info.ne << " scalar_dofs=" << x.Size()
+                << " interior_faces=" << info.nf << " dof=" << info.dof << " nq=" << info.nq
+                << " mesh_path=" << std::quoted(mesh_path)
+                << " serial_refinements=0 parallel_refinements=4"
+                << " warmups=" << warmups << " repeats=" << repeats
+                << " mean_record_ms=" << record_ms << " mean_gather_ms=" << gather_ms
+                << " mean_record_gather_ms=" << combined_ms
+                << " record_gather_speedup=" << baseline_combined_ms / combined_ms
+                << " tensor_admitted=1 compact_lift_admitted=" << compact
+                << " logical_record_scratch_bytes=" << std::size_t(packet.Size()) * sizeof(real_t)
+                << " record_scratch_device_resident_bytes=" << packet_bytes
+                << " scratch_device_resident_bytes=" << scratch_bytes
+                << " cuda_free_bytes=" << free_bytes << " cuda_total_bytes=" << total_bytes
+                << " output_reset_included=false gather_included=true solves_included=false"
+                << " oracle_expansion_timed=false" << std::endl;
+    };
+    const auto tensor_record = TensorRecordForTest(info, work, x, -1.0, packet);
+    if (compact)
+    {
+      run(::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record},
+          LiftGatherForTest(info, work, packet, output));
+    }
+    else { run(tensor_record, GatherForTest(info, work, packet, output)); }
+  }
+  if (profile_variant.empty())
+  { MFEM_GPU_CHECK(cudaEventDestroy(start)); MFEM_GPU_CHECK(cudaEventDestroy(stop)); }
+#else
+  (void)info; (void)work; (void)x; (void)mesh_path;
+  (void)warmups; (void)repeats; (void)profile_variant;
+  MFEM_ABORT("The compact-lift benchmark/profile must be compiled as native CUDA.");
+#endif
+}
+
+void BenchmarkFaceRecords512(const std::string& mesh_path,
+                             const std::string& profile_variant = "")
 {
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
   MFEM_VERIFY(::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA(),
@@ -1856,6 +2456,7 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
   { values[i] = 0.01 * std::sin(0.013 * (i + 1)) + 0.002 * (i % 7); }
 
   InteriorFaceDGDiffusionApplyScratch work;
+  work.compact_qdata = !profile_variant.empty();
   const auto info = BuildInteriorFaceDGDiffusionApplyData2D(
     fes, fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
     work.penalty, work.face_elements, work.element_vdof_map,
@@ -1866,6 +2467,11 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
               "The face benchmark must retain the prescribed 512-square p5/Q6 case.");
   LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
     info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+  if (!profile_variant.empty())
+  {
+    BenchmarkCompactFaceLifts512(info, work, x, mesh_path, warmups, repeats, profile_variant);
+    return;
+  }
   const bool compact_shape = work.shape_dictionary.Matches(info);
   const auto& factors = work.normal_factorization;
   const bool factorized = factors.Matches(info);
@@ -2090,10 +2696,11 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
               << " output_reset_included=true gather_included=true solves_included=false"
               << std::endl;
   }
+  BenchmarkCompactFaceLifts512(info, work, x, mesh_path, warmups, repeats);
   MFEM_GPU_CHECK(cudaEventDestroy(start));
   MFEM_GPU_CHECK(cudaEventDestroy(stop));
 #else
-  (void)mesh_path;
+  (void)mesh_path; (void)profile_variant;
   MFEM_ABORT("The large face-record benchmark must be compiled as native CUDA.");
 #endif
 }
@@ -2109,17 +2716,23 @@ int main(int argc, char** argv)
   mfem::Device device(backend.c_str());
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Exact face fixture is single rank.");
   const bool benchmark = argc == 4 && std::string(argv[2]) == "--benchmark512";
-  MFEM_VERIFY(argc <= 2 || benchmark,
-              "Expected [cpu|cuda] or cuda --benchmark512 /path/to/sedov_taylor.msh.");
-  if (benchmark)
+  const bool profile = argc == 5 && std::string(argv[2]) == "--profile-compact512";
+  MFEM_VERIFY(argc <= 2 || benchmark || profile,
+              "Expected [cpu|cuda], cuda --benchmark512 <mesh>, or "
+              "cuda --profile-compact512 <mesh> full_rows|compact_lift.");
+  if (benchmark || profile)
   {
-    MFEM_VERIFY(backend == "cuda", "--benchmark512 requires the CUDA backend.");
-    BenchmarkFaceRecords512(argv[3]);
+    MFEM_VERIFY(backend == "cuda", "Large benchmark/profile requires the CUDA backend.");
+    MFEM_VERIFY(!profile || std::string(argv[4]) == "full_rows" || std::string(argv[4]) == "compact_lift",
+                "Expected profile variant full_rows or compact_lift.");
+    BenchmarkFaceRecords512(argv[3], profile ? argv[4] : "");
     return 0;
   }
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
   CheckCompactFaceQdata();
+  CheckCompactFaceLifts();
+  CheckCompactFaceLiftGatherRounding();
   CheckProductionFactorizedDispatch();
   CheckProductionIdentityCopies();
   CheckGatherToBaseRounding();

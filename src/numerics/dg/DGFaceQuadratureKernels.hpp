@@ -167,8 +167,11 @@ struct InteriorFaceDGDiffusionFactorization2D
   mfem::Array<int> tensor_axes; // [side][slot], reference normal axis
   mfem::Array<int> tensor_face_slots;
   mfem::Array<int> tensor_lex_to_native;
+  /// Inverse of the independently proved tensor/native bijection.
+  mfem::Array<int> tensor_native_to_lex;
   int tensor_n = 0, tensor_slot_count = 0;
   std::uint64_t tensor_geometry_revision = 0;
+  std::uint64_t tensor_inverse_geometry_revision = 0;
 
   void ResetTensor()
   {
@@ -177,8 +180,10 @@ struct InteriorFaceDGDiffusionFactorization2D
     tensor_axes.DeleteAll();
     tensor_face_slots.DeleteAll();
     tensor_lex_to_native.DeleteAll();
+    tensor_native_to_lex.DeleteAll();
     tensor_n = tensor_slot_count = 0;
     tensor_geometry_revision = 0;
+    tensor_inverse_geometry_revision = 0;
   }
 
   void Reset()
@@ -231,6 +236,8 @@ struct InteriorFaceDGDiffusionApplyScratch
   mfem::Vector side_coefficient;
   /// Optional tensor-path qdata reduction; exact dense host geometry is kept.
   bool compact_qdata = false;
+  /// Optional FP64 tensor lifts; independent of coefficient qdata storage.
+  bool compact_lift = false;
   /// Independent stage generation: a geometry revision is not a state revision.
   std::uint64_t coefficient_geometry_revision = 0;
   std::uint64_t coefficient_generation = 0;
@@ -246,6 +253,8 @@ struct InteriorFaceDGDiffusionApplyScratch
   mutable std::uint64_t incidence_connectivity_revision = 0;
   /// Per-face row contributions written without atomics before the gather.
   mutable mfem::Vector face_contribution;
+  /// Compact [a/b][tangent][side][face] FP64 lifts, 24 entries per face.
+  mutable mfem::Vector tensor_lift;
 };
 
 inline bool HasCurrentInteriorFaceDGDiffusionTensorData2D(
@@ -272,6 +281,25 @@ inline bool UsesOrdinaryCUDAForDGDiffusionFaces2D()
   return mfem::Device::Allows(mfem::Backend::CUDA) &&
     !mfem::Device::Allows(alternative_backends);
 #else
+  return false;
+#endif
+}
+
+// This private witness is also the dispatch predicate. Its inverse-map proof
+// belongs to the geometry build; applies only compare revisions and sizes.
+inline bool UsesInteriorFaceDGDiffusionCompactLift2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  const auto& factor = work.normal_factorization;
+  return work.compact_lift && UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+    HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work) &&
+    factor.tensor_native_to_lex.Size() == 36 &&
+    factor.tensor_inverse_geometry_revision == info.connectivity_revision;
+#else
+  (void)info;
+  (void)work;
   return false;
 #endif
 }
@@ -1309,6 +1337,9 @@ BuildInteriorFaceDGDiffusionApplyData2D(
     {
       factor_cache->tensor_lex_to_native.SetSize(36);
       std::memcpy(factor_cache->tensor_lex_to_native.HostWrite(), tensor_native, sizeof(tensor_native));
+      factor_cache->tensor_native_to_lex.SetSize(36);
+      int* inverse = factor_cache->tensor_native_to_lex.HostWrite();
+      for (int lex = 0; lex < 36; ++lex) { inverse[tensor_native[lex]] = lex; }
       factor_cache->tensor_face_slots.SetSize(info.nf);
       tensor_packs.reserve(64 * tensor_pack_entries);
       tensor_pack_axes_all.reserve(128);
@@ -1591,9 +1622,11 @@ BuildInteriorFaceDGDiffusionApplyData2D(
         factor_cache->tensor_axes.GetMemory().UseDevice(true);
         factor_cache->tensor_face_slots.GetMemory().UseDevice(true);
         factor_cache->tensor_lex_to_native.GetMemory().UseDevice(true);
+        factor_cache->tensor_native_to_lex.GetMemory().UseDevice(true);
         factor_cache->tensor_n = 6;
         factor_cache->tensor_slot_count = count;
         factor_cache->tensor_geometry_revision = info.connectivity_revision;
+        factor_cache->tensor_inverse_geometry_revision = info.connectivity_revision;
       }
     }
     catch (const std::bad_alloc&) { decline_factorization(); }
@@ -2312,7 +2345,8 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
   const mfem::real_t* side_coefficient = nullptr;
   int slot_count = 0;
 
-  MFEM_HOST_DEVICE void operator()(int face) const
+  template <bool CompactLift>
+  MFEM_HOST_DEVICE void Apply(int face) const
   {
 #if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
     const int lane = threadIdx.x;
@@ -2328,7 +2362,6 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
     auto P = mfem::Reshape(record.penalty, 6, record.nf);
     auto F = mfem::Reshape(record.face_elements, 2, record.nf);
     auto D = mfem::Reshape(record.element_vdof_map, 36, record.vdim, record.ne);
-    auto C = mfem::Reshape(record.contribution, 36, 2, record.nf);
     const int axis = Axis(side, slot);
 
     mfem::real_t trace = 0.0, normal_trace = 0.0;
@@ -2392,28 +2425,53 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
         lift_b += bt * qn;
       }
     }
-#pragma unroll 1
-    for (int base = 0; base < 72; base += 32)
+    if constexpr (CompactLift)
     {
-      const int row = base + lane;
-      const bool owns = row < 72;
-      const int output_side = owns ? row / 36 : 0;
-      const int i = owns ? row % 6 : 0;
-      const int t = owns ? (row % 36) / 6 : 0;
-      const mfem::real_t a = __shfl_sync(0xffffffffu, lift_a, 6 * output_side + t);
-      const mfem::real_t b = __shfl_sync(0xffffffffu, lift_b, 6 * output_side + t);
-      if (owns)
+      auto L = mfem::Reshape(record.contribution, 2, 6, 2, record.nf);
+      if (active)
       {
-        const int output_axis = Axis(output_side, slot);
-        const int native = lex_to_native[output_axis == 0 ? i + 6 * t : t + 6 * i];
-        C(native, output_side, face) =
-          E(0, i, output_side, slot) * a + E(1, i, output_side, slot) * b;
+        L(0, index, side, face) = lift_a;
+        L(1, index, side, face) = lift_b;
+      }
+    }
+    else
+    {
+      auto C = mfem::Reshape(record.contribution, 36, 2, record.nf);
+#pragma unroll 1
+      for (int base = 0; base < 72; base += 32)
+      {
+        const int row = base + lane;
+        const bool owns = row < 72;
+        const int output_side = owns ? row / 36 : 0;
+        const int i = owns ? row % 6 : 0;
+        const int t = owns ? (row % 36) / 6 : 0;
+        const mfem::real_t a = __shfl_sync(0xffffffffu, lift_a, 6 * output_side + t);
+        const mfem::real_t b = __shfl_sync(0xffffffffu, lift_b, 6 * output_side + t);
+        if (owns)
+        {
+          const int output_axis = Axis(output_side, slot);
+          const int native = lex_to_native[output_axis == 0 ? i + 6 * t : t + 6 * i];
+          C(native, output_side, face) =
+            E(0, i, output_side, slot) * a + E(1, i, output_side, slot) * b;
+        }
       }
     }
 #else
-    record(face);
+    if constexpr (CompactLift)
+    {
+      MFEM_ABORT_KERNEL("Compact FP64 tensor face records require native CUDA.");
+    }
+    else { record(face); }
 #endif
   }
+
+  MFEM_HOST_DEVICE void operator()(int face) const { Apply<false>(face); }
+};
+
+struct InteriorFaceDGDiffusionTensorLiftRecord2DWarp
+  : InteriorFaceDGDiffusionTensorRecord2DWarp
+{
+  MFEM_HOST_DEVICE void operator()(int face) const { Apply<true>(face); }
 };
 
 struct InteriorFaceDGDiffusionGather2D
@@ -2465,6 +2523,69 @@ struct InteriorFaceDGDiffusionGather2D
     else
     {
       y[output] += sum;
+    }
+  }
+};
+
+struct InteriorFaceDGDiffusionTensorLiftGather2D
+  : InteriorFaceDGDiffusionGather2D
+{
+  const mfem::real_t* endpoint = nullptr;
+  const int* axes = nullptr;
+  const int* face_slots = nullptr;
+  const int* native_to_lex = nullptr;
+  int slot_count = 0;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int element = row / 36;
+    const int native = row - element * 36;
+    const int lex = native_to_lex[native];
+    auto D = mfem::Reshape(element_vdof_map, 36, vdim, ne);
+    auto E = mfem::Reshape(endpoint, 2, 6, 2, slot_count);
+    auto Axis = mfem::Reshape(axes, 2, slot_count);
+    auto L = mfem::Reshape(contribution, 2, 6, 2, nf);
+    mfem::real_t sum = 0.0;
+    for (int incidence = element_face_offsets[element];
+         incidence < element_face_offsets[element + 1]; ++incidence)
+    {
+      const int side = element_face_sides[incidence];
+      const int face = element_face_ids[incidence];
+      // Read the current independent tensor slot, including renumbered packs.
+      const int slot = face_slots[face];
+      const int axis = Axis(side, slot);
+      const int i = axis == 0 ? lex % 6 : lex / 6;
+      const int t = axis == 0 ? lex / 6 : lex % 6;
+      const mfem::real_t a = L(0, t, side, face);
+      const mfem::real_t b = L(1, t, side, face);
+      const mfem::real_t face_value =
+        E(0, i, side, slot) * a + E(1, i, side, slot) * b;
+      // The old record stores one rounded FP64 contribution before the ordered
+      // gather. Explicit add prevents contraction into that reconstruction.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      sum = __dadd_rn(sum, face_value);
+#else
+      volatile mfem::real_t rounded_face_value = face_value;
+      sum += rounded_face_value;
+#endif
+    }
+    const int output = D(native, 0, element);
+    if (add_to_base)
+    {
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      y[output] = __dadd_rn(y[output], __dadd_rn(0.0, sum));
+#else
+      const mfem::real_t scratch_value = mfem::real_t(0.0) + sum;
+      y[output] += scratch_value;
+#endif
+    }
+    else
+    {
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      y[output] = __dadd_rn(y[output], sum);
+#else
+      y[output] += sum;
+#endif
     }
   }
 };
@@ -2580,6 +2701,57 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
               "Deterministic exact DG face gather requires one uniquely "
               "owned scalar row per discontinuous element dof.");
   EnsureInteriorFaceElementIncidence2D(info, work);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  if (UsesInteriorFaceDGDiffusionCompactLift2D(info, work))
+  {
+    const auto& factor = work.normal_factorization;
+    // Keep only the selected live scratch format. A pooled allocator can retain
+    // the released block, so this logical reduction need not lower GPU residency.
+    if (work.face_contribution.Size()) { work.face_contribution.Destroy(); }
+    work.tensor_lift.SetSize(24 * info.nf);
+    work.tensor_lift.UseDevice(true);
+    InteriorFaceDGDiffusionRecord2D record;
+    record.dof = info.dof;
+    record.vdim = info.vdim;
+    record.nq = info.nq;
+    record.nf = info.nf;
+    record.ne = info.ne;
+    record.ip_sigma = ip_sigma;
+    record.penalty = work.penalty.Read();
+    record.face_elements = work.face_elements.Read();
+    record.element_vdof_map = work.element_vdof_map.Read();
+    record.x = scalar.Read();
+    record.contribution = work.tensor_lift.Write();
+    const InteriorFaceDGDiffusionTensorRecord2DWarp tensor_record{
+      record, factor.tensor_endpoint.Read(), factor.tensor_tangent.Read(),
+      factor.tensor_axes.Read(), factor.tensor_face_slots.Read(),
+      factor.tensor_lex_to_native.Read(), factor.normal_geometry.Read(),
+      work.side_coefficient.Read(), factor.tensor_slot_count};
+    mfem::forall_2D_batch(info.nf, 32, 1, 4,
+      InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record});
+
+    InteriorFaceDGDiffusionTensorLiftGather2D gather;
+    gather.dof = info.dof;
+    gather.vdim = info.vdim;
+    gather.ne = info.ne;
+    gather.nf = info.nf;
+    gather.element_vdof_map = work.element_vdof_map.Read();
+    gather.element_face_offsets = work.element_face_offsets.Read();
+    gather.element_face_ids = work.element_face_ids.Read();
+    gather.element_face_sides = work.element_face_sides.Read();
+    gather.contribution = work.tensor_lift.Read();
+    gather.y = y.ReadWrite();
+    gather.add_to_base = add_to_base;
+    gather.endpoint = factor.tensor_endpoint.Read();
+    gather.axes = factor.tensor_axes.Read();
+    gather.face_slots = factor.tensor_face_slots.Read();
+    gather.native_to_lex = factor.tensor_native_to_lex.Read();
+    gather.slot_count = factor.tensor_slot_count;
+    mfem::forall(info.ne * info.dof, gather);
+    return;
+  }
+#endif
+  if (work.tensor_lift.Size()) { work.tensor_lift.Destroy(); }
   work.face_contribution.SetSize(2 * info.dof * info.nf);
   work.face_contribution.UseDevice(true);
 

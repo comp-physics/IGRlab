@@ -978,7 +978,9 @@ public:
       rule_points_.push_back({{shared_ir.IntPoint(q).x, shared_ir.IntPoint(q).weight}});
     scratch_.compact_qdata =
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_COMPACT_FACE_QDATA", false);
-    const bool prepare_tensor_faces = scratch_.compact_qdata ||
+    scratch_.compact_lift =
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_COMPACT_FACE_LIFT", false);
+    const bool prepare_tensor_faces = scratch_.compact_qdata || scratch_.compact_lift ||
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACTORIZED_FACE_NORMALS", false);
     info_ = dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
       sfes_,
