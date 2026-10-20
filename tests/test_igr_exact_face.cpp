@@ -355,8 +355,11 @@ Mesh MakeMesh(int geometry)
   // tail fixture below.
   const bool periodic = geometry == 2;
   const bool factor_fixture = geometry >= 3;
-  Mesh mesh = Mesh::MakeCartesian2D(factor_fixture ? 4 : (periodic ? 4 : 3),
-                                    factor_fixture ? 4 : (periodic ? 3 : 2),
+  // Reference blocks contain both derivative components and need more reuse
+  // than scalar shape blocks. Retain the small tail fixtures, but give the
+  // mandatory skew/curved factorization cases enough repeated face patterns.
+  Mesh mesh = Mesh::MakeCartesian2D(factor_fixture ? 8 : (periodic ? 4 : 3),
+                                    factor_fixture ? 8 : (periodic ? 3 : 2),
                                     Element::QUADRILATERAL,
                                     true, 1.0, factor_fixture ? 1.0 : 0.7);
   if (geometry == 3)
@@ -443,8 +446,9 @@ void CheckCase(int order, int face_order, int basis, int geometry,
       work.penalty, work.face_elements, work.element_vdof_map, scaling,
       &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary,
       &work.normal_factorization);
-    MFEM_VERIFY(info.nf == (geometry >= 2 ? 24 : 7),
-                "Fixture must cover whole batches and a three-face tail.");
+    MFEM_VERIFY(info.nf == fqs.GetNE(), "Single-rank fixture must pack every interior face.");
+    MFEM_VERIFY(geometry >= 3 || info.nf == (geometry == 2 ? 24 : 7),
+                "Original fixtures must retain whole batches and a three-face tail.");
     MFEM_VERIFY(info.dof == (order + 1) * (order + 1) &&
                 info.nq == ir.GetNPoints(), "Unexpected packed dimensions.");
     CheckDictionaryCopies(info, work);
@@ -628,12 +632,16 @@ void CheckCase(int order, int face_order, int basis, int geometry,
 
 void CheckDictionaryGeometryRebuild()
 {
-  Mesh serial = MakeMesh(0);
+  // Seven faces may legitimately decline the two-component reference table.
+  // Repetition makes this an admission fixture without relaxing its budget.
+  Mesh serial = Mesh::MakeCartesian2D(8, 8, Element::QUADRILATERAL,
+                                      true, 1.0, 1.0);
   ParMesh mesh(MPI_COMM_SELF, serial);
   DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
   ParFiniteElementSpace fes(&mesh, &fec);
   IntegrationRule rule(IntRules.Get(Geometry::SEGMENT, 11));
-  Vector side_q(2 * rule.GetNPoints() * 7);
+  FaceQuadratureSpace initial_fqs(mesh, rule, FaceType::Interior);
+  Vector side_q(2 * rule.GetNPoints() * initial_fqs.GetNE());
   side_q = 0.07;
   Vector x(fes.GetVSize());
   x.UseDevice(true);
@@ -682,7 +690,9 @@ void CheckDictionaryGeometryRebuild()
   };
   auto info = build(true);
   MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.Matches(info),
-              "Rebuild fixture must admit shape and reference-derivative storage.");
+              "Repeated rebuild fixture must admit shape and reference-derivative storage: "
+              << "faces=" << info.nf << " shape_slots=" << work.shape_dictionary.slot_count
+              << " reference_slots=" << work.normal_factorization.slot_count);
   MFEM_VERIFY(work.normal_factorization.coefficient_revision == 0,
               "An initial geometry build must retain dense normal dispatch.");
   const auto first_revision = info.connectivity_revision;
@@ -788,7 +798,7 @@ private:
 
 void CheckProductionFactorizedDispatch()
 {
-  Mesh serial = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL,
+  Mesh serial = Mesh::MakeCartesian2D(8, 8, Element::QUADRILATERAL,
                                       true, 1.0, 1.0);
   ParMesh mesh(MPI_COMM_SELF, serial);
   DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
