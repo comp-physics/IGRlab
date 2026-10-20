@@ -4,10 +4,12 @@
 mesh. Complete final-field comparison passes the conservative accuracy
 budgets, with maximum conserved-component normalized L2 difference
 1.963e-9; every FP64
-current-equation certificate passes. A reliable whole-solver speedup is
-not established: the paired baseline suffered substantial timing pauses.
-The observed 23.24% process-time reduction must not be attributed to this
-optimization.**
+current-equation certificate passes. The original pair suffered baseline
+pauses; its 23.24% process-time reduction is not a valid causal speedup.
+A reversed-order repeat without those long pauses measured 0.767% lower
+whole-process time and 4.10–5.16% lower time in matched intervals without
+scheduled VTK saves. These support a compute-path benefit, but not a large
+or statistically established whole-solver speedup.**
 
 This pass targets the FP64 conversions surrounding the existing four TF32
 spectral-inverse GEMMs. It follows the validated compact-face source
@@ -276,10 +278,10 @@ FP64 SIMT samples do not measure the wider solver's TF32 GEMMs.
 ## Retained evidence and decision
 
 Keep this as an opt-in candidate: large-mesh conversion speed and physical
-agreement are established; a quantitative overall solver speedup remains
-unresolved. The next code experiment should address block packing,
-especially the reverse conversion, followed by another controlled timing
-comparison before any default change.
+agreement are established. The reversed-order repeat below supports a modest
+compute-path benefit, with only a sub-percent observed whole-process change.
+The fresh timeline makes face/volume operator work the next priority; nodal
+block packing remains a secondary experiment. No default change is made.
 
 Local campaign root:
 `/home/jarias9/.cache/igrlab-experiments/sedov-spectral-nodal-20261020`.
@@ -299,5 +301,131 @@ All four allocated jobs used one GPU, eight CPUs and 96G host memory under
 `bdiy-dtai-gh`/`ghx4`/`projects`. Actual use was **2,460 GH200-seconds /
 0.683333 GPU-hours**, including the build retry and all profiling.
 Queue waiting is excluded. Accounting is retained in
-`campaign-accounting.json`. No extra physical reruns were submitted to
-select a more favorable timing result.
+`campaign-accounting.json`. No extra physical reruns were submitted during that initial pass.
+The separately authorized reversed-order repeat is recorded below.
+
+## Reversed-order repeat and evolved Systems capture — job 3424855
+
+The user authorized a matched repeat after the readiness checks. The frozen
+candidate ran first, followed by the frozen dense-nodal baseline on the same
+GH200, `gh140`, UUID `GPU-fb152096-3fb4-11a7-9120-fb0d0d24ed10`.
+Both binaries, case specification, output cadence, solver controls and scan-off
+settings are unchanged. This baseline already contains the earlier TF32 inverse
+and compact-face improvements; it is not the original FP64 GPU implementation.
+No application rebuild or new production code was needed.
+
+The original application runner and process-memory sampler were retained.
+Additional external telemetry used an independent 100 ms host heartbeat,
+one-second GPU queries, and application `/proc` samples. These observations
+were buffered in RAM until each timed run ended. The new audit accepts the
+reversed execution order while retaining baseline/candidate order in result
+arrays. All run identity, residual and same-GPU checks passed.
+
+| Measurement | Dense-nodal baseline | Tensor-nodal candidate |
+|---|---:|---:|
+| Whole application, seconds | 729.635494 | 724.039335 |
+| Native simulation stopwatch, seconds | 650.653148 | 643.399586 |
+| Native accumulated linear-solve timer, seconds | 286.498402 | 266.800618 |
+| Native accumulated update timer, seconds | 417.161829 | 398.148426 |
+| Outside native stopwatch, seconds | 78.982346 | 80.639749 |
+| Steps / rejected steps | 4,939 / 0 | 4,939 / 0 |
+| Converged, certified solves | 14,818 | 14,818 |
+| Krylov iterations | 51,732 | 51,747 |
+| Maximum current-FP64 RHS-relative residual | 9.9998798e-7 | 9.9997421e-7 |
+| Sampled peak GPU memory, MiB | 18,376 | 18,376 |
+
+The observed process-time reduction is **0.76698% (1.007729×)**; the native
+stopwatch reduction is **1.11481%**. This is one reversed-order pair, not an
+estimate of a repeat distribution or a statistically established sub-percent
+whole-solver gain. The original 23.24% observation remains invalid as a causal
+speedup estimate.
+
+Using the same mechanical selection of adjacent 500-step intervals without
+scheduled VTK saves as the original analysis gives:
+
+| Steps | Baseline seconds | Candidate seconds | Time reduction |
+|---|---:|---:|---:|
+| 1,000–1,500 | 41.735478 | 40.025054 | 4.098% |
+| 2,000–2,500 | 41.773576 | 40.006055 | 4.231% |
+| 3,000–3,500 | 47.315255 | 44.877167 | 5.153% |
+| 4,000–4,500 | 52.290089 | 49.590294 | 5.163% |
+
+Across these four intervals, measured time falls from 183.114398 to
+174.498570 seconds (**4.70516%**). They include ordinary logging and analysis
+callback work and are not GPU-only timings. Their consistent direction
+supports a compute-path benefit, while total process timing still includes
+startup and saved output. There is no per-save timer that would isolate a
+filesystem contribution to the difference. The native accumulated linear-solve
+timer falls by 19.698 seconds, and the update timer by 19.013 seconds. These
+are host-side component timers, not independent GPU kernel totals. Applying
+the isolated conversion benchmark to the actual preconditioner call counts
+predicts about 19.389 seconds saved; this transferred microbenchmark model
+is consistent in scale, but is not a production kernel-time measurement.
+
+The earlier long process-memory-sampler gaps and anomalous baseline
+checkpoint interval did not recur. Maximum independent heartbeat spacing
+was 0.100156/0.100145 seconds for baseline/candidate, with no
+gaps over 1.5 seconds. One baseline GPU query took 3.241 seconds; concurrent
+`/proc` samples showed a running application with advancing CPU and write
+counters, so that query delay is not evidence of an application pause.
+Software power-capping counters increased during the pair; thermal and
+hardware power-brake counters did not. Clocks were dynamic, not locked.
+
+Each variant's entire 14,818-line certificate sequence matches its own earlier
+run. At t=0.1, each complete 1,160,775,042-byte native VTU also matches its own
+earlier payload exactly: baseline `c2e6c8cd…`, candidate `9ab51b75…` (full hashes
+in the retained receipts). The two variants are not byte-identical to one
+another. The previously verified complete Q5 norms therefore apply unchanged:
+maximum conserved-component normalized L2/Linf differences remain
+1.962825e-9/8.770991e-9, and sigma remains 9.478741e-8/3.960493e-7.
+Conserved-field budgets pass; sigma has no assigned budget. This establishes
+implementation reproducibility, not analytic Sedov accuracy.
+
+Only after both unprofiled applications and their audits ended, a separate
+continuous candidate evolution generated a **15.004648-second** Systems
+capture. Its delay was calibrated from the completed candidate's timing;
+the application was intentionally terminated after recording. It reached
+step 3,355 in the retained certificates and recorded 164 RK-step events.
+That controlled cutoff is not a physical comparison failure. Native report,
+SQLite, kernel census, API statistics and solve logs are retained.
+
+The union of GPU kernel/copy/memset intervals covers **14.724932 seconds,
+98.1358% of the trace**. Kernel intervals alone cover 14.166877 seconds.
+All observed device work is on one stream. Major measured groups are:
+
+| Kernel group | Summed kernel seconds | Share of kernel time |
+|---|---:|---:|
+| Interior exact-face record | 1.979831 | 13.98% |
+| Face record + gather + PA diffusion/mass | 4.195798 | 29.62% |
+| TF32-named cuBLAS GEMMs | 1.706217 | 12.04% |
+| Nodal tensor conversions, both directions | 0.639255 | 4.51% |
+
+The face-record row is included in the larger operator row; these rows are
+not disjoint categories. TF32-named GEMMs occupy 11.37% of elapsed capture
+time, and nodal conversions 4.26%. Kernel names and dispatch establish the
+GEMM path; Systems does not measure Tensor Core instruction utilization or
+achieved tensor FLOP/s. The earlier Compute counters remain separate evidence.
+
+Long host CUDA API durations mostly overlap GPU execution and should not be
+counted as CPU-only idle time. Nested NVTX and concurrent OS-runtime calls
+also cannot be added as elapsed-time partitions. The frozen source does not
+instrument VTK/analysis callbacks, so their absence from NVTX names alone is
+not proof of an output-free trace. Absolute RK-step mapping from the delayed
+capture remains an inference from retained progress and range counts.
+
+The next performance target should follow the measured current-operator cost:
+investigate face application/gather and volume mass/diffusion first.
+Fusion and data-layout changes are hypotheses to assess with hardware
+counters; this timeline alone does not establish a memory-bandwidth bottleneck.
+Block packing is still a valid secondary experiment, but the conversion pair
+now accounts for only 4.26%
+of this elapsed window. No further code optimization, default change, or GPU
+run was performed as part of this repeat.
+
+Retained repeat evidence:
+`/home/jarias9/.cache/igrlab-experiments/sedov-spectral-nodal-repeat-20261020`.
+Native remote output:
+`/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/sedov-spectral-nodal-20261020/repeat-3424855`.
+The job completed at **18:38:33 EDT on October 20, 2026**, using
+**1,959 GH200-seconds / 0.544167 GPU-hours**. The separate readiness checks
+used 103 GPU-seconds. No recurring automation was created.
