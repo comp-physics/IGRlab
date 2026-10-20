@@ -17,6 +17,7 @@
 #include <iostream>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,65 @@ void RequireFinite(const Vector& v)
   {
     MFEM_VERIFY(std::isfinite(data[i]), "Exact face output was not written.");
   }
+}
+
+// Validity flags describe the authoritative copy, not whether a stale device
+// allocation still exists. Inspect MFEM's existing test/debug inventory without
+// requesting a device pointer (which would allocate the storage being tested).
+std::string DeviceAllocationInventory()
+{
+  std::ostringstream out;
+  mfem::mm.PrintPtrs(out);
+  return out.str();
+}
+
+bool HasDeviceAllocation(const std::string& inventory, const void* host)
+{
+  if (!host) { return false; }
+  std::ostringstream key;
+  key << "\nkey " << host << ", ";
+  const auto begin = inventory.find(key.str());
+  if (begin == std::string::npos) { return false; } // Unregistered host-only data.
+  const auto end = inventory.find('\n', begin + 1);
+  const auto device = inventory.find(", d_ptr ", begin);
+  MFEM_VERIFY(device != std::string::npos &&
+                (end == std::string::npos || device < end),
+              "Unexpected MFEM device-allocation inventory format.");
+  void* pointer = nullptr;
+  std::istringstream value(inventory.substr(device + 8));
+  value >> pointer;
+  MFEM_VERIFY(!value.fail(), "Could not inspect MFEM's existing device allocation.");
+  return pointer != nullptr;
+}
+
+template <typename Buffer>
+std::size_t DeviceResidentBytes(const std::string& inventory, const Buffer& buffer)
+{
+  // HostRead does not create a device allocation or change device validity.
+  // Call only outside timed regions and after read-authority witnesses.
+  return buffer.Size() && HasDeviceAllocation(inventory, buffer.HostRead())
+    ? std::size_t(buffer.Capacity()) * sizeof(*buffer.HostRead()) : 0u;
+}
+
+std::size_t FaceScratchDeviceResidentBytes(
+  const InteriorFaceDGDiffusionApplyScratch& work, const std::string& inventory)
+{
+  const auto& shape = work.shape_dictionary;
+  const auto& factor = work.normal_factorization;
+  std::size_t bytes = 0;
+  const Vector* vectors[] = {
+    &work.shape, &shape.values, &factor.reference_dshape, &factor.normal_geometry,
+    &factor.tensor_endpoint, &factor.tensor_tangent, &work.weighted_normal_dshape,
+    &work.penalty, &work.normal_dshape_base, &work.penalty_metric,
+    &work.side_coefficient, &work.face_contribution};
+  for (const auto* vector : vectors) { bytes += DeviceResidentBytes(inventory, *vector); }
+  const Array<int>* arrays[] = {
+    &shape.face_slots, &factor.face_slots, &factor.tensor_axes,
+    &factor.tensor_face_slots, &factor.tensor_lex_to_native, &work.face_elements,
+    &work.element_vdof_map, &work.element_face_offsets, &work.element_face_ids,
+    &work.element_face_sides};
+  for (const auto* array : arrays) { bytes += DeviceResidentBytes(inventory, *array); }
+  return bytes;
 }
 
 void CheckDictionaryCopies(const InteriorFaceDGDiffusionApplyInfo& info,
@@ -930,6 +990,347 @@ void CheckDictionaryGeometryRebuild()
   parity(info, false);
 }
 
+// Discontinuous, spatially varying coefficients keep the two traces distinct;
+// changing the stage also changes their relative weights rather than merely
+// multiplying the whole face operator by one scalar.
+class EvolvingFaceCoefficient final : public mfem::Coefficient
+{
+public:
+  real_t Eval(mfem::ElementTransformation& transformation,
+              const mfem::IntegrationPoint& ip) override
+  {
+    Vector point(2);
+    transformation.Transform(ip, point);
+    return 0.043 * (1.0 + 0.071 * stage +
+      0.027 * std::sin(0.19 * (transformation.ElementNo + 1) * (stage + 1))) /
+      (0.9 + 0.04 * point[0] + 0.03 * point[1] +
+       0.003 * (transformation.ElementNo % 13));
+  }
+  int stage = 0;
+};
+
+void FillEvolvingFaceQdata(ParMesh& mesh, const FaceQuadratureSpace& fqs,
+                          EvolvingFaceCoefficient& coefficient, Vector& side_q)
+{
+  const int nq = fqs.GetIntRule(0).GetNPoints();
+  side_q.SetSize(2 * nq * fqs.GetNE());
+  side_q.UseDevice(true);
+  auto Q = Reshape(side_q.HostWrite(), 2, nq, fqs.GetNE());
+  for (int face = 0; face < fqs.GetNE(); ++face)
+  {
+    auto* transformation = mesh.GetFaceElementTransformations(fqs.GetMeshFaceIndex(face));
+    const auto& rule = fqs.GetIntRule(face);
+    for (int q = 0; q < nq; ++q)
+    {
+      transformation->SetAllIntPoints(&rule.IntPoint(q));
+      Q(0, q, face) = coefficient.Eval(*transformation->Elem1,
+                                      transformation->GetElement1IntPoint());
+      Q(1, q, face) = coefficient.Eval(*transformation->Elem2,
+                                      transformation->GetElement2IntPoint());
+    }
+  }
+}
+
+void CheckAssembledFaceDiagonal(ParFiniteElementSpace& fes, ParMesh& mesh,
+                                const FaceQuadratureSpace& fqs,
+                                mfem::Coefficient& coefficient,
+                                real_t ip_sigma, const Vector& actual)
+{
+  DGDiffusionIntegrator integrator(coefficient, ip_sigma, 2.75);
+  Vector expected(actual.Size());
+  expected = 0.125;
+  real_t* diagonal = expected.HostReadWrite();
+  DenseMatrix matrix;
+  Array<int> left, right;
+  for (int face = 0; face < fqs.GetNE(); ++face)
+  {
+    integrator.SetIntegrationRule(fqs.GetIntRule(face));
+    auto* transformation = mesh.GetFaceElementTransformations(fqs.GetMeshFaceIndex(face));
+    integrator.AssembleFaceMatrix(*fes.GetFE(transformation->Elem1No),
+                                  *fes.GetFE(transformation->Elem2No),
+                                  *transformation, matrix);
+    fes.GetElementDofs(transformation->Elem1No, left);
+    fes.GetElementDofs(transformation->Elem2No, right);
+    for (int d = 0; d < left.Size(); ++d)
+    {
+      diagonal[FiniteElementSpace::DecodeDof(left[d])] += matrix(d, d);
+      diagonal[FiniteElementSpace::DecodeDof(right[d])] +=
+        matrix(left.Size() + d, left.Size() + d);
+    }
+  }
+  CheckFactorizationError(actual, expected, "Compact face diagonal versus assembled MFEM");
+}
+
+void CheckCompactFaceQdata()
+{
+  Mesh serial = MakeMesh(4); // Rotated, curved elements and reversed tangents.
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  DG_FECollection fec(5, 2, mfem::BasisType::GaussLobatto);
+  ParFiniteElementSpace fes(&mesh, &fec);
+  IntegrationRule rule(IntRules.Get(Geometry::SEGMENT, 11));
+  FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
+  EvolvingFaceCoefficient coefficient;
+  Vector side_q, x(fes.GetVSize());
+  x.UseDevice(true);
+  real_t* input = x.HostWrite();
+  for (int i = 0; i < x.Size(); ++i)
+  { input[i] = 0.01 * std::sin(0.071 * (i + 1)) + 0.001 * (i % 11); }
+  bool native_cuda = false;
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  native_cuda = ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA();
+#endif
+  int compact_refreshes = 0, dense_fallbacks = 0, diagonal_checks = 0;
+  for (const auto scaling : {DGDiffusionFaceScaling::Arithmetic,
+                             DGDiffusionFaceScaling::Max,
+                             DGDiffusionFaceScaling::Sum})
+  {
+    coefficient.stage = 0;
+    FillEvolvingFaceQdata(mesh, fqs, coefficient, side_q);
+    InteriorFaceDGDiffusionApplyScratch work, dense;
+    work.compact_qdata = true;
+    auto build = [&](InteriorFaceDGDiffusionApplyScratch& target,
+                      bool factors, std::size_t budget = 256u * 1024u * 1024u)
+    {
+      return BuildInteriorFaceDGDiffusionApplyData2D(
+        fes, fqs, side_q, 2.75, target.shape, target.weighted_normal_dshape,
+        target.penalty, target.face_elements, target.element_vdof_map, scaling,
+        &target.normal_dshape_base, &target.penalty_metric,
+        factors ? &target.shape_dictionary : nullptr,
+        factors ? &target.normal_factorization : nullptr, budget);
+    };
+    auto info = build(work, true);
+    auto dense_info = build(dense, false);
+    MFEM_VERIFY(work.normal_factorization.TensorMatches(info),
+                "Compact qdata fixture requires independently admitted p5/Q6 tensor geometry.");
+    const void* full_shape = work.shape.HostRead();
+    const void* full_base = work.normal_dshape_base.HostRead();
+    const void* full_normal = work.weighted_normal_dshape.HostRead();
+    auto check_storage = [&]()
+    {
+      if (!native_cuda) { return; }
+      const auto inventory = DeviceAllocationInventory();
+      MFEM_VERIFY(!HasDeviceAllocation(inventory, full_shape) &&
+                    !HasDeviceAllocation(inventory, full_base) &&
+                    !HasDeviceAllocation(inventory, full_normal) &&
+                    !work.shape.GetMemory().DeviceIsValid() &&
+                    !work.normal_dshape_base.GetMemory().DeviceIsValid() &&
+                    !work.weighted_normal_dshape.GetMemory().DeviceIsValid(),
+                  "Compact refresh/apply/diagonal must free full S/base/N device allocations.");
+      MFEM_VERIFY(work.side_coefficient.GetMemory().DeviceIsValid() &&
+                    work.penalty.GetMemory().DeviceIsValid(),
+                  "Compact refresh must publish current coefficients and penalties on device.");
+      MFEM_VERIFY(work.dense_normal_generation != work.coefficient_generation,
+                  "Compact apply and diagonal must not materialize the stale dense normal table.");
+    };
+    auto parity = [&](bool compact, bool assembled, DGDiffusionFaceScaling current_scaling)
+    {
+      for (const real_t ip_sigma : {-1.0, 1.0})
+      {
+        Vector actual(x.Size()), diagonal(x.Size());
+        actual.UseDevice(true);
+        actual = 0.03125;
+        // Diagonal first also tests lazy fallback without an apply having
+        // already repaired the old dense normal table.
+        diagonal = 0.125;
+        ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(info, work, ip_sigma, diagonal);
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, actual);
+        if (compact) { check_storage(); }
+        else if (work.coefficient_geometry_revision == info.connectivity_revision)
+        {
+          MFEM_VERIFY(work.dense_normal_generation == work.coefficient_generation,
+                      "Dense fallback diagonal/apply must materialize the current Q generation.");
+        }
+        Vector dense_contribution;
+        const Vector expected = OriginalRecordAndGather(dense_info, dense, x, ip_sigma,
+                                                       dense_contribution);
+        CheckFactorizationError(actual, expected, "Compact qdata versus independently rebuilt dense action");
+        if (work.face_contribution.Size())
+        {
+          CheckFactorizationError(work.face_contribution, dense_contribution,
+                                  "Compact qdata versus independent dense face records");
+        }
+        Vector dense_diagonal(x.Size());
+        dense_diagonal = 0.125;
+        ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+          dense_info, dense, ip_sigma, dense_diagonal);
+        CheckFactorizationError(diagonal, dense_diagonal,
+                                "Compact qdata versus independently rebuilt dense diagonal");
+        if (assembled && current_scaling == DGDiffusionFaceScaling::Arithmetic)
+        { CheckAssembledFaceDiagonal(fes, mesh, fqs, coefficient, ip_sigma, diagonal); }
+        Vector repeat(x.Size());
+        repeat.UseDevice(true);
+        repeat = 0.03125;
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, repeat);
+        MFEM_VERIFY(SameBits(actual, repeat), "Repeated current-qdata apply changed bits.");
+        ++diagonal_checks;
+      }
+      if (!compact && native_cuda) { ++dense_fallbacks; }
+    };
+    auto refresh = [&]()
+    {
+      const auto previous = work.coefficient_generation;
+      // A compact update must not overwrite/read this invalid old dense cache.
+      real_t* old_normal = work.weighted_normal_dshape.HostWrite();
+      std::fill(old_normal, old_normal + work.weighted_normal_dshape.Size(),
+                std::numeric_limits<real_t>::quiet_NaN());
+      LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(info, work, side_q, 2.75, scaling);
+      MFEM_VERIFY(work.coefficient_generation > previous,
+                  "Every repeated coefficient refresh must invalidate the old dense generation.");
+      if (native_cuda) { check_storage(); ++compact_refreshes; }
+      dense_info = build(dense, false);
+    };
+
+    // The builder's initial dense values remain usable before current-Q storage exists.
+    parity(false, true, scaling);
+    if (native_cuda)
+    {
+      work.shape.Read(); work.normal_dshape_base.Read(); work.weighted_normal_dshape.Read();
+      const auto inventory = DeviceAllocationInventory();
+      MFEM_VERIFY(HasDeviceAllocation(inventory, full_shape) &&
+                    HasDeviceAllocation(inventory, full_base) &&
+                    HasDeviceAllocation(inventory, full_normal),
+                  "Allocation-removal witness must start with all three full device tables.");
+    }
+    for (int stage = 1; stage <= 3; ++stage)
+    {
+      coefficient.stage = stage;
+      FillEvolvingFaceQdata(mesh, fqs, coefficient, side_q);
+      refresh();
+      parity(native_cuda, true, scaling);
+      if (stage == 2) // An unchanged Q is still a new, valid refresh generation.
+      { refresh(); parity(native_cuda, false, scaling); }
+    }
+    auto& factors = work.normal_factorization;
+    const auto tensor_revision = factors.tensor_geometry_revision;
+    factors.tensor_geometry_revision = 0;
+    parity(false, false, scaling); // First fallback must materialize the newest Q.
+    factors.tensor_geometry_revision = tensor_revision;
+    coefficient.stage = 4;
+    FillEvolvingFaceQdata(mesh, fqs, coefficient, side_q);
+    refresh();
+    parity(native_cuda, true, scaling);
+    const auto coefficient_revision = factors.coefficient_revision;
+    factors.coefficient_revision = 0;
+    parity(false, false, scaling); // A later fallback must not reuse that dense generation.
+    factors.coefficient_revision = coefficient_revision;
+    coefficient.stage = 5;
+    FillEvolvingFaceQdata(mesh, fqs, coefficient, side_q);
+    refresh();
+    const Array<int> native_map(factors.tensor_lex_to_native);
+    factors.tensor_lex_to_native.SetSize(0);
+    parity(false, false, scaling); // Missing tensor storage with valid reference geometry.
+    factors.tensor_lex_to_native = native_map;
+
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info, work, side_q, 2.75, DGDiffusionFaceScaling::HarmonicWeighted);
+    dense_info = BuildInteriorFaceDGDiffusionApplyData2D(
+      fes, fqs, side_q, 2.75, dense.shape, dense.weighted_normal_dshape,
+      dense.penalty, dense.face_elements, dense.element_vdof_map,
+      DGDiffusionFaceScaling::HarmonicWeighted);
+    parity(false, false, DGDiffusionFaceScaling::HarmonicWeighted);
+    refresh();
+    parity(native_cuda, false, scaling);
+
+    const auto old_revision = info.connectivity_revision;
+    info = build(work, false); // Legacy same-size rebuild leaves old factor epochs stale.
+    dense_info = build(dense, false);
+    full_shape = work.shape.HostRead(); full_base = work.normal_dshape_base.HostRead();
+    full_normal = work.weighted_normal_dshape.HostRead();
+    MFEM_VERIFY(info.connectivity_revision != old_revision && !factors.TensorMatches(info),
+                "Same-size rebuild must reject all earlier tensor/coefficient epochs.");
+    parity(false, false, scaling);
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(info, work, side_q, 2.75, scaling);
+    parity(false, false, scaling);
+    info = build(work, true, 1);
+    dense_info = build(dense, false);
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(info, work, side_q, 2.75, scaling);
+    MFEM_VERIFY(!factors.TensorMatches(info), "Insufficient cache budget must force dense refresh.");
+    parity(false, false, scaling);
+    if (scaling == DGDiffusionFaceScaling::Sum)
+    {
+      // Geometry and quadrature change without changing any packed dimension.
+      mesh.Transform([](const Vector& point, Vector& out)
+      { out.SetSize(2); out[0] = 1.03 * point[0] + 0.07 * point[1];
+        out[1] = 0.97 * point[1]; });
+      rule.IntPoint(0).x += 0.001;
+      FaceQuadratureSpace rebuilt_fqs(mesh, rule, FaceType::Interior);
+      ++coefficient.stage;
+      FillEvolvingFaceQdata(mesh, rebuilt_fqs, coefficient, side_q);
+      const auto stale_revision = info.connectivity_revision;
+      info = BuildInteriorFaceDGDiffusionApplyData2D(
+        fes, rebuilt_fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
+        work.penalty, work.face_elements, work.element_vdof_map, scaling,
+        &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary,
+        &work.normal_factorization);
+      dense_info = BuildInteriorFaceDGDiffusionApplyData2D(
+        fes, rebuilt_fqs, side_q, 2.75, dense.shape, dense.weighted_normal_dshape,
+        dense.penalty, dense.face_elements, dense.element_vdof_map, scaling);
+      full_shape = work.shape.HostRead(); full_base = work.normal_dshape_base.HostRead();
+      full_normal = work.weighted_normal_dshape.HostRead();
+      MFEM_VERIFY(info.connectivity_revision != stale_revision && factors.TensorMatches(info) &&
+                    factors.coefficient_revision == 0,
+                  "Geometry/rule rebuild must discard every earlier current-Q admission stamp.");
+      parity(false, false, scaling);
+      LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(info, work, side_q, 2.75, scaling);
+      parity(native_cuda, false, scaling);
+    }
+  }
+
+  // A real unsupported element order must refresh and apply through dense
+  // storage even with the selector enabled and repeating reference geometry.
+  DG_FECollection unsupported_fec(4, 2, mfem::BasisType::GaussLegendre);
+  ParFiniteElementSpace unsupported_fes(&mesh, &unsupported_fec);
+  FaceQuadratureSpace unsupported_fqs(mesh, rule, FaceType::Interior);
+  FillEvolvingFaceQdata(mesh, unsupported_fqs, coefficient, side_q);
+  InteriorFaceDGDiffusionApplyScratch unsupported, unsupported_dense;
+  unsupported.compact_qdata = true;
+  const auto unsupported_info = BuildInteriorFaceDGDiffusionApplyData2D(
+    unsupported_fes, unsupported_fqs, side_q, 2.75, unsupported.shape,
+    unsupported.weighted_normal_dshape, unsupported.penalty, unsupported.face_elements,
+    unsupported.element_vdof_map, DGDiffusionFaceScaling::Arithmetic,
+    &unsupported.normal_dshape_base, &unsupported.penalty_metric,
+    &unsupported.shape_dictionary, &unsupported.normal_factorization);
+  const auto unsupported_dense_info = BuildInteriorFaceDGDiffusionApplyData2D(
+    unsupported_fes, unsupported_fqs, side_q, 2.75, unsupported_dense.shape,
+    unsupported_dense.weighted_normal_dshape, unsupported_dense.penalty,
+    unsupported_dense.face_elements, unsupported_dense.element_vdof_map);
+  LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+    unsupported_info, unsupported, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+  MFEM_VERIFY(!unsupported.normal_factorization.TensorMatches(unsupported_info) &&
+                unsupported.dense_normal_generation == unsupported.coefficient_generation,
+              "Unsupported p4 element order must retain the current dense refresh.");
+  Vector unsupported_x(unsupported_fes.GetVSize()), unsupported_actual(unsupported_fes.GetVSize());
+  unsupported_x.UseDevice(true); unsupported_actual.UseDevice(true);
+  real_t* unsupported_input = unsupported_x.HostWrite();
+  for (int i = 0; i < unsupported_x.Size(); ++i)
+  { unsupported_input[i] = 0.01 * std::sin(0.083 * (i + 1)); }
+  unsupported_actual = 0.03125;
+  LaunchInteriorFaceDGDiffusionApply2D(
+    unsupported_info, unsupported, unsupported_x, -1.0, unsupported_actual);
+  Vector unsupported_contribution;
+  const Vector unsupported_expected = OriginalRecordAndGather(
+    unsupported_dense_info, unsupported_dense, unsupported_x, -1.0, unsupported_contribution);
+  CheckFactorizationError(unsupported_actual, unsupported_expected,
+                          "Unsupported compact-qdata selector dense fallback");
+  Vector unsupported_diagonal(unsupported_x.Size());
+  unsupported_diagonal = 0.125;
+  ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+    unsupported_info, unsupported, -1.0, unsupported_diagonal);
+  CheckAssembledFaceDiagonal(unsupported_fes, mesh, unsupported_fqs,
+                             coefficient, -1.0, unsupported_diagonal);
+  if (native_cuda)
+  {
+    MFEM_VERIFY(unsupported.weighted_normal_dshape.GetMemory().DeviceIsValid() &&
+                  HasDeviceAllocation(DeviceAllocationInventory(),
+                                      unsupported.weighted_normal_dshape.HostRead()),
+                "Unsupported compact selector must actually use its current dense device table.");
+  }
+  std::cout << "ExactFaceCompactQdata native_cuda=" << native_cuda
+            << " compact_refreshes=" << compact_refreshes
+            << " dense_fallbacks=" << dense_fallbacks
+            << " independent_diagonal_checks=" << diagonal_checks << '\n';
+}
+
 class ScopedEnvironment
 {
 public:
@@ -964,14 +1365,18 @@ void CheckProductionFactorizedDispatch()
   real_t* x = input.HostWrite();
   for (int d = 0; d < input.Size(); ++d)
   { x[d] = 0.01 * std::sin(0.13 * (d + 1)); }
-  Vector dense_actions[2];
-  for (const bool compact : {false, true})
+  Vector dense_actions[2], dense_diagonals[2];
+  for (const int variant : {0, 1, 2})
   {
     // This switch is sampled when the production face operator is built.
     ScopedEnvironment selection("DG_IGR_IGR_FACTORIZED_FACE_NORMALS",
-                                compact ? "true" : "false");
+                                variant == 1 ? "true" : "false");
     ScopedEnvironment canonical_selection("IGRLAB_IGR_FACTORIZED_FACE_NORMALS",
-                                          compact ? "true" : "false");
+                                          variant == 1 ? "true" : "false");
+    ScopedEnvironment qdata_selection("DG_IGR_IGR_COMPACT_FACE_QDATA",
+                                      variant == 2 ? "true" : "false");
+    ScopedEnvironment canonical_qdata_selection("IGRLAB_IGR_COMPACT_FACE_QDATA",
+                                                variant == 2 ? "true" : "false");
     ::igrlab::IGRSolver solver(scalar_fes, state_fes, 2, 4, 0.07);
     solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
     solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
@@ -996,17 +1401,21 @@ void CheckProductionFactorizedDispatch()
       MFEM_VERIFY(face && solver.GetLastExactFaceEffective() &&
                     solver.GetLastExactFaceSharedFaceCount() == 0,
                   "Factorized-normal switch fixture must exercise local exact faces.");
-      Vector actual(input.Size());
+      Vector actual(input.Size()), diagonal(input.Size());
       actual.UseDevice(true);
+      face->AssembleDiagonal(diagonal);
       face->Mult(input, actual);
       RequireFinite(actual);
       MFEM_VERIFY(actual.Normlinf() > 1.0e-6,
                   "Factorized-normal production fixture needs a nonzero face action.");
-      if (!compact) { dense_actions[refresh] = actual; }
+      if (!variant)
+      { dense_actions[refresh] = actual; dense_diagonals[refresh] = diagonal; }
       else
       {
         CheckFactorizationError(actual, dense_actions[refresh],
                                 "Production factorized face dispatch");
+        CheckFactorizationError(diagonal, dense_diagonals[refresh],
+                                "Production compact-qdata current diagonal");
       }
     }
   }
@@ -1399,7 +1808,8 @@ void CheckProductionIdentityCopies()
     }
   }
 }
-// Opt-in fixed-workload record diagnostic; timings exclude setup, gather and solves.
+// Opt-in fixed workload: preserve the record-only comparisons, then measure
+// current dense-refresh/tensor apply against compact refresh/tensor apply.
 void BenchmarkFaceRecords512(const std::string& mesh_path)
 {
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
@@ -1563,6 +1973,120 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
     factors.tensor_axes.Read(), factors.tensor_face_slots.Read(),
     factors.tensor_lex_to_native.Read(), factors.normal_geometry.Read(),
     work.side_coefficient.Read(), factors.tensor_slot_count});
+
+  // Use one geometry pack for both variants so the large host S/base/N tables
+  // and all mesh/packing choices are identical. The opt-in flag changes only
+  // current qdata refresh and its resulting dense-device cache state.
+  Vector combined_output(x.Size()), combined_reference(x.Size());
+  combined_output.UseDevice(true); combined_reference.UseDevice(true);
+  combined_output = 0.0; combined_reference = 0.0;
+  const void* full_shape = work.shape.HostRead();
+  const void* full_base = work.normal_dshape_base.HostRead();
+  const void* full_normal = work.weighted_normal_dshape.HostRead();
+  std::size_t baseline_resident_bytes = 0, baseline_dense_bytes = 0;
+  std::size_t baseline_free_bytes = 0;
+  double baseline_refresh_ms = 0.0, baseline_combined_ms = 0.0;
+  for (const bool compact : {false, true})
+  {
+    work.compact_qdata = compact;
+    auto update_and_apply = [&](bool apply)
+    {
+      LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+        info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+      if (apply)
+      {
+        combined_output = 0.03125;
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, combined_output);
+      }
+    };
+    auto time_refresh = [&](bool apply)
+    {
+      for (int repeat = 0; repeat < warmups; ++repeat) { update_and_apply(apply); }
+      MFEM_GPU_CHECK(cudaGetLastError());
+      MFEM_GPU_CHECK(cudaDeviceSynchronize());
+      MFEM_GPU_CHECK(cudaEventRecord(start));
+      for (int repeat = 0; repeat < repeats; ++repeat) { update_and_apply(apply); }
+      MFEM_GPU_CHECK(cudaEventRecord(stop));
+      MFEM_GPU_CHECK(cudaEventSynchronize(stop));
+      MFEM_GPU_CHECK(cudaGetLastError());
+      float elapsed_ms = 0.0f;
+      MFEM_GPU_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+      return double(elapsed_ms) / repeats;
+    };
+    const double refresh_ms = time_refresh(false);
+    const double combined_ms = time_refresh(true);
+    const bool tensor_apply_admitted =
+      ::igrlab::dg_face::HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work);
+    const bool compact_refresh_admitted = work.compact_qdata && tensor_apply_admitted &&
+      work.coefficient_geometry_revision == info.connectivity_revision &&
+      work.coefficient_generation != 0 &&
+      work.dense_normal_generation != work.coefficient_generation;
+    MFEM_VERIFY(tensor_apply_admitted && compact_refresh_admitted == compact,
+                "Large qdata benchmark must time its declared tensor refresh/apply admission.");
+    const auto inventory = DeviceAllocationInventory();
+    const std::size_t dense_shape_device_bytes = DeviceResidentBytes(inventory, work.shape);
+    const std::size_t dense_base_device_bytes = DeviceResidentBytes(inventory, work.normal_dshape_base);
+    const std::size_t dense_normal_device_bytes = DeviceResidentBytes(inventory, work.weighted_normal_dshape);
+    const std::size_t resident_bytes = FaceScratchDeviceResidentBytes(work, inventory);
+    std::size_t free_bytes = 0, total_bytes = 0;
+    MFEM_GPU_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    MFEM_VERIFY(work.side_coefficient.GetMemory().DeviceIsValid() &&
+                  work.penalty.GetMemory().DeviceIsValid() &&
+                  factors.normal_geometry.GetMemory().DeviceIsValid() &&
+                  factors.tensor_endpoint.GetMemory().DeviceIsValid() &&
+                  factors.tensor_tangent.GetMemory().DeviceIsValid(),
+                "Timed tensor update/apply must actually consume compact current device data.");
+    if (compact)
+    {
+      MFEM_VERIFY(!HasDeviceAllocation(inventory, full_shape) &&
+                    !HasDeviceAllocation(inventory, full_base) &&
+                    !HasDeviceAllocation(inventory, full_normal) &&
+                    dense_shape_device_bytes + dense_base_device_bytes + dense_normal_device_bytes == 0 &&
+                    resident_bytes < baseline_resident_bytes &&
+                    baseline_resident_bytes - resident_bytes >= baseline_dense_bytes,
+                  "Compact large-case device residency must remove the actual dense S/base/N allocations.");
+      CheckFactorizationError(combined_output, combined_reference,
+                              "Large compact refresh/apply versus current dense-refresh/tensor apply");
+    }
+    else
+    {
+      MFEM_VERIFY(HasDeviceAllocation(inventory, full_base) &&
+                    HasDeviceAllocation(inventory, full_normal) &&
+                    work.dense_normal_generation == work.coefficient_generation,
+                  "Baseline must retain and refresh the original full dense device normal tables.");
+      combined_reference = combined_output;
+      baseline_resident_bytes = resident_bytes;
+      baseline_dense_bytes = dense_shape_device_bytes + dense_base_device_bytes + dense_normal_device_bytes;
+      baseline_free_bytes = free_bytes;
+      baseline_refresh_ms = refresh_ms;
+      baseline_combined_ms = combined_ms;
+    }
+    CheckFactorizationError(work.face_contribution, reference,
+                            "Large current-qdata face contributions versus original dense record");
+    std::cout << "ExactFaceBenchmark512 variant="
+              << (compact ? "compact_refresh_tensor_apply" : "dense_refresh_tensor_apply")
+              << " scope=coefficient_refresh_and_face_apply"
+              << " mean_refresh_ms=" << refresh_ms
+              << " mean_refresh_apply_ms=" << combined_ms
+              << " refresh_speedup=" << baseline_refresh_ms / refresh_ms
+              << " refresh_apply_speedup=" << baseline_combined_ms / combined_ms
+              << " tensor_apply_admitted=" << tensor_apply_admitted
+              << " compact_refresh_admitted=" << compact_refresh_admitted
+              << " coefficient_generation=" << work.coefficient_generation
+              << " dense_normal_generation=" << work.dense_normal_generation
+              << " scratch_device_resident_bytes=" << resident_bytes
+              << " dense_shape_device_bytes=" << dense_shape_device_bytes
+              << " dense_geometry_normal_device_bytes=" << dense_base_device_bytes
+              << " dense_weighted_normal_device_bytes=" << dense_normal_device_bytes
+              << " scratch_device_bytes_removed=" << baseline_resident_bytes - resident_bytes
+              << " cuda_free_bytes=" << free_bytes
+              << " cuda_total_bytes=" << total_bytes
+              << " cuda_free_bytes_increase="
+              << (free_bytes >= baseline_free_bytes ? free_bytes - baseline_free_bytes : 0u)
+              << " bitwise_dense_refresh_tensor_reference=" << SameBits(combined_output, combined_reference)
+              << " output_reset_included=true gather_included=true solves_included=false"
+              << std::endl;
+  }
   MFEM_GPU_CHECK(cudaEventDestroy(start));
   MFEM_GPU_CHECK(cudaEventDestroy(stop));
 #else
@@ -1592,6 +2116,7 @@ int main(int argc, char** argv)
   }
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
+  CheckCompactFaceQdata();
   CheckProductionFactorizedDispatch();
   CheckProductionIdentityCopies();
   CheckGatherToBaseRounding();

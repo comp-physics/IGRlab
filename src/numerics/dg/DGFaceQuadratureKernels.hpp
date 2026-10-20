@@ -221,7 +221,7 @@ struct InteriorFaceDGDiffusionApplyScratch
   mfem::Vector shape;
   InteriorFaceShapeDictionary2D shape_dictionary;
   InteriorFaceDGDiffusionFactorization2D normal_factorization;
-  mfem::Vector weighted_normal_dshape;
+  mutable mfem::Vector weighted_normal_dshape;
   mfem::Vector penalty;
   /// Geometry-only normal derivative used to refresh state-dependent qdata.
   mfem::Vector normal_dshape_base;
@@ -229,6 +229,13 @@ struct InteriorFaceDGDiffusionApplyScratch
   mfem::Vector penalty_metric;
   /// Persistent copy of the current [side][quadrature][face] alpha/rho data.
   mfem::Vector side_coefficient;
+  /// Optional tensor-path qdata reduction; exact dense host geometry is kept.
+  bool compact_qdata = false;
+  /// Independent stage generation: a geometry revision is not a state revision.
+  std::uint64_t coefficient_geometry_revision = 0;
+  std::uint64_t coefficient_generation = 0;
+  mutable std::uint64_t dense_normal_generation = 0;
+  DGDiffusionFaceScaling coefficient_scaling = DGDiffusionFaceScaling::Arithmetic;
   mfem::Array<int> face_elements;
   mfem::Array<int> element_vdof_map;
   /// Fixed-order element-to-(face,side) CSR used by the CUDA row gather.
@@ -240,6 +247,41 @@ struct InteriorFaceDGDiffusionApplyScratch
   /// Per-face row contributions written without atomics before the gather.
   mutable mfem::Vector face_contribution;
 };
+
+inline bool HasCurrentInteriorFaceDGDiffusionTensorData2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  const auto& factor = work.normal_factorization;
+  return factor.TensorMatches(info) &&
+    factor.coefficient_revision == info.connectivity_revision &&
+    std::size_t(work.side_coefficient.Size()) ==
+      2u * std::size_t(info.nq) * std::size_t(info.nf) &&
+    (factor.coefficient_scaling == DGDiffusionFaceScaling::Arithmetic ||
+     factor.coefficient_scaling == DGDiffusionFaceScaling::Max ||
+     factor.coefficient_scaling == DGDiffusionFaceScaling::Sum);
+}
+
+inline bool UsesOrdinaryCUDAForDGDiffusionFaces2D()
+{
+#if defined(MFEM_USE_CUDA)
+  const unsigned long alternative_backends =
+    mfem::Backend::OMP_MASK | mfem::Backend::RAJA_MASK |
+    mfem::Backend::OCCA_MASK | mfem::Backend::CEED_MASK |
+    mfem::Backend::HIP_MASK | mfem::Backend::DEBUG_DEVICE;
+  return mfem::Device::Allows(mfem::Backend::CUDA) &&
+    !mfem::Device::Allows(alternative_backends);
+#else
+  return false;
+#endif
+}
+
+// A tensor refresh may leave the full normal table from an older stage. Every
+// dense reader must materialize it from exact host geometry and current Q,
+// independently of whether the optional factorization is still admitted.
+void EnsureInteriorFaceDGDiffusionDenseNormals2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work);
 
 inline void PrepareInteriorFaceShapeDictionary2D(
   const InteriorFaceDGDiffusionApplyInfo& info,
@@ -2559,17 +2601,8 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       !mfem::Device::Allows(mfem::Backend::RAJA_CUDA))
   {
     const auto& factor = work.normal_factorization;
-    const unsigned long alternative_backends =
-      mfem::Backend::OMP_MASK | mfem::Backend::RAJA_MASK |
-      mfem::Backend::OCCA_MASK | mfem::Backend::CEED_MASK |
-      mfem::Backend::HIP_MASK | mfem::Backend::DEBUG_DEVICE;
-    const bool factorized = !mfem::Device::Allows(alternative_backends) &&
-      factor.TensorMatches(info) && factor.coefficient_revision == info.connectivity_revision &&
-      std::size_t(work.side_coefficient.Size()) ==
-        2u * std::size_t(info.nq) * std::size_t(info.nf) &&
-      (factor.coefficient_scaling == DGDiffusionFaceScaling::Arithmetic ||
-       factor.coefficient_scaling == DGDiffusionFaceScaling::Max ||
-       factor.coefficient_scaling == DGDiffusionFaceScaling::Sum);
+    const bool factorized = UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+      HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work);
     if (factorized)
     {
       mfem::forall_2D_batch(
@@ -2581,6 +2614,7 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
     }
     else
     {
+      EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
       const bool compact_shape = work.shape_dictionary.Matches(info);
       record.shape = compact_shape ? work.shape_dictionary.values.Read() : work.shape.Read();
       const int* shape_slots = compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
@@ -2594,6 +2628,7 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   else
 #endif
   {
+    EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
     record.shape = work.shape.Read();
     record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
     mfem::forall(info.nf, record);
@@ -3000,6 +3035,7 @@ AddInteriorFaceDGDiffusionApply2D(
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
+  EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,
@@ -3099,6 +3135,7 @@ inline void AddInteriorFaceDGDiffusionApply2D(
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
+  EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,
@@ -3177,6 +3214,60 @@ inline void AddInteriorFaceDGDiffusionDiagonal2D(
   mfem::real_t ip_sigma,
   mfem::Vector& diag)
 {
+  if (work.compact_qdata && UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+      work.coefficient_geometry_revision == info.connectivity_revision &&
+      work.coefficient_generation != 0 &&
+      HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work))
+  {
+    // Reconstruct only each diagonal entry. Materializing the full current N
+    // table here would undo both the refresh and device-residency reduction.
+    const auto& factor = work.normal_factorization;
+    const auto E = mfem::Reshape(factor.tensor_endpoint.HostRead(),
+                                  2, 6, 2, factor.tensor_slot_count);
+    const auto T = mfem::Reshape(factor.tensor_tangent.HostRead(),
+                                  2, 6, 6, 2, factor.tensor_slot_count);
+    const auto Axis = mfem::Reshape(factor.tensor_axes.HostRead(),
+                                     2, factor.tensor_slot_count);
+    const int* slots = factor.tensor_face_slots.HostRead();
+    const int* native = factor.tensor_lex_to_native.HostRead();
+    const auto G = mfem::Reshape(factor.normal_geometry.HostRead(), 2, 2, 6, info.nf);
+    const auto Q = mfem::Reshape(work.side_coefficient.HostRead(), 2, 6, info.nf);
+    const auto P = mfem::Reshape(work.penalty.HostRead(), 6, info.nf);
+    const auto F = mfem::Reshape(work.face_elements.HostRead(), 2, info.nf);
+    const auto D = mfem::Reshape(work.element_vdof_map.HostRead(), 36, 1, info.ne);
+    mfem::real_t* diag_data = diag.HostReadWrite();
+    for (int face = 0; face < info.nf; ++face)
+    {
+      const int slot = slots[face];
+      for (int side = 0; side < 2; ++side)
+      {
+        const int axis = Axis(side, slot), element = F(side, face);
+        for (int q = 0; q < 6; ++q)
+        {
+          for (int t = 0; t < 6; ++t) for (int i = 0; i < 6; ++i)
+          {
+            const int d = native[axis == 0 ? i + 6 * t : t + 6 * i];
+            const int vdof = D(d, 0, element);
+            MFEM_VERIFY(vdof >= 0 && vdof < diag.Size(),
+                        "Compact interior exact-face diagonal vdof out of range.");
+            const mfem::real_t bn = E(0, i, side, slot), bt = T(0, t, q, side, slot);
+            const mfem::real_t dn = E(1, i, side, slot) * bt;
+            const mfem::real_t dt = bn * T(1, t, q, side, slot);
+            const mfem::real_t dx = axis == 0 ? dn : dt;
+            const mfem::real_t dy = axis == 0 ? dt : dn;
+            // Preserve the physical x/y normal accumulation order.
+            mfem::real_t normal = G(0, side, q, face) * dx;
+            normal += G(1, side, q, face) * dy;
+            normal *= Q(side, q, face);
+            diag_data[vdof] += DGDiffusionFaceDiagonalEntry2D(
+              side, bn * bt, normal, P(q, face), ip_sigma);
+          }
+        }
+      }
+    }
+    return;
+  }
+  EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,

@@ -976,6 +976,10 @@ public:
   {
     for (int q = 0; q < shared_ir.GetNPoints(); ++q)
       rule_points_.push_back({{shared_ir.IntPoint(q).x, shared_ir.IntPoint(q).weight}});
+    scratch_.compact_qdata =
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_COMPACT_FACE_QDATA", false);
+    const bool prepare_tensor_faces = scratch_.compact_qdata ||
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACTORIZED_FACE_NORMALS", false);
     info_ = dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
       sfes_,
       fqs,
@@ -990,8 +994,7 @@ public:
       &scratch_.normal_dshape_base,
       &scratch_.penalty_metric,
       &scratch_.shape_dictionary,
-      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACTORIZED_FACE_NORMALS", false)
-        ? &scratch_.normal_factorization : nullptr);
+      prepare_tensor_faces ? &scratch_.normal_factorization : nullptr);
     timing_enabled_ =
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
                                       false);
