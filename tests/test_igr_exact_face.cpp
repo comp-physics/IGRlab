@@ -1,6 +1,10 @@
 #include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "mfem/general/forall.hpp"
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+#include "mfem/general/cuda.hpp"
+#include <cuda_runtime.h>
+#endif
 #include "physics/igr/IGR.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 #include "../src/physics/igr/IGR_chebyshev.hpp"
@@ -11,6 +15,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <string>
 #include <vector>
@@ -50,6 +55,7 @@ using ::igrlab::dg_face::InteriorFaceDGDiffusionGather2D;
 using ::igrlab::dg_face::InteriorFaceDGDiffusionRecord2D;
 using ::igrlab::dg_face::InteriorFaceShapeDictionary2D;
 using ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D;
+using ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D;
 using ::igrlab::dg_face::PrepareInteriorFaceShapeDictionary2D;
 
 bool SameBits(const Vector& a, const Vector& b)
@@ -177,6 +183,103 @@ Vector OriginalRecordAndGather(const InteriorFaceDGDiffusionApplyInfo& info,
   return result;
 }
 
+// Factorization changes the order of FP64 products, so compare norm-scaled
+// errors rather than individual near-zero rows. This bound allows roughly
+// 2e4 eps for the longest tested p10 contractions without admitting a changed
+// discretization; measured maxima are printed by the test executable.
+constexpr double factorization_tolerance = 5.0e-12;
+struct FactorizationTestStats
+{
+  int prepared = 0, cuda_applications = 0;
+  double max_relative_l2 = 0.0, max_relative_linf = 0.0;
+} factorization_stats;
+
+void CheckFactorizationError(const Vector& actual, const Vector& reference,
+                              const char* label)
+{
+  MFEM_VERIFY(actual.Size() == reference.Size(), "Factorized action size changed.");
+  RequireFinite(actual);
+  RequireFinite(reference);
+  Vector difference(actual);
+  difference -= reference;
+  const double l2 = difference.Norml2() / std::max(reference.Norml2(), 1.0e-300);
+  const double linf = difference.Normlinf() / std::max(reference.Normlinf(), 1.0e-300);
+  factorization_stats.max_relative_l2 = std::max(factorization_stats.max_relative_l2, l2);
+  factorization_stats.max_relative_linf = std::max(factorization_stats.max_relative_linf, linf);
+  MFEM_VERIFY(l2 <= factorization_tolerance && linf <= factorization_tolerance,
+              label << " relative_l2=" << l2 << " relative_linf=" << linf);
+}
+
+// Independent scalar CPU evaluation of the stored reference derivatives and
+// physical mapping factors. Production CPU dispatch intentionally stays dense.
+Vector HostFactorizedAction(const InteriorFaceDGDiffusionApplyInfo& info,
+                            const InteriorFaceDGDiffusionApplyScratch& work,
+                            const Vector& x, real_t ip_sigma,
+                            Vector& contribution)
+{
+  const auto& factors = work.normal_factorization;
+  MFEM_VERIFY(factors.Matches(info) &&
+                factors.coefficient_revision == info.connectivity_revision,
+              "Host factor oracle requires current geometry and coefficients.");
+  const auto DS = Reshape(factors.reference_dshape.HostRead(),
+                          2, 2, info.nq, info.dof, factors.slot_count);
+  const auto NH = Reshape(factors.normal_geometry.HostRead(), 2, 2, info.nq, info.nf);
+  const auto Q = Reshape(work.side_coefficient.HostRead(), 2, info.nq, info.nf);
+  const auto PM = Reshape(work.penalty_metric.HostRead(), 2, info.nq, info.nf);
+  const int* slots = factors.face_slots.HostRead();
+  Vector normals(work.weighted_normal_dshape.Size());
+  auto N = Reshape(normals.HostWrite(), 2, info.nq, info.dof, info.nf);
+  for (int face = 0; face < info.nf; ++face)
+  {
+    for (int q = 0; q < info.nq; ++q)
+    {
+      const real_t metric0 = Q(0, q, face) * PM(0, q, face);
+      const real_t metric1 = Q(1, q, face) * PM(1, q, face);
+      for (int side = 0; side < 2; ++side)
+      {
+        real_t scale = Q(side, q, face);
+        if (factors.coefficient_scaling == DGDiffusionFaceScaling::HarmonicWeighted &&
+            metric0 + metric1 > 0.0)
+        { scale *= 2.0 * (side == 0 ? metric1 : metric0) / (metric0 + metric1); }
+        for (int d = 0; d < info.dof; ++d)
+        {
+          N(side, q, d, face) = scale *
+            (DS(0, side, q, d, slots[face]) * NH(0, side, q, face) +
+             DS(1, side, q, d, slots[face]) * NH(1, side, q, face));
+        }
+      }
+    }
+  }
+  CheckFactorizationError(normals, work.weighted_normal_dshape,
+                          "Factorized normal reconstruction changed the physical mapping");
+  contribution.SetSize(2 * info.dof * info.nf);
+  InteriorFaceDGDiffusionRecord2D record;
+  record.dof = info.dof; record.vdim = info.vdim;
+  record.nq = info.nq; record.nf = info.nf; record.ne = info.ne;
+  record.ip_sigma = ip_sigma;
+  record.shape = work.shape.HostRead();
+  record.weighted_normal_dshape = normals.HostRead();
+  record.penalty = work.penalty.HostRead();
+  record.face_elements = work.face_elements.HostRead();
+  record.element_vdof_map = work.element_vdof_map.HostRead();
+  record.x = x.HostRead();
+  record.contribution = contribution.HostWrite();
+  for (int face = 0; face < info.nf; ++face) { record(face); }
+  Vector result(x.Size());
+  result = 0.03125;
+  InteriorFaceDGDiffusionGather2D gather;
+  gather.dof = info.dof; gather.vdim = info.vdim;
+  gather.ne = info.ne; gather.nf = info.nf;
+  gather.element_vdof_map = work.element_vdof_map.HostRead();
+  gather.element_face_offsets = work.element_face_offsets.HostRead();
+  gather.element_face_ids = work.element_face_ids.HostRead();
+  gather.element_face_sides = work.element_face_sides.HostRead();
+  gather.contribution = contribution.HostRead();
+  gather.y = result.HostReadWrite();
+  for (int row = 0; row < info.ne * info.dof; ++row) { gather(row); }
+  return result;
+}
+
 void CheckGatherToBaseRounding()
 {
   // The combined production path admits ordinary CUDA only. Host arithmetic
@@ -251,15 +354,23 @@ Mesh MakeMesh(int geometry)
   // covers full four-face batches; the nonperiodic meshes retain a 7-face
   // tail fixture below.
   const bool periodic = geometry == 2;
-  Mesh mesh = Mesh::MakeCartesian2D(periodic ? 4 : 3,
-                                    periodic ? 3 : 2, Element::QUADRILATERAL,
-                                    true, 1.0, 0.7);
+  const bool factor_fixture = geometry >= 3;
+  Mesh mesh = Mesh::MakeCartesian2D(factor_fixture ? 4 : (periodic ? 4 : 3),
+                                    factor_fixture ? 4 : (periodic ? 3 : 2),
+                                    Element::QUADRILATERAL,
+                                    true, 1.0, factor_fixture ? 1.0 : 0.7);
+  if (geometry == 3)
+  {
+    mesh.Transform([](const Vector& x, Vector& y)
+    { y.SetSize(2); y[0] = 1.1 * x[0] + 0.2 * x[1];
+      y[1] = 0.15 * x[0] + 0.9 * x[1]; });
+  }
   if (geometry == 2)
   {
     const std::vector<Vector> shifts = {Vector({1.0, 0.0}), Vector({0.0, 0.7})};
     return Mesh::MakePeriodic(mesh, mesh.CreatePeriodicVertexMapping(shifts));
   }
-  if (geometry == 1)
+  if (geometry == 1 || geometry == 4)
   {
     // Positive rotations change the local face/dof orientation.  Curvature
     // then exercises nonconstant physical normals and inverse Jacobians.
@@ -330,8 +441,9 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     const auto info = BuildInteriorFaceDGDiffusionApplyData2D(
       fes, fqs, side_q, kappa, work.shape, work.weighted_normal_dshape,
       work.penalty, work.face_elements, work.element_vdof_map, scaling,
-      &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary);
-    MFEM_VERIFY(info.nf == (geometry == 2 ? 24 : 7),
+      &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary,
+      &work.normal_factorization);
+    MFEM_VERIFY(info.nf == (geometry >= 2 ? 24 : 7),
                 "Fixture must cover whole batches and a three-face tail.");
     MFEM_VERIFY(info.dof == (order + 1) * (order + 1) &&
                 info.nq == ir.GetNPoints(), "Unexpected packed dimensions.");
@@ -345,7 +457,16 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     }
 #endif
     const Vector compact_before(work.shape_dictionary.values);
+    const Vector reference_before(work.normal_factorization.reference_dshape);
+    const Vector geometry_before(work.normal_factorization.normal_geometry);
     const auto dictionary_revision = work.shape_dictionary.geometry_revision;
+    if (geometry >= 3)
+    {
+      MFEM_VERIFY(work.normal_factorization.Matches(info) ==
+                    (scaling != DGDiffusionFaceScaling::HarmonicWeighted),
+                  "Skew/nonaffine p5 fixtures must admit supported factorized scalings only.");
+    }
+    if (work.normal_factorization.Matches(info)) { ++factorization_stats.prepared; }
     for (const real_t ip_sigma : {-1.0, 1.0})
     {
       // A second coefficient pack exercises the persistent geometry refresh.
@@ -368,6 +489,11 @@ void CheckCase(int order, int face_order, int basis, int geometry,
         MFEM_VERIFY(work.shape_dictionary.geometry_revision == dictionary_revision &&
                       SameBits(compact_before, work.shape_dictionary.values),
                     "Current coefficients must not change the immutable shape dictionary.");
+        MFEM_VERIFY(SameBits(reference_before, work.normal_factorization.reference_dshape) &&
+                      SameBits(geometry_before, work.normal_factorization.normal_geometry),
+                    "Current qdata must not modify immutable reference or mapping factors.");
+        const auto factor_revision = work.normal_factorization.coefficient_revision;
+        work.normal_factorization.coefficient_revision = 0; // Original dense-path oracle.
         work.face_contribution.SetSize(2 * info.dof * info.nf);
         work.face_contribution.UseDevice(true);
         work.face_contribution = std::numeric_limits<real_t>::quiet_NaN();
@@ -417,6 +543,36 @@ void CheckCase(int order, int face_order, int basis, int geometry,
         AddInteriorFaceDGDiffusionApplyDevice2D(info, work, x, ip_sigma, repeat);
         MFEM_VERIFY(SameBits(actual, repeat), "Exact face repeat changed bits.");
 
+        work.normal_factorization.coefficient_revision = factor_revision;
+        Vector factorized(x.Size());
+        factorized.UseDevice(true);
+        factorized = 0.03125;
+        work.weighted_normal_dshape.HostReadWrite();
+        LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, factorized);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+        if (::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+        {
+          const bool admitted = work.normal_factorization.Matches(info) && info.nq <= 16 &&
+            factor_revision == info.connectivity_revision &&
+            scaling != DGDiffusionFaceScaling::HarmonicWeighted;
+          MFEM_VERIFY(work.weighted_normal_dshape.GetMemory().DeviceIsValid() != admitted,
+                      "Public apply must select factorized storage only when admitted.");
+          if (admitted) { ++factorization_stats.cuda_applications; }
+        }
+#endif
+        CheckFactorizationError(factorized, original, "Factorized public face action");
+        CheckFactorizationError(work.face_contribution, original_contribution,
+                                "Factorized face contributions");
+        if (work.normal_factorization.Matches(info))
+        {
+          Vector host_contribution;
+          const Vector host_action = HostFactorizedAction(info, work, x, ip_sigma,
+                                                          host_contribution);
+          CheckFactorizationError(host_action, original, "Scalar CPU factorized action");
+          CheckFactorizationError(host_contribution, original_contribution,
+                                  "Scalar CPU factorized contributions");
+        }
+
         if (!refresh && scaling == DGDiffusionFaceScaling::Arithmetic)
         {
           DGDiffusionIntegrator integrator(coefficient, ip_sigma, kappa);
@@ -459,6 +615,7 @@ void CheckCase(int order, int face_order, int basis, int geometry,
           const double max_error = delta.Normlinf();
           const double relative_error = delta.Norml2() / reference_norm;
           max_assembled_error = std::max(max_assembled_error, max_error);
+          CheckFactorizationError(factorized, expected, "Factorized assembled-MFEM oracle");
           MFEM_VERIFY(max_error < 5.0e-13 && relative_error < 5.0e-13,
                       "Exact face action differs from assembled MFEM: "
                       << max_error << " relative=" << relative_error);
@@ -483,51 +640,131 @@ void CheckDictionaryGeometryRebuild()
   real_t* input = x.HostWrite();
   for (int i = 0; i < x.Size(); ++i) { input[i] = 0.01 * std::sin(0.07 * (i + 1)); }
   InteriorFaceDGDiffusionApplyScratch work;
-  auto build = [&](bool compact)
+  auto build = [&](bool compact_shape, bool factorize = true,
+                    std::size_t budget = 256u * 1024u * 1024u)
   {
     FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
     return BuildInteriorFaceDGDiffusionApplyData2D(
       fes, fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
       work.penalty, work.face_elements, work.element_vdof_map,
       DGDiffusionFaceScaling::Arithmetic, &work.normal_dshape_base,
-      &work.penalty_metric, compact ? &work.shape_dictionary : nullptr);
+      &work.penalty_metric, compact_shape ? &work.shape_dictionary : nullptr,
+      factorize ? &work.normal_factorization : nullptr, budget);
   };
-  auto parity = [&](const InteriorFaceDGDiffusionApplyInfo& info)
+  auto parity = [&](const InteriorFaceDGDiffusionApplyInfo& info, bool factorized)
   {
     Vector actual(x.Size());
     actual.UseDevice(true);
     actual = 0.03125;
-    AddInteriorFaceDGDiffusionApplyDevice2D(info, work, x, -1.0, actual);
+    work.weighted_normal_dshape.HostReadWrite();
+    LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, actual);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+    if (::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+    {
+      MFEM_VERIFY(work.weighted_normal_dshape.GetMemory().DeviceIsValid() != factorized,
+                  "Factorized dispatch must reject stale or unavailable geometry/coefficient data.");
+    }
+#else
+    (void)factorized;
+#endif
     Vector original_contribution;
     const Vector original = OriginalRecordAndGather(info, work, x, -1.0,
                                                    original_contribution);
-    RequireFinite(actual);
-    MFEM_VERIFY(SameBits(actual, original) &&
-                  SameBits(work.face_contribution, original_contribution),
-                "Rebuilt or declined dictionary changed the original action.");
+    CheckFactorizationError(actual, original, "Rebuilt factorized face action");
+    CheckFactorizationError(work.face_contribution, original_contribution,
+                            "Rebuilt factorized face records");
+    return actual;
+  };
+  auto refresh = [&](const InteriorFaceDGDiffusionApplyInfo& info)
+  {
+    LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
   };
   auto info = build(true);
-  MFEM_VERIFY(work.shape_dictionary.Matches(info), "Rebuild fixture must admit compression.");
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.Matches(info),
+              "Rebuild fixture must admit shape and reference-derivative storage.");
+  MFEM_VERIFY(work.normal_factorization.coefficient_revision == 0,
+              "An initial geometry build must retain dense normal dispatch.");
   const auto first_revision = info.connectivity_revision;
-  const Vector old_shape(work.shape);
-  parity(info);
-  // Legacy vector-only builders can reuse the same allocations; an epoch miss
-  // must reject the old dictionary rather than lazily accepting its pointers.
-  info = build(false);
+  const Vector old_shape(work.shape), old_geometry(work.normal_factorization.normal_geometry);
+  parity(info, false);
+  // Reference-derivative slots are independent of shape slots. Renumber the
+  // former without changing any block to expose accidental shape-slot reuse.
+  auto& factors = work.normal_factorization;
+  MFEM_VERIFY(factors.slot_count > 1, "Reference slot test requires distinct orientations.");
+  const int block = 4 * info.nq * info.dof;
+  const Vector original_reference(factors.reference_dshape);
+  real_t* reordered = factors.reference_dshape.HostWrite();
+  for (int slot = 0; slot < factors.slot_count; ++slot)
+  {
+    std::copy(original_reference.HostRead() + block * slot,
+              original_reference.HostRead() + block * (slot + 1),
+              reordered + block * (factors.slot_count - 1 - slot));
+  }
+  int* slots = factors.face_slots.HostReadWrite();
+  for (int face = 0; face < info.nf; ++face)
+  { slots[face] = factors.slot_count - 1 - slots[face]; }
+  refresh(info);
+  const Vector old_action = parity(info, true);
+  side_q *= 1.19;
+  refresh(info);
+  const Vector new_action = parity(info, true);
+  MFEM_VERIFY(!SameBits(old_action, new_action) && SameBits(old_shape, work.shape) &&
+                SameBits(old_geometry, work.normal_factorization.normal_geometry),
+              "Coefficient refresh must change action without changing geometric factors.");
+
+  Vector harmonic_q(side_q);
+  real_t* harmonic_values = harmonic_q.HostReadWrite();
+  for (int i = 0; i < harmonic_q.Size(); ++i)
+  { harmonic_values[i] *= (i % 2) ? 1.31 : 0.73; }
+  LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+    info, work, harmonic_q, 2.75, DGDiffusionFaceScaling::HarmonicWeighted);
+  MFEM_VERIFY(work.normal_factorization.Matches(info),
+              "Harmonic fallback must be tested with otherwise admitted geometric factors.");
+  const Vector harmonic_action = parity(info, false);
+  Vector harmonic_contribution;
+  const Vector host_harmonic = HostFactorizedAction(info, work, x, -1.0,
+                                                   harmonic_contribution);
+  CheckFactorizationError(host_harmonic, harmonic_action, "Host harmonic geometric reconstruction");
+  refresh(info);
+
+  // Legacy vector-only rebuilds can reuse allocations but never old epochs.
+  info = build(false, false);
   MFEM_VERIFY(info.connectivity_revision != first_revision &&
-                !work.shape_dictionary.Matches(info), "Fresh geometry must reject stale slots.");
-  parity(info);
+                !work.shape_dictionary.Matches(info) && !work.normal_factorization.Matches(info),
+              "Same-size rebuild must reject stale shape and derivative slots.");
+  parity(info, false);
+  refresh(info);
+  parity(info, false); // New qdata cannot make stale geometry valid.
   mesh.Transform([](const Vector& point, Vector& out)
-  { out.SetSize(2); out[0] = 1.03 * point[0]; out[1] = 0.97 * point[1]; });
+  { out.SetSize(2); out[0] = 1.03 * point[0] + 0.07 * point[1];
+    out[1] = 0.97 * point[1]; });
   rule.IntPoint(0).x += 0.001;
   info = build(true);
-  MFEM_VERIFY(work.shape_dictionary.Matches(info) && !SameBits(old_shape, work.shape) &&
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.Matches(info) &&
+                !SameBits(old_shape, work.shape) &&
+                !SameBits(old_geometry, work.normal_factorization.normal_geometry) &&
                 info.connectivity_revision != first_revision,
-              "Same-size changed geometry/rule must rebuild immutable slots.");
+              "Changed geometry/rule must rebuild the reference and mapping factors.");
   CheckDictionaryCopies(info, work);
-  parity(info);
+  parity(info, false);
+  refresh(info);
+  parity(info, true);
+  info = build(true, false);
+  refresh(info);
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) && !work.normal_factorization.Matches(info),
+              "Missing factor storage must leave the original shape optimization available.");
+  parity(info, false);
+  info = build(true, true, 1);
+  refresh(info);
+  MFEM_VERIFY(!work.normal_factorization.Matches(info) &&
+                work.normal_factorization.reference_dshape.Size() == 0 &&
+                work.normal_factorization.normal_geometry.Size() == 0 &&
+                work.normal_factorization.face_slots.Size() == 0,
+              "Factor memory-budget decline must discard old storage.");
+  parity(info, false);
   PrepareInteriorFaceShapeDictionary2D(info, work.shape, work.shape_dictionary, 1);
-  parity(info); // A budget decline follows the original full-S warp path.
+  parity(info, false);
 }
 
 class ScopedEnvironment
@@ -548,6 +785,71 @@ private:
   std::string name_, value_;
   bool had_value_ = false;
 };
+
+void CheckProductionFactorizedDispatch()
+{
+  Mesh serial = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL,
+                                      true, 1.0, 1.0);
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  ParFiniteElementSpace scalar_fes(&mesh, &fec, 1, Ordering::byNODES);
+  ParFiniteElementSpace state_fes(&mesh, &fec, 4, Ordering::byNODES);
+  ParGridFunction state(&state_fes);
+  state.UseDevice(true);
+  Vector input(scalar_fes.GetVSize());
+  input.UseDevice(true);
+  real_t* x = input.HostWrite();
+  for (int d = 0; d < input.Size(); ++d)
+  { x[d] = 0.01 * std::sin(0.13 * (d + 1)); }
+  Vector dense_actions[2];
+  for (const bool compact : {false, true})
+  {
+    // This switch is sampled when the production face operator is built.
+    ScopedEnvironment selection("DG_IGR_IGR_FACTORIZED_FACE_NORMALS",
+                                compact ? "true" : "false");
+    ScopedEnvironment canonical_selection("IGRLAB_IGR_FACTORIZED_FACE_NORMALS",
+                                          compact ? "true" : "false");
+    ::igrlab::IGRSolver solver(scalar_fes, state_fes, 2, 4, 0.07);
+    solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
+    solver.SetExactDGFaceOperator(true);
+    solver.SetSolveMode(::igrlab::IGRSolveMode::SmootherSweeps);
+    solver.SetSweeps(0, 0);
+    for (int refresh = 0; refresh < 2; ++refresh)
+    {
+      const int ndofs = state_fes.GetNDofs();
+      real_t* u = state.HostWrite();
+      for (int d = 0; d < ndofs; ++d)
+      {
+        const real_t rho = (refresh ? 1.19 : 1.0) *
+          (1.0 + 0.03 * std::sin(0.17 * (d + 1)));
+        u[d] = rho;
+        u[d + ndofs] = 0.04 * rho;
+        u[d + 2 * ndofs] = -0.02 * rho;
+        u[d + 3 * ndofs] = 2.5 + 0.001 * rho;
+      }
+      solver.UpdateFromState(state, false);
+      const auto* face = solver.GetLinearFaceOperator();
+      MFEM_VERIFY(face && solver.GetLastExactFaceEffective() &&
+                    solver.GetLastExactFaceSharedFaceCount() == 0,
+                  "Factorized-normal switch fixture must exercise local exact faces.");
+      Vector actual(input.Size());
+      actual.UseDevice(true);
+      face->Mult(input, actual);
+      RequireFinite(actual);
+      MFEM_VERIFY(actual.Normlinf() > 1.0e-6,
+                  "Factorized-normal production fixture needs a nonzero face action.");
+      if (!compact) { dense_actions[refresh] = actual; }
+      else
+      {
+        CheckFactorizationError(actual, dense_actions[refresh],
+                                "Production factorized face dispatch");
+      }
+    }
+  }
+  MFEM_VERIFY(!SameBits(dense_actions[0], dense_actions[1]),
+              "Production factorized-normal comparison must evolve its coefficients.");
+}
 
 // A test-only virtual-access witness distinguishes the production direct
 // read from the old identity-copy path, without adding a production counter.
@@ -934,6 +1236,159 @@ void CheckProductionIdentityCopies()
     }
   }
 }
+// Opt-in fixed-workload record diagnostic; timings exclude setup, gather and solves.
+void BenchmarkFaceRecords512(const std::string& mesh_path)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  MFEM_VERIFY(::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA(),
+              "The large face-record benchmark requires ordinary native CUDA.");
+  constexpr int n = 512, warmups = 4, repeats = 64;
+  // Match production -rs 0 -rp 4 exactly, including mesh-file element and
+  // face ordering; direct Cartesian construction has a different packing.
+  Mesh serial(mesh_path);
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  for (int level = 0; level < 4; ++level) { mesh.UniformRefinement(); }
+  MFEM_VERIFY(mesh.Dimension() == 2 && mesh.SpaceDimension() == 2 &&
+                mesh.GetNE() == n * n,
+              "The supplied Sedov mesh plus four parallel refinements must have 512-square cells.");
+  real_t lower[2] = {1.0, 1.0}, upper[2] = {0.0, 0.0};
+  for (int vertex = 0; vertex < mesh.GetNV(); ++vertex)
+  {
+    const real_t* coordinate = mesh.GetVertex(vertex);
+    for (int d = 0; d < 2; ++d)
+    {
+      lower[d] = std::min(lower[d], coordinate[d]);
+      upper[d] = std::max(upper[d], coordinate[d]);
+    }
+  }
+  MFEM_VERIFY(std::abs(lower[0]) < 1.0e-13 && std::abs(lower[1]) < 1.0e-13 &&
+                std::abs(upper[0] - 1.0) < 1.0e-13 &&
+                std::abs(upper[1] - 1.0) < 1.0e-13,
+              "The large face benchmark requires the production unit-square domain.");
+  DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  ParFiniteElementSpace fes(&mesh, &fec, 1, Ordering::byNODES);
+  const IntegrationRule& rule = IntRules.Get(Geometry::SEGMENT, 11);
+  FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
+  Vector side_q(2 * rule.GetNPoints() * fqs.GetNE()), x(fes.GetVSize());
+  side_q.UseDevice(true);
+  x.UseDevice(true);
+  real_t* q = side_q.HostWrite();
+  for (int i = 0; i < side_q.Size(); ++i)
+  { q[i] = 0.043 / (0.9 + 0.003 * (i % 31) + 0.002 * ((i / 2) % 17)); }
+  real_t* values = x.HostWrite();
+  for (int i = 0; i < x.Size(); ++i)
+  { values[i] = 0.01 * std::sin(0.013 * (i + 1)) + 0.002 * (i % 7); }
+
+  InteriorFaceDGDiffusionApplyScratch work;
+  const auto info = BuildInteriorFaceDGDiffusionApplyData2D(
+    fes, fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
+    work.penalty, work.face_elements, work.element_vdof_map,
+    DGDiffusionFaceScaling::Arithmetic, &work.normal_dshape_base,
+    &work.penalty_metric, &work.shape_dictionary, &work.normal_factorization);
+  MFEM_VERIFY(info.dof == 36 && info.nq == 6 && info.ne == n * n &&
+                info.nf == 2 * n * (n - 1),
+              "The face benchmark must retain the prescribed 512-square p5/Q6 case.");
+  LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+    info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
+  const bool compact_shape = work.shape_dictionary.Matches(info);
+  const auto& factors = work.normal_factorization;
+  const bool factorized = factors.Matches(info);
+  MFEM_VERIFY(factors.coefficient_revision == info.connectivity_revision &&
+                factors.coefficient_scaling == DGDiffusionFaceScaling::Arithmetic &&
+                work.side_coefficient.Size() == 2 * info.nq * info.nf,
+              "The face benchmark must use refreshed current coefficients.");
+  std::cout << std::setprecision(17)
+            << "ExactFaceBenchmark512 cells=" << info.ne << " scalar_dofs=" << x.Size()
+            << " interior_faces=" << info.nf << " dof=" << info.dof << " nq=" << info.nq
+            << " shape_dictionary_admitted=" << compact_shape
+            << " shape_slots=" << work.shape_dictionary.slot_count
+            << " factorization_admitted=" << factorized
+            << " reference_slots=" << factors.slot_count
+            << " dense_shape_bytes=" << std::size_t(work.shape.Size()) * sizeof(real_t)
+            << " dense_geometry_normal_bytes=" << std::size_t(work.normal_dshape_base.Size()) * sizeof(real_t)
+            << " dense_weighted_normal_bytes=" << std::size_t(work.weighted_normal_dshape.Size()) * sizeof(real_t)
+            << " factor_reference_bytes=" << std::size_t(factors.reference_dshape.Size()) * sizeof(real_t)
+            << " factor_geometry_bytes=" << std::size_t(factors.normal_geometry.Size()) * sizeof(real_t)
+            << " factor_slot_bytes=" << std::size_t(factors.face_slots.Size()) * sizeof(int)
+            << " mesh_path=" << std::quoted(mesh_path) << " serial_refinements=0 parallel_refinements=4"
+            << " warmups=" << warmups << " repeats=" << repeats
+            << " scope=record_kernel_only" << std::endl;
+
+  MFEM_VERIFY(factorized,
+              "The prescribed large case must admit factorization before timing a candidate.");
+  work.face_contribution.SetSize(2 * info.dof * info.nf);
+  work.face_contribution.UseDevice(true);
+  InteriorFaceDGDiffusionRecord2D record;
+  record.dof = info.dof; record.vdim = info.vdim;
+  record.nq = info.nq; record.nf = info.nf; record.ne = info.ne;
+  record.ip_sigma = -1.0;
+  record.shape = compact_shape ? work.shape_dictionary.values.Read() : work.shape.Read();
+  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
+  record.penalty = work.penalty.Read();
+  record.face_elements = work.face_elements.Read();
+  record.element_vdof_map = work.element_vdof_map.Read();
+  record.x = x.Read();
+  record.contribution = work.face_contribution.Write();
+  const int* shape_slots = compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
+  const int shape_count = compact_shape ? work.shape_dictionary.slot_count : info.nf;
+  using ::igrlab::dg_face::InteriorFaceDGDiffusionRecord2DWarp;
+  const auto dense = InteriorFaceDGDiffusionRecord2DWarp<false>{
+    record, shape_slots, shape_count};
+  mfem::forall_2D_batch(info.nf, 32, 1, 4, dense);
+  MFEM_GPU_CHECK(cudaGetLastError());
+  MFEM_GPU_CHECK(cudaDeviceSynchronize());
+  Vector reference(work.face_contribution);
+  RequireFinite(reference);
+  MFEM_VERIFY(reference.Normlinf() > 1.0e-6,
+              "Large record benchmark must exercise a nontrivial face action.");
+
+  cudaEvent_t start, stop;
+  MFEM_GPU_CHECK(cudaEventCreate(&start));
+  MFEM_GPU_CHECK(cudaEventCreate(&stop));
+  auto measure = [&](const char* name, auto kernel)
+  {
+    // Reestablish device-write authority after the preceding host comparison.
+    kernel.record.contribution = work.face_contribution.Write();
+    for (int i = 0; i < warmups; ++i)
+    { mfem::forall_2D_batch(info.nf, 32, 1, 4, kernel); }
+    MFEM_GPU_CHECK(cudaGetLastError());
+    MFEM_GPU_CHECK(cudaDeviceSynchronize());
+    MFEM_GPU_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < repeats; ++i)
+    { mfem::forall_2D_batch(info.nf, 32, 1, 4, kernel); }
+    MFEM_GPU_CHECK(cudaEventRecord(stop));
+    MFEM_GPU_CHECK(cudaEventSynchronize(stop));
+    MFEM_GPU_CHECK(cudaGetLastError());
+    float elapsed_ms = 0.0f;
+    MFEM_GPU_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    Vector difference(work.face_contribution);
+    difference -= reference;
+    const double relative_l2 = difference.Norml2() / reference.Norml2();
+    const double relative_linf = difference.Normlinf() / reference.Normlinf();
+    std::cout << "ExactFaceBenchmark512 variant=" << name
+              << " total_ms=" << elapsed_ms
+              << " mean_record_ms=" << double(elapsed_ms) / repeats
+              << " relative_l2=" << relative_l2
+              << " relative_linf=" << relative_linf
+              << " bitwise_dense_reference=" << SameBits(work.face_contribution, reference)
+              << std::endl;
+    MFEM_VERIFY(std::isfinite(relative_l2) && std::isfinite(relative_linf) &&
+                  relative_l2 <= factorization_tolerance && relative_linf <= factorization_tolerance,
+                "Large face-record factorization exceeds its FP64 rounding budget: " << name);
+  };
+  measure("original_dense", dense);
+  measure("reference_factorized", InteriorFaceDGDiffusionRecord2DWarp<true>{
+    record, shape_slots, shape_count, factors.reference_dshape.Read(),
+    factors.normal_geometry.Read(), factors.face_slots.Read(), factors.slot_count,
+    work.side_coefficient.Read()});
+  MFEM_GPU_CHECK(cudaEventDestroy(start));
+  MFEM_GPU_CHECK(cudaEventDestroy(stop));
+#else
+  (void)mesh_path;
+  MFEM_ABORT("The large face-record benchmark must be compiled as native CUDA.");
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -944,8 +1399,18 @@ int main(int argc, char** argv)
   MFEM_VERIFY(backend == "cpu" || backend == "cuda", "Expected cpu or cuda.");
   mfem::Device device(backend.c_str());
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Exact face fixture is single rank.");
+  const bool benchmark = argc == 4 && std::string(argv[2]) == "--benchmark512";
+  MFEM_VERIFY(argc <= 2 || benchmark,
+              "Expected [cpu|cuda] or cuda --benchmark512 /path/to/sedov_taylor.msh.");
+  if (benchmark)
+  {
+    MFEM_VERIFY(backend == "cuda", "--benchmark512 requires the CUDA backend.");
+    BenchmarkFaceRecords512(argv[3]);
+    return 0;
+  }
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
+  CheckProductionFactorizedDispatch();
   CheckProductionIdentityCopies();
   CheckGatherToBaseRounding();
   CheckChebyshevOwnedScratch();
@@ -971,6 +1436,8 @@ int main(int argc, char** argv)
   }
   CheckCase(5, 11, mfem::BasisType::GaussLegendre, 1, cases, max_assembled_error);
   CheckCase(5, 11, mfem::BasisType::GaussLegendre, 2, cases, max_assembled_error);
+  CheckCase(5, 11, mfem::BasisType::GaussLegendre, 3, cases, max_assembled_error);
+  CheckCase(5, 11, mfem::BasisType::GaussLobatto, 4, cases, max_assembled_error);
   CheckCase(6, 13, mfem::BasisType::GaussLegendre, 1, cases, max_assembled_error);
   // P7 has 128 output rows: exactly two full 64-row groups.
   CheckCase(7, 15, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
@@ -989,8 +1456,12 @@ int main(int argc, char** argv)
   CheckCase(5, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(4, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(5, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
-  std::cout << "Exact face record/gather parity: backend=" << backend
+  std::cout << std::setprecision(17) << "Exact face record/gather parity: backend=" << backend
             << " cases=" << cases << " max_assembled_error="
-            << max_assembled_error << '\n';
+            << max_assembled_error
+            << " factor_geometries=" << factorization_stats.prepared
+            << " factor_cuda_applications=" << factorization_stats.cuda_applications
+            << " factor_max_relative_l2=" << factorization_stats.max_relative_l2
+            << " factor_max_relative_linf=" << factorization_stats.max_relative_linf << '\n';
   return 0;
 }

@@ -157,6 +157,8 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
   mfem::real_t kappa,
   DGDiffusionFaceScaling face_scaling)
 {
+  // A failed/aborted refresh cannot leave an earlier coefficient stamp valid.
+  work.normal_factorization.coefficient_revision = 0;
   LaunchDGDiffusionCoefficientUpdate2D(info.dof,
                                        info.nq,
                                        info.nf,
@@ -168,6 +170,8 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
                                        work.penalty,
                                        kappa,
                                        face_scaling);
+  work.normal_factorization.coefficient_scaling = face_scaling;
+  work.normal_factorization.coefficient_revision = info.connectivity_revision;
 }
 
 void LaunchSharedFaceDGDiffusionCoefficientUpdate2D(
