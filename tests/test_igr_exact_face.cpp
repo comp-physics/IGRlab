@@ -191,6 +191,8 @@ constexpr double factorization_tolerance = 5.0e-12;
 struct FactorizationTestStats
 {
   int prepared = 0, cuda_applications = 0;
+  int tensor_packs = 0, tensor_normal_axes = 0, reversed_tensor_sides = 0;
+  int nonidentity_tensor_maps = 0;
   double max_relative_l2 = 0.0, max_relative_linf = 0.0;
 } factorization_stats;
 
@@ -208,6 +210,99 @@ void CheckFactorizationError(const Vector& actual, const Vector& reference,
   factorization_stats.max_relative_linf = std::max(factorization_stats.max_relative_linf, linf);
   MFEM_VERIFY(l2 <= factorization_tolerance && linf <= factorization_tolerance,
               label << " relative_l2=" << l2 << " relative_linf=" << linf);
+}
+
+// Reconstruct full shape and physical normal tables from the cached 1D data
+// on the CPU, independently of the candidate's contraction schedule. Also
+// prove that its local-index map and axes describe the actual MFEM elements.
+void CheckTensorFacePack(const InteriorFaceDGDiffusionApplyInfo& info,
+                         const InteriorFaceDGDiffusionApplyScratch& work,
+                         const ParFiniteElementSpace& fes, ParMesh& mesh,
+                         const FaceQuadratureSpace& fqs)
+{
+  const auto& pack = work.normal_factorization;
+  if (!pack.TensorMatches(info)) { return; }
+  const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(fes.GetFE(0));
+  MFEM_VERIFY(tensor && info.dof == 36 && info.nq == 6,
+              "Tensor-face fixture must use the admitted scalar p5/Q6 tensor element.");
+  const auto& native_map = tensor->GetDofMap();
+  MFEM_VERIFY(native_map.Size() == 0 || native_map.Size() == 36,
+              "Scalar p5 tensor DOF map must be identity or a complete permutation.");
+  const int* map = pack.tensor_lex_to_native.HostRead();
+  bool used[36] = {};
+  bool nonidentity = false;
+  for (int lex = 0; lex < 36; ++lex)
+  {
+    const int native = native_map.Size() ? native_map[lex] : lex;
+    MFEM_VERIFY(native >= 0 && native < 36 && !used[native] && map[lex] == native,
+                "Tensor-face cache must preserve the actual lexical/native DOF permutation.");
+    used[native] = true;
+    nonidentity = nonidentity || native != lex;
+  }
+  factorization_stats.nonidentity_tensor_maps += nonidentity ? 1 : 0;
+  ++factorization_stats.tensor_packs;
+  const int* slots = pack.tensor_face_slots.HostRead();
+  const auto A = Reshape(pack.tensor_axes.HostRead(), 2, pack.tensor_slot_count);
+  const auto E = Reshape(pack.tensor_endpoint.HostRead(), 2, 6, 2, pack.tensor_slot_count);
+  const auto T = Reshape(pack.tensor_tangent.HostRead(), 2, 6, 6, 2, pack.tensor_slot_count);
+  const auto G = Reshape(pack.normal_geometry.HostRead(), 2, 2, info.nq, info.nf);
+  Vector shape(work.shape.Size()), normal(work.normal_dshape_base.Size());
+  auto S = Reshape(shape.HostWrite(), 2, info.nq, info.dof, info.nf);
+  auto N = Reshape(normal.HostWrite(), 2, info.nq, info.dof, info.nf);
+  for (int face = 0; face < info.nf; ++face)
+  {
+    const int slot = slots[face];
+    MFEM_VERIFY(slot >= 0 && slot < pack.tensor_slot_count,
+                "Tensor-face slot must address the independent 1D pack.");
+    const int mesh_face = fqs.GetMeshFaceIndex(face);
+    const auto face_info = mesh.GetFaceInformation(mesh_face);
+    auto* transformation = mesh.GetFaceElementTransformations(mesh_face);
+    const auto& rule = fqs.GetIntRule(face);
+    real_t first_tangent[2];
+    transformation->SetAllIntPoints(&rule.IntPoint(0));
+    for (int side = 0; side < 2; ++side)
+    {
+      const int axis = ::igrlab::dg_face::ReferenceNormalComponent2D(
+        face_info.element[side].local_face_id);
+      MFEM_VERIFY(A(side, slot) == axis,
+                  "Tensor-face normal axis must match the actual local face.");
+      factorization_stats.tensor_normal_axes |= 1 << axis;
+      const auto& ip = side ? transformation->GetElement2IntPoint()
+                            : transformation->GetElement1IntPoint();
+      first_tangent[side] = axis == 0 ? ip.y : ip.x;
+    }
+    transformation->SetAllIntPoints(&rule.IntPoint(info.nq - 1));
+    for (int side = 0; side < 2; ++side)
+    {
+      const int axis = A(side, slot);
+      const auto& ip = side ? transformation->GetElement2IntPoint()
+                            : transformation->GetElement1IntPoint();
+      const real_t last = axis == 0 ? ip.y : ip.x;
+      if (last < first_tangent[side]) { ++factorization_stats.reversed_tensor_sides; }
+      for (int q = 0; q < info.nq; ++q)
+      {
+        for (int j = 0; j < 6; ++j)
+        {
+          for (int i = 0; i < 6; ++i)
+          {
+            const int native = map[i + 6 * j];
+            const int ni = axis == 0 ? i : j;
+            const int ti = axis == 0 ? j : i;
+            const real_t value = E(0, ni, side, slot) * T(0, ti, q, side, slot);
+            const real_t dn = E(1, ni, side, slot) * T(0, ti, q, side, slot);
+            const real_t dt = E(0, ni, side, slot) * T(1, ti, q, side, slot);
+            S(side, q, native, face) = value;
+            N(side, q, native, face) = axis == 0
+              ? dn * G(0, side, q, face) + dt * G(1, side, q, face)
+              : dt * G(0, side, q, face) + dn * G(1, side, q, face);
+          }
+        }
+      }
+    }
+  }
+  CheckFactorizationError(shape, work.shape, "Independent CPU tensor-product shape reconstruction");
+  CheckFactorizationError(normal, work.normal_dshape_base,
+                          "Independent CPU tensor-product physical normal reconstruction");
 }
 
 // Independent scalar CPU evaluation of the stored reference derivatives and
@@ -463,14 +558,20 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     const Vector compact_before(work.shape_dictionary.values);
     const Vector reference_before(work.normal_factorization.reference_dshape);
     const Vector geometry_before(work.normal_factorization.normal_geometry);
+    const Vector endpoint_before(work.normal_factorization.tensor_endpoint);
+    const Vector tangent_before(work.normal_factorization.tensor_tangent);
     const auto dictionary_revision = work.shape_dictionary.geometry_revision;
     if (geometry >= 3)
     {
-      MFEM_VERIFY(work.normal_factorization.Matches(info) ==
+      MFEM_VERIFY(work.normal_factorization.TensorMatches(info) ==
                     (scaling != DGDiffusionFaceScaling::HarmonicWeighted),
-                  "Skew/nonaffine p5 fixtures must admit supported factorized scalings only.");
+                  "Skew/nonaffine p5 fixtures must admit supported tensor-face scalings only.");
     }
     if (work.normal_factorization.Matches(info)) { ++factorization_stats.prepared; }
+    CheckTensorFacePack(info, work, fes, mesh, fqs);
+    // Norm checks above may migrate the full shape table; restore host-only
+    // authority for the existing dense-path dictionary-read witness.
+    work.shape.HostReadWrite();
     for (const real_t ip_sigma : {-1.0, 1.0})
     {
       // A second coefficient pack exercises the persistent geometry refresh.
@@ -494,8 +595,10 @@ void CheckCase(int order, int face_order, int basis, int geometry,
                       SameBits(compact_before, work.shape_dictionary.values),
                     "Current coefficients must not change the immutable shape dictionary.");
         MFEM_VERIFY(SameBits(reference_before, work.normal_factorization.reference_dshape) &&
-                      SameBits(geometry_before, work.normal_factorization.normal_geometry),
-                    "Current qdata must not modify immutable reference or mapping factors.");
+                      SameBits(geometry_before, work.normal_factorization.normal_geometry) &&
+                      SameBits(endpoint_before, work.normal_factorization.tensor_endpoint) &&
+                      SameBits(tangent_before, work.normal_factorization.tensor_tangent),
+                    "Current qdata must not modify immutable reference, 1D or mapping factors.");
         const auto factor_revision = work.normal_factorization.coefficient_revision;
         work.normal_factorization.coefficient_revision = 0; // Original dense-path oracle.
         work.face_contribution.SetSize(2 * info.dof * info.nf);
@@ -552,16 +655,25 @@ void CheckCase(int order, int face_order, int basis, int geometry,
         factorized.UseDevice(true);
         factorized = 0.03125;
         work.weighted_normal_dshape.HostReadWrite();
+        work.shape.HostReadWrite();
+        if (work.shape_dictionary.values.Size())
+        { work.shape_dictionary.values.HostReadWrite(); }
         LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, factorized);
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
         if (::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
         {
-          const bool admitted = work.normal_factorization.Matches(info) && info.nq <= 16 &&
+          const bool admitted = work.normal_factorization.TensorMatches(info) &&
             factor_revision == info.connectivity_revision &&
             scaling != DGDiffusionFaceScaling::HarmonicWeighted;
           MFEM_VERIFY(work.weighted_normal_dshape.GetMemory().DeviceIsValid() != admitted,
                       "Public apply must select factorized storage only when admitted.");
-          if (admitted) { ++factorization_stats.cuda_applications; }
+          if (admitted)
+          {
+            MFEM_VERIFY(!work.shape.GetMemory().DeviceIsValid() &&
+                          !work.shape_dictionary.values.GetMemory().DeviceIsValid(),
+                        "Tensor-face dispatch must avoid both dense and cached full shape tables.");
+            ++factorization_stats.cuda_applications;
+          }
         }
 #endif
         CheckFactorizationError(factorized, original, "Factorized public face action");
@@ -689,12 +801,13 @@ void CheckDictionaryGeometryRebuild()
       info, work, side_q, 2.75, DGDiffusionFaceScaling::Arithmetic);
   };
   auto info = build(true);
-  MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.Matches(info),
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.TensorMatches(info),
               "Repeated rebuild fixture must admit shape and reference-derivative storage: "
               << "faces=" << info.nf << " shape_slots=" << work.shape_dictionary.slot_count
               << " reference_slots=" << work.normal_factorization.slot_count);
   MFEM_VERIFY(work.normal_factorization.coefficient_revision == 0,
               "An initial geometry build must retain dense normal dispatch.");
+  CheckTensorFacePack(info, work, fes, mesh, initial_fqs);
   const auto first_revision = info.connectivity_revision;
   const Vector old_shape(work.shape), old_geometry(work.normal_factorization.normal_geometry);
   parity(info, false);
@@ -714,11 +827,44 @@ void CheckDictionaryGeometryRebuild()
   int* slots = factors.face_slots.HostReadWrite();
   for (int face = 0; face < info.nf; ++face)
   { slots[face] = factors.slot_count - 1 - slots[face]; }
+  // Give the 1D packs a different independent numbering as well. Neither
+  // shape slots nor the older reference-derivative slots may index these.
+  const int tensor_slots = factors.tensor_slot_count;
+  MFEM_VERIFY(tensor_slots > 1, "1D slot test requires distinct local face orientations.");
+  const Vector original_endpoint(factors.tensor_endpoint), original_tangent(factors.tensor_tangent);
+  const std::vector<int> original_axes(factors.tensor_axes.HostRead(),
+                                       factors.tensor_axes.HostRead() + factors.tensor_axes.Size());
+  real_t* endpoint = factors.tensor_endpoint.HostWrite();
+  real_t* tangent = factors.tensor_tangent.HostWrite();
+  int* axes = factors.tensor_axes.HostWrite();
+  constexpr int endpoint_block = 2 * 6 * 2, tangent_block = 2 * 6 * 6 * 2;
+  for (int slot = 0; slot < tensor_slots; ++slot)
+  {
+    const int shifted = (slot + 1) % tensor_slots;
+    std::copy(original_endpoint.HostRead() + endpoint_block * slot,
+              original_endpoint.HostRead() + endpoint_block * (slot + 1),
+              endpoint + endpoint_block * shifted);
+    std::copy(original_tangent.HostRead() + tangent_block * slot,
+              original_tangent.HostRead() + tangent_block * (slot + 1),
+              tangent + tangent_block * shifted);
+    axes[2 * shifted] = original_axes[2 * slot];
+    axes[2 * shifted + 1] = original_axes[2 * slot + 1];
+  }
+  int* tensor_face_slots = factors.tensor_face_slots.HostReadWrite();
+  for (int face = 0; face < info.nf; ++face)
+  { tensor_face_slots[face] = (tensor_face_slots[face] + 1) % tensor_slots; }
+  CheckTensorFacePack(info, work, fes, mesh, initial_fqs);
   refresh(info);
   const Vector old_action = parity(info, true);
   side_q *= 1.19;
   refresh(info);
   const Vector new_action = parity(info, true);
+  const auto tensor_revision = factors.tensor_geometry_revision;
+  factors.tensor_geometry_revision = 0;
+  MFEM_VERIFY(factors.Matches(info) && !factors.TensorMatches(info),
+              "Tensor-only rejection must be tested while the reference cache remains valid.");
+  parity(info, false);
+  factors.tensor_geometry_revision = tensor_revision;
   MFEM_VERIFY(!SameBits(old_action, new_action) && SameBits(old_shape, work.shape) &&
                 SameBits(old_geometry, work.normal_factorization.normal_geometry),
               "Coefficient refresh must change action without changing geometric factors.");
@@ -751,12 +897,14 @@ void CheckDictionaryGeometryRebuild()
     out[1] = 0.97 * point[1]; });
   rule.IntPoint(0).x += 0.001;
   info = build(true);
-  MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.Matches(info) &&
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) && work.normal_factorization.TensorMatches(info) &&
                 !SameBits(old_shape, work.shape) &&
                 !SameBits(old_geometry, work.normal_factorization.normal_geometry) &&
                 info.connectivity_revision != first_revision,
               "Changed geometry/rule must rebuild the reference and mapping factors.");
   CheckDictionaryCopies(info, work);
+  FaceQuadratureSpace changed_fqs(mesh, rule, FaceType::Interior);
+  CheckTensorFacePack(info, work, fes, mesh, changed_fqs);
   parity(info, false);
   refresh(info);
   parity(info, true);
@@ -770,8 +918,13 @@ void CheckDictionaryGeometryRebuild()
   MFEM_VERIFY(!work.normal_factorization.Matches(info) &&
                 work.normal_factorization.reference_dshape.Size() == 0 &&
                 work.normal_factorization.normal_geometry.Size() == 0 &&
-                work.normal_factorization.face_slots.Size() == 0,
-              "Factor memory-budget decline must discard old storage.");
+                work.normal_factorization.face_slots.Size() == 0 &&
+                !work.normal_factorization.TensorMatches(info) &&
+                work.normal_factorization.tensor_endpoint.Size() == 0 &&
+                work.normal_factorization.tensor_tangent.Size() == 0 &&
+                work.normal_factorization.tensor_face_slots.Size() == 0 &&
+                work.normal_factorization.tensor_lex_to_native.Size() == 0,
+              "Factor memory-budget decline must discard old reference and tensor storage.");
   parity(info, false);
   PrepareInteriorFaceShapeDictionary2D(info, work.shape, work.shape_dictionary, 1);
   parity(info, false);
@@ -1303,6 +1456,7 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
   const bool compact_shape = work.shape_dictionary.Matches(info);
   const auto& factors = work.normal_factorization;
   const bool factorized = factors.Matches(info);
+  const bool tensor_admitted = factors.TensorMatches(info);
   MFEM_VERIFY(factors.coefficient_revision == info.connectivity_revision &&
                 factors.coefficient_scaling == DGDiffusionFaceScaling::Arithmetic &&
                 work.side_coefficient.Size() == 2 * info.nq * info.nf,
@@ -1314,6 +1468,14 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
             << " shape_slots=" << work.shape_dictionary.slot_count
             << " factorization_admitted=" << factorized
             << " reference_slots=" << factors.slot_count
+            << " tensor_admitted=" << tensor_admitted
+            << " tensor_n=" << factors.tensor_n
+            << " tensor_slots=" << factors.tensor_slot_count
+            << " tensor_endpoint_bytes=" << std::size_t(factors.tensor_endpoint.Size()) * sizeof(real_t)
+            << " tensor_tangent_bytes=" << std::size_t(factors.tensor_tangent.Size()) * sizeof(real_t)
+            << " tensor_axes_bytes=" << std::size_t(factors.tensor_axes.Size()) * sizeof(int)
+            << " tensor_slot_bytes=" << std::size_t(factors.tensor_face_slots.Size()) * sizeof(int)
+            << " tensor_native_map_bytes=" << std::size_t(factors.tensor_lex_to_native.Size()) * sizeof(int)
             << " dense_shape_bytes=" << std::size_t(work.shape.Size()) * sizeof(real_t)
             << " dense_geometry_normal_bytes=" << std::size_t(work.normal_dshape_base.Size()) * sizeof(real_t)
             << " dense_weighted_normal_bytes=" << std::size_t(work.weighted_normal_dshape.Size()) * sizeof(real_t)
@@ -1324,8 +1486,8 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
             << " warmups=" << warmups << " repeats=" << repeats
             << " scope=record_kernel_only" << std::endl;
 
-  MFEM_VERIFY(factorized,
-              "The prescribed large case must admit factorization before timing a candidate.");
+  MFEM_VERIFY(factorized && tensor_admitted,
+              "The prescribed large case must admit the tensor candidate before it is timed.");
   work.face_contribution.SetSize(2 * info.dof * info.nf);
   work.face_contribution.UseDevice(true);
   InteriorFaceDGDiffusionRecord2D record;
@@ -1391,6 +1553,16 @@ void BenchmarkFaceRecords512(const std::string& mesh_path)
     record, shape_slots, shape_count, factors.reference_dshape.Read(),
     factors.normal_geometry.Read(), factors.face_slots.Read(), factors.slot_count,
     work.side_coefficient.Read()});
+  // No full S/N pointers are supplied: the true tensor record must consume
+  // only its 1D basis, current coefficients and per-quadrature geometry.
+  auto tensor_record = record;
+  tensor_record.shape = nullptr;
+  tensor_record.weighted_normal_dshape = nullptr;
+  measure("tensor_1d", ::igrlab::dg_face::InteriorFaceDGDiffusionTensorRecord2DWarp{
+    tensor_record, factors.tensor_endpoint.Read(), factors.tensor_tangent.Read(),
+    factors.tensor_axes.Read(), factors.tensor_face_slots.Read(),
+    factors.tensor_lex_to_native.Read(), factors.normal_geometry.Read(),
+    work.side_coefficient.Read(), factors.tensor_slot_count});
   MFEM_GPU_CHECK(cudaEventDestroy(start));
   MFEM_GPU_CHECK(cudaEventDestroy(stop));
 #else
@@ -1466,11 +1638,19 @@ int main(int argc, char** argv)
   CheckCase(5, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(4, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(5, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
+  MFEM_VERIFY(factorization_stats.tensor_packs > 0 &&
+                factorization_stats.tensor_normal_axes == 3 &&
+                factorization_stats.reversed_tensor_sides > 0,
+              "Tensor-face correctness fixtures must cover both normal axes and reversed tangents.");
   std::cout << std::setprecision(17) << "Exact face record/gather parity: backend=" << backend
             << " cases=" << cases << " max_assembled_error="
             << max_assembled_error
             << " factor_geometries=" << factorization_stats.prepared
-            << " factor_cuda_applications=" << factorization_stats.cuda_applications
+            << " tensor_cuda_applications=" << factorization_stats.cuda_applications
+            << " tensor_packs=" << factorization_stats.tensor_packs
+            << " tensor_normal_axes=" << factorization_stats.tensor_normal_axes
+            << " reversed_tensor_sides=" << factorization_stats.reversed_tensor_sides
+            << " nonidentity_tensor_maps=" << factorization_stats.nonidentity_tensor_maps
             << " factor_max_relative_l2=" << factorization_stats.max_relative_l2
             << " factor_max_relative_linf=" << factorization_stats.max_relative_linf << '\n';
   return 0;

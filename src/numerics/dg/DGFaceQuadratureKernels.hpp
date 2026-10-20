@@ -161,6 +161,25 @@ struct InteriorFaceDGDiffusionFactorization2D
   std::uint64_t geometry_revision = 0;
   std::uint64_t coefficient_revision = 0;
   DGDiffusionFaceScaling coefficient_scaling = DGDiffusionFaceScaling::Arithmetic;
+  // Independently proved/deduplicated 1D packs, never keyed by DShape slots.
+  mfem::Vector tensor_endpoint; // [value/derivative][i][side][slot]
+  mfem::Vector tensor_tangent;  // [value/derivative][t][q][side][slot]
+  mfem::Array<int> tensor_axes; // [side][slot], reference normal axis
+  mfem::Array<int> tensor_face_slots;
+  mfem::Array<int> tensor_lex_to_native;
+  int tensor_n = 0, tensor_slot_count = 0;
+  std::uint64_t tensor_geometry_revision = 0;
+
+  void ResetTensor()
+  {
+    tensor_endpoint.Destroy();
+    tensor_tangent.Destroy();
+    tensor_axes.DeleteAll();
+    tensor_face_slots.DeleteAll();
+    tensor_lex_to_native.DeleteAll();
+    tensor_n = tensor_slot_count = 0;
+    tensor_geometry_revision = 0;
+  }
 
   void Reset()
   {
@@ -170,6 +189,7 @@ struct InteriorFaceDGDiffusionFactorization2D
     dof = nq = nf = slot_count = 0;
     geometry_revision = coefficient_revision = 0;
     coefficient_scaling = DGDiffusionFaceScaling::Arithmetic;
+    ResetTensor();
   }
 
   bool Matches(const InteriorFaceDGDiffusionApplyInfo& info) const
@@ -182,6 +202,17 @@ struct InteriorFaceDGDiffusionFactorization2D
         4u * std::size_t(nq) * std::size_t(dof) * std::size_t(slot_count) &&
       std::size_t(normal_geometry.Size()) ==
         4u * std::size_t(nq) * std::size_t(nf);
+  }
+
+  bool TensorMatches(const InteriorFaceDGDiffusionApplyInfo& info) const
+  {
+    return Matches(info) && info.vdim == 1 && info.dof == 36 && info.nq == 6 &&
+      tensor_n == 6 && tensor_slot_count > 0 && tensor_slot_count <= 64 &&
+      tensor_geometry_revision == info.connectivity_revision &&
+      tensor_endpoint.Size() == 24 * tensor_slot_count &&
+      tensor_tangent.Size() == 144 * tensor_slot_count &&
+      tensor_axes.Size() == 2 * tensor_slot_count &&
+      tensor_face_slots.Size() == nf && tensor_lex_to_native.Size() == 36;
   }
 };
 
@@ -1114,8 +1145,13 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   {
     const std::size_t budget = std::min(factorization_memory_budget,
                                        std::size_t(256u * 1024u * 1024u));
+    // The extra face map is charged on host/device; 1 MiB bounds both final
+    // copies and all staging for at most 64 independent 1D packs and FE proof.
+    const std::size_t tensor_reserve = info.dof == 36 && info.nq == 6
+      ? 2u * factor_map_bytes + 1024u * 1024u : 0u;
     const std::size_t fixed_bytes =
-      2u * factor_geometry_bytes + 2u * factor_map_bytes + factor_block_bytes + 8192u;
+      2u * factor_geometry_bytes + 2u * factor_map_bytes + factor_block_bytes +
+      tensor_reserve + 8192u;
     const std::size_t max_entries = std::size_t(std::numeric_limits<int>::max());
     if (info.dof <= 0 || info.nq <= 0 || info.nq > 16 || info.nf <= 1 ||
         face_scaling == DGDiffusionFaceScaling::HarmonicWeighted ||
@@ -1173,6 +1209,140 @@ BuildInteriorFaceDGDiffusionApplyData2D(
       factor_values.insert(factor_values.end(), block, block + factor_block_entries);
     }
     factor_slots[face] = int(slot);
+  };
+
+  // One fixed p5/Q6 candidate: prove the actual tensor FE and its native
+  // permutation, then build each side from its mapped reference points.
+  bool tensor_active = factor_cache && info.dof == 36 && info.nq == 6 && info.vdim == 1;
+  const auto& tensor_reference = *sfes.GetFE(0);
+  const auto* tensor_fe = dynamic_cast<const mfem::NodalTensorFiniteElement*>(&tensor_reference);
+  int tensor_native[36] = {};
+  if (tensor_active)
+  {
+    tensor_active = tensor_fe && tensor_reference.GetOrder() == 5 &&
+      tensor_reference.GetGeomType() == mfem::Geometry::SQUARE &&
+      tensor_reference.GetMapType() == mfem::FiniteElement::VALUE &&
+      tensor_reference.GetRangeType() == mfem::FiniteElement::SCALAR &&
+      tensor_reference.GetNodes().Size() == 36 &&
+      (tensor_fe->GetBasisType() == mfem::BasisType::GaussLegendre ||
+       tensor_fe->GetBasisType() == mfem::BasisType::GaussLobatto);
+    if (tensor_active)
+    {
+      const auto& permutation = tensor_fe->GetDofMap();
+      tensor_active = permutation.Size() == 0 || permutation.Size() == 36;
+      const mfem::real_t* nodes = mfem::poly1d.GetPoints(5, tensor_fe->GetBasisType());
+      bool used[36] = {};
+      for (int lex = 0; tensor_active && lex < 36; ++lex)
+      {
+        const int native = permutation.Size() ? permutation[lex] : lex;
+        if (native < 0 || native >= 36 || used[native]) { tensor_active = false; break; }
+        used[native] = true;
+        tensor_native[lex] = native;
+        const auto& point = tensor_reference.GetNodes().IntPoint(native);
+        if (point.x != nodes[lex % 6] || point.y != nodes[lex / 6])
+        { tensor_active = false; }
+      }
+      for (int e = 0; tensor_active && e < info.ne; ++e)
+      { if (sfes.GetFE(e) != &tensor_reference) { tensor_active = false; } }
+    }
+  }
+  // Staging is bounded independently of face count and of reference slots.
+  constexpr int tensor_pack_entries = 24 + 144;
+  mfem::real_t tensor_pack[tensor_pack_entries] = {};
+  int tensor_pack_axes[2] = {};
+  mfem::real_t tensor_fixed[2] = {};
+  std::vector<mfem::real_t> tensor_packs;
+  std::vector<int> tensor_pack_axes_all;
+  mfem::Vector tensor_b(6), tensor_d(6);
+  auto decline_tensor = [&]()
+  {
+    tensor_active = false;
+    if (factor_cache) { factor_cache->ResetTensor(); }
+    std::vector<mfem::real_t>().swap(tensor_packs);
+    std::vector<int>().swap(tensor_pack_axes_all);
+  };
+  if (tensor_active)
+  {
+    try
+    {
+      factor_cache->tensor_lex_to_native.SetSize(36);
+      std::memcpy(factor_cache->tensor_lex_to_native.HostWrite(), tensor_native, sizeof(tensor_native));
+      factor_cache->tensor_face_slots.SetSize(info.nf);
+      tensor_packs.reserve(64 * tensor_pack_entries);
+      tensor_pack_axes_all.reserve(128);
+    }
+    catch (const std::bad_alloc&) { decline_tensor(); }
+  }
+  auto prepare_tensor_side = [&](int side, int q, const mfem::IntegrationPoint& point,
+                                  const mfem::Vector& exact_shape,
+                                  const mfem::DenseMatrix& exact_dshape)
+  {
+    if (!factor_cache || !tensor_active) { return; }
+    const int axis = (point.x == 0.0 || point.x == 1.0) ? 0 :
+      (point.y == 0.0 || point.y == 1.0) ? 1 : -1;
+    if (axis < 0) { decline_tensor(); return; }
+    const mfem::real_t fixed = axis == 0 ? point.x : point.y;
+    const mfem::real_t tangent = axis == 0 ? point.y : point.x;
+    if (!std::isfinite(tangent)) { decline_tensor(); return; }
+    if (q == 0)
+    {
+      tensor_pack_axes[side] = axis;
+      tensor_fixed[side] = fixed;
+      tensor_fe->GetBasis1D().Eval(fixed, tensor_b, tensor_d);
+      for (int i = 0; i < 6; ++i)
+      {
+        tensor_pack[2 * (i + 6 * side)] = tensor_b(i);
+        tensor_pack[1 + 2 * (i + 6 * side)] = tensor_d(i);
+      }
+    }
+    else if (axis != tensor_pack_axes[side] || fixed != tensor_fixed[side])
+    { decline_tensor(); return; }
+    tensor_fe->GetBasis1D().Eval(tangent, tensor_b, tensor_d);
+    for (int t = 0; t < 6; ++t)
+    {
+      tensor_pack[24 + 2 * (t + 6 * (q + 6 * side))] = tensor_b(t);
+      tensor_pack[25 + 2 * (t + 6 * (q + 6 * side))] = tensor_d(t);
+    }
+    // Verify this full 1D representation against the existing FE evaluations;
+    // DShape-slot equality alone cannot prove a tensor contraction layout.
+    const mfem::real_t tolerance = 64 * 36 * std::numeric_limits<mfem::real_t>::epsilon();
+    for (int t = 0; t < 6; ++t) for (int i = 0; i < 6; ++i)
+    {
+      const int native = tensor_native[axis == 0 ? i + 6 * t : t + 6 * i];
+      const mfem::real_t bn = tensor_pack[2 * (i + 6 * side)];
+      const mfem::real_t dn = tensor_pack[1 + 2 * (i + 6 * side)];
+      const mfem::real_t reconstructed[3] =
+        {bn * tensor_b(t), dn * tensor_b(t), bn * tensor_d(t)};
+      const mfem::real_t expected[3] =
+        {exact_shape(native), exact_dshape(native, axis), exact_dshape(native, 1 - axis)};
+      for (int k = 0; k < 3; ++k)
+      {
+        if (!std::isfinite(reconstructed[k]) || !std::isfinite(expected[k]) ||
+            std::abs(reconstructed[k] - expected[k]) >
+              tolerance * std::max(mfem::real_t(1.0), std::abs(expected[k])))
+        { decline_tensor(); return; }
+      }
+    }
+  };
+  auto finish_tensor_face = [&](int face)
+  {
+    if (!factor_cache || !tensor_active) { return; }
+    const int count = int(tensor_pack_axes_all.size() / 2);
+    int slot = 0;
+    for (; slot < count; ++slot)
+    {
+      if (tensor_pack_axes_all[2 * slot] == tensor_pack_axes[0] &&
+          tensor_pack_axes_all[2 * slot + 1] == tensor_pack_axes[1] &&
+          std::memcmp(tensor_pack, tensor_packs.data() + slot * tensor_pack_entries,
+                      sizeof(tensor_pack)) == 0) { break; }
+    }
+    if (slot == count)
+    {
+      if (count == 64) { decline_tensor(); return; }
+      tensor_packs.insert(tensor_packs.end(), tensor_pack, tensor_pack + tensor_pack_entries);
+      tensor_pack_axes_all.insert(tensor_pack_axes_all.end(), tensor_pack_axes, tensor_pack_axes + 2);
+    }
+    factor_cache->tensor_face_slots.HostWrite()[face] = slot;
   };
 
   shape.SetSize(info.shape_size);
@@ -1265,6 +1435,7 @@ BuildInteriorFaceDGDiffusionApplyData2D(
 
         fe.CalcShape(eip, side_shape);
         fe.CalcDShape(eip, side_dshape);
+        prepare_tensor_side(side, q, eip, side_shape, side_dshape);
 
         const mfem::real_t base_weight =
           ip.weight * static_cast<mfem::real_t>(0.5) / elem_tr.Weight();
@@ -1337,6 +1508,7 @@ BuildInteriorFaceDGDiffusionApplyData2D(
       penalty_out(q, of) = kappa * penalty_q;
     }
     finish_factorized_face(of);
+    finish_tensor_face(of);
     of++;
   }
   MFEM_VERIFY(of == info.nf,
@@ -1356,6 +1528,31 @@ BuildInteriorFaceDGDiffusionApplyData2D(
       factor_cache->nf = info.nf;
       factor_cache->slot_count = int(factor_hashes.size());
       factor_cache->geometry_revision = info.connectivity_revision;
+      if (tensor_active)
+      {
+        const int count = int(tensor_pack_axes_all.size() / 2);
+        factor_cache->tensor_endpoint.SetSize(24 * count);
+        factor_cache->tensor_tangent.SetSize(144 * count);
+        factor_cache->tensor_axes.SetSize(2 * count);
+        for (int slot = 0; slot < count; ++slot)
+        {
+          const auto* pack = tensor_packs.data() + slot * tensor_pack_entries;
+          std::memcpy(factor_cache->tensor_endpoint.HostWrite() + 24 * slot, pack,
+                      24 * sizeof(mfem::real_t));
+          std::memcpy(factor_cache->tensor_tangent.HostWrite() + 144 * slot, pack + 24,
+                      144 * sizeof(mfem::real_t));
+        }
+        std::memcpy(factor_cache->tensor_axes.HostWrite(), tensor_pack_axes_all.data(),
+                    tensor_pack_axes_all.size() * sizeof(int));
+        factor_cache->tensor_endpoint.UseDevice(true);
+        factor_cache->tensor_tangent.UseDevice(true);
+        factor_cache->tensor_axes.GetMemory().UseDevice(true);
+        factor_cache->tensor_face_slots.GetMemory().UseDevice(true);
+        factor_cache->tensor_lex_to_native.GetMemory().UseDevice(true);
+        factor_cache->tensor_n = 6;
+        factor_cache->tensor_slot_count = count;
+        factor_cache->tensor_geometry_revision = info.connectivity_revision;
+      }
     }
     catch (const std::bad_alloc&) { decline_factorization(); }
   }
@@ -2058,6 +2255,125 @@ struct InteriorFaceDGDiffusionRecord2DWarp
   }
 };
 
+// Fixed p5/Q6 tensor contractions: each warp owns one face.  Lanes 0..11
+// hold side/t or side/q scalars; every lane executes every full-mask shuffle.
+// There are no order-sized per-thread arrays and no additional quadrature weight.
+struct InteriorFaceDGDiffusionTensorRecord2DWarp
+{
+  InteriorFaceDGDiffusionRecord2D record;
+  const mfem::real_t* endpoint = nullptr;
+  const mfem::real_t* tangent = nullptr;
+  const int* axes = nullptr;
+  const int* face_slots = nullptr;
+  const int* lex_to_native = nullptr;
+  const mfem::real_t* normal_geometry = nullptr;
+  const mfem::real_t* side_coefficient = nullptr;
+  int slot_count = 0;
+
+  MFEM_HOST_DEVICE void operator()(int face) const
+  {
+#if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x;
+    const bool active = lane < 12;
+    const int side = active ? lane / 6 : 0;
+    const int index = active ? lane % 6 : 0;
+    const int slot = face_slots[face];
+    auto E = mfem::Reshape(endpoint, 2, 6, 2, slot_count);
+    auto T = mfem::Reshape(tangent, 2, 6, 6, 2, slot_count);
+    auto Axis = mfem::Reshape(axes, 2, slot_count);
+    auto G = mfem::Reshape(normal_geometry, 2, 2, 6, record.nf);
+    auto Q = mfem::Reshape(side_coefficient, 2, 6, record.nf);
+    auto P = mfem::Reshape(record.penalty, 6, record.nf);
+    auto F = mfem::Reshape(record.face_elements, 2, record.nf);
+    auto D = mfem::Reshape(record.element_vdof_map, 36, record.vdim, record.ne);
+    auto C = mfem::Reshape(record.contribution, 36, 2, record.nf);
+    const int axis = Axis(side, slot);
+
+    mfem::real_t trace = 0.0, normal_trace = 0.0;
+    if (active)
+    {
+      const int element = F(side, face);
+#pragma unroll 1
+      for (int i = 0; i < 6; ++i)
+      {
+        const int native = lex_to_native[axis == 0 ? i + 6 * index : index + 6 * i];
+        const mfem::real_t x = record.x[D(native, 0, element)];
+        trace += E(0, i, side, slot) * x;
+        normal_trace += E(1, i, side, slot) * x;
+      }
+    }
+    mfem::real_t value = 0.0, gn = 0.0, gt = 0.0;
+#pragma unroll 1
+    for (int t = 0; t < 6; ++t)
+    {
+      const mfem::real_t a = __shfl_sync(0xffffffffu, trace, 6 * side + t);
+      const mfem::real_t b = __shfl_sync(0xffffffffu, normal_trace, 6 * side + t);
+      if (active)
+      {
+        const mfem::real_t bt = T(0, t, index, side, slot);
+        value += bt * a;
+        gn += bt * b;
+        gt += T(1, t, index, side, slot) * a;
+      }
+    }
+    mfem::real_t flux = 0.0;
+    if (active)
+    {
+      flux = Q(side, index, face) *
+        (G(axis, side, index, face) * gn + G(1 - axis, side, index, face) * gt);
+    }
+    const int other = 6 * (1 - side) + index;
+    const mfem::real_t other_value = __shfl_sync(0xffffffffu, value, other);
+    const mfem::real_t other_flux = __shfl_sync(0xffffffffu, flux, other);
+    mfem::real_t cs = 0.0, cn = 0.0, ct = 0.0;
+    if (active)
+    {
+      const mfem::real_t jump = side == 0 ? value - other_value : other_value - value;
+      const mfem::real_t average = side == 0 ? flux + other_flux : other_flux + flux;
+      const mfem::real_t penalty_jump = P(index, face) * jump;
+      cs = side == 0 ? -average + penalty_jump : average - penalty_jump;
+      const mfem::real_t scaled_jump = record.ip_sigma * jump * Q(side, index, face);
+      cn = scaled_jump * G(axis, side, index, face);
+      ct = scaled_jump * G(1 - axis, side, index, face);
+    }
+    mfem::real_t lift_a = 0.0, lift_b = 0.0;
+#pragma unroll 1
+    for (int q = 0; q < 6; ++q)
+    {
+      const mfem::real_t qs = __shfl_sync(0xffffffffu, cs, 6 * side + q);
+      const mfem::real_t qn = __shfl_sync(0xffffffffu, cn, 6 * side + q);
+      const mfem::real_t qt = __shfl_sync(0xffffffffu, ct, 6 * side + q);
+      if (active)
+      {
+        const mfem::real_t bt = T(0, index, q, side, slot);
+        lift_a += bt * qs + T(1, index, q, side, slot) * qt;
+        lift_b += bt * qn;
+      }
+    }
+#pragma unroll 1
+    for (int base = 0; base < 72; base += 32)
+    {
+      const int row = base + lane;
+      const bool owns = row < 72;
+      const int output_side = owns ? row / 36 : 0;
+      const int i = owns ? row % 6 : 0;
+      const int t = owns ? (row % 36) / 6 : 0;
+      const mfem::real_t a = __shfl_sync(0xffffffffu, lift_a, 6 * output_side + t);
+      const mfem::real_t b = __shfl_sync(0xffffffffu, lift_b, 6 * output_side + t);
+      if (owns)
+      {
+        const int output_axis = Axis(output_side, slot);
+        const int native = lex_to_native[output_axis == 0 ? i + 6 * t : t + 6 * i];
+        C(native, output_side, face) =
+          E(0, i, output_side, slot) * a + E(1, i, output_side, slot) * b;
+      }
+    }
+#else
+    record(face);
+#endif
+  }
+};
+
 struct InteriorFaceDGDiffusionGather2D
 {
   int dof = 0;
@@ -2242,19 +2558,13 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       mfem::Device::Allows(mfem::Backend::CUDA) &&
       !mfem::Device::Allows(mfem::Backend::RAJA_CUDA))
   {
-    const bool compact_shape = work.shape_dictionary.Matches(info);
-    record.shape = compact_shape ? work.shape_dictionary.values.Read()
-                                 : work.shape.Read();
-    const int* shape_slots =
-      compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
-    const int shape_count = compact_shape ? work.shape_dictionary.slot_count : info.nf;
     const auto& factor = work.normal_factorization;
     const unsigned long alternative_backends =
       mfem::Backend::OMP_MASK | mfem::Backend::RAJA_MASK |
       mfem::Backend::OCCA_MASK | mfem::Backend::CEED_MASK |
       mfem::Backend::HIP_MASK | mfem::Backend::DEBUG_DEVICE;
     const bool factorized = !mfem::Device::Allows(alternative_backends) &&
-      factor.Matches(info) && factor.coefficient_revision == info.connectivity_revision &&
+      factor.TensorMatches(info) && factor.coefficient_revision == info.connectivity_revision &&
       std::size_t(work.side_coefficient.Size()) ==
         2u * std::size_t(info.nq) * std::size_t(info.nf) &&
       (factor.coefficient_scaling == DGDiffusionFaceScaling::Arithmetic ||
@@ -2263,13 +2573,18 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
     if (factorized)
     {
       mfem::forall_2D_batch(
-        info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<true>{
-          record, shape_slots, shape_count, factor.reference_dshape.Read(),
-          factor.normal_geometry.Read(), factor.face_slots.Read(),
-          factor.slot_count, work.side_coefficient.Read()});
+        info.nf, 32, 1, 4, InteriorFaceDGDiffusionTensorRecord2DWarp{
+          record, factor.tensor_endpoint.Read(), factor.tensor_tangent.Read(),
+          factor.tensor_axes.Read(), factor.tensor_face_slots.Read(),
+          factor.tensor_lex_to_native.Read(), factor.normal_geometry.Read(),
+          work.side_coefficient.Read(), factor.tensor_slot_count});
     }
     else
     {
+      const bool compact_shape = work.shape_dictionary.Matches(info);
+      record.shape = compact_shape ? work.shape_dictionary.values.Read() : work.shape.Read();
+      const int* shape_slots = compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
+      const int shape_count = compact_shape ? work.shape_dictionary.slot_count : info.nf;
       record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
       mfem::forall_2D_batch(
         info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<false>{
