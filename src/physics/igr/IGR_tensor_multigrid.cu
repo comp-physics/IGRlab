@@ -4,8 +4,10 @@
 #include "IGR_tensor_reference.hpp"
 #include "IGR_tensor_owned.hpp"
 #include "IGR_tensor_spectral.hpp"
+#include "IGR_spectral_nodal.cuh"
 #include "IGR_device_krylov.hpp"
 #include "IGR_shared_patch_cuda.cuh" // Keep the shared/MG periodic topology gate.
+#include "utils/config/env_flags.hpp"
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 #include <cublas_v2.h>
@@ -27,6 +29,10 @@
 namespace igrlab { namespace igr_internal { namespace {
 using Stencil = std::vector<double>;
 using Topology = std::vector<std::array<int, 5>>;
+using spectral_nodal_detail::ToSpectralKernel;
+using spectral_nodal_detail::FromSpectralKernel;
+using spectral_nodal_detail::ToSpectralTensorKernel;
+using spectral_nodal_detail::FromSpectralTensorKernel;
 
 void CUDA(cudaError_t status)
 { MFEM_VERIFY(status == cudaSuccess, "Tensor multigrid CUDA: " << cudaGetErrorString(status)); }
@@ -1214,30 +1220,6 @@ template<typename T> __global__ void SpectralInverseKernel(int nx,int ny,
   if(!isfinite(value)||!(inv>0)||!isfinite(inv))atomicExch(status,1);
 }
 
-template<typename T> __global__ void ToSpectralKernel(int nx,int ny,
-    const int* elements,const int* map,const double* nodal,const double* x,
-    const int* exponent,T* result)
-{
-  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=nx*ny)return;
-  if(*exponent==INT_MAX){result[row]=static_cast<T>(CUDART_NAN);return;}
-  const int gx=row%nx,gy=row/nx,e=elements[gx/6+(nx/6)*(gy/6)],i=gx%6+6*(gy%6);
-  double sum=0;
-  for(int j=0;j<36;++j)sum+=nodal[j+36*i]*scalbn(x[map[36*e+j]],-*exponent);
-  result[row]=static_cast<T>(sum);
-}
-
-template<typename T> __global__ void FromSpectralKernel(int nx,int ny,
-    const int* elements,const int* map,const double* nodal,const T* x,
-    const int* exponent,double scale,double* result)
-{
-  const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=nx*ny)return;
-  const int gx=row%nx,gy=row/nx,cx=gx/6,cy=gy/6,e=elements[cx+(nx/6)*cy],i=gx%6+6*(gy%6);
-  if(*exponent==INT_MAX){result[map[36*e+i]]=CUDART_NAN;return;}
-  double sum=0;
-  for(int j=0;j<36;++j)sum+=nodal[i+36*j]*static_cast<double>(x[6*cx+j%6+nx*(6*cy+j/6)]);
-  result[map[36*e+i]]=scalbn(sum/scale,*exponent);
-}
-
 template<typename T> __global__ void ScaleSpectralKernel(int n,const T* inverse,T* x)
 {
   const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row<n)x[row]*=inverse[row];
@@ -1617,11 +1599,13 @@ public:
                 "Spectral dimensions exceed cuSolver/int matrix bounds.");
     nx_=6*coordinates.nx;ny_=6*coordinates.ny;
     MFEM_VERIFY(std::size_t(nx_)*ny_==std::size_t(height),"Spectral Cartesian field size mismatch.");
+    const bool tensor_nodal_requested=::igrlab::EnvFlagEnabled("DG_IGR_IGR_SPECTRAL_TENSOR_NODAL");
     const std::size_t matrices=std::size_t(nx_)*nx_+std::size_t(ny_)*ny_;
     const std::size_t fields=std::size_t(height)*(precision_==TensorMultigridPrecision::TF32x3?5:3);
     std::size_t free_bytes=0,total_bytes=0;CUDA(cudaMemGetInfo(&free_bytes,&total_bytes));
     const std::size_t map_bytes=(std::size_t(height)+sfes.GetNE())*sizeof(int)+
-        (std::size_t(36*36)+4096)*sizeof(double)+sizeof(int);
+        (std::size_t(36*36)+4096)*sizeof(double)+sizeof(int)+
+        (tensor_nodal_requested?sizeof(spectral_nodal_detail::FactorPacket):0);
     MFEM_VERIFY((matrices*(precision_==TensorMultigridPrecision::TF32x3?2:1)+fields)*sizeof(T)+map_bytes<free_bytes,
                 "Spectral persistent basis/field storage exceeds free device memory.");
     mfem::Array<int> neighbors(5*sfes.GetNE());
@@ -1649,6 +1633,22 @@ public:
     std::copy(coordinates.elements.begin(),coordinates.elements.end(),elements_.HostWrite());
     std::copy(map.begin(),map.end(),element_map_.HostWrite());
     Store(nodal_,nodal);
+    std::string tensor_nodal_rejection="not-requested";double tensor_nodal_error=0;
+    if(tensor_nodal_requested)
+    {
+      const auto& native=sfes.GetFE(0)->GetNodes();
+      std::vector<std::array<double,2>> points(native.GetNPoints());
+      for(int i=0;i<native.GetNPoints();++i)points[i]={native.IntPoint(i).x,native.IntPoint(i).y};
+      spectral_nodal_detail::Factors factors;
+      tensor_nodal_enabled_=spectral_nodal_detail::BuildFactors(sfes.GetFE(0)->GetOrder(),
+          sfes.GetMesh()->Dimension(),points,nodal,factors,tensor_nodal_rejection);
+      if(tensor_nodal_enabled_)
+      {
+        tensor_nodal_factors_.SetSize(1);
+        tensor_nodal_factors_.HostWrite()[0]=spectral_nodal_detail::PackFactors(factors);
+        tensor_nodal_error=factors.matrix_relative_error;tensor_nodal_rejection="none";
+      }
+    }
     SpectralBLAS(cublasCreate(&blas_));SpectralBLAS(cublasSetStream(blas_,nullptr));
     SpectralBLAS(cublasSetPointerMode(blas_,CUBLAS_POINTER_MODE_HOST));
     SpectralBLAS(cublasSetMathMode(blas_,precision_==TensorMultigridPrecision::FP64 ||
@@ -1691,6 +1691,7 @@ public:
     norm_blocks_=std::min(4096,(height+255)/256);
     norm_partial_.SetSize(norm_blocks_);norm_partial_.UseDevice(true);exponent_.SetSize(1);
     (void)norm_partial_.Write();(void)exponent_.Write();(void)elements_.Read();(void)element_map_.Read();
+    if(tensor_nodal_enabled_)(void)tensor_nodal_factors_.Read();
     CUDA(cudaDeviceSynchronize());
     const std::size_t basis_bytes=(std::size_t(qx_.Size())+qy_.Size()+qx_low_.Size()+qy_low_.Size())*sizeof(T);
     const std::size_t field_bytes=(std::size_t(field_.Size())+temporary_.Size()+inverse_.Size()+high_.Size()+low_.Size())*sizeof(T);
@@ -1712,6 +1713,10 @@ public:
       <<" gemm_compute="<<(precision_==TensorMultigridPrecision::FP64?"fp64":
           precision_==TensorMultigridPrecision::FP32?"fp32-pedantic":"tf32-explicit")
       <<" low_low_term="<<(precision_==TensorMultigridPrecision::TF32x3?"omitted":"not-applicable")
+      <<" nodal_transform="<<(tensor_nodal_enabled_?"tensor-fp64-6x6":"dense-fp64-36x36")
+      <<" nodal_transform_requested="<<tensor_nodal_requested
+      <<" nodal_transform_fallback="<<tensor_nodal_rejection
+      <<" nodal_matrix_proof_rel="<<tensor_nodal_error
       <<" alpha=inherited-fine acceptance=original-current-fp64 fallback=none"
       // cuBLAS can select IEEE FP64 tensor cores even with pedantic arithmetic.
       <<" tensor_execution=requires-profile-proof"
@@ -1734,15 +1739,25 @@ public:
     x.SetSize(height);x.UseDevice(true);
     InputMaximum<<<norm_blocks_,256>>>(height,b.Read(),norm_partial_.Write());
     InputExponent<<<1,1>>>(norm_blocks_,norm_partial_.Read(),exponent_.Write());
-    ToSpectralKernel<<<(height+255)/256,256>>>(nx_,ny_,elements_.Read(),element_map_.Read(),
-        nodal_.Read(),b.Read(),exponent_.Read(),field_.Write());
+    if(tensor_nodal_enabled_)
+      ToSpectralTensorKernel<<<elements_.Size(),spectral_nodal_detail::tensor_threads>>>(
+          nx_,ny_,elements_.Read(),element_map_.Read(),tensor_nodal_factors_.Read(),
+          b.Read(),exponent_.Read(),field_.Write());
+    else
+      ToSpectralKernel<<<(height+255)/256,256>>>(nx_,ny_,elements_.Read(),element_map_.Read(),
+          nodal_.Read(),b.Read(),exponent_.Read(),field_.Write());
     Product(true,true,qx_,qx_low_,field_,temporary_);
     Product(false,false,qy_,qy_low_,temporary_,field_);
     ScaleSpectralKernel<<<(height+255)/256,256>>>(height,inverse_.Read(),field_.ReadWrite());
     Product(true,false,qx_,qx_low_,field_,temporary_);
     Product(false,true,qy_,qy_low_,temporary_,field_);
-    FromSpectralKernel<<<(height+255)/256,256>>>(nx_,ny_,elements_.Read(),element_map_.Read(),
-        nodal_.Read(),field_.Read(),exponent_.Read(),operator_scale_,x.Write());
+    if(tensor_nodal_enabled_)
+      FromSpectralTensorKernel<<<elements_.Size(),spectral_nodal_detail::tensor_threads>>>(
+          nx_,ny_,elements_.Read(),element_map_.Read(),tensor_nodal_factors_.Read(),
+          field_.Read(),exponent_.Read(),operator_scale_,x.Write());
+    else
+      FromSpectralKernel<<<(height+255)/256,256>>>(nx_,ny_,elements_.Read(),element_map_.Read(),
+          nodal_.Read(),field_.Read(),exponent_.Read(),operator_scale_,x.Write());
     CUDA(cudaGetLastError());++applications_;
   }
 private:
@@ -1831,6 +1846,8 @@ private:
   cublasHandle_t blas_=nullptr;cusolverDnHandle_t solver_=nullptr;
   mfem::Array<int> elements_,element_map_;
   mfem::Array<double> nodal_;
+  mfem::Array<spectral_nodal_detail::FactorPacket> tensor_nodal_factors_;
+  bool tensor_nodal_enabled_=false;
   mfem::Array<T> qx_,qy_,qx_low_,qy_low_,inverse_;
   mutable mfem::Array<T> field_,temporary_,high_,low_;
   mutable mfem::Vector norm_partial_;
