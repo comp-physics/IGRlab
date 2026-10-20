@@ -206,6 +206,9 @@ Vector OriginalRecordAndGather(const InteriorFaceDGDiffusionApplyInfo& info,
                               const Vector& x, real_t ip_sigma,
                               Vector& contribution)
 {
+  // Independent dense fixtures have not necessarily used the public apply,
+  // which normally prepares this gather's element-to-face incidence data.
+  ::igrlab::dg_face::EnsureInteriorFaceElementIncidence2D(info, work);
   contribution.SetSize(2 * info.dof * info.nf);
   contribution.UseDevice(true);
   contribution = std::numeric_limits<real_t>::quiet_NaN();
