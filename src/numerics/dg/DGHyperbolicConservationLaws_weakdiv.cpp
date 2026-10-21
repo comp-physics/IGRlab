@@ -18,9 +18,10 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   weakdiv_shared_row_sums_.SetSize(0);
   weakdiv_shared_column_sums_.SetSize(0);
   weakdiv_shared_mass_fractions_.SetSize(0);
-  weakdiv_shared_moment_correction_.SetSize(0);
+  weakdiv_shared_moment_correction_.Destroy();
   weakdiv_shared_flux_.SetSize(0);
   weakdiv_shared_flux_execution_ = -1;
+  weakdiv_shared_conservative_fusion_request_ = -1;
   weakdiv_volume_speed_.SetSize(0);
   weakdiv_point_speed_.SetSize(0);
   weakdiv_q_sigma_telemetry_.SetSize(0);
@@ -375,6 +376,8 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
   const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  const bool fusion_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION", false);
   const char* execution = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
   const bool requested_pointwise = execution && std::string(execution) == "pointwise";
   MFEM_VERIFY(!execution || std::string(execution) == "element" || requested_pointwise,
@@ -387,6 +390,11 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
                 "Shared Euler flux execution cannot change on a live DG operator; "
                 "rebuild the packed setup first.");
     weakdiv_shared_flux_execution_ = static_cast<int>(pointwise);
+    MFEM_VERIFY(weakdiv_shared_conservative_fusion_request_ < 0 ||
+                  weakdiv_shared_conservative_fusion_request_ == int(fusion_requested),
+                "Shared Euler conservative fusion cannot change on a live DG operator; "
+                "rebuild the packed setup first.");
+    weakdiv_shared_conservative_fusion_request_ = int(fusion_requested);
   }
   const char* layout = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_LAYOUT");
   const bool tensor_lines = layout && std::string(layout) == "tensor-lines";
@@ -397,6 +405,8 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   MFEM_VERIFY(!weakdiv_reference_only_ || (shared && tensor_lines),
               "Reference-only DG setup requires the tensor-lines shared Euler layout; "
               "rebuild the operator before selecting a full-matrix backend.");
+  const bool conservative_fusion = fusion_requested && shared && tensor_lines &&
+    dof == 36 && neq == 4 && shared_precision == ::igrlab::shared_reference::Precision::FP32;
   if (shared && !weakdiv_shared_map_)
   {
     MFEM_VERIFY(dim == 2 && neq == 4 && dof <= 256 &&
@@ -523,11 +533,14 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
           static_cast<real_t>(mass_fractions[e * dof + i] / total_mass);
       }
     }
-    weakdiv_shared_moment_correction_.SetSize(ne * neq);
-    weakdiv_shared_moment_correction_.UseDevice(true);
+    if (!conservative_fusion)
+    {
+      weakdiv_shared_moment_correction_.SetSize(ne * neq);
+      weakdiv_shared_moment_correction_.UseDevice(true);
+      weakdiv_shared_moment_correction_.Write();
+    }
     weakdiv_shared_column_sums_.Read();
     weakdiv_shared_mass_fractions_.Read();
-    weakdiv_shared_moment_correction_.Write();
     if (weakdiv_reference_only_)
       std::cout << "[shared-reference-map] event=operator-equivalence method=dg-weakdiv"
                 << " geometry=identical-affine-parallelograms proof=identical-reference-integrals"
@@ -543,7 +556,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               << " matrix_column_sum_relative=" << maximum_column_sum / reference_norm
               << " additional_workspace_bytes="
               << (std::size_t(dof) * dim + std::size_t(ne) * dof +
-                  std::size_t(ne) * neq) * sizeof(real_t)
+                  (conservative_fusion ? 0 : std::size_t(ne) * neq)) * sizeof(real_t)
               << std::endl;
     weakdiv_shared_row_sums_.SetSize(dof, dim);
     weakdiv_shared_row_sums_.GetMemory().UseDevice(true);
@@ -567,7 +580,8 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       DenseMatrix adjugate(2);
       CalcAdjugate(transformation->Jacobian(), adjugate);
       weakdiv_shared_map_->ConfigureDGTensorLines(
-        weakdiv[0], ne * neq, shared_precision, *vfes.GetFE(0), adjugate);
+        weakdiv[0], ne * neq, shared_precision, *vfes.GetFE(0), adjugate,
+        conservative_fusion);
     }
     else
       weakdiv_shared_map_->Configure(weakdiv[0], ne * neq, shared_precision, "dg-weakdiv");
@@ -579,6 +593,22 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               "Shared reference precision cannot change on a live DG operator.");
   MFEM_VERIFY(!shared || weakdiv_shared_map_->UsesDGTensorLines() == tensor_lines,
               "Shared Euler layout cannot change on a live DG operator.");
+  MFEM_VERIFY(!shared ||
+                weakdiv_shared_map_->UsesDGConservativeFusion() == conservative_fusion,
+              "Shared Euler conservative-fusion workspace policy is inconsistent.");
+  if (!weakdiv_volume_path_logged_ && mfem::Mpi::Root())
+  {
+    const char* reason = !fusion_requested ? "disabled" : !shared ? "shared-off" :
+      !tensor_lines ? "requires-tensor-lines" :
+      shared_precision != ::igrlab::shared_reference::Precision::FP32 ? "requires-fp32" :
+      dof != 36 ? "requires-p5" : "admitted";
+    std::cout << "[dg-weakdiv-conservative-fusion] requested=" << int(fusion_requested)
+              << " selected=" << (conservative_fusion ? "fused-p5-fp32" : "buffered")
+              << " reason=" << reason
+              << " eliminated_scratch_bytes=" <<
+                 (conservative_fusion ? std::size_t(ne)*neq*(dof*dim+dof+1)*sizeof(real_t) : 0)
+              << std::endl;
+  }
 
   const int* sigma_map = nullptr;
   const real_t* sigma_interp = nullptr;
@@ -661,7 +691,13 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   {
     mfem::forall(ne, kernel);
   }
-  if (shared)
+  if (conservative_fusion)
+  {
+    weakdiv_shared_map_->ApplyDGConservativeFusion(
+      weakdiv_shared_flux_, weakdiv_shared_column_sums_, weakdiv_shared_row_sums_,
+      weakdiv_shared_mass_fractions_, invmass_elem_vdof_map_, z_inout);
+  }
+  else if (shared)
   {
     const int k = dof * dim, columns = ne * neq;
     const real_t* flux = weakdiv_shared_flux_.Read();
