@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -53,20 +54,53 @@ private:
   std::string old_value_[2];
 };
 
+class ScopedStorageSelection
+{
+public:
+  explicit ScopedStorageSelection(const char* storage)
+  {
+    for (int i = 0; i < 2; ++i)
+    {
+      if (const char* old = std::getenv(names_[i]))
+      { had_value_[i] = true; old_value_[i] = old; }
+      MFEM_VERIFY(setenv(names_[i], storage, 1) == 0,
+                  "Could not set the test-only volume storage selector.");
+    }
+  }
+  ~ScopedStorageSelection()
+  {
+    for (int i = 0; i < 2; ++i)
+    {
+      if (had_value_[i]) { setenv(names_[i], old_value_[i].c_str(), 1); }
+      else { unsetenv(names_[i]); }
+    }
+  }
+private:
+  const char* names_[2] = {"IGRLAB_IGR_TENSOR_VOLUME_STORAGE",
+                           "DG_IGR_IGR_TENSOR_VOLUME_STORAGE"};
+  bool had_value_[2] = {false, false};
+  std::string old_value_[2];
+};
+
 struct VolumeSetup
 {
   std::unique_ptr<Operator> op;
   bool requested = false, enabled = false;
   std::string reason, kernel;
+  std::string storage_requested, storage, storage_reason, geometry_layout;
+  bool mass_geometry_shared = false, diffusion_geometry_shared = false;
+  std::size_t owned_geometry_bytes = 0, owned_coefficient_bytes = 0, owned_bytes = 0;
 };
 
 VolumeSetup MakeVolumeForTest(ParFiniteElementSpace& fes,
                              const QuadratureFunction& mass,
                              const QuadratureFunction& diffusion,
                              const char* execution, bool requested,
-                             bool expected_enabled, const char* expected_reason)
+                             bool expected_enabled, const char* expected_reason,
+                             const char* storage = "cached")
 {
   ScopedCollocatedSelection selection(requested);
+  ScopedStorageSelection storage_selection(storage);
   std::ostringstream captured;
   VolumeSetup result;
   {
@@ -92,11 +126,41 @@ VolumeSetup MakeVolumeForTest(ParFiniteElementSpace& fes,
   result.requested = field("collocated_requested") == "1";
   result.enabled = field("collocated_enabled") == "1";
   result.reason = field("collocated_reason"); result.kernel = field("kernel");
+  result.storage_requested = field("storage_requested");
+  result.storage = field("storage"); result.storage_reason = field("storage_reason");
+  result.geometry_layout = field("geometry_layout");
+  result.mass_geometry_shared = field("mass_geometry_shared") == "1";
+  result.diffusion_geometry_shared = field("diffusion_geometry_shared") == "1";
+  result.owned_geometry_bytes = std::stoull(field("owned_geometry_bytes"));
+  result.owned_coefficient_bytes = std::stoull(field("owned_coefficient_bytes"));
+  result.owned_bytes = std::stoull(field("owned_bytes"));
   MFEM_VERIFY(field("execution") == execution && result.requested == requested &&
                 result.enabled == expected_enabled && result.reason == expected_reason &&
                 result.kernel == (expected_enabled ? "collocated-simt-one-warp-per-element" :
                                                     "fused-one-warp-per-element"),
               "Actual collocated volume admission differs from the focused fixture: " << log);
+  const bool direct = std::string(storage) == "direct" && expected_enabled;
+  MFEM_VERIFY(result.storage_requested == storage &&
+                result.storage == (direct ? "direct" : "cached") &&
+                result.storage_reason == (direct ? "admitted" :
+                  std::string(storage) == "cached" ? "cached-requested" : "requires-collocated-simt") &&
+                result.geometry_layout == (direct ? "compact" : "padded") &&
+                result.owned_geometry_bytes > 0 &&
+                result.owned_bytes > result.owned_geometry_bytes &&
+                (direct ? result.owned_coefficient_bytes == 0 : result.owned_coefficient_bytes > 0),
+              "Actual direct storage admission or owned footprint differs from the fixture: " << log);
+  const std::size_t elements = std::size_t(fes.GetNE());
+  const std::size_t padded_bytes = elements*4u*64u*sizeof(double);
+  const std::size_t geometry_bytes = direct ?
+    ((result.mass_geometry_shared ? 1u : elements)*mass.GetSpace()->GetIntRule(0).GetNPoints() +
+     3u*(result.diffusion_geometry_shared ? 1u : elements)*diffusion.GetSpace()->GetIntRule(0).GetNPoints())*sizeof(double) :
+    padded_bytes;
+  const std::size_t coefficient_bytes = direct ? 0u : padded_bytes;
+  const std::size_t owned_bytes = geometry_bytes+coefficient_bytes+
+    std::size_t(fes.GetVSize())*sizeof(int)+6u*64u*sizeof(double);
+  MFEM_VERIFY(result.owned_geometry_bytes == geometry_bytes &&
+                result.owned_coefficient_bytes == coefficient_bytes && result.owned_bytes == owned_bytes,
+              "Actual owned arrays do not match compact/cached storage and proved sharing: " << log);
   return result;
 }
 
@@ -159,8 +223,10 @@ void DenseOracle(ParFiniteElementSpace& fes, QuadratureFunction& mass,
   }
 }
 
-void CheckCase(int order, int basis, bool curved, bool unequal)
+void CheckCase(int order, int basis, bool curved, bool unequal,
+               const char* storage = "cached")
 {
+  ScopedStorageSelection storage_selection(storage);
   // Nine elements exercises the final partial four-warp CTA. Rotating one
   // element also prevents accidental reliance on an axis-aligned Jacobian.
   Mesh serial=Mesh::MakeCartesian2D(3,3,Element::QUADRILATERAL,false,1.0,1.0,false);
@@ -228,7 +294,15 @@ void CheckCase(int order, int basis, bool curved, bool unequal)
     for(int i=0;i<yw.Size();++i) { nonfinite=nonfinite||!std::isfinite(values[i]); }
     MFEM_VERIFY(nonfinite,"IGR tensor volume hid a nonfinite current coefficient.");
   }
+  FillCoefficients(mass,diffusion,2);
+  RefreshTensorVolumeCoefficients(*simt,mass,diffusion);
+  RefreshTensorVolumeCoefficients(*wmma,mass,diffusion);
+  simt->Mult(x,ys);wmma->Mult(x,yw);
+  DenseOracle(fes,mass,diffusion,x,yd);
+  MFEM_VERIFY(Relative(ys,yd)<=2e-12 && Relative(yw,yd)<=2e-12,
+              "IGR tensor volume did not recover after a nonfinite coefficient.");
   std::cout<<"igr_tensor_volume_case p="<<order<<" basis="<<basis<<" curved="<<curved
+           <<" storage_requested="<<storage
            <<" mass_nq="<<mass_rule.GetNPoints()<<" diffusion_nq="<<diff_rule.GetNPoints()
            <<" max_pa_relative="<<worst_pa<<" max_dense_relative="<<worst_dense
            <<" max_simt_wmma_relative="<<worst_modes<<" passed\n";
@@ -284,9 +358,83 @@ private:
 
 enum class BasisMutation { None, NonunitDiagonals, MassOffDiagonal };
 
+void CheckDirectCurrentQFs(VolumeSetup& direct, ParFiniteElementSpace& fes,
+                           QuadratureFunction& original_mass,
+                           QuadratureFunction& original_diffusion,
+                           bool use_dense_oracle)
+{
+  MFEM_VERIFY(direct.storage == "direct", "Current-object fixture requires admitted direct storage.");
+  auto& mass_space = *original_mass.GetSpace();
+  auto& diffusion_space = *original_diffusion.GetSpace();
+  QuadratureFunction mass(mass_space), diffusion(diffusion_space);
+  mass.UseDevice(true); diffusion.UseDevice(true);
+  Vector x(fes.GetVSize()), actual(fes.GetVSize()), expected(fes.GetVSize()), dense;
+  x.UseDevice(true); actual.UseDevice(true); expected.UseDevice(true);
+  double* input = x.HostWrite();
+  for (int i = 0; i < x.Size(); ++i) { input[i] = 0.8+0.2*std::sin(0.37*(i+1)); }
+  const double* output_address = actual.Write();
+  auto check = [&]()
+  {
+    QuadratureFunctionCoefficient mc(mass), dc(diffusion);
+    ParBilinearForm pa(&fes); pa.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+    auto* mi = new MassIntegrator(mc); mi->SetIntRule(&mass_space.GetIntRule(0)); pa.AddDomainIntegrator(mi);
+    auto* di = new DiffusionIntegrator(dc); di->SetIntRule(&diffusion_space.GetIntRule(0)); pa.AddDomainIntegrator(di);
+    pa.Assemble(); pa.Mult(x, expected); direct.op->Mult(x, actual);
+    MFEM_VERIFY(Relative(actual, expected) <= 2e-12 && output_address == actual.Read(),
+                "Direct volume did not read its current QF objects into its owning output.");
+    if (use_dense_oracle)
+    {
+      DenseOracle(fes, mass, diffusion, x, dense);
+      MFEM_VERIFY(Relative(actual, dense) <= 2e-12,
+                  "Direct current-QF action differs from independent dense assembly.");
+    }
+  };
+  FillCoefficients(mass, diffusion, 2);
+  RefreshTensorVolumeCoefficients(*direct.op, mass, diffusion);
+  // Rebinding keeps both old objects alive. Poison them on device so retaining
+  // either the construction-time QF or its raw buffer cannot pass the oracle.
+  for (QuadratureFunction* old : {&original_mass, &original_diffusion})
+  {
+    double* data = old->Write();
+    const double bad = std::numeric_limits<double>::quiet_NaN();
+    mfem::forall(old->Size(), [=] MFEM_HOST_DEVICE(int i) { data[i] = bad; });
+  }
+  check();
+  FillCoefficients(mass, diffusion, 1);
+  check(); // Direct Mult must Read current device values even without Refresh.
+
+  const double* old_mass_address = mass.Read();
+  const double* old_diffusion_address = diffusion.Read();
+  Vector retired_mass, retired_diffusion;
+  retired_mass.Swap(static_cast<Vector&>(mass));
+  retired_diffusion.Swap(static_cast<Vector&>(diffusion));
+  mass.SetSize(mass_space.GetSize()); diffusion.SetSize(diffusion_space.GetSize());
+  mass.UseDevice(true); diffusion.UseDevice(true);
+  FillCoefficients(mass, diffusion, 3);
+  MFEM_VERIFY(mass.Read() != old_mass_address && diffusion.Read() != old_diffusion_address,
+              "The current-QF fixture must replace both live device buffers.");
+  check(); // No Refresh: retaining a raw pointer must read the retired buffer.
+  double* current = diffusion.Write();
+  const double bad = std::numeric_limits<double>::quiet_NaN();
+  mfem::forall(1, [=] MFEM_HOST_DEVICE(int) { current[0] = bad; });
+  direct.op->Mult(x, actual);
+  const double* poisoned = actual.HostRead(); bool nonfinite = false;
+  for (int i = 0; i < actual.Size(); ++i) { nonfinite = nonfinite || !std::isfinite(poisoned[i]); }
+  MFEM_VERIFY(nonfinite, "Direct Mult hid a device-only nonfinite current coefficient.");
+  FillCoefficients(mass, diffusion, 2);
+  check();
+  FillCoefficients(original_mass, original_diffusion, 2);
+  RefreshTensorVolumeCoefficients(*direct.op, original_mass, original_diffusion);
+  std::cout << "igr_tensor_volume_current_qfs storage=direct qf_objects_rebound=true"
+            << " old_objects_poisoned=true device_buffers_replaced=true"
+            << " device_updates_without_refresh=true device_nonfinite_exposed=true"
+            << " finite_recovery=true public_pa=true independent_dense=" << use_dense_oracle
+            << " passed\n";
+}
+
 void CheckCollocatedCase(int basis, bool skew, bool unequal,
                          BasisMutation mutation = BasisMutation::None,
-                         const char* execution = "simt")
+                         const char* execution = "simt", const char* storage = "cached")
 {
   constexpr int order = 5;
   Mesh serial = Mesh::MakeCartesian2D(3, 3, Element::QUADRILATERAL, false, 1.0, 1.0, false);
@@ -333,14 +481,17 @@ void CheckCollocatedCase(int basis, bool skew, bool unequal,
   const char* reason = std::string(execution) != "simt" ? "execution-not-simt" :
     unequal ? "unequal-d1d-q1d" : expected_enabled ? "admitted" : "nonzero-b-offdiagonal";
   auto generic = MakeVolumeForTest(fes, mass, diffusion, "simt", false, false, "not-requested");
-  auto selected = MakeVolumeForTest(fes, mass, diffusion, execution, true, expected_enabled, reason);
-  Vector x(fes.GetVSize()), yg(fes.GetVSize()), ys(fes.GetVSize()), yp(fes.GetVSize()), yd;
-  for (Vector* v : {&x, &yg, &ys, &yp}) { v->UseDevice(true); }
+  auto selected = MakeVolumeForTest(fes, mass, diffusion, execution, true, expected_enabled, reason, storage);
+  VolumeSetup retained;
+  if (std::string(storage) == "direct")
+  { retained = MakeVolumeForTest(fes, mass, diffusion, execution, true, expected_enabled, reason); }
+  Vector x(fes.GetVSize()), yg(fes.GetVSize()), ys(fes.GetVSize()), yp(fes.GetVSize()), yr(fes.GetVSize()), yd;
+  for (Vector* v : {&x, &yg, &ys, &yp, &yr}) { v->UseDevice(true); }
   const double* generic_address = yg.Write(); const double* selected_address = ys.Write();
   MFEM_VERIFY(x.OwnsData() && yg.OwnsData() && ys.OwnsData() && yp.OwnsData() &&
                 generic_address != selected_address,
               "Focused volume fixtures require distinct owning vectors.");
-  double worst_pa = 0.0, worst_generic = 0.0, worst_dense = 0.0;
+  double worst_pa = 0.0, worst_generic = 0.0, worst_dense = 0.0, worst_cached = 0.0;
   for (int phase = 0; phase < 4; ++phase)
   {
     FillCoefficients(mass, diffusion, phase);
@@ -348,6 +499,7 @@ void CheckCollocatedCase(int basis, bool skew, bool unequal,
     {
       RefreshTensorVolumeCoefficients(*generic.op, mass, diffusion);
       RefreshTensorVolumeCoefficients(*selected.op, mass, diffusion);
+      if (retained.op) { RefreshTensorVolumeCoefficients(*retained.op, mass, diffusion); }
     }
     double* input = x.HostWrite();
     for (int i = 0; i < x.Size(); ++i)
@@ -360,6 +512,11 @@ void CheckCollocatedCase(int basis, bool skew, bool unequal,
     generic.op->Mult(x, yg); selected.op->Mult(x, ys);
     worst_pa = std::max(worst_pa, Relative(ys, yp));
     worst_generic = std::max(worst_generic, Relative(ys, yg));
+    if (retained.op)
+    {
+      retained.op->Mult(x, yr);
+      worst_cached = std::max(worst_cached, Relative(ys, yr));
+    }
     if (mutation == BasisMutation::None)
     {
       DenseOracle(fes, mass, diffusion, x, yd);
@@ -367,7 +524,7 @@ void CheckCollocatedCase(int basis, bool skew, bool unequal,
     }
     // Artificially modified cached maps define a test operator different from
     // CalcShape/CalcDShape. Public PA built from those same maps is its oracle.
-    MFEM_VERIFY(worst_pa <= 2e-12 && worst_generic <= 2e-12 && worst_dense <= 2e-12,
+    MFEM_VERIFY(worst_pa <= 2e-12 && worst_generic <= 2e-12 && worst_dense <= 2e-12 && worst_cached <= 2e-12,
                 "Collocated volume math/fallback differs from its actual-map oracle: "
                   << mutation_name << " pa=" << worst_pa << " generic=" << worst_generic
                   << " dense=" << worst_dense);
@@ -390,12 +547,23 @@ void CheckCollocatedCase(int basis, bool skew, bool unequal,
   generic.op->Mult(x, yg); selected.op->Mult(x, ys);
   MFEM_VERIFY(Relative(ys, yp) <= 2e-12 && Relative(ys, yg) <= 2e-12,
               "Collocated volume must recover finite current-coefficient parity after poisoning.");
+  if (selected.storage == "direct")
+  {
+    MFEM_VERIFY(selected.owned_bytes < retained.owned_bytes,
+                "Admitted direct storage must remove owned weighted coefficient arrays.");
+    CheckDirectCurrentQFs(selected, fes, mass, diffusion, mutation == BasisMutation::None);
+  }
   std::cout << "igr_tensor_volume_collocated_case p=" << order << " basis=" << basis
             << " skew=" << skew << " unequal=" << unequal << " mutation=" << mutation_name
             << " execution=" << execution << " collocated_requested=" << selected.requested
             << " collocated_enabled=" << selected.enabled << " collocated_reason=" << selected.reason
             << " actual_kernel=" << selected.kernel << " max_pa_relative=" << worst_pa
-            << " max_generic_relative=" << worst_generic;
+            << " max_generic_relative=" << worst_generic << " max_cached_relative=" << worst_cached
+            << " storage_requested=" << selected.storage_requested << " storage=" << selected.storage
+            << " storage_reason=" << selected.storage_reason
+            << " owned_geometry_bytes=" << selected.owned_geometry_bytes
+            << " owned_coefficient_bytes=" << selected.owned_coefficient_bytes
+            << " owned_bytes=" << selected.owned_bytes;
   if (mutation == BasisMutation::None) { std::cout << " max_dense_relative=" << worst_dense; }
   else { std::cout << " dense_oracle=skipped-modified-cached-maps"; }
   std::cout << " setup_selection_verified=true current_coefficients=true nonfinite_exposed=true"
@@ -404,17 +572,98 @@ void CheckCollocatedCase(int basis, bool skew, bool unequal,
 
 void CheckCollocatedSuite()
 {
-  CheckCollocatedCase(BasisType::GaussLegendre, false, false);
-  CheckCollocatedCase(BasisType::GaussLegendre, true, false, BasisMutation::NonunitDiagonals);
-  CheckCollocatedCase(BasisType::GaussLegendre, false, false, BasisMutation::MassOffDiagonal);
-  CheckCollocatedCase(BasisType::GaussLobatto, false, false);
-  CheckCollocatedCase(BasisType::GaussLegendre, false, true);
-  CheckCollocatedCase(BasisType::GaussLegendre, false, false, BasisMutation::None, "wmma");
+  for (const char* storage : {"cached", "direct"})
+  {
+    CheckCollocatedCase(BasisType::GaussLegendre, false, false, BasisMutation::None, "simt", storage);
+    CheckCollocatedCase(BasisType::GaussLegendre, true, false, BasisMutation::NonunitDiagonals, "simt", storage);
+    CheckCollocatedCase(BasisType::GaussLegendre, false, false, BasisMutation::MassOffDiagonal, "simt", storage);
+    CheckCollocatedCase(BasisType::GaussLobatto, false, false, BasisMutation::None, "simt", storage);
+    CheckCollocatedCase(BasisType::GaussLegendre, false, true, BasisMutation::None, "simt", storage);
+    CheckCollocatedCase(BasisType::GaussLegendre, false, false, BasisMutation::None, "wmma", storage);
+  }
   std::cout << "igr_tensor_volume_collocated_test passed p5_gl_admission=true"
             << " nonunit_mass_diffusion_diagonals=true offdiagonal_rejection=true"
             << " gll_fallback=true unequal_rule_fallback=true wmma_fallback=true"
             << " per_quadrature_geometry=true current_coefficients=true nonfinite_exposed=true"
             << " finite_recovery=true setup_selection_verified=true\n";
+}
+
+bool IdenticalElementFactors(const Vector& factors, int elements)
+{
+  MFEM_VERIFY(elements > 1 && factors.Size()%elements == 0,
+              "Geometry source proof requires multiple equal-sized element records.");
+  const int entries = factors.Size()/elements;
+  const double* data = factors.HostRead();
+  for (int e = 1; e < elements; ++e)
+  {
+    if (std::memcmp(data, data+e*entries, std::size_t(entries)*sizeof(double))) { return false; }
+  }
+  return true;
+}
+
+void CheckDirectGeometry(bool curved)
+{
+  Mesh serial = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  if (curved)
+  {
+    serial.SetCurvature(2, false, 2, Ordering::byVDIM);
+    serial.Transform([](const Vector& x, Vector& y)
+    {
+      y.SetSize(2); y[0] = x[0]+0.125*x[0]*x[0]; y[1] = x[1]+0.0625*x[0]*x[1];
+    });
+  }
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  L2_FECollection fec(5, 2, BasisType::GaussLegendre);
+  ParFiniteElementSpace fes(&mesh, &fec);
+  // Keep GL6 collocation admitted on the curved fixture, independently of the
+  // default-rule fallback already exercised by CheckCase.
+  IntegrationRule mass_rule(IntRules.Get(Geometry::SQUARE, 11));
+  IntegrationRule diffusion_rule(IntRules.Get(Geometry::SQUARE, 11));
+  QuadratureSpace mass_space(mesh, mass_rule), diffusion_space(mesh, diffusion_rule);
+  QuadratureFunction mass(mass_space), diffusion(diffusion_space);
+  FillCoefficients(mass, diffusion, 2);
+  const auto* mass_source = mesh.GetGeometricFactors(mass_rule, GeometricFactors::DETERMINANTS);
+  const auto* diffusion_source = mesh.GetGeometricFactors(diffusion_rule, GeometricFactors::JACOBIANS);
+  const bool identical_mass = IdenticalElementFactors(mass_source->detJ, mesh.GetNE());
+  const bool identical_diffusion = IdenticalElementFactors(diffusion_source->J, mesh.GetNE());
+  auto cached = MakeVolumeForTest(fes, mass, diffusion, "simt", true, true, "admitted");
+  auto direct = MakeVolumeForTest(fes, mass, diffusion, "simt", true, true, "admitted", "direct");
+  auto disabled = MakeVolumeForTest(fes, mass, diffusion, "simt", false, false, "not-requested", "direct");
+  // Equal raw geometric inputs prove that the weighted geometry tiles can be
+  // shared. An affine label alone does not prove floating-point identity.
+  MFEM_VERIFY(!identical_mass || direct.mass_geometry_shared,
+              "Exactly identical mass geometry must share one immutable tile.");
+  MFEM_VERIFY(!identical_diffusion || direct.diffusion_geometry_shared,
+              "Exactly identical diffusion geometry must share one immutable tile.");
+  if (curved)
+  {
+    MFEM_VERIFY(!identical_mass && !identical_diffusion &&
+                  !direct.mass_geometry_shared && !direct.diffusion_geometry_shared,
+                "The varying curved fixture must retain compact per-element geometry.");
+  }
+  Vector x(fes.GetVSize()), actual(fes.GetVSize()), retained(fes.GetVSize()), expected(fes.GetVSize()), dense;
+  for (Vector* value : {&x, &actual, &retained, &expected}) { value->UseDevice(true); }
+  double* input = x.HostWrite();
+  for (int i = 0; i < x.Size(); ++i) { input[i] = 0.8+0.2*std::sin(0.37*(i+1)); }
+  QuadratureFunctionCoefficient mc(mass), dc(diffusion);
+  ParBilinearForm pa(&fes); pa.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+  auto* mi = new MassIntegrator(mc); mi->SetIntRule(&mass_rule); pa.AddDomainIntegrator(mi);
+  auto* di = new DiffusionIntegrator(dc); di->SetIntRule(&diffusion_rule); pa.AddDomainIntegrator(di);
+  pa.Assemble(); pa.Mult(x, expected);
+  cached.op->Mult(x, retained); direct.op->Mult(x, actual);
+  DenseOracle(fes, mass, diffusion, x, dense);
+  MFEM_VERIFY(Relative(actual, expected) <= 2e-12 && Relative(actual, retained) <= 2e-12 &&
+                Relative(actual, dense) <= 2e-12,
+              "Direct shared/per-element geometry differs from retained and independent oracles.");
+  std::cout << "igr_tensor_volume_direct_geometry curved=" << curved
+            << " identical_mass_source=" << identical_mass
+            << " identical_diffusion_source=" << identical_diffusion
+            << " mass_geometry_shared=" << direct.mass_geometry_shared
+            << " diffusion_geometry_shared=" << direct.diffusion_geometry_shared
+            << " owned_geometry_bytes=" << direct.owned_geometry_bytes
+            << " owned_coefficient_bytes=" << direct.owned_coefficient_bytes
+            << " owned_bytes=" << direct.owned_bytes
+            << " public_pa=true retained_cached=true independent_dense=true passed\n";
 }
 
 // The opt-in large benchmark uses the original mass and diffusion rules,
@@ -533,8 +782,8 @@ void Benchmark512(const std::string& mesh_path)
   QuadratureFunction mass(mass_space), diffusion(diffusion_space);
   mass.UseDevice(true); diffusion.UseDevice(true);
   FillBenchmarkCoefficients(mass, diffusion, 0);
-  Vector x(fes.GetVSize()), yp(fes.GetVSize()), ys(fes.GetVSize()), yw(fes.GetVSize()), yc(fes.GetVSize());
-  for (Vector* value : {&x, &yp, &ys, &yw, &yc}) { value->UseDevice(true); }
+  Vector x(fes.GetVSize()), yp(fes.GetVSize()), ys(fes.GetVSize()), yw(fes.GetVSize()), yc(fes.GetVSize()), yd(fes.GetVSize());
+  for (Vector* value : {&x, &yp, &ys, &yw, &yc, &yd}) { value->UseDevice(true); }
   double* input = x.HostWrite();
   for (int i = 0; i < x.Size(); ++i)
   { input[i] = 0.01*std::sin(0.013*(i+1)) + 0.002*(i%7); }
@@ -543,12 +792,15 @@ void Benchmark512(const std::string& mesh_path)
   const double* simt_address = ys.Write();
   const double* wmma_address = yw.Write();
   const double* collocated_address = yc.Write();
-  MFEM_VERIFY(x.OwnsData() && yp.OwnsData() && ys.OwnsData() && yw.OwnsData() && yc.OwnsData() &&
+  const double* direct_address = yd.Write();
+  MFEM_VERIFY(x.OwnsData() && yp.OwnsData() && ys.OwnsData() && yw.OwnsData() && yc.OwnsData() && yd.OwnsData() &&
                 input_address != pa_address && input_address != simt_address &&
                 input_address != wmma_address && pa_address != simt_address &&
                 pa_address != wmma_address && simt_address != wmma_address &&
                 collocated_address != input_address && collocated_address != pa_address &&
-                collocated_address != simt_address && collocated_address != wmma_address,
+                collocated_address != simt_address && collocated_address != wmma_address &&
+                direct_address != input_address && direct_address != pa_address &&
+                direct_address != simt_address && direct_address != wmma_address && direct_address != collocated_address,
               "Large volume input and outputs must be distinct owning device vectors.");
 
   using Clock = std::chrono::steady_clock;
@@ -569,13 +821,15 @@ void Benchmark512(const std::string& mesh_path)
     auto* di = new DiffusionIntegrator(dc); di->SetIntRule(&diffusion_rule); pa.AddDomainIntegrator(di);
     pa.Assemble();
   });
-  VolumeSetup simt, wmma, collocated;
+  VolumeSetup simt, wmma, collocated, direct;
   const double simt_setup = setup([&]()
   { simt = MakeVolumeForTest(fes, mass, diffusion, "simt", false, false, "not-requested"); });
   const double wmma_setup = setup([&]()
   { wmma = MakeVolumeForTest(fes, mass, diffusion, "wmma", false, false, "not-requested"); });
   const double collocated_setup = setup([&]()
   { collocated = MakeVolumeForTest(fes, mass, diffusion, "simt", true, true, "admitted"); });
+  const double direct_setup = setup([&]()
+  { direct = MakeVolumeForTest(fes, mass, diffusion, "simt", true, true, "admitted", "direct"); });
   // These are source-derived persistent array footprints for one fused mode,
   // not allocation-inventory measurements or whole-process memory savings.
   const std::size_t geometry_bytes = std::size_t(mesh.GetNE())*4*64*sizeof(double);
@@ -587,6 +841,7 @@ void Benchmark512(const std::string& mesh_path)
   std::cout << "IGRTensorVolumeBenchmark512 event=setup pa_seconds=" << pa_setup
             << " simt_seconds=" << simt_setup << " wmma_seconds=" << wmma_setup
             << " collocated_simt_seconds=" << collocated_setup
+            << " direct_collocated_simt_seconds=" << direct_setup
             << " setup_scope=operator-setup-and-initial-coefficients first_apply_included=false"
             << " mesh_and_vector_setup_included=false"
             << " per_fused_geometry_bytes=" << geometry_bytes
@@ -594,7 +849,10 @@ void Benchmark512(const std::string& mesh_path)
             << " per_fused_dof_map_bytes=" << map_bytes << " per_fused_basis_map_bytes=" << basis_bytes
             << " per_fused_array_bytes=" << geometry_bytes+current_bytes+map_bytes+basis_bytes
             << " array_bytes_scope=source-derived-persistent-device-arrays"
-            << " original_pa_retained=true fused_instances_live=3"
+            << " direct_owned_geometry_bytes=" << direct.owned_geometry_bytes
+            << " direct_owned_coefficient_bytes=" << direct.owned_coefficient_bytes
+            << " direct_owned_bytes=" << direct.owned_bytes
+            << " original_pa_retained=true cached_fused_instances_live=3 fused_instances_live=4"
             << " cuda_free_bytes=" << free_bytes << " cuda_total_bytes=" << total_bytes
             << " process_memory_saving_claim=false" << std::endl;
 
@@ -615,6 +873,17 @@ void Benchmark512(const std::string& mesh_path)
                 "Large volume CUDA-event timing must be finite and positive.");
     return result;
   };
+  auto measure_host_refresh = [&](auto refresh)
+  {
+    for (int i = 0; i < warmups; ++i) { refresh(); }
+    MFEM_GPU_CHECK(cudaDeviceSynchronize());
+    const auto begin = Clock::now();
+    for (int i = 0; i < repeats; ++i) { refresh(); }
+    const double elapsed_ms = 1000.0*std::chrono::duration<double>(Clock::now()-begin).count()/repeats;
+    MFEM_VERIFY(std::isfinite(elapsed_ms) && elapsed_ms >= 0.0,
+                "Metadata-only direct refresh needs a finite nonnegative host timing.");
+    return elapsed_ms;
+  };
   Vector previous;
   for (int phase = 0; phase < 2; ++phase)
   {
@@ -625,15 +894,19 @@ void Benchmark512(const std::string& mesh_path)
       RefreshTensorVolumeCoefficients(*simt.op, mass, diffusion);
       RefreshTensorVolumeCoefficients(*wmma.op, mass, diffusion);
       RefreshTensorVolumeCoefficients(*collocated.op, mass, diffusion);
+      RefreshTensorVolumeCoefficients(*direct.op, mass, diffusion);
     }
     yp = std::numeric_limits<double>::quiet_NaN();
     ys = std::numeric_limits<double>::quiet_NaN();
     yw = std::numeric_limits<double>::quiet_NaN();
     yc = std::numeric_limits<double>::quiet_NaN();
-    pa.Mult(x, yp); simt.op->Mult(x, ys); wmma.op->Mult(x, yw); collocated.op->Mult(x, yc);
+    yd = std::numeric_limits<double>::quiet_NaN();
+    pa.Mult(x, yp); simt.op->Mult(x, ys); wmma.op->Mult(x, yw); collocated.op->Mult(x, yc); direct.op->Mult(x, yd);
     const BenchmarkError simt_error = CheckBenchmarkParity(ys, yp);
     const BenchmarkError wmma_error = CheckBenchmarkParity(yw, yp);
     const BenchmarkError collocated_error = CheckBenchmarkParity(yc, yp);
+    const BenchmarkError direct_error = CheckBenchmarkParity(yd, yp);
+    CheckBenchmarkParity(yd, yc);
     if (phase)
     {
       const double* now = yp.HostRead(); const double* old = previous.HostRead();
@@ -650,23 +923,30 @@ void Benchmark512(const std::string& mesh_path)
     const double simt_apply_ms = measure([&]() { simt.op->Mult(x, ys); });
     const double wmma_apply_ms = measure([&]() { wmma.op->Mult(x, yw); });
     const double collocated_apply_ms = measure([&]() { collocated.op->Mult(x, yc); });
+    const double direct_apply_ms = measure([&]() { direct.op->Mult(x, yd); });
     // Production continues to assemble original PA data for its independent
     // current-equation certificates. Fused Refresh is additional work.
     const double pa_refresh_ms = measure([&]() { pa.Update(); pa.Assemble(); });
     const double simt_refresh_ms = measure([&]() { RefreshTensorVolumeCoefficients(*simt.op, mass, diffusion); });
     const double wmma_refresh_ms = measure([&]() { RefreshTensorVolumeCoefficients(*wmma.op, mass, diffusion); });
     const double collocated_refresh_ms = measure([&]() { RefreshTensorVolumeCoefficients(*collocated.op, mass, diffusion); });
-    pa.Mult(x, yp); simt.op->Mult(x, ys); wmma.op->Mult(x, yw); collocated.op->Mult(x, yc);
+    // Direct refresh only validates/rebinds host metadata. Do not present its
+    // CUDA-event interval or submission noise as a coefficient-kernel cost.
+    const double direct_refresh_ms = measure_host_refresh([&]()
+    { RefreshTensorVolumeCoefficients(*direct.op, mass, diffusion); });
+    pa.Mult(x, yp); simt.op->Mult(x, ys); wmma.op->Mult(x, yw); collocated.op->Mult(x, yc); direct.op->Mult(x, yd);
     const BenchmarkError timed_simt = CheckBenchmarkParity(ys, yp);
     const BenchmarkError timed_wmma = CheckBenchmarkParity(yw, yp);
     const BenchmarkError timed_collocated = CheckBenchmarkParity(yc, yp);
+    const BenchmarkError timed_direct = CheckBenchmarkParity(yd, yp);
+    CheckBenchmarkParity(yd, yc);
     MFEM_VERIFY(input_address == x.Read() && pa_address == yp.Read() &&
                   simt_address == ys.Read() && wmma_address == yw.Read() &&
-                  collocated_address == yc.Read(),
+                  collocated_address == yc.Read() && direct_address == yd.Read(),
                 "Measured public Mult must reuse the preallocated input/output buffers.");
     auto report = [&](const char* variant, double apply_ms, double refresh_ms,
                       const BenchmarkError& initial, const BenchmarkError& timed,
-                      const VolumeSetup* selection)
+                      const VolumeSetup* selection, bool host_refresh = false)
     {
       std::cout << "IGRTensorVolumeBenchmark512 variant=" << variant << " phase=" << phase
                 << " parity=passed coefficient_refresh_parity=passed cells=" << mesh.GetNE()
@@ -675,28 +955,45 @@ void Benchmark512(const std::string& mesh_path)
                 << " mean_apply_ms=" << apply_ms << " apply_speedup_vs_pa=" << pa_apply_ms/apply_ms
                 << " mean_refresh_ms=" << refresh_ms
                 << " mean_common_pa_refresh_ms=" << pa_refresh_ms
-                << " refresh_scope=" << (std::string(variant) == "pa" ? "original-pa-common" : "additional-fused-only")
+                << " refresh_scope=" << (host_refresh ? "host-only-metadata-binding" :
+                  std::string(variant) == "pa" ? "original-pa-common" : "additional-fused-only")
                 << " original_pa_refresh_retained=true"
                 << " collocated_requested=" << (selection && selection->requested)
                 << " collocated_enabled=" << (selection && selection->enabled)
                 << " collocated_reason=" << (selection ? selection->reason : "not-applicable")
                 << " actual_kernel=" << (selection ? selection->kernel : "public-pa")
+                << " storage_requested=" << (selection ? selection->storage_requested : "not-applicable")
+                << " storage=" << (selection ? selection->storage : "public-pa")
+                << " storage_reason=" << (selection ? selection->storage_reason : "not-applicable")
+                << " geometry_layout=" << (selection ? selection->geometry_layout : "public-pa")
+                << " mass_geometry_shared=" << (selection && selection->mass_geometry_shared)
+                << " diffusion_geometry_shared=" << (selection && selection->diffusion_geometry_shared)
+                << " owned_geometry_bytes=" << (selection ? selection->owned_geometry_bytes : 0)
+                << " owned_coefficient_bytes=" << (selection ? selection->owned_coefficient_bytes : 0)
+                << " owned_bytes=" << (selection ? selection->owned_bytes : 0)
+                << " owned_bytes_scope=" << (selection ? "operator-persistent-arrays-borrowed-qfs-excluded" : "not-inventoried")
                 << " relative_l2=" << std::max(initial.l2, timed.l2)
                 << " relative_linf=" << std::max(initial.linf, timed.linf)
                 << " apply_includes_public_mult=true coefficient_generation_timed=false"
-                << " timing_clock=cuda-events refresh_includes_host_submission_gaps=true"
+                << " timing_clock=cuda-events"
+                << " refresh_timing_clock=" << (host_refresh ? "host-steady-clock" : "cuda-events")
+                << " refresh_includes_host_submission_gaps=" << (host_refresh ? "false" : "true")
                 << " setup_timed_separately=true oracle_downloads_timed=false"
-                << " faces_included=false solves_included=false" << std::endl;
+                << " faces_included=false solves_included=false";
+      if (host_refresh) { std::cout << " mean_refresh_host_ms=" << refresh_ms; }
+      std::cout << std::endl;
     };
     report("pa", pa_apply_ms, pa_refresh_ms, {}, {}, nullptr);
     report("simt", simt_apply_ms, simt_refresh_ms, simt_error, timed_simt, &simt);
     report("wmma", wmma_apply_ms, wmma_refresh_ms, wmma_error, timed_wmma, &wmma);
     report("collocated_simt", collocated_apply_ms, collocated_refresh_ms,
            collocated_error, timed_collocated, &collocated);
+    report("direct_collocated_simt", direct_apply_ms, direct_refresh_ms,
+           direct_error, timed_direct, &direct, true);
   }
   MFEM_GPU_CHECK(cudaEventDestroy(start)); MFEM_GPU_CHECK(cudaEventDestroy(stop));
   std::cout << "IGRTensorVolumeBenchmark512 parity=passed coefficient_generations=2"
-            << " variants=4 large_oracle=public-pa normal_suite_executed=false"
+            << " variants=5 large_oracle=public-pa normal_suite_executed=false"
             << " baseline_route=public-ParBilinearForm-Mult restriction_scatter_included=true"
             << " full_dense_assembly=false full_solver_speedup_claim=false" << std::endl;
 #else
@@ -724,9 +1021,22 @@ int main(int argc,char** argv)
     }
     std::cout << "igr_tensor_volume_control_suite collocated_requested=" << collocated << " passed\n";
   }
+  {
+    ScopedCollocatedSelection selection(true);
+    for (int basis : {mfem::BasisType::GaussLegendre, mfem::BasisType::GaussLobatto})
+    {
+      for (int order : {1, 3, 5, 7}) { CheckCase(order, basis, false, false, "direct"); }
+      CheckCase(5, basis, true, false, "direct");
+      CheckCase(5, basis, false, true, "direct");
+    }
+    std::cout << "igr_tensor_volume_control_suite collocated_requested=1 storage_requested=direct passed\n";
+  }
   CheckCollocatedSuite();
+  CheckDirectGeometry(false);
+  CheckDirectGeometry(true);
   std::cout<<"igr_tensor_volume_test passed original_pa=true independent_dense=true "
               "current_coefficients=true separate_quadratures=true curved_geometry=true "
-              "real_columns=true partial_warp_batch=true fp64_simt=true fp64_wmma=true nonfinite_exposed=true\n";
+              "real_columns=true partial_warp_batch=true fp64_simt=true fp64_wmma=true nonfinite_exposed=true "
+              "direct_storage=true current_qf_objects=true replaced_device_buffers=true finite_recovery=true\n";
   return 0;
 }

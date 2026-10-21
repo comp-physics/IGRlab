@@ -4,6 +4,7 @@
 #include <mma.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <vector>
@@ -132,10 +133,12 @@ __global__ void IGRFusedTensorVolumeKernel(
 // Admission proves that both interpolation maps are diagonal, not that they
 // equal the identity. Retain each actual diagonal multiply at its original
 // forward/transpose stage. Only the four derivative contractions remain dense.
-template <int D>
+template <int D, bool direct>
 __global__ void IGRFusedCollocatedTensorVolumeKernel(
   int ne, const int* dof_map, const double* maps, const double* mass,
-  const double* diffusion, const double* x, double* y)
+  const double* diffusion, const double* x, double* y,
+  int mass_geometry_stride, int diffusion_geometry_stride,
+  const double* invrho, const double* ck)
 {
   constexpr int points = D*D;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -173,9 +176,24 @@ __global__ void IGRFusedCollocatedTensorVolumeKernel(
       gy += by * g[c+D*k];
     }
     gx *= bd[c];
-    const double* metric = diffusion + e*3*tile_size + r + side*c;
-    fx[warp][i] = metric[0]*gx + metric[tile_size]*gy;
-    fy[warp][i] = metric[tile_size]*gx + metric[2*tile_size]*gy;
+    if constexpr (direct)
+    {
+      const double* metric = diffusion + e*diffusion_geometry_stride + i;
+      const double coefficient = ck[e*points+i];
+      // The cached path rounds geometry*coefficient before using the metric.
+      // Preserve that intermediate rather than contracting it into a flux.
+      const double d00 = __dmul_rn(metric[0], coefficient);
+      const double d01 = __dmul_rn(metric[points], coefficient);
+      const double d11 = __dmul_rn(metric[2*points], coefficient);
+      fx[warp][i] = d00*gx + d01*gy;
+      fy[warp][i] = d01*gx + d11*gy;
+    }
+    else
+    {
+      const double* metric = diffusion + e*3*tile_size + r + side*c;
+      fx[warp][i] = metric[0]*gx + metric[tile_size]*gy;
+      fy[warp][i] = metric[tile_size]*gx + metric[2*tile_size]*gy;
+    }
   }
   __syncwarp();
   for (int i = lane; i < points; i += 32)
@@ -192,7 +210,14 @@ __global__ void IGRFusedCollocatedTensorVolumeKernel(
     dx *= bd[c];
     double value = bm[r] * u[warp][i];
     value *= bm[c];
-    value *= mass[e*tile_size+r+side*c];
+    if constexpr (direct)
+    {
+      value *= __dmul_rn(mass[e*mass_geometry_stride+i], invrho[e*points+i]);
+    }
+    else
+    {
+      value *= mass[e*tile_size+r+side*c];
+    }
     value = bm[r] * value;
     value *= bm[c];
     value += dx + dy;
@@ -203,19 +228,24 @@ __global__ void IGRFusedCollocatedTensorVolumeKernel(
 }
 
 // Instantiate compact shared-memory fields for every admitted D1D.
-template <int D = 1>
+template <bool direct, int D = 1>
 void LaunchCollocatedTensorVolumeKernel(
   int d, int ne, const int* dof_map, const double* maps, const double* mass,
-  const double* diffusion, const double* x, double* y)
+  const double* diffusion, const double* x, double* y,
+  int mass_geometry_stride = 0, int diffusion_geometry_stride = 0,
+  const double* invrho = nullptr, const double* ck = nullptr)
 {
   if (d == D)
   {
-    IGRFusedCollocatedTensorVolumeKernel<D><<<(ne+warps-1)/warps,32*warps>>>(
-      ne,dof_map,maps,mass,diffusion,x,y);
+    IGRFusedCollocatedTensorVolumeKernel<D, direct><<<(ne+warps-1)/warps,32*warps>>>(
+      ne,dof_map,maps,mass,diffusion,x,y,
+      mass_geometry_stride,diffusion_geometry_stride,invrho,ck);
   }
   else if constexpr (D < side)
   {
-    LaunchCollocatedTensorVolumeKernel<D+1>(d,ne,dof_map,maps,mass,diffusion,x,y);
+    LaunchCollocatedTensorVolumeKernel<direct, D+1>(
+      d,ne,dof_map,maps,mass,diffusion,x,y,
+      mass_geometry_stride,diffusion_geometry_stride,invrho,ck);
   }
   else
   {
@@ -299,6 +329,15 @@ const mfem::QuadratureSpace& CheckQF(const mfem::QuadratureFunction& qf,
   return *space;
 }
 
+std::string TensorVolumeStorageSelection()
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_IGR_TENSOR_VOLUME_STORAGE");
+  const std::string storage = value ? value : "cached";
+  MFEM_VERIFY(storage == "cached" || storage == "direct",
+              "IGR tensor volume storage must be cached|direct.");
+  return storage;
+}
+
 class TensorVolumeOperator final : public mfem::Operator
 {
 public:
@@ -309,6 +348,7 @@ public:
     : mfem::Operator(fes.GetVSize()), fes_(fes), execution_(execution),
       collocated_requested_(::igrlab::EnvFlagEnabledDefault(
         "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED", false)),
+      storage_requested_(TensorVolumeStorageSelection()),
       mass_space_(&CheckQF(invrho, fes)), diffusion_space_(&CheckQF(ck, fes))
   {
     static_assert(sizeof(mfem::real_t) == sizeof(double), "FP64 MFEM required");
@@ -335,6 +375,9 @@ public:
     qm_ = CheckRule(mass_space_->GetIntRule(0));
     qd_ = CheckRule(diffusion_space_->GetIntRule(0));
     BuildMaps(fe);
+    direct_storage_ = storage_requested_ == "direct" && collocated_enabled_;
+    storage_reason_ = storage_requested_ == "cached" ? "cached-requested" :
+      (direct_storage_ ? "admitted" : "requires-collocated-simt");
     dof_map_.SetSize(ne_*d_*d_);
     int* map = dof_map_.HostWrite();
     std::vector<bool> visited(fes.GetVSize(), false);
@@ -373,11 +416,20 @@ public:
     mesh_sequence_ = fes.GetMesh()->GetSequence();
     nodes_sequence_ = fes.GetMesh()->GetNodesSequence();
     maps_.UseDevice(true); mass_geometry_.UseDevice(true); diffusion_geometry_.UseDevice(true);
-    mass_.SetSize(ne_*tile_size); mass_.UseDevice(true);
-    diffusion_.SetSize(ne_*3*tile_size); diffusion_.UseDevice(true);
     dof_map_.Read(); maps_.Read(); mass_geometry_.Read(); diffusion_geometry_.Read();
-    mass_.Write(); diffusion_.Write();
+    if (!direct_storage_)
+    {
+      mass_.SetSize(ne_*tile_size); mass_.UseDevice(true);
+      diffusion_.SetSize(ne_*3*tile_size); diffusion_.UseDevice(true);
+      mass_.Write(); diffusion_.Write();
+    }
     Refresh(invrho, ck);
+    const std::size_t geometry_bytes =
+      (std::size_t(mass_geometry_.Size()) + diffusion_geometry_.Size())*sizeof(double);
+    const std::size_t coefficient_bytes =
+      (std::size_t(mass_.Size()) + diffusion_.Size())*sizeof(double);
+    const std::size_t owned_bytes = geometry_bytes + coefficient_bytes +
+      std::size_t(dof_map_.Size())*sizeof(int) + std::size_t(maps_.Size())*sizeof(double);
     std::cout << "[igr-tensor-volume] event=setup execution=" << execution_
               << " precision=fp64 d1d=" << d_ << " mass_q1d=" << qm_
               << " diffusion_q1d=" << qd_ << " elements=" << ne_
@@ -386,6 +438,15 @@ public:
               << " collocated_requested=" << int(collocated_requested_)
               << " collocated_enabled=" << int(collocated_enabled_)
               << " collocated_reason=" << collocated_reason_
+              << " storage_requested=" << storage_requested_
+              << " storage=" << (direct_storage_ ? "direct" : "cached")
+              << " storage_reason=" << storage_reason_
+              << " geometry_layout=" << (direct_storage_ ? "compact" : "padded")
+              << " mass_geometry_shared=" << int(mass_geometry_stride_ == 0)
+              << " diffusion_geometry_shared=" << int(diffusion_geometry_stride_ == 0)
+              << " owned_geometry_bytes=" << geometry_bytes
+              << " owned_coefficient_bytes=" << coefficient_bytes
+              << " owned_bytes=" << owned_bytes
               << " kernel=" << (collocated_enabled_ ? "collocated-simt-one-warp-per-element" :
                                                     "fused-one-warp-per-element")
               << " fallback=none" << std::endl;
@@ -397,10 +458,20 @@ public:
     MFEM_VERIFY(&CheckQF(invrho, fes_) == mass_space_ && &CheckQF(ck, fes_) == diffusion_space_ &&
                   invrho.Size() == ne_*qm_*qm_ && ck.Size() == ne_*qd_*qd_,
                 "IGR tensor volume quadrature changed; reconstruct the operator.");
-    IGRTensorVolumeRefreshKernel<<<(ne_*tile_size+255)/256,256>>>(
-      ne_, qm_, qd_, mass_geometry_.Read(), diffusion_geometry_.Read(),
-      invrho.Read(), ck.Read(), mass_.Write(), diffusion_.Write());
-    MFEM_VERIFY(cudaGetLastError() == cudaSuccess, "IGR tensor coefficient refresh launch failed.");
+    if (direct_storage_)
+    {
+      // Keep object identities, not data pointers: MFEM may reallocate or change
+      // the authoritative memory location of a current coefficient buffer.
+      invrho_ = &invrho;
+      ck_ = &ck;
+    }
+    else
+    {
+      IGRTensorVolumeRefreshKernel<<<(ne_*tile_size+255)/256,256>>>(
+        ne_, qm_, qd_, mass_geometry_.Read(), diffusion_geometry_.Read(),
+        invrho.Read(), ck.Read(), mass_.Write(), diffusion_.Write());
+      MFEM_VERIFY(cudaGetLastError() == cudaSuccess, "IGR tensor coefficient refresh launch failed.");
+    }
     ++refreshes_;
   }
 
@@ -416,9 +487,16 @@ public:
       IGRFusedTensorVolumeKernel<true><<<(ne_+warps-1)/warps,32*warps>>>(
         ne_,d_,qm_,qd_,dof_map_.Read(),maps_.Read(),mass_.Read(),diffusion_.Read(),input,output);
     }
+    else if (direct_storage_)
+    {
+      MFEM_VERIFY(invrho_ && ck_, "Direct IGR tensor coefficients are not bound.");
+      LaunchCollocatedTensorVolumeKernel<true>(
+        d_,ne_,dof_map_.Read(),maps_.Read(),mass_geometry_.Read(),diffusion_geometry_.Read(),
+        input,output,mass_geometry_stride_,diffusion_geometry_stride_,invrho_->Read(),ck_->Read());
+    }
     else if (collocated_enabled_)
     {
-      LaunchCollocatedTensorVolumeKernel(
+      LaunchCollocatedTensorVolumeKernel<false>(
         d_,ne_,dof_map_.Read(),maps_.Read(),mass_.Read(),diffusion_.Read(),input,output);
     }
     else
@@ -438,6 +516,7 @@ public:
               << " collocated_requested=" << int(collocated_requested_)
               << " collocated_enabled=" << int(collocated_enabled_)
               << " collocated_reason=" << collocated_reason_
+              << " storage=" << (direct_storage_ ? "direct" : "cached")
               << " precision=fp64 fallback=none" << std::endl;
   }
 
@@ -489,8 +568,14 @@ private:
     const auto* mg = fes_.GetMesh()->GetGeometricFactors(mi, mfem::GeometricFactors::DETERMINANTS);
     const auto* dg = fes_.GetMesh()->GetGeometricFactors(di, mfem::GeometricFactors::JACOBIANS);
     const double* det = mg->detJ.HostRead(); const double* jac = dg->J.HostRead();
-    mass_geometry_.SetSize(ne_*tile_size); mass_geometry_ = 0.0;
-    diffusion_geometry_.SetSize(ne_*3*tile_size); diffusion_geometry_ = 0.0;
+    const int mass_points = direct_storage_ ? qm_*qm_ : tile_size;
+    const int diffusion_points = direct_storage_ ? qd_*qd_ : tile_size;
+    const int mass_side = direct_storage_ ? qm_ : side;
+    const int diffusion_side = direct_storage_ ? qd_ : side;
+    mass_geometry_stride_ = mass_points;
+    diffusion_geometry_stride_ = 3*diffusion_points;
+    mass_geometry_.SetSize(ne_*mass_points); mass_geometry_ = 0.0;
+    diffusion_geometry_.SetSize(ne_*3*diffusion_points); diffusion_geometry_ = 0.0;
     double* m = mass_geometry_.HostReadWrite(); double* g = diffusion_geometry_.HostReadWrite();
     for (int e = 0; e < ne_; ++e)
     {
@@ -499,7 +584,7 @@ private:
         const int q = i+qm_*j;
         MFEM_VERIFY(std::isfinite(det[e*qm_*qm_+q]) && det[e*qm_*qm_+q] > 0.0,
                     "IGR tensor volume requires positive finite Jacobians.");
-        m[e*tile_size+i+side*j] = mi.IntPoint(q).weight*det[e*qm_*qm_+q];
+        m[e*mass_points+i+mass_side*j] = mi.IntPoint(q).weight*det[e*qm_*qm_+q];
       }
       const int nq = qd_*qd_;
       for (int j = 0; j < qd_; ++j) for (int i = 0; i < qd_; ++i)
@@ -510,22 +595,48 @@ private:
         MFEM_VERIFY(std::isfinite(determinant) && determinant > 0.0,
                     "IGR tensor diffusion requires positive finite Jacobians.");
         const double factor = di.IntPoint(q).weight/determinant;
-        const int target = e*3*tile_size+i+side*j;
+        const int target = e*3*diffusion_points+i+diffusion_side*j;
         g[target] = factor*(c*c+d*d);
-        g[target+tile_size] = -factor*(c*a+d*b);
-        g[target+2*tile_size] = factor*(a*a+b*b);
-        MFEM_VERIFY(std::isfinite(g[target]) && std::isfinite(g[target+tile_size]) &&
-                      std::isfinite(g[target+2*tile_size]), "Nonfinite IGR tensor diffusion metric.");
+        g[target+diffusion_points] = -factor*(c*a+d*b);
+        g[target+2*diffusion_points] = factor*(a*a+b*b);
+        MFEM_VERIFY(std::isfinite(g[target]) && std::isfinite(g[target+diffusion_points]) &&
+                      std::isfinite(g[target+2*diffusion_points]), "Nonfinite IGR tensor diffusion metric.");
       }
     }
+    if (direct_storage_)
+    {
+      mass_geometry_stride_ = ShareIdenticalGeometry(mass_geometry_, mass_points);
+      diffusion_geometry_stride_ = ShareIdenticalGeometry(diffusion_geometry_, 3*diffusion_points);
+    }
+  }
+  int ShareIdenticalGeometry(mfem::Vector& geometry, int entries) const
+  {
+    const double* values = geometry.HostRead();
+    const std::size_t bytes = std::size_t(entries)*sizeof(double);
+    for (int e = 1; e < ne_; ++e)
+    {
+      // Bitwise comparison preserves every quadrature value and signed zero.
+      if (std::memcmp(values, values+e*entries, bytes) != 0) { return entries; }
+    }
+    // SetSize alone can retain the full allocation. Swap in a new one-tile
+    // owner before either vector has acquired device storage.
+    mfem::Vector shared(entries);
+    std::copy_n(values, entries, shared.HostWrite());
+    geometry.Swap(shared);
+    return 0;
   }
   mfem::ParFiniteElementSpace& fes_;
   const std::string execution_;
   const bool collocated_requested_;
+  const std::string storage_requested_;
   bool collocated_enabled_=false;
   const char* collocated_reason_="not-requested";
+  bool direct_storage_=false;
+  const char* storage_reason_="cached-requested";
   const mfem::QuadratureSpace *mass_space_, *diffusion_space_;
+  const mfem::QuadratureFunction *invrho_=nullptr, *ck_=nullptr;
   int ne_=0,d_=0,qm_=0,qd_=0;
+  int mass_geometry_stride_=tile_size, diffusion_geometry_stride_=3*tile_size;
   long space_sequence_=0,mesh_sequence_=0,nodes_sequence_=0;
   mfem::Array<int> dof_map_;
   mfem::Vector maps_,mass_geometry_,diffusion_geometry_,mass_,diffusion_;
