@@ -268,10 +268,11 @@
     "cpus": 8,
     "omp_threads": 1,
     "host_memory_gib": 96,
-    "gpu": "NVIDIA GH200 96GB",
+    "gpu": "NVIDIA GH200 120GB",
     "account": "bdiy-dtai-gh",
     "partition": "ghx4",
-    "constraint": "projects"
+    "constraint": "projects",
+    "visible_gpu_memory_mib": 97871
   },
   "reproduction_notes": [
     "Replace {mesh} with the absolute path to the mesh in the pinned checkout.",

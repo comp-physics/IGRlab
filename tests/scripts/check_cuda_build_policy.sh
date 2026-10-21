@@ -265,9 +265,13 @@ trap cleanup EXIT
 fixture_root="${tmp_root}/fixture"
 fixture_mfem="${fixture_root}/tpl/mfem"
 fake_bin="${tmp_root}/fake-bin"
+# Keep the caller's supported Python when isolating fake tools from the site PATH.
+policy_python="$(type -P python3)"
+[[ -n "${policy_python}" ]] || fail "python3 is unavailable"
 mkdir -p "${fixture_root}/spack-envs/cuda-sm120/.spack-env/view" \
          "${fixture_root}/spack-envs/cpu/.spack-env/view" \
          "${fixture_root}/tpl" "${fake_bin}"
+ln -s "${policy_python}" "${fake_bin}/python3"
 git -c advice.detachedHead=false clone --quiet --shared --no-checkout \
   "${mfem_source}" "${fixture_mfem}"
 git -c advice.detachedHead=false -C "${fixture_mfem}" checkout --quiet \
@@ -725,7 +729,7 @@ mkdir -p "${forward_spack_env}/.spack-env/view"
 cp "${REPO_ROOT}/spack-envs/cuda-sm120/spack.yaml" \
   "${forward_spack_env}/spack.yaml"
 set +e
-env -u CUDA_ARCHS -u MFEM_CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
+"${clean_env[@]}" \
   PATH="${fake_bin}:/usr/bin:/bin" \
   FAKE_HELPER_LOG="${tmp_root}/forwarded-args.log" \
   FAKE_SPACK_LOG="${tmp_root}/forwarded-spack.log" \
@@ -736,7 +740,10 @@ env -u CUDA_ARCHS -u MFEM_CUDA_ARCHS -u APP_CUDA_ARCHS -u SPACK_CUDA_ARCH \
   >"${tmp_root}/forwarding-output.log" 2>&1
 forward_rc=$?
 set -e
-[[ ${forward_rc} -eq 77 ]] || fail "fake-helper forwarding exited ${forward_rc}, expected 77"
+[[ ${forward_rc} -eq 77 ]] || {
+  cat "${tmp_root}/forwarding-output.log" >&2
+  fail "fake-helper forwarding exited ${forward_rc}, expected 77"
+}
 forwarded_log="$(<"${tmp_root}/forwarded-args.log")"
 forward_scope="$(plan_field "$(<"${tmp_root}/forwarding-output.log")" scope)"
 [[ "${forward_scope}" == "${forward_output_root}/worktrees/"*/cuda-sm120 ]] || {
@@ -809,14 +816,14 @@ assert_not_exists "${tmp_root}/external-spack.log"
 # separate scope and reaches the fake helper without a spurious mkdir failure.
 concurrent_output_root="${tmp_root}/concurrent-output"
 set +e
-PATH="${fake_bin}:/usr/bin:/bin" \
+"${clean_env[@]}" PATH="${fake_bin}:/usr/bin:/bin" \
   FAKE_HELPER_LOG="${tmp_root}/concurrent-gpu-helper.log" \
   FAKE_SPACK_LOG="${tmp_root}/concurrent-gpu-spack.log" \
   bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
     --output-root "${concurrent_output_root}" --no-clean --no-deps --no-tests \
     >"${tmp_root}/concurrent-gpu.out" 2>&1 &
 concurrent_gpu_pid=$!
-PATH="${fake_bin}:/usr/bin:/bin" \
+"${clean_env[@]}" PATH="${fake_bin}:/usr/bin:/bin" \
   FAKE_HELPER_LOG="${tmp_root}/concurrent-cpu-helper.log" \
   FAKE_SPACK_LOG="${tmp_root}/concurrent-cpu-spack.log" \
   bash "${fixture_root}/build.sh" --cpu-only \
