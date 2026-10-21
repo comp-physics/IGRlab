@@ -19,7 +19,43 @@
 
 namespace
 {
-using namespace mfem;
+// Do not import mfem::igrlab into the translation-unit lookup scope: NVCC's
+// generated registration stubs use unqualified igrlab::dg_face type names.
+using mfem::Array;
+using mfem::AssemblyLevel;
+using mfem::BasisType;
+using mfem::BdrHyperbolicFluxIntegrator;
+using mfem::BilinearForm;
+using mfem::Coefficient;
+using mfem::DenseMatrix;
+using mfem::DenseMatrixInverse;
+using mfem::DenseTensor;
+using mfem::DG_FECollection;
+using mfem::DGDiffusionIntegrator;
+using mfem::DGHyperbolicConservationLaws;
+using mfem::DiffusionIntegrator;
+using mfem::Element;
+using mfem::EulerFlux;
+using mfem::EulerWithIGR;
+using mfem::FaceQuadratureSpace;
+using mfem::FaceType;
+using mfem::FluxWithIGR;
+using mfem::FunctionCoefficient;
+using mfem::Geometry;
+using mfem::HyperbolicFormIntegrator;
+using mfem::IntegrationRule;
+using mfem::IntRules;
+using mfem::MassIntegrator;
+using mfem::Mesh;
+using mfem::Ordering;
+using mfem::ParFiniteElementSpace;
+using mfem::ParGridFunction;
+using mfem::ParMesh;
+using mfem::Reshape;
+using mfem::RusanovFluxWithSides;
+using mfem::SlipWallState;
+using mfem::Vector;
+using mfem::VectorFunctionCoefficient;
 using namespace ::igrlab::dg_face;
 
 void AddDomain(BilinearForm& form, Coefficient& mass, Coefficient& diffusion,
