@@ -561,12 +561,19 @@ RunEulerCase(ExampleContext& ctx,
   const bool sigma_certification_supported =
     sigma_provider &&
     sigma_provider->SupportsIndependentResidualCertification();
+  const bool fixed_element_jacobi =
+    ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) ==
+      ::igrlab::IGRSolveMode::FixedElementJacobi;
+  MFEM_VERIFY(!fixed_element_jacobi ||
+                (!restart_info && initial_time == 0.0 && initial_step == 0),
+              "Fixed element-block Jacobi requires a fresh t=0 state.");
 
   EulerOutputFieldTiming initial_field_timing;
   double initial_sigma_prepare_s = 0.0;
   mfem::IGRSigmaPreparationResult initial_sigma_preparation;
   if (sigma_provider &&
-      (restart_info || run_cfg.opts.vtk_save || glvis_enabled))
+      (restart_info || run_cfg.opts.vtk_save || glvis_enabled ||
+       fixed_element_jacobi))
   {
     const auto prepare_start = std::chrono::steady_clock::now();
     initial_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
@@ -579,6 +586,16 @@ RunEulerCase(ExampleContext& ctx,
       /*certify_residual=*/restart_info != nullptr &&
         sigma_certification_supported);
     initial_sigma_prepare_s = SecondsSince(prepare_start);
+  }
+  if (fixed_element_jacobi && sigma_provider && communicator_root)
+  {
+    std::cout << "[igr-element-block-jacobi] event=initial-preparation"
+              << " time=" << initial_time
+              << " solved=" << (initial_sigma_preparation.solved ? 1 : 0)
+              << " reusable_stage0="
+              << (initial_sigma_preparation.reusable_stage0 ? 1 : 0)
+              << " vtk_enabled=" << (run_cfg.opts.vtk_save ? 1 : 0)
+              << " certification_supported=0 certified=0 approximate=1\n";
   }
   if (restart_info && sigma_provider && communicator_root)
   {
@@ -1094,7 +1111,9 @@ RunEulerCase(ExampleContext& ctx,
     if (communicator_root)
     {
       std::cout << std::setprecision(17)
-                << "[igr-closure-certificate] event=accepted-state"
+                << (fixed_element_jacobi ? "[igr-closure-approximation]"
+                                         : "[igr-closure-certificate]")
+                << " event=accepted-state"
                 << " scope=final-committed-accepted-state"
                 << " precision=fp64"
                 << " time=" << result.final_time
@@ -1122,7 +1141,9 @@ RunEulerCase(ExampleContext& ctx,
                 << final_q_sigma_nonpositive
                 << " q_sigma_nonfinite_samples="
                 << final_q_sigma_nonfinite
-                << "\n";
+                << (fixed_element_jacobi
+                      ? " solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps"
+                      : "") << "\n";
     }
   }
   if (final_sigma_transport_admission_failed && communicator_root)
@@ -1667,6 +1688,16 @@ struct Solver
       request_resolution.discretization_provenance,
       request_resolution.regularization,
       request_resolution.time_integrator);
+    const std::string fixed_element_jacobi_rejection =
+      ValidateFixedElementJacobiIGRSelection(run_cfg);
+    if (!fixed_element_jacobi_rejection.empty())
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cerr << fixed_element_jacobi_rejection << '\n';
+      }
+      return 1;
+    }
     const std::string cfl_selection_rejection =
       ValidateExplicitSSPRKCFLSelection(run_cfg);
     if (!cfl_selection_rejection.empty())
@@ -2447,7 +2478,10 @@ struct Solver
                 << " exact_face_operator_uses="
                 << igr->GetExactFaceOperatorUseCount()
                 << " exact_face_last_mult_calls="
-                << igr->GetLastExactFaceOperatorMultCalls() << "\n";
+                << igr->GetLastExactFaceOperatorMultCalls()
+                << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
+                      ? " solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps"
+                      : "") << "\n";
     }
 
     if (!ok)

@@ -14,6 +14,7 @@
 #include "IGR_face_density_cuda.hpp"
 #include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
+#include "IGR_element_block_jacobi.hpp"
 #include "IGR_device_krylov.hpp"
 #include "IGR_chebyshev.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
@@ -1068,6 +1069,15 @@ public:
 
   bool TimingEnabled() const { return timing_enabled_; }
 
+#ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
+  void AddElementBlocks(mfem::DenseTensor& blocks) const
+  {
+    MFEM_VERIFY(HasDirectIdentityLayout() && !has_shared_,
+                "Current element blocks require rank-one identity L2 faces.");
+    igr_internal::AddExactFaceBlocks(info_, scratch_, ip_sigma_, blocks);
+  }
+#endif
+
   bool HasDirectIdentityLayout() const
   { return direct_identity_layout_ && sfes_.GetSequence() == sfes_sequence_; }
 
@@ -1541,6 +1551,7 @@ void IGRSolver::BuildBilinearForm_()
   // layout. Drop both before rebuilding the coefficient-dependent forms.
   Ah_.Clear();
   exact_face_operator_.reset();
+  element_jacobi_blocks_.reset();
 
   const bool debug_qf =
     ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
@@ -2323,6 +2334,8 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 void IGRSolver::SolveEllipticSystem_(bool warm_start)
 {
   ::igrlab::NVTXRange range("IGR/solve-elliptic-system");
+  const bool fixed_element_jacobi =
+    solve_mode_ == SolveMode::FixedElementJacobi;
   mfem::Operator* A_op = ActiveLinearOperator_();
   MFEM_VERIFY(A_op != nullptr,
               "IGR: linear operator is not assembled before Krylov solve.");
@@ -2456,7 +2469,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 (using_cuda && is_dg && exact_face_sum_op &&
                  direct_identity_system_ && ess_tdof_list_.Size() == 0 &&
                  using_device_coeffs_ && use_partial_assembly_ &&
-                 DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND")),
+                 (fixed_element_jacobi ||
+                  DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"))),
               "Tensor IGR experiments require CUDA, partial-assembly L2 DG with "
               "exact faces, current device coefficients, direct identity layout, "
               "no essential constraints, and CUDA FP64 FGMRES.");
@@ -2475,6 +2489,21 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool using_two_level_inverse = two_level_env && two_level_env[0];
   const char* patch_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_RADIUS");
   const bool using_screened_patch = patch_env && patch_env[0];
+  MFEM_VERIFY(!fixed_element_jacobi ||
+                (using_cuda && is_dg && spd_ok && exact_face_sum_op &&
+                 direct_identity_system_ && sfes_.GetNRanks() == 1 &&
+                 ess_tdof_list_.Size() == 0 && using_device_coeffs_ &&
+                 use_partial_assembly_ && !using_tensor_mg &&
+                 !using_dense_inverse && !using_two_level_inverse &&
+                 !using_screened_patch && tensor_volume_mode != "wmma" &&
+                 !certify_current_solve_ &&
+                 sigma_cadence_ == IGRSigmaUpdateCadence::EveryStage &&
+                 regular_sweeps_ > 0 && warm_start_sweeps_ > 0),
+              "Fixed element-block Jacobi requires rank-one CUDA PA L2 SIPG "
+              "with current device coefficients, exact faces, identity layout, "
+              "no essential constraints, every-stage updates and positive sweep "
+              "counts. Disable global/patch preconditioners and do not request "
+              "a converged residual certificate for this approximate mode.");
   MFEM_VERIFY(!using_tensor_mg ||
                 !(using_dense_inverse || using_two_level_inverse || using_screened_patch),
               "Tensor multigrid cannot be combined with another experimental preconditioner.");
@@ -2604,7 +2633,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                  patch_precision == "fp64" && solver_choice == LinearSolverType::CG),
               "Screened RAS and mixed precision require FGMRES; FP64 vertex/face-condensed also permit CG.");
 
-  MFEM_VERIFY(!(using_tensor_mg || using_tensor_volume) ||
+  MFEM_VERIFY(fixed_element_jacobi || !(using_tensor_mg || using_tensor_volume) ||
                 solver_choice == LinearSolverType::FGMRES,
               "Tensor IGR experiments require explicit FGMRES.");
 
@@ -2621,7 +2650,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
 
   // --- Choose preconditioner (Auto policy is space-aware) ---
-  PrecondType prec_choice = prec_type_;
+  PrecondType prec_choice = fixed_element_jacobi ? PrecondType::None : prec_type_;
   if (prec_choice == PrecondType::Auto)
   {
     // CPU: keep BoomerAMG as robust default.
@@ -2718,6 +2747,132 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     iteration_face_sum = tensor_solve_operator.get();
 #else
     MFEM_ABORT("Tensor volume experiment requires a CUDA build.");
+#endif
+  }
+  if (fixed_element_jacobi)
+  {
+#ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
+    // Cache structure/storage only. The element diagonal includes the current
+    // volume coefficients and both SIPG self-face contributions at this stage.
+    auto* exact_face = dynamic_cast<ExactL2DGFaceOperator*>(
+      &exact_face_sum_op->FaceOperator());
+    MFEM_VERIFY(exact_face, "Fixed element Jacobi requires exact L2 face data.");
+    if (!element_jacobi_blocks_)
+    {
+      element_jacobi_blocks_ = MakeElementBlockJacobi(sfes_);
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-element-block-jacobi] event=setup"
+                  << " blocks=current-fp64"
+                  << " regular_sweeps=" << regular_sweeps_
+                  << " initial_sweeps=" << warm_start_sweeps_
+                  << " omega=" << element_jacobi_omega_
+                  << " coarse=none fallback=none acceptance=fixed-sweeps"
+                  << std::endl;
+      }
+    }
+    auto& blocks = dynamic_cast<ElementBlockJacobi&>(*element_jacobi_blocks_);
+    {
+      ::igrlab::NVTXRange block_range("IGR/element-block-assembly");
+      auto& matrices = blocks.PrepareVolumeBlocks(*a_);
+      exact_face->AddElementBlocks(matrices);
+    }
+    {
+      ::igrlab::NVTXRange factor_range("IGR/element-block-factor");
+      blocks.FactorBlocks();
+    }
+    last_pc_setup_seconds_ = ElapsedSeconds(pc_setup_start);
+    total_pc_setup_seconds_ += last_pc_setup_seconds_;
+
+    const bool initialized = element_jacobi_history_valid_;
+    const int sweeps = initialized ? regular_sweeps_ : warm_start_sweeps_;
+    last_warm_start_effective_ = warm_start && initialized;
+    last_warm_start_guard_rejected_ = false;
+    last_warm_start_residual_norm_ = std::numeric_limits<double>::quiet_NaN();
+    last_zero_start_residual_norm_ = std::numeric_limits<double>::quiet_NaN();
+    if (last_warm_start_effective_)
+    {
+      MFEM_VERIFY(element_jacobi_history_.Size() == X_.Size(),
+                  "Fixed element Jacobi production history size changed.");
+      X_ = element_jacobi_history_;
+    }
+    else { X_ = 0.0; }
+    if (diagnostic_nan_scan_)
+    {
+      MFEM_VERIFY(VectorIsFinite(X_) && VectorIsFinite(B_),
+                  "Nonfinite fixed element-Jacobi initial state or RHS.");
+    }
+    auto& residual = element_jacobi_residual_;
+    auto& correction = element_jacobi_correction_;
+    residual.SetSize(X_.Size());
+    correction.SetSize(X_.Size());
+    residual.UseDevice(true);
+    correction.UseDevice(true);
+    const auto sweep_start = Clock::now();
+    for (int sweep = 0; sweep < sweeps; ++sweep)
+    {
+      ::igrlab::NVTXRange sweep_range("IGR/element-jacobi-sweep");
+      {
+        ::igrlab::NVTXRange apply_range("IGR/element-jacobi-current-A");
+        iteration_operator->Mult(X_, residual);
+      }
+      mfem::subtract(B_, residual, residual);
+      {
+        ::igrlab::NVTXRange block_range("IGR/element-jacobi-block-solve");
+        blocks.Mult(residual, correction);
+      }
+      X_.Add(element_jacobi_omega_, correction);
+    }
+    last_krylov_operator_apply_count_ = sweeps;
+    last_krylov_preconditioner_apply_count_ = sweeps;
+    // Explicit diagnostic only; fixed sweeps are not a tolerance certificate.
+    // This never retries, substitutes a converged solve, or changes acceptance.
+    if (true_residual_requested)
+    {
+      A_op->Mult(X_, residual);
+      mfem::subtract(B_, residual, residual);
+      last_linear_true_residual_abs_ = OperatorProbeNorm(residual, comm);
+      const double rhs_norm = OperatorProbeNorm(B_, comm);
+      last_linear_true_residual_rel_rhs_ = rhs_norm > 0.0
+        ? last_linear_true_residual_abs_ / rhs_norm
+        : (last_linear_true_residual_abs_ == 0.0 ? 0.0
+             : std::numeric_limits<double>::infinity());
+      ++last_krylov_operator_apply_count_;
+    }
+    if (diagnostic_nan_scan_)
+    {
+      MFEM_VERIFY(VectorIsFinite(X_),
+                  "Fixed element Jacobi produced nonfinite sigma.");
+    }
+    X_.SyncAliasMemory(sigma_);
+    last_linear_iters_ = sweeps;
+    last_linear_solver_name_ = "fixed-element-jacobi";
+    last_precond_name_ = "current-element-lu-fp64";
+    last_linear_solve_seconds_ = ElapsedSeconds(sweep_start);
+    total_linear_solve_seconds_ += last_linear_solve_seconds_;
+    ++linear_solve_calls_;
+    total_linear_iters_ += sweeps;
+    max_linear_iters_ = std::max(max_linear_iters_, sweeps);
+    total_krylov_operator_apply_count_ += last_krylov_operator_apply_count_;
+    total_krylov_preconditioner_apply_count_ += sweeps;
+    ++exact_face_operator_uses_;
+    last_exact_face_operator_mult_calls_ =
+      iteration_face_sum->LastMultCalls() +
+      (iteration_face_sum != exact_face_sum_op
+         ? exact_face_sum_op->LastMultCalls() : 0);
+    if ((lin_print_ > 0 || true_residual_requested) && mfem::Mpi::Root())
+    {
+      std::cout << "[igr-element-block-jacobi] event=solve"
+                << " solve_call=" << linear_solve_calls_
+                << " sweeps=" << sweeps
+                << " warm_effective=" << last_warm_start_effective_
+                << " converged=0 acceptance=fixed-sweeps"
+                << " true_residual_rel_rhs=" << last_linear_true_residual_rel_rhs_
+                << std::endl;
+    }
+    return;
+#else
+    MFEM_ABORT("Fixed element-block Jacobi requires a CUDA build.");
 #endif
   }
   std::unique_ptr<KrylovTelemetryOperator> cheb_operator_telemetry;

@@ -144,6 +144,11 @@ public:
       subcell_recovery_(subcell_recovery)
   {
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
+    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi ||
+                  (sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage &&
+                   base_.GetVolumeMode() == VolumeMode::WeakDivergence),
+                "Fixed element-block Jacobi requires ordinary DG with "
+                "every-stage sigma updates.");
     MFEM_VERIFY(base_.GetModalDampingRate() == 0.0 ||
                   sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
                 "Modal damping with IGR requires a current stress solve "
@@ -451,6 +456,10 @@ public:
   {
     MFEM_VERIFY(state.Size() == state_.Size(),
                 "Sigma output preparation received an unexpected state size.");
+    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi ||
+                  !certify_residual,
+                "Fixed element-block Jacobi output is approximate and cannot "
+                "request an independent convergence certificate.");
     if (accepted_state_generation_ != kInvalidGeneration)
     {
       MFEM_VERIFY(state_generation == accepted_state_generation_,

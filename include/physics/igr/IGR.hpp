@@ -114,6 +114,7 @@ public:
   // ---- Legacy smoother-sweep knobs (still supported) ----
   void SetSmoother(SmootherType t);
   void SetSweeps(int regular_sweeps, int warm_start_sweeps);
+  void SetElementJacobiDamping(double omega);
 
   // ---- Recommended Krylov-solve knobs ----
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
@@ -189,6 +190,7 @@ public:
 
     SetSmoother(cfg.smoot);
     SetSweeps(cfg.regular_sweeps, cfg.warm_start_sweeps);
+    SetElementJacobiDamping(cfg.element_jacobi_omega);
 
     SetSolveMode(cfg.solve_mode);
     SetLinearSolver(cfg.lin_solver_type);
@@ -726,6 +728,14 @@ private:
   int regular_sweeps_ = mfem::igrlab::IGRDefaults::kRegularSweeps;
   int warm_start_sweeps_ = mfem::igrlab::IGRDefaults::kWarmStartSweeps;
   bool first_call_ = true;
+
+  // Fixed-sweep closure keeps production history separate from output-only
+  // evaluations. Numerical element blocks are refreshed for every new state.
+  double element_jacobi_omega_ = 0.7;
+  std::unique_ptr<mfem::Solver> element_jacobi_blocks_;
+  mfem::Vector element_jacobi_history_;
+  mfem::Vector element_jacobi_residual_, element_jacobi_correction_;
+  bool element_jacobi_history_valid_ = false;
 
   // New solve controls
   SolveMode solve_mode_ = SolveMode::Krylov;

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 
 namespace igrlab
@@ -252,6 +253,13 @@ void IGRSolver::SetSweeps(int regular_sweeps, int warm_start_sweeps)
   warm_start_sweeps_ = std::max(regular_sweeps_, warm_start_sweeps);
 }
 
+void IGRSolver::SetElementJacobiDamping(double omega)
+{
+  MFEM_VERIFY(std::isfinite(omega) && omega > 0.0 && omega <= 1.0,
+              "Element-block Jacobi damping must be finite and in (0, 1].");
+  element_jacobi_omega_ = omega;
+}
+
 void IGRSolver::SetRhoFloor(double rho_floor)
 {
   rho_floor_ = rho_floor;
@@ -316,6 +324,13 @@ void IGRSolver::AddOutputOnlyAccounting_(const SolveAccountingDelta& delta)
 
 void IGRSolver::ConsumePendingStage0PrefetchAccounting()
 {
+  if (pending_stage0_prefetch_accounting_.valid &&
+      solve_mode_ == SolveMode::FixedElementJacobi)
+  {
+    element_jacobi_history_.UseDevice(true);
+    element_jacobi_history_ = sigma_;
+    element_jacobi_history_valid_ = true;
+  }
   pending_stage0_prefetch_accounting_ = {};
 }
 
@@ -421,6 +436,13 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   }
 
   certify_current_solve_ = false;
+  if (solve_mode_ == SolveMode::FixedElementJacobi &&
+      purpose == IGRSolvePurpose::ProductionStage)
+  {
+    element_jacobi_history_.UseDevice(true);
+    element_jacobi_history_ = sigma_;
+    element_jacobi_history_valid_ = true;
+  }
   first_call_ = false;
   diagnostic_state_ = nullptr;
 

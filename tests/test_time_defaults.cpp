@@ -38,6 +38,101 @@ int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
 
+  // Explicit fixed-sweep closure leaves the established solve defaults intact.
+  {
+    const ::igrlab::IGRConfig defaults;
+    ctx.Check(defaults.solve_mode == ::igrlab::IGRSolveMode::Krylov &&
+                defaults.regular_sweeps == mfem::igrlab::IGRDefaults::kRegularSweeps &&
+                defaults.warm_start_sweeps == mfem::igrlab::IGRDefaults::kWarmStartSweeps,
+              "fixed element Jacobi: legacy mode and sweep defaults are unchanged");
+    ctx.Check(dg_sim::ParseIGRSolveMode("ELEMENT-BLOCK-JACOBI") ==
+                ::igrlab::IGRSolveMode::FixedElementJacobi &&
+                std::string(dg_sim::IGRSolveModeToString(
+                  ::igrlab::IGRSolveMode::FixedElementJacobi)) == "element-block-jacobi",
+              "fixed element Jacobi: explicit mode parses and round-trips");
+    std::vector<std::string> arguments = {
+      "test", "--igr-solve-mode", "element-block-jacobi",
+      "--igr-sweeps", "2", "--igr-initial-sweeps", "50",
+      "--igr-jacobi-omega", "0.7", "--igr-sigma-cadence", "every-stage"};
+    std::vector<char*> argv;
+    for (auto& argument : arguments) { argv.push_back(argument.data()); }
+    dg_sim::IGROptions options;
+    mfem::OptionsParser parser(static_cast<int>(argv.size()), argv.data());
+    dg_sim::AddIGROptions(parser, options);
+    parser.Parse();
+    ctx.Check(parser.Good(), "fixed element Jacobi: bounded candidate CLI parses");
+    options.space = "L2";
+    options.grad = "BrokenL2";
+    options.exact_dg_face_operator = true;
+    ::igrlab::IGRConfig configured;
+    dg_sim::ApplyIGRRuntimeOptionOverrides(options, configured);
+    ctx.Check(configured.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi &&
+                configured.regular_sweeps == 2 && configured.warm_start_sweeps == 50 &&
+                configured.element_jacobi_omega == 0.7,
+              "fixed element Jacobi: exact 2/50 sweep counts and damping reach solver config");
+    dg_sim::CommonOptions common;
+    common.device = "cuda";
+    common.dg_backend = "dg";
+    const auto candidate = dg_sim::MakeRunConfig(
+      dg_sim::CaseConfig{}, common, options,
+      dg_sim::DiscretizationProvenance::DiscretizationOption,
+      dg_sim::Regularization::IGR);
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(candidate).empty(),
+              "fixed element Jacobi: ordinary-DG every-stage candidate is admitted");
+    for (const char* cadence : {"every-step", "every-n-steps", "extrapolated-every-step"})
+    {
+      auto unsupported = candidate;
+      unsupported.igr_opts.sigma_cadence = cadence;
+      ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+                "fixed element Jacobi: unsupported sigma cadence is rejected");
+    }
+    auto unsupported = candidate;
+    unsupported.discretization = dg_sim::Discretization::DGSEM;
+    unsupported.dg_backend = dg_sim::DGBackend::DGSEM;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: DGSEM is not silently selected");
+    unsupported = candidate;
+    unsupported.device_backend = dg_sim::DeviceBackend::CPU;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: unsupported CPU execution is rejected");
+    unsupported = candidate;
+    unsupported.igr_opts.exact_dg_face_operator = false;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: exact DG faces are required");
+    unsupported = candidate;
+    unsupported.igr_opts.grad = "H1";
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: conforming gradient selection is rejected");
+    unsupported = candidate;
+    unsupported.opts.restart_vtk = "prior.pvd";
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: unqualified approximate-history restart is rejected");
+    unsupported = candidate;
+    unsupported.igr_opts.regular_sweeps = 0;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: zero regular sweeps are rejected");
+    unsupported = candidate;
+    unsupported.igr_opts.initial_sweeps = 1;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: initial sweeps cannot be silently clamped upward");
+    for (double omega : {0.0, 1.01, std::numeric_limits<double>::quiet_NaN()})
+    {
+      unsupported = candidate;
+      unsupported.igr_opts.element_jacobi_omega = omega;
+      ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+                "fixed element Jacobi: invalid damping is rejected");
+    }
+    ctx.Check(!dg_sim::ValidateHdgIGRSigmaCadence(
+                dg_sim::Discretization::HDG, dg_sim::Regularization::IGR,
+                dg_sim::CaseConfig{}, options).empty(),
+              "fixed element Jacobi: HDG early dispatch rejects this DG closure mode");
+    unsupported = candidate;
+    unsupported.igr_opts.solve_mode = "krylov";
+    unsupported.igr_opts.sigma_cadence = "every-step";
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: other solver modes retain their cadence surface");
+  }
+
   // --- Diagnostic state scans are opt-in and have paired CLI controls ---
   {
     const dg_sim::CommonOptions defaults;
