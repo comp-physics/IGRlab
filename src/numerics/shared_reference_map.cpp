@@ -21,7 +21,7 @@ namespace
 {
 // Frozen source variants qualify launch width and shared-field padding without
 // adding runtime policy or changing the conservative map's numerical contract.
-constexpr int kDGConservativeFusionThreads = 128;
+constexpr int kDGConservativeFusionThreads = 64;
 constexpr int kDGConservativeFusionSharedPitch = 72;
 static_assert(kDGConservativeFusionThreads == 64 || kDGConservativeFusionThreads == 128,
               "Conservative fusion tuning supports 64 or 128 threads.");
