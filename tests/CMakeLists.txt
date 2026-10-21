@@ -1997,4 +1997,11 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   set_tests_properties(dg_igr_tensor_multigrid_nodal_cuda PROPERTIES
     ENVIRONMENT "IGRLAB_IGR_SPECTRAL_TENSOR_NODAL=1"
     LABELS "cuda;igr;tensor-pipeline" TIMEOUT 300 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  foreach(nodal_mode IN ITEMS 0 1)
+    add_test(NAME dg_igr_tensor_spectral_gll_nodal${nodal_mode}_cuda
+      COMMAND dg_igr_tensor_multigrid_test --spectral-gll-only)
+    set_tests_properties(dg_igr_tensor_spectral_gll_nodal${nodal_mode}_cuda PROPERTIES
+      ENVIRONMENT "IGRLAB_IGR_SPECTRAL_TENSOR_NODAL=${nodal_mode}"
+      LABELS "cuda;igr;tensor-pipeline;spectral;gll" TIMEOUT 300 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  endforeach()
 endif()

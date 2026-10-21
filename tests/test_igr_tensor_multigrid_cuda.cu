@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -481,6 +482,162 @@ void CheckSpectral(bool variable,bool natural=false)
     }
   }
 }
+
+// GLL sigma uses the consistent (noncollocated) reaction mass. Keep this
+// separate from the existing GL controls and their diagonal-mass condition
+// estimate: the minimum GL quadrature weight is not a GLL mass eigenvalue.
+void CheckSpectralGLL(bool natural)
+{
+  constexpr int d=6,nx=5,ny=7;
+  constexpr double width_x=1.25,width_y=.875,pi=3.14159265358979323846;
+  // Binary-exact spacings (.25,.125), unequal axes and reordered elements
+  // exercise the production Cartesian proof without relying on element IDs.
+  mfem::Mesh box=mfem::Mesh::MakeCartesian2D(nx,ny,mfem::Element::QUADRILATERAL,
+                                           true,width_x,width_y);
+  for(int v=0;v<box.GetNV();++v)
+  {double* vertex=box.GetVertex(v);vertex[0]+=.125;vertex[1]-=.0625;}
+  mfem::Array<int> ordering(box.GetNE());
+  for(int e=0;e<box.GetNE();++e)ordering[e]=(12*e+3)%box.GetNE();
+  box.ReorderElements(ordering,false);
+  const std::vector<mfem::Vector> shifts{mfem::Vector({width_x,0.0}),
+                                         mfem::Vector({0.0,width_y})};
+  mfem::Mesh mesh=natural?mfem::Mesh(box):
+    mfem::Mesh::MakePeriodic(box,box.CreatePeriodicVertexMapping(shifts));
+  mfem::ParMesh pmesh(MPI_COMM_WORLD,mesh);
+  mfem::L2_FECollection collection(5,2,mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace fes(&pmesh,&collection);
+  const auto* tensor=dynamic_cast<const mfem::TensorBasisElement*>(fes.GetFE(0));
+  MFEM_VERIFY(tensor&&tensor->GetBasisType()==mfem::BasisType::GaussLobatto&&
+                fes.GetFE(0)->GetDof()==d*d,
+              "GLL spectral fixture must use the actual p5 Gauss-Lobatto element.");
+  const int n=fes.GetVSize();
+  mfem::ConstantCoefficient reaction(1.0),diffusion(.01);
+  mfem::BilinearForm frozen_oracle(&fes),mass_oracle(&fes);
+  Assemble(frozen_oracle,reaction,diffusion);
+  mass_oracle.AddDomainIntegrator(new mfem::MassIntegrator(reaction));
+  mass_oracle.Assemble();mass_oracle.Finalize();
+  bool consistent_mass_has_offdiagonal=false;
+  const int* mass_rows=mass_oracle.SpMat().HostReadI();
+  const int* mass_columns=mass_oracle.SpMat().HostReadJ();
+  const double* mass_values=mass_oracle.SpMat().HostReadData();
+  for(int row=0;row<n;++row)for(int entry=mass_rows[row];entry<mass_rows[row+1];++entry)
+    if(mass_columns[entry]!=row&&mass_values[entry]!=0.0)consistent_mass_has_offdiagonal=true;
+  MFEM_VERIFY(consistent_mass_has_offdiagonal,
+              "GLL spectral oracle must retain the noncollocated consistent mass.");
+
+  std::array<std::unique_ptr<mfem::FunctionCoefficient>,2> current_reaction,current_diffusion;
+  std::array<std::unique_ptr<mfem::BilinearForm>,2> current;
+  for(int phase=0;phase<2;++phase)
+  {
+    current_reaction[phase]=std::make_unique<mfem::FunctionCoefficient>(
+      [phase](const mfem::Vector& point)
+      {return 1.1+.05*phase+.07*std::sin(2*pi*point(1));});
+    current_diffusion[phase]=std::make_unique<mfem::FunctionCoefficient>(
+      [phase](const mfem::Vector& point)
+      {return .012*(1.0+.04*phase+.08*std::cos(2*pi*point(0)));});
+    current[phase]=std::make_unique<mfem::BilinearForm>(&fes);
+    Assemble(*current[phase],*current_reaction[phase],*current_diffusion[phase]);
+  }
+
+  mfem::Vector exact(n),probe(n),rhs(n),x(n),result(n),action(n),ones(n),mass_load(n);
+  mfem::Vector retained(n),repeated(n),first_action(n),second_action(n);
+  for(auto* vector:{&exact,&probe,&rhs,&x,&result,&action,&ones,&mass_load,
+                   &retained,&repeated,&first_action,&second_action})vector->UseDevice(true);
+  double* probe_values=probe.HostWrite();
+  for(int i=0;i<n;++i)
+    probe_values[i]=.31+std::sin(.19*(1+i))+.17*std::cos(.37*(2*i+3));
+  // Independently witness that neither current matrix equals the retained A0,
+  // and that the second coefficient stage changes the operator again.
+  frozen_oracle.SpMat().Mult(probe,first_action);
+  current[0]->SpMat().Mult(probe,second_action);
+  MFEM_VERIFY(Relative(second_action,first_action)>1e-3,
+              "GLL spectral current-A fixture did not change frozen coefficients.");
+  first_action=second_action;
+  current[1]->SpMat().Mult(probe,second_action);
+  MFEM_VERIFY(Relative(second_action,first_action)>1e-3,
+              "GLL spectral second coefficient stage did not change current A.");
+
+  ones=1.0;mass_oracle.SpMat().Mult(ones,mass_load);
+  frozen_oracle.SpMat().Mult(ones,action);
+  // This fixed 5e-10 gate is the strict floor of the old GL inverse gate.
+  // It measures the actual assembled consistent-mass residual directly; no
+  // collocated-mass lower bound or condition-number inflation is used.
+  constexpr double inverse_limit=5e-10;
+  MFEM_VERIFY(Relative(action,mass_load)<=inverse_limit,
+              "GLL natural/periodic diffusion failed its physical constant mode.");
+  mfem::Array<int> endpoint_dofs;fes.GetElementDofs(0,endpoint_dofs);
+
+  for(Precision precision:{Precision::FP64,Precision::TF32})
+  {
+    std::unique_ptr<mfem::Solver> inverse;
+    {
+      // A separate oracle remains above after the sampled source is destroyed.
+      mfem::BilinearForm frozen(&fes);Assemble(frozen,reaction,diffusion);
+      inverse=igrlab::igr_internal::MakeTensorMultigridPreconditioner(
+        frozen.SpMat(),fes,precision,Smoother::Separable,1,1,OperatorMode::Spectral);
+    }
+    if(precision==Precision::FP64)
+    {
+      for(int kind=0;kind<4;++kind)
+      {
+        if(kind==0)rhs=1.0;
+        else if(kind==1)
+        {
+          rhs=0.0;double* values=rhs.HostReadWrite();
+          values[endpoint_dofs[0]]=1.0;values[endpoint_dofs[d*d-1]]=-.31;
+        }
+        else if(kind==2)rhs=probe;
+        else rhs=mass_load;
+        inverse->Mult(rhs,result);frozen_oracle.SpMat().Mult(result,action);
+        const double residual=Relative(action,rhs);
+        const double constant_error=kind==3?Relative(result,ones):0.0;
+        MFEM_VERIFY(residual<=inverse_limit&&constant_error<=inverse_limit,
+          "GLL FP64 spectral inverse failed independently assembled consistent A0: "
+          <<"boundary="<<(natural?"natural":"periodic")<<" kind="<<kind
+          <<" residual="<<residual<<" constant_error="<<constant_error);
+        std::cout<<"tensor_spectral_gll_inverse_test boundary="<<(natural?"natural":"periodic")
+          <<" kind="<<kind<<" precision=fp64 original_A0_residual="<<residual
+          <<" physical_constant_error="<<constant_error<<" fixed_limit="<<inverse_limit
+          <<" mass=consistent noncollocated=true\n";
+      }
+    }
+    inverse->Mult(probe,retained);
+    auto solver=igrlab::igr_internal::MakeDeviceFGMRESSolver(MPI_COMM_WORLD,50);
+    solver->SetRelTol(1e-11);solver->SetAbsTol(0.0);
+    solver->SetMaxIter(400);solver->SetPrintLevel(0);
+    for(int phase=0;phase<2;++phase)
+    {
+      inverse->SetOperator(current[phase]->SpMat());
+      inverse->Mult(probe,repeated);
+      MFEM_VERIFY(Relative(repeated,retained)<1e-13,
+                  "GLL spectral SetOperator changed its retained frozen reference.");
+      solver->SetOperator(current[phase]->SpMat());
+      // DeviceKrylovBase::SetOperator clears a previous preconditioner.
+      solver->SetPreconditioner(*inverse);
+      for(int warm=0;warm<2;++warm)
+      {
+        double* values=exact.HostWrite();
+        for(int i=0;i<n;++i)
+          values[i]=.7+.13*std::sin(.17*(i+1))-.09*std::cos(.23*i)+
+                    .04*phase*std::sin(.11*i)+.043*warm*std::cos(.29*i);
+        current[phase]->SpMat().Mult(exact,rhs);
+        if(!warm){x=0.0;solver->iterative_mode=false;}
+        else solver->iterative_mode=true;
+        solver->Mult(rhs,x);current[phase]->SpMat().Mult(x,action);
+        const double residual=Relative(action,rhs),error=Relative(x,exact);
+        MFEM_VERIFY(solver->GetConverged()&&residual<=1e-10&&error<1e-7,
+          "GLL spectral preconditioner failed independent current FP64 A: "
+          <<"boundary="<<(natural?"natural":"periodic")<<" precision="<<Name(precision)
+          <<" phase="<<phase<<" warm="<<warm<<" residual="<<residual<<" error="<<error);
+        std::cout<<"tensor_spectral_gll_current_A_test boundary="<<(natural?"natural":"periodic")
+          <<" precision="<<Name(precision)<<" coefficient_phase="<<phase<<" warm="<<warm
+          <<" modal_nx="<<d*nx<<" modal_ny="<<d*ny<<" iterations="<<solver->GetNumIterations()
+          <<" true_residual="<<residual<<" solution_error="<<error
+          <<" frozen_reference_retained=true original_current_A=fp64\n";
+      }
+    }
+  }
+}
 }
 
 int main(int argc,char** argv)
@@ -489,6 +646,17 @@ int main(int argc,char** argv)
   int ordinal=0;cudaDeviceProp properties{};
   MFEM_VERIFY(cudaGetDevice(&ordinal)==cudaSuccess&&cudaGetDeviceProperties(&properties,ordinal)==cudaSuccess,"CUDA property query failed.");
   if(properties.major<8){std::cout<<"tensor_mg_test skipped: nativeSM80+ required\n";return 77;}
+  const bool spectral_gll_only=argc==2&&std::string(argv[1])=="--spectral-gll-only";
+  MFEM_VERIFY(argc==1||spectral_gll_only,
+              "Usage: dg_igr_tensor_multigrid_test [--spectral-gll-only]");
+  if(spectral_gll_only)
+  {
+    CheckSpectralGLL(false);CheckSpectralGLL(true);
+    std::cout<<"tensor_spectral_gll_test passed actual_gll_nodes=true consistent_mass=true"
+      <<" periodic=true natural=true fp64_inverse=true tf32_current_A=true"
+      <<" changed_coefficients=true cold_warm=true reordered_elements=true snapshot_lifetime=true\n";
+    return 0;
+  }
   CheckSharedResidualAdmission();CheckHierarchy(false);CheckHierarchy(true);
   CheckHierarchy(false,true);CheckHierarchy(true,true);
   CheckSpectral(false);CheckSpectral(true);CheckSpectral(false,true);
