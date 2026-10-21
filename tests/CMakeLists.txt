@@ -15,7 +15,8 @@ add_test(NAME dg_igr_cuda_build_policy
 )
 set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   LABELS "build;cuda;contract"
-  TIMEOUT 30
+  # Temporary source clones and policy subprocesses can exceed 30s on HPC storage.
+  TIMEOUT 120
 )
 
 foreach(build_check pace_submission pace_manifest pace_discovery delta_site dependency_bindings
