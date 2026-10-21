@@ -389,8 +389,28 @@ void ApplyInverseMassDevice(int ne,
 /// Deterministic component sums, one MFEM kernel iteration per component.
 void ComponentSumsDevice(const DenseMatrix& values, Vector& sums);
 
-/// Deterministic nonnegative maximum, evaluated by one MFEM kernel iteration.
+/// Original single-block/serial maximum; requires no reduction workspace.
 void DeterministicMaximumDevice(const Vector& values, Vector& maximum);
+
+/** Number of retained partial maxima needed by the workspace overload.
+ *
+ * Returns zero for the small-vector single-block path. The bound depends only
+ * on the input length and is valid for every supported backend.
+ */
+int DeterministicMaximumWorkspaceSize(int value_count);
+
+/** Deterministic nonnegative maximum using retained reduction workspace.
+ *
+ * The caller prepares workspace.Size() >=
+ * DeterministicMaximumWorkspaceSize(values.Size()) once. This function never
+ * resizes workspace. Large native-CUDA inputs use parallel block maxima and a
+ * final reduction; small inputs and other backends retain the original path.
+ * All three vectors must have disjoint storage. The result preserves the
+ * literal ordered fmax(+0, values[i]) loop, including exceptional zero bits.
+ */
+void DeterministicMaximumDevice(const Vector& values,
+                                Vector& maximum,
+                                Vector& workspace);
 
 } // namespace dgsem
 } // namespace mfem
