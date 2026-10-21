@@ -2816,7 +2816,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
         ::igrlab::NVTXRange apply_range("IGR/element-jacobi-current-A");
         iteration_operator->Mult(X_, residual);
       }
-      mfem::subtract(B_, residual, residual);
+      subtract(B_, residual, residual);
       {
         ::igrlab::NVTXRange block_range("IGR/element-jacobi-block-solve");
         blocks.Mult(residual, correction);
@@ -2830,7 +2830,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     if (true_residual_requested)
     {
       A_op->Mult(X_, residual);
-      mfem::subtract(B_, residual, residual);
+      subtract(B_, residual, residual);
       last_linear_true_residual_abs_ = OperatorProbeNorm(residual, comm);
       const double rhs_norm = OperatorProbeNorm(B_, comm);
       last_linear_true_residual_rel_rhs_ = rhs_norm > 0.0
