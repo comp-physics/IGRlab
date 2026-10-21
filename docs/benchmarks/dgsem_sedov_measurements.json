@@ -1,0 +1,3154 @@
+{
+  "schema": "igr-dgsem-sedov-measurements-v1",
+  "status": "qualified-native-full-fields-and-hardware-routes",
+  "base_dev_commit": "1dd0a70aba56a516829a8c5a7210f134d15468db",
+  "base_merge_pr": "https://github.com/comp-physics/IGRlab/pull/77",
+  "tested_source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+  "branch": "igr-dgsem-sedov-qualification",
+  "comparison_scope": "Current FP64 DGSEM Euler and shared FP64 IGR operators; only the preconditioner selectors change. This baseline is not a historical original implementation.",
+  "case_document": "dgsem_sedov_case.json",
+  "case_document_sha256": "2542b9fd3fda4fcbbfc0ad0a7598b6cdd9e390a31b41f3cb1d47526fc03ddc64",
+  "case": {
+    "mesh_n": 512,
+    "elements": 262144,
+    "order": 5,
+    "euler_dofs": 37748736,
+    "sigma_dofs": 9437184,
+    "target_time": 0.1,
+    "cfl": 0.3,
+    "c_alpha": 0.16666666666666666,
+    "physical_alpha": 6.357828776041666e-07,
+    "linear_rtol": 1e-06,
+    "residual_scale": "rhs",
+    "nan_scan": false,
+    "admissibility_scan": false,
+    "positivity_limiter": "none",
+    "modal_damping_rate": 0,
+    "discretization": "dgsem",
+    "euler_basis": "gll",
+    "sigma_basis": "lgl",
+    "preflight_target_time": 0.0025
+  },
+  "native_qualification": {
+    "job": "3430371",
+    "node": "gh022",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-7dbaad5a-37eb-2325-f8f6-34fd2ccc4719",
+      "inherited_cuda_visible_devices": "0"
+    },
+    "source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+    "source_manifest_sha256": "3fec93ea51825ca432b15d9f92504994621e2d55f95e0afdbf59dc66979635bb",
+    "case_spec_sha256": "2542b9fd3fda4fcbbfc0ad0a7598b6cdd9e390a31b41f3cb1d47526fc03ddc64",
+    "native_config_sha256": "abfd85d237af9c839fe3c97b6cabaa188a98b4d7ff6ef53f025a57fe5427d3ca",
+    "native_check_status": "passed",
+    "native_checks": [
+      "dg_igr_tensor_spectral_gll_nodal0_cuda",
+      "dg_igr_tensor_spectral_gll_nodal1_cuda",
+      "dg_igr_tensor_volume_cuda",
+      "dg_igr_exact_face_cuda",
+      "dg_igr_dgsem_operator_cuda",
+      "dg_igr_dgsem_igr_tests",
+      "dg_igr_igr_diagnostic_scans_cuda",
+      "dg_igr_device_krylov_cuda"
+    ],
+    "native_passed": [
+      "dg_igr_exact_face_cuda",
+      "dg_igr_dgsem_operator_cuda",
+      "dg_igr_dgsem_igr_tests",
+      "dg_igr_igr_diagnostic_scans_cuda",
+      "dg_igr_device_krylov_cuda",
+      "dg_igr_tensor_volume_cuda",
+      "dg_igr_tensor_spectral_gll_nodal0_cuda",
+      "dg_igr_tensor_spectral_gll_nodal1_cuda"
+    ],
+    "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/frozen/sedov_taylor_blast",
+    "binary_sha256": "7c7a92a88f77cb8871977085724df6ce5c0c121f1834c20ea1bf6feb25b85737",
+    "native_stdout_sha256": "c6992103ccd67510f0b9f1a87a3a3c6dcdc6572bdebae58955c03f8fa549dd24",
+    "native_detail_sha256": "7d589dc40529e75b423896fc4ddf6b2ff44dd4ed8373855d761a42562bfbf8ea",
+    "scan_policy_proof": {
+      "native_check": "dg_igr_dgsem_operator_cuda",
+      "scope": "Frozen-source default-off/on parity policy tests; no claim of zero CFL or explicit admission checks."
+    },
+    "source_file_count": 768,
+    "canonical_commands": [
+      {
+        "label": "build",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/source/build.sh",
+          "--gpu",
+          "--cuda-arch",
+          "90",
+          "--hdg-runtime",
+          "--nvtx-profile",
+          "--iterate",
+          "--output-root",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/builds",
+          "--no-tests",
+          "--jobs",
+          "4",
+          "--target",
+          "sedov_taylor_blast",
+          "--target",
+          "dg_igr_unit_tests",
+          "--target",
+          "dg_igr_tensor_multigrid_test",
+          "--target",
+          "dg_igr_tensor_volume_test",
+          "--target",
+          "dg_igr_exact_face_test",
+          "--target",
+          "dg_igr_device_krylov_test"
+        ],
+        "returncode": 0
+      },
+      {
+        "label": "native",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/source/build.sh",
+          "--gpu",
+          "--cuda-arch",
+          "90",
+          "--hdg-runtime",
+          "--nvtx-profile",
+          "--iterate",
+          "--output-root",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/builds",
+          "--tests-only",
+          "--jobs",
+          "1",
+          "--test-regex",
+          "^(dg_igr_tensor_spectral_gll_nodal0_cuda|dg_igr_tensor_spectral_gll_nodal1_cuda|dg_igr_tensor_volume_cuda|dg_igr_exact_face_cuda|dg_igr_dgsem_operator_cuda|dg_igr_dgsem_igr_tests|dg_igr_igr_diagnostic_scans_cuda|dg_igr_device_krylov_cuda)$"
+        ],
+        "returncode": 0
+      }
+    ],
+    "full_repository_or_multirank_qualification": false,
+    "inverse_oracle_maximum_residual": 7.14955e-13,
+    "changed_current_A_maximum_residual": 2.2537e-12
+  },
+  "full_case": {
+    "job": "3430525",
+    "node": "gh019",
+    "comparison": {
+      "schema": "igr-dgsem-sedov-comparison-v1",
+      "phase": "full",
+      "target_time": 0.1,
+      "case_spec_sha256": "2542b9fd3fda4fcbbfc0ad0a7598b6cdd9e390a31b41f3cb1d47526fc03ddc64",
+      "native": {
+        "status": "passed",
+        "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/frozen/sedov_taylor_blast",
+        "binary_sha256": "7c7a92a88f77cb8871977085724df6ce5c0c121f1834c20ea1bf6feb25b85737",
+        "source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+        "native_run": {
+          "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/run.json",
+          "sha256": "b108947077219d2117d99e93a68d9a9da8e9d1fb797ba7c1f046eb0a782cf75e",
+          "bytes": 96046
+        },
+        "build_receipt": {
+          "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/frozen/build-complete.json",
+          "sha256": "aae4d97921b017ee3215e8cfe71a714a19dc9df90afa97f710218dce6647b8bf",
+          "bytes": 96002
+        },
+        "source_manifest": {
+          "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/source-manifest.json",
+          "sha256": "3fec93ea51825ca432b15d9f92504994621e2d55f95e0afdbf59dc66979635bb",
+          "bytes": 183476
+        },
+        "native_config": {
+          "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-config.json",
+          "sha256": "abfd85d237af9c839fe3c97b6cabaa188a98b4d7ff6ef53f025a57fe5427d3ca",
+          "bytes": 604
+        }
+      },
+      "execution_order": [
+        "fp64_two_level",
+        "tf32_spectral"
+      ],
+      "gpu_uuid": "GPU-4f86110d-740a-c230-3939-e777ffba2498",
+      "same_gpu": true,
+      "same_physical_gpu_uuid": true,
+      "paired_measurement": true,
+      "preflight_paired_speedup_claim": null,
+      "arm_gpu_uuid": {
+        "fp64_two_level": "GPU-4f86110d-740a-c230-3939-e777ffba2498",
+        "tf32_spectral": "GPU-4f86110d-740a-c230-3939-e777ffba2498"
+      },
+      "arm_jobs": {
+        "fp64_two_level": "3430525",
+        "tf32_spectral": "3430525"
+      },
+      "comparison_scope": "Current FP64 DGSEM Euler and shared FP64 IGR operators; only the preconditioner selectors change. This baseline is not a historical original implementation.",
+      "run_record_sha256": {
+        "fp64_two_level": "5aaa7877569d47effe2def30de48b9b76fe686923c833d88096ff782f0a3eb53",
+        "tf32_spectral": "cc8c9583b105abf6e26229402d410753c7657e54edd871ecefc3ebb1c3cfcffd"
+      },
+      "arms": {
+        "fp64_two_level": {
+          "application_wall_seconds": 1581.6928772599786,
+          "audit": {
+            "status": "passed",
+            "target_time": 0.1,
+            "accepted_steps": 4939,
+            "rejected_attempts": 0,
+            "rhs_evaluations": 14818,
+            "linear_calls": 14818,
+            "certificate_count": 14818,
+            "initial_anchor_certificate_log_omitted": false,
+            "initial_anchor_iterations_proven": null,
+            "initial_anchor_logging_policy": null,
+            "outer_iterations": 193166,
+            "maximum_rhs_residual": 9.9999349e-07,
+            "native_done_seconds": 1488.510498069,
+            "explicit_summary": {
+              "event": "run-summary",
+              "steps": "4939",
+              "final_time": "0.10000000000000001",
+              "cfl_control_enabled": "1",
+              "cfl_safety_factor": "0.29999999999999999",
+              "ssp_coefficient": "1",
+              "ssp_scaled_cfl_factor": "0.29999999999999999",
+              "nominal_global_courant": "0.027272727272727271",
+              "rhs_evaluations": "14818",
+              "accepted_attempts": "4939",
+              "rejected_attempts": "0",
+              "rejected_limiter_elements": "0",
+              "rejected_q_sigma_attempts": "0",
+              "rejected_q_sigma_nonpositive_samples": "0",
+              "rejected_q_sigma_nonfinite_samples": "0",
+              "last_q_sigma_rejection_reason": "none",
+              "last_q_sigma_rejection_stage": "-1",
+              "minimum_attempted_dt": "3.8540598042008378e-06",
+              "maximum_attempted_dt": "2.113479054444225e-05",
+              "minimum_accepted_dt": "3.8540598042008378e-06",
+              "maximum_accepted_dt": "2.113479054444225e-05",
+              "maximum_accepted_step_growth_ratio": "5.2756320656175939",
+              "characteristic_speed_probes": "4940",
+              "minimum_characteristic_speed": "2.5201158552649896",
+              "maximum_characteristic_speed": "2.6950108295667246",
+              "dt_min_reached": "0",
+              "success": "1",
+              "termination_reason": "target-reached"
+            },
+            "linear_summary": {
+              "event": "run-summary",
+              "calls": "14818",
+              "converged_calls": "14818",
+              "production_calls": "14817",
+              "production_converged_calls": "14817",
+              "output_only_calls": "1",
+              "output_only_converged_calls": "1",
+              "output_only_iters": "19",
+              "output_only_solve_s": "0.087078815000040777",
+              "output_only_igr_s": "0.090872720000042762",
+              "total_iters": "193166",
+              "avg_iters": "13.035902281009584",
+              "max_iters": "32",
+              "avg_solve_iter_s": "0.0045156362571104692",
+              "avg_krylov_operator_apply_count": "15.035834795518964",
+              "avg_krylov_preconditioner_apply_count": "13.035902281009584",
+              "avg_krylov_preconditioner_operator_apply_count": "0",
+              "krylov_operator_apply_count_per_iter": "1.1534172680492427",
+              "krylov_preconditioner_apply_count_per_iter": "1",
+              "krylov_preconditioner_operator_apply_count_per_iter": "0",
+              "avg_assemble_s": "0.0046893282963287822",
+              "avg_form_s": "0.00091619861425294323",
+              "avg_pc_setup_s": "0.0011576813850047369",
+              "avg_solve_s": "0.058865392984275948",
+              "total_assemble_s": "69.486466694999891",
+              "total_form_s": "13.576231066000112",
+              "total_pc_setup_s": "17.154522763000191",
+              "total_cheb_diag_s": "0",
+              "total_cheb_setup_s": "0",
+              "total_cheb_eigen_reuses": "0",
+              "total_cheb_smoother_reuses": "0",
+              "total_cheb_smoother_builds": "0",
+              "total_krylov_operator_apply_s": "0",
+              "total_krylov_preconditioner_apply_s": "0",
+              "total_krylov_preconditioner_operator_apply_s": "0",
+              "total_krylov_operator_apply_count": "222801",
+              "total_krylov_preconditioner_apply_count": "193166",
+              "total_krylov_preconditioner_operator_apply_count": "0",
+              "total_solve_s": "872.26739324100095",
+              "total_igr_s": "972.48461376500109",
+              "total_update_s": "979.6827003819991",
+              "solve_pct": "58.600016215711427",
+              "total_igr_pct": "65.332734638188725",
+              "solve_pct_stage": "89.035704407241795",
+              "total_igr_pct_stage": "99.265263476205988",
+              "last_solver": "fgmres-cuda-fp64",
+              "last_precond": "two-level-inverse-fp64",
+              "last_cheb_diag_s": "0",
+              "last_cheb_setup_s": "0",
+              "last_cheb_eigen_reused": "0",
+              "last_cheb_smoother_reused": "0",
+              "last_cheb_eigen_estimate": "0",
+              "last_krylov_operator_apply_s": "0",
+              "last_krylov_preconditioner_apply_s": "0",
+              "last_krylov_preconditioner_operator_apply_s": "0",
+              "last_krylov_operator_apply_count": "21",
+              "last_krylov_preconditioner_apply_count": "19",
+              "last_krylov_preconditioner_operator_apply_count": "0",
+              "direct_identity_system": "1",
+              "direct_identity_reason": "active",
+              "direct_identity_uses": "14818",
+              "exact_face_requested": "1",
+              "exact_face_effective": "1",
+              "exact_face_reason": "active",
+              "exact_face_local_nf": "523264",
+              "exact_face_shared_nf": "0",
+              "exact_face_operator_uses": "14818",
+              "exact_face_last_mult_calls": "1"
+            },
+            "closure": {
+              "event": "accepted-state",
+              "scope": "final-committed-accepted-state",
+              "precision": "fp64",
+              "time": "0.10000000000000001",
+              "state_generation": "14817",
+              "solved": "1",
+              "supported": "1",
+              "certified": "1",
+              "residual_rel_rhs": "7.8237292465110115e-07",
+              "run_success": "1",
+              "residual_abs": "7.264761633150125e-15",
+              "relative_limit": "9.9999999999999995e-07",
+              "absolute_limit": "0",
+              "skipped_nonfinite": "0",
+              "q_sigma_admitted": "1",
+              "q_sigma_nonpositive_samples": "0",
+              "q_sigma_nonfinite_samples": "0"
+            },
+            "dispatch": {
+              "sigma": {
+                "basis": "lgl",
+                "order": "5",
+                "representation": "equivalent-L2-space"
+              },
+              "sigma_gather": {
+                "mode": "exact-nodal-gather",
+                "rows": "9437184",
+                "scalar_dofs": "36",
+                "shared_faces": "dense"
+              },
+              "euler": {
+                "enabled": "1",
+                "precision": "fp64",
+                "contraction": "simt",
+                "elements": "262144",
+                "order": "5",
+                "llf_volume": "0",
+                "unique_face_flux": "1",
+                "packed_output": "1"
+              },
+              "production": {
+                "selected": "mfem-native-packed",
+                "strict": "1",
+                "backend": "cuda",
+                "lvec_mode": "P-x-PT",
+                "volume_dissipation": "none",
+                "llf_volume_active": "0",
+                "frozen_sigma_spectral_speed": "0",
+                "order": "5",
+                "dim": "2"
+              },
+              "face": {
+                "event": "face-density-path",
+                "arithmetic": "cuda",
+                "scope": "local-interior-faces",
+                "geometry_cache": "per-solver"
+              },
+              "volume": {
+                "event": "setup",
+                "execution": "simt",
+                "precision": "fp64",
+                "d1d": "6",
+                "mass_q1d": "6",
+                "diffusion_q1d": "6",
+                "elements": "262144",
+                "geometry": "per-quadrature",
+                "coefficient_policy": "current-stage",
+                "quadrature": "original-separate",
+                "local_true": "identity",
+                "faces": "external",
+                "collocated_requested": "0",
+                "collocated_enabled": "0",
+                "collocated_reason": "not-requested",
+                "storage_requested": "cached",
+                "storage": "cached",
+                "storage_reason": "cached-requested",
+                "geometry_layout": "padded",
+                "mass_geometry_shared": "0",
+                "diffusion_geometry_shared": "0",
+                "owned_geometry_bytes": "536870912",
+                "owned_coefficient_bytes": "536870912",
+                "owned_bytes": "1111493632",
+                "kernel": "fused-one-warp-per-element",
+                "fallback": "none"
+              },
+              "krylov": {
+                "backend": "cuda-fp64",
+                "method": "fgmres",
+                "restart": "50",
+                "residual-scale": "rhs",
+                "orthogonalization": "ordered-mgs",
+                "final-gate": "fp64-true-residual",
+                "convergence-read": "each-iteration",
+                "workspace": "cached"
+              },
+              "preconditioner": {
+                "n": "9437184",
+                "elements": "262144",
+                "block_dof": "36",
+                "coarse_n": "263169",
+                "coarse_mode": "cg",
+                "local_mode": "element",
+                "patch_composition": "additive",
+                "coarse_cg_backend": "cuda-fp64",
+                "coarse_cg_execution": "cooperative",
+                "coarse_order": "1",
+                "element_colors": "2",
+                "coarse_colors": "39",
+                "operator_probes": "117",
+                "block_inverse_bytes": "2717908992",
+                "dense_coarse_bytes": "0",
+                "block_probe_rel": "2.3286826e-16",
+                "coarse_probe_rel": "1.5170803e-16",
+                "setup_seconds": "16.518503",
+                "retained": "first-operator-preconditioner"
+              }
+            },
+            "scan_policy_evidence": "CLI off flags plus frozen-source registered off/on parity test; host-sync counters do not establish zero scans, and CFL/explicit admission checks remain algorithmic."
+          },
+          "telemetry_summary": {
+            "host_max_gap_s": 0.1007524260203354,
+            "host_gaps_over_1_5_s": 0,
+            "process_gpu_uuids": [
+              "GPU-4f86110d-740a-c230-3939-e777ffba2498"
+            ],
+            "process_peak_gpu_mib": 25502,
+            "gpu_memory_sample_count": 1579,
+            "samples": 1582,
+            "errors": [],
+            "all_sampler_threads_stopped": true
+          },
+          "clocks": {
+            "sm_clock_MHz": {
+              "samples": 1582,
+              "minimum": 345.0,
+              "median": 1965.0,
+              "maximum": 1980.0
+            },
+            "memory_clock_MHz": {
+              "samples": 1582,
+              "minimum": 2619.0,
+              "median": 2619.0,
+              "maximum": 2619.0
+            },
+            "power_W": {
+              "samples": 1582,
+              "minimum": 78.52,
+              "median": 448.635,
+              "maximum": 517.76
+            },
+            "temperature_C": {
+              "samples": 1582,
+              "minimum": 20.0,
+              "median": 36.0,
+              "maximum": 39.0
+            }
+          }
+        },
+        "tf32_spectral": {
+          "application_wall_seconds": 973.2057811660343,
+          "audit": {
+            "status": "passed",
+            "target_time": 0.1,
+            "accepted_steps": 4939,
+            "rejected_attempts": 0,
+            "rhs_evaluations": 14818,
+            "linear_calls": 14818,
+            "certificate_count": 14818,
+            "initial_anchor_certificate_log_omitted": false,
+            "initial_anchor_iterations_proven": null,
+            "initial_anchor_logging_policy": null,
+            "outer_iterations": 49175,
+            "maximum_rhs_residual": 9.9979699e-07,
+            "native_done_seconds": 894.873573704,
+            "explicit_summary": {
+              "event": "run-summary",
+              "steps": "4939",
+              "final_time": "0.10000000000000001",
+              "cfl_control_enabled": "1",
+              "cfl_safety_factor": "0.29999999999999999",
+              "ssp_coefficient": "1",
+              "ssp_scaled_cfl_factor": "0.29999999999999999",
+              "nominal_global_courant": "0.027272727272727271",
+              "rhs_evaluations": "14818",
+              "accepted_attempts": "4939",
+              "rejected_attempts": "0",
+              "rejected_limiter_elements": "0",
+              "rejected_q_sigma_attempts": "0",
+              "rejected_q_sigma_nonpositive_samples": "0",
+              "rejected_q_sigma_nonfinite_samples": "0",
+              "last_q_sigma_rejection_reason": "none",
+              "last_q_sigma_rejection_stage": "-1",
+              "minimum_attempted_dt": "3.8540597717545699e-06",
+              "maximum_attempted_dt": "2.1134790544403307e-05",
+              "minimum_accepted_dt": "3.8540597717545699e-06",
+              "maximum_accepted_dt": "2.1134790544403307e-05",
+              "maximum_accepted_step_growth_ratio": "5.2756321100465664",
+              "characteristic_speed_probes": "4940",
+              "minimum_characteristic_speed": "2.5201158552701575",
+              "maximum_characteristic_speed": "2.6950108295685391",
+              "dt_min_reached": "0",
+              "success": "1",
+              "termination_reason": "target-reached"
+            },
+            "linear_summary": {
+              "event": "run-summary",
+              "calls": "14818",
+              "converged_calls": "14818",
+              "production_calls": "14817",
+              "production_converged_calls": "14817",
+              "output_only_calls": "1",
+              "output_only_converged_calls": "1",
+              "output_only_iters": "5",
+              "output_only_solve_s": "0.024426812000001519",
+              "output_only_igr_s": "0.028149002999998896",
+              "total_iters": "49175",
+              "avg_iters": "3.3185990012147388",
+              "max_iters": "5",
+              "avg_solve_iter_s": "0.0056440399892424978",
+              "avg_krylov_operator_apply_count": "5.3185315157241195",
+              "avg_krylov_preconditioner_apply_count": "3.3185990012147388",
+              "avg_krylov_preconditioner_operator_apply_count": "0",
+              "krylov_operator_apply_count_per_iter": "1.6026436197254703",
+              "krylov_preconditioner_apply_count_per_iter": "1",
+              "krylov_preconditioner_operator_apply_count_per_iter": "0",
+              "avg_assemble_s": "0.0046061055086381334",
+              "avg_form_s": "0.00092631621305168908",
+              "avg_pc_setup_s": "0.00024767052490214987",
+              "avg_solve_s": "0.018730305471116197",
+              "total_assemble_s": "68.253271426999859",
+              "total_form_s": "13.726153644999929",
+              "total_pc_setup_s": "3.6699818380000568",
+              "total_cheb_diag_s": "0",
+              "total_cheb_setup_s": "0",
+              "total_cheb_eigen_reuses": "0",
+              "total_cheb_smoother_reuses": "0",
+              "total_cheb_smoother_builds": "0",
+              "total_krylov_operator_apply_s": "0",
+              "total_krylov_preconditioner_apply_s": "0",
+              "total_krylov_preconditioner_operator_apply_s": "0",
+              "total_krylov_operator_apply_count": "78810",
+              "total_krylov_preconditioner_apply_count": "49175",
+              "total_krylov_preconditioner_operator_apply_count": "0",
+              "total_solve_s": "277.54566647099983",
+              "total_igr_s": "363.1950733809997",
+              "total_update_s": "370.8220071770013",
+              "solve_pct": "31.015070131326105",
+              "total_igr_pct": "40.586188267655203",
+              "solve_pct_stage": "74.846061209771008",
+              "total_igr_pct_stage": "97.943235933038594",
+              "last_solver": "fgmres-cuda-fp64",
+              "last_precond": "tensor-spectral-tf32",
+              "last_cheb_diag_s": "0",
+              "last_cheb_setup_s": "0",
+              "last_cheb_eigen_reused": "0",
+              "last_cheb_smoother_reused": "0",
+              "last_cheb_eigen_estimate": "0",
+              "last_krylov_operator_apply_s": "0",
+              "last_krylov_preconditioner_apply_s": "0",
+              "last_krylov_preconditioner_operator_apply_s": "0",
+              "last_krylov_operator_apply_count": "7",
+              "last_krylov_preconditioner_apply_count": "5",
+              "last_krylov_preconditioner_operator_apply_count": "0",
+              "direct_identity_system": "1",
+              "direct_identity_reason": "active",
+              "direct_identity_uses": "14818",
+              "exact_face_requested": "1",
+              "exact_face_effective": "1",
+              "exact_face_reason": "active",
+              "exact_face_local_nf": "523264",
+              "exact_face_shared_nf": "0",
+              "exact_face_operator_uses": "14818",
+              "exact_face_last_mult_calls": "1"
+            },
+            "closure": {
+              "event": "accepted-state",
+              "scope": "final-committed-accepted-state",
+              "precision": "fp64",
+              "time": "0.10000000000000001",
+              "state_generation": "14817",
+              "solved": "1",
+              "supported": "1",
+              "certified": "1",
+              "residual_rel_rhs": "2.8228554080321248e-07",
+              "run_success": "1",
+              "residual_abs": "2.6211760420038969e-15",
+              "relative_limit": "9.9999999999999995e-07",
+              "absolute_limit": "0",
+              "skipped_nonfinite": "0",
+              "q_sigma_admitted": "1",
+              "q_sigma_nonpositive_samples": "0",
+              "q_sigma_nonfinite_samples": "0"
+            },
+            "dispatch": {
+              "sigma": {
+                "basis": "lgl",
+                "order": "5",
+                "representation": "equivalent-L2-space"
+              },
+              "sigma_gather": {
+                "mode": "exact-nodal-gather",
+                "rows": "9437184",
+                "scalar_dofs": "36",
+                "shared_faces": "dense"
+              },
+              "euler": {
+                "enabled": "1",
+                "precision": "fp64",
+                "contraction": "simt",
+                "elements": "262144",
+                "order": "5",
+                "llf_volume": "0",
+                "unique_face_flux": "1",
+                "packed_output": "1"
+              },
+              "production": {
+                "selected": "mfem-native-packed",
+                "strict": "1",
+                "backend": "cuda",
+                "lvec_mode": "P-x-PT",
+                "volume_dissipation": "none",
+                "llf_volume_active": "0",
+                "frozen_sigma_spectral_speed": "0",
+                "order": "5",
+                "dim": "2"
+              },
+              "face": {
+                "event": "face-density-path",
+                "arithmetic": "cuda",
+                "scope": "local-interior-faces",
+                "geometry_cache": "per-solver"
+              },
+              "volume": {
+                "event": "setup",
+                "execution": "simt",
+                "precision": "fp64",
+                "d1d": "6",
+                "mass_q1d": "6",
+                "diffusion_q1d": "6",
+                "elements": "262144",
+                "geometry": "per-quadrature",
+                "coefficient_policy": "current-stage",
+                "quadrature": "original-separate",
+                "local_true": "identity",
+                "faces": "external",
+                "collocated_requested": "0",
+                "collocated_enabled": "0",
+                "collocated_reason": "not-requested",
+                "storage_requested": "cached",
+                "storage": "cached",
+                "storage_reason": "cached-requested",
+                "geometry_layout": "padded",
+                "mass_geometry_shared": "0",
+                "diffusion_geometry_shared": "0",
+                "owned_geometry_bytes": "536870912",
+                "owned_coefficient_bytes": "536870912",
+                "owned_bytes": "1111493632",
+                "kernel": "fused-one-warp-per-element",
+                "fallback": "none"
+              },
+              "krylov": {
+                "backend": "cuda-fp64",
+                "method": "fgmres",
+                "restart": "50",
+                "residual-scale": "rhs",
+                "orthogonalization": "ordered-mgs",
+                "final-gate": "fp64-true-residual",
+                "convergence-read": "each-iteration",
+                "workspace": "cached"
+              },
+              "preconditioner": {
+                "event": "setup",
+                "precision": "tf32",
+                "operator": "spectral",
+                "cycle": "global-reference-inverse",
+                "coarse_execution": "none",
+                "elements": "262144",
+                "n": "9437184",
+                "cells_x": "512",
+                "cells_y": "512",
+                "topology": "natural-boundary-cartesian",
+                "reference_classes": "9",
+                "matrix_rows": "3072",
+                "matrix_columns": "3072",
+                "operator_probes": "324",
+                "colors": "9",
+                "basis_bytes": "75497472",
+                "field_workspace_bytes": "113246208",
+                "eigen_workspace_bound_bytes": "494118424",
+                "shared_symmetry_rel": "2.4322432e-16",
+                "separable_reference_rel": "2.1796346e-15",
+                "eigen_residual": "1.5554494e-15",
+                "eigen_orthogonality": "5.4109922e-15",
+                "screen_mass": "0.00094607379",
+                "spectral_mean": "0.54588458",
+                "raw_eigen_min": "0.00094607379",
+                "raw_eigen_max": "3.47597",
+                "screen_roundoff_tolerance": "7.9763224e-10",
+                "inverse_floor": "screen-mass-roundoff-only",
+                "clipped_eigenvalues": "0",
+                "basis_setup": "fp64-cusolver-dsyevd",
+                "basis_orthogonal_check_gemms": "2",
+                "gemms_per_application": "4",
+                "gemm_compute": "tf32-explicit",
+                "low_low_term": "not-applicable",
+                "nodal_transform": "tensor-fp64-6x6",
+                "nodal_transform_requested": "1",
+                "nodal_transform_fallback": "none",
+                "nodal_matrix_proof_rel": "0",
+                "alpha": "inherited-fine",
+                "acceptance": "original-current-fp64",
+                "fallback": "none",
+                "tensor_execution": "requires-profile-proof",
+                "setup_seconds": "3.3075506"
+              }
+            },
+            "scan_policy_evidence": "CLI off flags plus frozen-source registered off/on parity test; host-sync counters do not establish zero scans, and CFL/explicit admission checks remain algorithmic."
+          },
+          "telemetry_summary": {
+            "host_max_gap_s": 0.1005376770044677,
+            "host_gaps_over_1_5_s": 0,
+            "process_gpu_uuids": [
+              "GPU-4f86110d-740a-c230-3939-e777ffba2498"
+            ],
+            "process_peak_gpu_mib": 19212,
+            "gpu_memory_sample_count": 969,
+            "samples": 971,
+            "errors": [],
+            "all_sampler_threads_stopped": true
+          },
+          "clocks": {
+            "sm_clock_MHz": {
+              "samples": 971,
+              "minimum": 345.0,
+              "median": 1980.0,
+              "maximum": 1980.0
+            },
+            "memory_clock_MHz": {
+              "samples": 971,
+              "minimum": 2619.0,
+              "median": 2619.0,
+              "maximum": 2619.0
+            },
+            "power_W": {
+              "samples": 971,
+              "minimum": 79.56,
+              "median": 350.72,
+              "maximum": 388.95
+            },
+            "temperature_C": {
+              "samples": 971,
+              "minimum": 21.0,
+              "median": 32.0,
+              "maximum": 36.0
+            }
+          }
+        }
+      },
+      "status": "two-arms-passed",
+      "application_speedup": 1.6252399110955682,
+      "application_time_reduction_percent": 38.47062251099263,
+      "fixed_order": true,
+      "confidence_interval": null,
+      "complete_native_vtu_bytes_identical": false,
+      "full_polynomial_comparison_pending": true,
+      "final_fields_sha256": "f528ae9a6435d045d43603b5109648953765eded5bc36474141b08637a5cebff",
+      "measurement_limits": [
+        "One sequential FP64-two-level-first pair on one physical GPU, no confidence interval.",
+        "Both arms use the same current FP64 DGSEM/IGR operators; only three preconditioner selectors change.",
+        "One-second memory/clock samples can miss short peaks.",
+        "Byte-different final VTUs require complete degree-5 conservative and sigma polynomial comparison before field-equivalence claims."
+      ]
+    },
+    "timing_comparisons": {
+      "process": {
+        "baseline_seconds": 1581.6928772599786,
+        "candidate_seconds": 973.2057811660343,
+        "speedup": 1.6252399110955682,
+        "time_reduction_percent": 38.47062251099263
+      },
+      "native_done": {
+        "baseline_seconds": 1488.510498069,
+        "candidate_seconds": 894.873573704,
+        "speedup": 1.6633751870757099,
+        "time_reduction_percent": 39.88127226076722
+      },
+      "predefined_vtk_free_aggregate": {
+        "baseline_seconds": 664.7603509999999,
+        "candidate_seconds": 342.07192,
+        "speedup": 1.9433350477876112,
+        "time_reduction_percent": 48.54206941111624
+      }
+    },
+    "fixed_windows": [
+      {
+        "start_step": 1000,
+        "end_step": 1500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 115.08081999999996,
+          "candidate_seconds": 65.51325299999999,
+          "speedup": 1.7566036600258572,
+          "time_reduction_percent": 43.071961948133485
+        },
+        "iteration_work": {
+          "equal_work_required": false,
+          "interpretation": "Preconditioner work differs by design; counts and iteration differences are descriptive and never select or exclude timing windows.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 1500,
+          "identical_iteration_work": false,
+          "baseline_total_iterations": 17072,
+          "candidate_total_iterations": 4296
+        }
+      },
+      {
+        "start_step": 2000,
+        "end_step": 2500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 102.94751400000007,
+          "candidate_seconds": 67.00120599999997,
+          "speedup": 1.5365024026582466,
+          "time_reduction_percent": 34.917120970983405
+        },
+        "iteration_work": {
+          "equal_work_required": false,
+          "interpretation": "Preconditioner work differs by design; counts and iteration differences are descriptive and never select or exclude timing windows.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 1500,
+          "identical_iteration_work": false,
+          "baseline_total_iterations": 14091,
+          "candidate_total_iterations": 4500
+        }
+      },
+      {
+        "start_step": 3000,
+        "end_step": 3500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 122.71449500000006,
+          "candidate_seconds": 69.505447,
+          "speedup": 1.765537814611854,
+          "time_reduction_percent": 43.36003501460852
+        },
+        "iteration_work": {
+          "equal_work_required": false,
+          "interpretation": "Preconditioner work differs by design; counts and iteration differences are descriptive and never select or exclude timing windows.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 1500,
+          "identical_iteration_work": false,
+          "baseline_total_iterations": 18563,
+          "candidate_total_iterations": 5466
+        }
+      },
+      {
+        "start_step": 4000,
+        "end_step": 4500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 163.82241499999986,
+          "candidate_seconds": 73.21200699999997,
+          "speedup": 2.2376440929969306,
+          "time_reduction_percent": 55.31014055677299
+        },
+        "iteration_work": {
+          "equal_work_required": false,
+          "interpretation": "Preconditioner work differs by design; counts and iteration differences are descriptive and never select or exclude timing windows.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 1500,
+          "identical_iteration_work": false,
+          "baseline_total_iterations": 27062,
+          "candidate_total_iterations": 6604
+        }
+      },
+      {
+        "start_step": 4500,
+        "end_step": 4939,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 160.195107,
+          "candidate_seconds": 66.84000700000001,
+          "speedup": 2.396694946486166,
+          "time_reduction_percent": 58.2758748055894
+        },
+        "iteration_work": {
+          "equal_work_required": false,
+          "interpretation": "Preconditioner work differs by design; counts and iteration differences are descriptive and never select or exclude timing windows.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "common_solve_count": 1317,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 1317,
+          "identical_iteration_work": false,
+          "baseline_total_iterations": 26614,
+          "candidate_total_iterations": 6585
+        }
+      }
+    ],
+    "cost_per_conserved_dof_step": {
+      "fp64_two_level": {
+        "conserved_dofs": 37748736,
+        "steps": 4939,
+        "full_process_ns_per_conserved_dof_step": 8.483610455813958,
+        "native_ns_per_conserved_dof_step": 7.9838149406620795
+      },
+      "tf32_spectral": {
+        "conserved_dofs": 37748736,
+        "steps": 4939,
+        "full_process_ns_per_conserved_dof_step": 5.2199127020546685,
+        "native_ns_per_conserved_dof_step": 4.799767967380825
+      }
+    }
+  },
+  "fields": {
+    "qualification": {
+      "schema": "igr-dgsem-sedov-field-qualification-v1",
+      "status": "passed",
+      "source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+      "binary_sha256": "7c7a92a88f77cb8871977085724df6ce5c0c121f1834c20ea1bf6feb25b85737",
+      "pair_comparison_sha256": "8425d48d13359e147776477761a0228d1bf70b0417b98bbf190117d8ab21faf8",
+      "final_fields_sha256": "f528ae9a6435d045d43603b5109648953765eded5bc36474141b08637a5cebff",
+      "field_plan_sha256": "8eeb549b9d2b46211cb082273b736ed12477d423a138da9d649ad33056b12bb4",
+      "download_receipt_sha256": "3a4e603e3c0339acc5c2e85aa6274591baaf2d902f7587c87038f8a6f5c92d72",
+      "all_conserved_components_pass": true,
+      "native_gll_admissibility_pass": true,
+      "sigma_norms_reported": true,
+      "artifacts": {
+        "conserved": {
+          "path": "fields/conserved.json",
+          "sha256": "ce13d70160a251b3c7e0a1a26ffeaf59ebe8c04068d48b22d6149eb0a0db75e2"
+        },
+        "sigma": {
+          "path": "fields/sigma.json",
+          "sha256": "0b68c4cf6e0297b9a1f67fa4643cf3381bd6be570c96b833675ef9ff4224beb6"
+        },
+        "native_gll": {
+          "path": "fields/native-gll.json",
+          "sha256": "a76e009f89d8df228e201205d41626051c7a713e45d21b24feb8c846e6a76c43"
+        }
+      },
+      "scope": "Final saved Q5 polynomial agreement with the FP64 preconditioner control and final-node signs. No analytic accuracy, between-node positivity or unsaved-time claim."
+    },
+    "conserved": {
+      "schema": "igrlab-sedov-q5-field-comparison-v1",
+      "status": "ok",
+      "command": "compare",
+      "vtk_version": "9.2.20220823",
+      "numpy_version": "1.26.4",
+      "python": "/usr/bin/python3",
+      "reference": {
+        "input": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+        "selected": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+        "time": 0.1,
+        "time_source": "explicit-label"
+      },
+      "candidate": {
+        "input": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+        "selected": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+        "time": 0.1,
+        "time_source": "explicit-label"
+      },
+      "physical_alpha": 6.357828776041666e-07,
+      "alpha_provenance": "caller-supplied physical alpha assertions; not encoded/verified in VTU",
+      "gamma": 1.4,
+      "derived": true,
+      "grid": {
+        "nx": 512,
+        "ny": 512,
+        "bounds_xy": [
+          0.0,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "cells": 262144,
+        "quadrature_points_per_cell": 36,
+        "quadrature_points_total": 9437184,
+        "complete_unique_cell_coverage": true,
+        "integration_measure": "common expected Cartesian cell area; saved coordinates checked against that mesh",
+        "all_corresponding_node_coordinate_difference_bound": 6.661338147750939e-16,
+        "geometry_pair_tolerance": 1e-11
+      },
+      "quadrature": {
+        "rule": "tensor Gauss-Legendre 6x6 on [0,1]^2",
+        "points_1d": [
+          0.033765242898423975,
+          0.16939530676686776,
+          0.3806904069584015,
+          0.6193095930415985,
+          0.8306046932331322,
+          0.966234757101576
+        ],
+        "weights_2d": [
+          0.007338020422245048,
+          0.015451823343095793,
+          0.0200412793294516,
+          0.0200412793294516,
+          0.015451823343095793,
+          0.007338020422245048,
+          0.015451823343095793,
+          0.03253722814704192,
+          0.04220134177189703,
+          0.04220134177189703,
+          0.03253722814704192,
+          0.015451823343095793,
+          0.0200412793294516,
+          0.04220134177189703,
+          0.05473586254182423,
+          0.05473586254182423,
+          0.04220134177189703,
+          0.0200412793294516,
+          0.0200412793294516,
+          0.04220134177189703,
+          0.05473586254182423,
+          0.05473586254182423,
+          0.04220134177189703,
+          0.0200412793294516,
+          0.015451823343095793,
+          0.03253722814704192,
+          0.04220134177189703,
+          0.04220134177189703,
+          0.03253722814704192,
+          0.015451823343095793,
+          0.007338020422245048,
+          0.015451823343095793,
+          0.0200412793294516,
+          0.0200412793294516,
+          0.015451823343095793,
+          0.007338020422245048
+        ],
+        "node_order": "physical x index fastest, then y; obtained from every cell's coordinates",
+        "q5_squared_degree_per_axis": 10,
+        "gl6_exact_degree_per_axis": 11
+      },
+      "reference_pieces": [
+        {
+          "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+          "bytes": 1160775042,
+          "mtime_ns": 1792617287843886920,
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy"
+          ],
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "max_affine_geometry_error": 3.3306690738754696e-16,
+          "max_deviation_from_common_cartesian_lattice": 3.3306690738754696e-16
+        }
+      ],
+      "candidate_pieces": [
+        {
+          "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+          "bytes": 1160775042,
+          "mtime_ns": 1792617288864686920,
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy"
+          ],
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "max_affine_geometry_error": 3.3306690738754696e-16,
+          "max_deviation_from_common_cartesian_lattice": 3.3306690738754696e-16
+        }
+      ],
+      "reference_temporary_cache_bytes": 301989888,
+      "components": {
+        "density": {
+          "conservative_component": true,
+          "l2_reference": 1.0210687033917585,
+          "l2_candidate": 1.0210687033917478,
+          "l2_difference": 1.9364895032820523e-11,
+          "normalized_l2": 1.8965320324180674e-11,
+          "linf_reference_at_gl_points": 1.2875394415103492,
+          "linf_candidate_at_gl_points": 1.287539441516204,
+          "linf_difference_at_gl_points": 5.615470310971205e-10,
+          "normalized_linf_at_gl_points": 4.3613967307937167e-10,
+          "maximum_difference_location": {
+            "cell_ij": [
+              453,
+              256
+            ],
+            "gauss_ij": [
+              3,
+              0
+            ],
+            "xy": [
+              0.8859752140489093,
+              0.500065947740036
+            ],
+            "reference": 1.1647326505151774,
+            "candidate": 1.1647326510767244
+          },
+          "reference_range_at_gl_points": [
+            0.44942023855304347,
+            1.2875394415103492
+          ],
+          "candidate_range_at_gl_points": [
+            0.44942023855590923,
+            1.287539441516204
+          ],
+          "integral_reference": 0.9999999999997674,
+          "integral_candidate": 0.999999999999768,
+          "integral_candidate_minus_reference": -3.2682431406948538e-18,
+          "difference_of_separately_accumulated_integrals": 5.551115123125783e-16,
+          "absolute_integral_difference": 3.2682431406948538e-18,
+          "integral_abs_difference_over_abs_reference_integral": 3.268243140695614e-18,
+          "integral_abs_difference_over_reference_gl_l1": 3.268243140695614e-18,
+          "integrals_exact_for_saved_polynomial_up_to_roundoff": true,
+          "engineering_budget_pass": true
+        },
+        "momentum_x": {
+          "conservative_component": true,
+          "l2_reference": 0.2773154825258617,
+          "l2_candidate": 0.2773154825255492,
+          "l2_difference": 1.4381277225668568e-11,
+          "normalized_l2": 5.1858904864164623e-11,
+          "linf_reference_at_gl_points": 0.8063055100894373,
+          "linf_candidate_at_gl_points": 0.8063055100679569,
+          "linf_difference_at_gl_points": 5.326204477462682e-10,
+          "normalized_linf_at_gl_points": 6.605690288377028e-10,
+          "maximum_difference_location": {
+            "cell_ij": [
+              59,
+              266
+            ],
+            "gauss_ij": [
+              1,
+              3
+            ],
+            "xy": [
+              0.11556522520852903,
+              0.5207408390489093
+            ],
+            "reference": -0.3020860778255338,
+            "candidate": -0.30208607835815426
+          },
+          "reference_range_at_gl_points": [
+            -0.8063055100329672,
+            0.8063055100894373
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063055100115041,
+            0.8063055100679569
+          ],
+          "integral_reference": 4.095143583233377e-14,
+          "integral_candidate": 4.058643747690063e-14,
+          "integral_candidate_minus_reference": 2.746884375330177e-19,
+          "difference_of_separately_accumulated_integrals": -3.649983554331396e-16,
+          "absolute_integral_difference": 2.746884375330177e-19,
+          "integral_abs_difference_over_abs_reference_integral": 6.7076631612543765e-06,
+          "integral_abs_difference_over_reference_gl_l1": 1.5494960751530549e-18,
+          "integrals_exact_for_saved_polynomial_up_to_roundoff": true,
+          "engineering_budget_pass": true
+        },
+        "momentum_y": {
+          "conservative_component": true,
+          "l2_reference": 0.27731548252586125,
+          "l2_candidate": 0.2773154825255488,
+          "l2_difference": 1.4381622827157879e-11,
+          "normalized_l2": 5.186015110359628e-11,
+          "linf_reference_at_gl_points": 0.8063055100789217,
+          "linf_candidate_at_gl_points": 0.8063055100573867,
+          "linf_difference_at_gl_points": 5.326519780801675e-10,
+          "normalized_linf_at_gl_points": 6.606081335448535e-10,
+          "maximum_difference_location": {
+            "cell_ij": [
+              266,
+              452
+            ],
+            "gauss_ij": [
+              3,
+              4
+            ],
+            "xy": [
+              0.5207408390489093,
+              0.8844347747914709
+            ],
+            "reference": 0.3020860778221057,
+            "candidate": 0.3020860783547577
+          },
+          "reference_range_at_gl_points": [
+            -0.8063055100461683,
+            0.8063055100789217
+          ],
+          "candidate_range_at_gl_points": [
+            -0.806305510024635,
+            0.8063055100573867
+          ],
+          "integral_reference": 4.078934083128361e-14,
+          "integral_candidate": 4.095165267276827e-14,
+          "integral_candidate_minus_reference": 7.526440195093039e-19,
+          "difference_of_separately_accumulated_integrals": 1.6231184148465805e-16,
+          "absolute_integral_difference": 7.526440195093039e-19,
+          "integral_abs_difference_over_abs_reference_integral": 1.845197799646861e-05,
+          "integral_abs_difference_over_reference_gl_l1": 4.2456062755714135e-18,
+          "integrals_exact_for_saved_polynomial_up_to_roundoff": true,
+          "engineering_budget_pass": true
+        },
+        "energy": {
+          "conservative_component": true,
+          "l2_reference": 3.623325812117029,
+          "l2_candidate": 3.6233258121169407,
+          "l2_difference": 7.345602951567393e-11,
+          "normalized_l2": 2.0273095306534192e-11,
+          "linf_reference_at_gl_points": 5.051546878134015,
+          "linf_candidate_at_gl_points": 5.0515468780940935,
+          "linf_difference_at_gl_points": 2.072141125353255e-09,
+          "normalized_linf_at_gl_points": 4.1019932613565703e-10,
+          "maximum_difference_location": {
+            "cell_ij": [
+              453,
+              255
+            ],
+            "gauss_ij": [
+              3,
+              5
+            ],
+            "xy": [
+              0.8859752140489093,
+              0.499934052259964
+            ],
+            "reference": 3.3316126772142836,
+            "candidate": 3.3316126792864247
+          },
+          "reference_range_at_gl_points": [
+            2.5007969112304282,
+            5.051546878134015
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969112304473,
+            5.0515468780940935
+          ],
+          "integral_reference": 3.4999888357528834,
+          "integral_candidate": 3.499988835752878,
+          "integral_candidate_minus_reference": -3.0396707703316042e-18,
+          "difference_of_separately_accumulated_integrals": -5.329070518200751e-15,
+          "absolute_integral_difference": 3.0396707703316042e-18,
+          "integral_abs_difference_over_abs_reference_integral": 8.684801332166934e-19,
+          "integral_abs_difference_over_reference_gl_l1": 8.684801332166934e-19,
+          "integrals_exact_for_saved_polynomial_up_to_roundoff": true,
+          "engineering_budget_pass": true
+        },
+        "pressure": {
+          "conservative_component": false,
+          "l2_reference": 1.4117711416834169,
+          "l2_candidate": 1.4117711416834564,
+          "l2_difference": 3.1030239080339385e-11,
+          "normalized_l2": 2.1979652483431887e-11,
+          "linf_reference_at_gl_points": 1.9119039968690414,
+          "linf_candidate_at_gl_points": 1.911903996853065,
+          "linf_difference_at_gl_points": 8.889449176763264e-10,
+          "normalized_linf_at_gl_points": 4.6495269591573324e-10,
+          "maximum_difference_location": {
+            "cell_ij": [
+              453,
+              255
+            ],
+            "gauss_ij": [
+              3,
+              5
+            ],
+            "xy": [
+              0.8859752140489093,
+              0.499934052259964
+            ],
+            "reference": 1.317591014078513,
+            "candidate": 1.317591014967458
+          },
+          "reference_range_at_gl_points": [
+            1.0003187644921347,
+            1.9119039968690414
+          ],
+          "candidate_range_at_gl_points": [
+            1.0003187644921425,
+            1.911903996853065
+          ],
+          "integral_reference": 1.3703150445410452,
+          "integral_candidate": 1.3703150445410857,
+          "integral_candidate_minus_reference": 3.9827786952633876e-14,
+          "difference_of_separately_accumulated_integrals": 4.04121180963557e-14,
+          "absolute_integral_difference": 3.9827786952633876e-14,
+          "integral_abs_difference_over_abs_reference_integral": 2.906469363472051e-14,
+          "integral_abs_difference_over_reference_gl_l1": 2.906469363472051e-14,
+          "integrals_exact_for_saved_polynomial_up_to_roundoff": false,
+          "engineering_budget_pass": null
+        },
+        "speed": {
+          "conservative_component": false,
+          "l2_reference": 0.3906357432056063,
+          "l2_candidate": 0.390635743205409,
+          "l2_difference": 2.0728082378761637e-11,
+          "normalized_l2": 5.3062431534463214e-11,
+          "linf_reference_at_gl_points": 0.7062097222072988,
+          "linf_candidate_at_gl_points": 0.706209722216065,
+          "linf_difference_at_gl_points": 5.738702291147035e-10,
+          "normalized_linf_at_gl_points": 8.126059597721756e-10,
+          "maximum_difference_location": {
+            "cell_ij": [
+              255,
+              58
+            ],
+            "gauss_ij": [
+              3,
+              2
+            ],
+            "xy": [
+              0.4992564640489094,
+              0.11402478595109063
+            ],
+            "reference": 0.25421005233569316,
+            "candidate": 0.25421005176182293
+          },
+          "reference_range_at_gl_points": [
+            4.258928775684168e-07,
+            0.7062097222072988
+          ],
+          "candidate_range_at_gl_points": [
+            4.258928780720166e-07,
+            0.706209722216065
+          ],
+          "integral_reference": 0.284603090234607,
+          "integral_candidate": 0.28460309023406793,
+          "integral_candidate_minus_reference": -5.38928286946416e-13,
+          "difference_of_separately_accumulated_integrals": -5.390687896067448e-13,
+          "absolute_integral_difference": 5.38928286946416e-13,
+          "integral_abs_difference_over_abs_reference_integral": 1.8936136164303803e-12,
+          "integral_abs_difference_over_reference_gl_l1": 1.8936136164303803e-12,
+          "integrals_exact_for_saved_polynomial_up_to_roundoff": false,
+          "engineering_budget_pass": null
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "all_conservative_components_pass": true,
+        "meaning": "engineering comparison budgets, not analytic Sedov error bounds"
+      },
+      "wall_seconds": 28.90127181902062,
+      "peak_process_rss_mib": 1112.234375,
+      "scope": "Differences of saved Q5 conservative polynomials at matching Cartesian cells. GL6 integrates their squared differences and conservative integrals exactly up to FP64 roundoff on affine geometry. Linf is the maximum over GL points, not a continuous polynomial supremum. Derived pressure/speed norms and integrals are quadrature estimates. No analytic Sedov-error, between-frame, or positivity-everywhere claim.",
+      "normalization": "Per component: L2=||candidate-reference||_L2/||reference||_L2; Linf=max_GL|candidate-reference|/max_GL|reference|. Zero reference denominator gives zero for zero difference, otherwise JSON null. Signed conservative integral differences integrate candidate-reference directly; the GL L1 denominator avoids cancellation in near-zero total momentum."
+    },
+    "sigma": {
+      "schema": "igrlab-sedov-q5-sigma-comparison-v1",
+      "status": "ok",
+      "command": "compare",
+      "python": "/usr/bin/python3",
+      "numpy_version": "1.26.4",
+      "vtk_version": "9.2.20220823",
+      "field": "sigma",
+      "engineering_budgets": null,
+      "reader_provenance": {
+        "retained_helper": "/tmp/igr-volume-storage-20261021/fields/compare-sedov-fields.py",
+        "retained_helper_sha256": "4e4d58131b08d0c6fbd61fd0ef6802619d637d10f67ccb2b15a39d444d063405",
+        "scalar_adapter_sha256": "3e5604ee06e2844b614e988f6cc2d7d6f42c5a8fe24f4647d3388812b05babf6",
+        "scalar_comparator_sha256": "bd4544fcea3325209cb02187aa092a652f44025d452359d60c39c27b4cc15a90"
+      },
+      "reference": {
+        "input": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+        "selected": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+        "time": 0.1,
+        "time_source": "explicit-label"
+      },
+      "candidate": {
+        "input": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+        "selected": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+        "time": 0.1,
+        "time_source": "explicit-label"
+      },
+      "physical_alpha": 6.357828776041666e-07,
+      "alpha_provenance": "caller-supplied physical alpha assertions; not encoded/verified in VTU",
+      "grid": {
+        "nx": 512,
+        "ny": 512,
+        "bounds_xy": [
+          0.0,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "cells": 262144,
+        "quadrature_points_per_cell": 36,
+        "quadrature_points_total": 9437184,
+        "complete_unique_cell_coverage": true,
+        "integration_measure": "common Cartesian cell area after checking every saved node against that mesh",
+        "all_corresponding_node_coordinate_difference_bound": 6.661338147750939e-16,
+        "geometry_pair_tolerance": 1e-11
+      },
+      "quadrature": {
+        "rule": "tensor Gauss-Legendre 6x6 on [0,1]^2",
+        "points_1d": [
+          0.033765242898423975,
+          0.16939530676686776,
+          0.3806904069584015,
+          0.6193095930415985,
+          0.8306046932331322,
+          0.966234757101576
+        ],
+        "weights_2d": [
+          0.007338020422245048,
+          0.015451823343095793,
+          0.0200412793294516,
+          0.0200412793294516,
+          0.015451823343095793,
+          0.007338020422245048,
+          0.015451823343095793,
+          0.03253722814704192,
+          0.04220134177189703,
+          0.04220134177189703,
+          0.03253722814704192,
+          0.015451823343095793,
+          0.0200412793294516,
+          0.04220134177189703,
+          0.05473586254182423,
+          0.05473586254182423,
+          0.04220134177189703,
+          0.0200412793294516,
+          0.0200412793294516,
+          0.04220134177189703,
+          0.05473586254182423,
+          0.05473586254182423,
+          0.04220134177189703,
+          0.0200412793294516,
+          0.015451823343095793,
+          0.03253722814704192,
+          0.04220134177189703,
+          0.04220134177189703,
+          0.03253722814704192,
+          0.015451823343095793,
+          0.007338020422245048,
+          0.015451823343095793,
+          0.0200412793294516,
+          0.0200412793294516,
+          0.015451823343095793,
+          0.007338020422245048
+        ],
+        "q5_squared_degree_per_axis": 10,
+        "gl6_exact_degree_per_axis": 11
+      },
+      "reference_pieces": [
+        {
+          "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+          "bytes": 1160775042,
+          "mtime_ns": 1792617287843886920,
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "sigma"
+          ],
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "max_affine_geometry_error": 3.3306690738754696e-16,
+          "max_deviation_from_common_cartesian_lattice": 3.3306690738754696e-16
+        }
+      ],
+      "candidate_pieces": [
+        {
+          "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+          "bytes": 1160775042,
+          "mtime_ns": 1792617288864686920,
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "sigma"
+          ],
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "max_affine_geometry_error": 3.3306690738754696e-16,
+          "max_deviation_from_common_cartesian_lattice": 3.3306690738754696e-16
+        }
+      ],
+      "reference_temporary_cache_bytes": 75497472,
+      "components": {
+        "sigma": {
+          "conservative_component": false,
+          "field_semantics": "IGR scalar sigma, compared as its complete saved Q5 polynomial; not an Euler conserved component.",
+          "l2_reference": 2.0021673727436074e-05,
+          "l2_candidate": 2.002167512682136e-05,
+          "l2_difference": 4.955078195654843e-12,
+          "normalized_l2": 2.474857128884688e-07,
+          "linf_reference_at_gl_points": 5.6529215526751496e-05,
+          "linf_candidate_at_gl_points": 5.6529214597315457e-05,
+          "linf_difference_at_gl_points": 1.1203892432814491e-10,
+          "normalized_linf_at_gl_points": 1.981964958900312e-06,
+          "maximum_difference_location": {
+            "cell_ij": [
+              256,
+              59
+            ],
+            "gauss_ij": [
+              0,
+              2
+            ],
+            "xy": [
+              0.500065947740036,
+              0.11597791095109063
+            ],
+            "reference": 3.344154901350142e-05,
+            "candidate": 3.3441436974577095e-05
+          },
+          "reference_range_at_gl_points": [
+            7.966113494040563e-11,
+            5.6529215526751496e-05
+          ],
+          "candidate_range_at_gl_points": [
+            7.962438890137231e-11,
+            5.6529214597315457e-05
+          ],
+          "integral_reference": 1.3210717708177258e-05,
+          "integral_candidate": 1.3210718690615814e-05,
+          "integral_candidate_minus_reference": 9.824385576335779e-13,
+          "difference_of_separately_accumulated_integrals": 9.824385567764639e-13,
+          "integral_abs_difference_over_reference_gl_l1": 7.436678152811195e-08,
+          "polynomial_l2_and_integrals_exact_up_to_roundoff": true,
+          "engineering_budget": null,
+          "engineering_budget_pass": null
+        }
+      },
+      "wall_seconds": 12.665249850018881,
+      "peak_process_rss_mib": 660.4375,
+      "scope": "Full saved Q5 sigma polynomials over every matched Cartesian cell. GL6 integrates the squared difference and scalar integrals exactly up to FP64 roundoff. Linf is sampled at GL points, not a continuous supremum. Sigma is not an Euler conserved component. No physical sigma acceptance budget, analytic accuracy, center-preview proxy or unsaved-time claim.",
+      "normalization": "L2=||candidate-reference||_L2/||reference||_L2; Linf=max_GL|candidate-reference|/max_GL|reference|. Zero denominator gives zero for zero difference, otherwise JSON null."
+    },
+    "native_gll": {
+      "schema": "igr-dgsem-gll6-admissibility-v1",
+      "gamma": 1.4,
+      "grid": {
+        "nx": 512,
+        "ny": 512,
+        "bounds": [
+          0.0,
+          1.0,
+          0.0,
+          1.0
+        ]
+      },
+      "conservative_component_order": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "helper_sha256": "30abacaa15d9d79ccbede4717ef51d1d5e330655cb4c2fce3800a6b62d3c2f6a",
+      "reader_sha256": "4e4d58131b08d0c6fbd61fd0ef6802619d637d10f67ccb2b15a39d444d063405",
+      "offline_only": true,
+      "application_executed": false,
+      "gpu_used": false,
+      "gll_nodes_1d_unit_interval": [
+        0.0,
+        0.11747233803526796,
+        0.3573842417596774,
+        0.6426157582403225,
+        0.8825276619647324,
+        1.0
+      ],
+      "roles": {
+        "reference": {
+          "minimum_finite_density": 0.4494202014836769,
+          "minimum_finite_pressure": 1.0003187637495004,
+          "conservative_nonfinite_samples": 0,
+          "conservative_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_nodal_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "density_nonpositive_samples": 0,
+          "pressure_nonpositive_samples": 0,
+          "pressure_unavailable_or_nonfinite_samples": 0,
+          "samples": 9437184,
+          "selection": {
+            "input": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+            "selected": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+            "time": 0.1,
+            "time_source": "explicit-label"
+          },
+          "pieces": [
+            {
+              "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+              "sha256": "124e5a822f7605dfd9c72f266475fe99035af185f52b9649c0e28c47ba5189ce"
+            }
+          ],
+          "reader_geometry_records": [
+            {
+              "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/fp64_two_level-final.vtu",
+              "bytes": 1160775042,
+              "mtime_ns": 1792617287843886920,
+              "cells": 262144,
+              "points": 9437184,
+              "point_arrays_decoded": [
+                "density",
+                "momentum",
+                "energy"
+              ],
+              "vtk_parametric_ij_in_connectivity_order": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  5,
+                  0
+                ],
+                [
+                  5,
+                  5
+                ],
+                [
+                  0,
+                  5
+                ],
+                [
+                  1,
+                  0
+                ],
+                [
+                  2,
+                  0
+                ],
+                [
+                  3,
+                  0
+                ],
+                [
+                  4,
+                  0
+                ],
+                [
+                  5,
+                  1
+                ],
+                [
+                  5,
+                  2
+                ],
+                [
+                  5,
+                  3
+                ],
+                [
+                  5,
+                  4
+                ],
+                [
+                  1,
+                  5
+                ],
+                [
+                  2,
+                  5
+                ],
+                [
+                  3,
+                  5
+                ],
+                [
+                  4,
+                  5
+                ],
+                [
+                  0,
+                  1
+                ],
+                [
+                  0,
+                  2
+                ],
+                [
+                  0,
+                  3
+                ],
+                [
+                  0,
+                  4
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  1
+                ],
+                [
+                  3,
+                  1
+                ],
+                [
+                  4,
+                  1
+                ],
+                [
+                  1,
+                  2
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  2
+                ],
+                [
+                  4,
+                  2
+                ],
+                [
+                  1,
+                  3
+                ],
+                [
+                  2,
+                  3
+                ],
+                [
+                  3,
+                  3
+                ],
+                [
+                  4,
+                  3
+                ],
+                [
+                  1,
+                  4
+                ],
+                [
+                  2,
+                  4
+                ],
+                [
+                  3,
+                  4
+                ],
+                [
+                  4,
+                  4
+                ]
+              ],
+              "max_affine_geometry_error": 3.3306690738754696e-16,
+              "max_deviation_from_common_cartesian_lattice": 3.3306690738754696e-16
+            }
+          ],
+          "cells": 262144,
+          "complete_unique_cell_coverage": true,
+          "all_samples_finite_with_positive_density_and_pressure": true
+        },
+        "candidate": {
+          "minimum_finite_density": 0.4494202014856217,
+          "minimum_finite_pressure": 1.000318763749507,
+          "conservative_nonfinite_samples": 0,
+          "conservative_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_nodal_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "density_nonpositive_samples": 0,
+          "pressure_nonpositive_samples": 0,
+          "pressure_unavailable_or_nonfinite_samples": 0,
+          "samples": 9437184,
+          "selection": {
+            "input": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+            "selected": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+            "time": 0.1,
+            "time_source": "explicit-label"
+          },
+          "pieces": [
+            {
+              "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+              "sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948"
+            }
+          ],
+          "reader_geometry_records": [
+            {
+              "path": "/tmp/igr-dgsem-sedov-20261021/full-3430525/fields/tf32_spectral-final.vtu",
+              "bytes": 1160775042,
+              "mtime_ns": 1792617288864686920,
+              "cells": 262144,
+              "points": 9437184,
+              "point_arrays_decoded": [
+                "density",
+                "momentum",
+                "energy"
+              ],
+              "vtk_parametric_ij_in_connectivity_order": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  5,
+                  0
+                ],
+                [
+                  5,
+                  5
+                ],
+                [
+                  0,
+                  5
+                ],
+                [
+                  1,
+                  0
+                ],
+                [
+                  2,
+                  0
+                ],
+                [
+                  3,
+                  0
+                ],
+                [
+                  4,
+                  0
+                ],
+                [
+                  5,
+                  1
+                ],
+                [
+                  5,
+                  2
+                ],
+                [
+                  5,
+                  3
+                ],
+                [
+                  5,
+                  4
+                ],
+                [
+                  1,
+                  5
+                ],
+                [
+                  2,
+                  5
+                ],
+                [
+                  3,
+                  5
+                ],
+                [
+                  4,
+                  5
+                ],
+                [
+                  0,
+                  1
+                ],
+                [
+                  0,
+                  2
+                ],
+                [
+                  0,
+                  3
+                ],
+                [
+                  0,
+                  4
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  1
+                ],
+                [
+                  3,
+                  1
+                ],
+                [
+                  4,
+                  1
+                ],
+                [
+                  1,
+                  2
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  2
+                ],
+                [
+                  4,
+                  2
+                ],
+                [
+                  1,
+                  3
+                ],
+                [
+                  2,
+                  3
+                ],
+                [
+                  3,
+                  3
+                ],
+                [
+                  4,
+                  3
+                ],
+                [
+                  1,
+                  4
+                ],
+                [
+                  2,
+                  4
+                ],
+                [
+                  3,
+                  4
+                ],
+                [
+                  4,
+                  4
+                ]
+              ],
+              "max_affine_geometry_error": 3.3306690738754696e-16,
+              "max_deviation_from_common_cartesian_lattice": 3.3306690738754696e-16
+            }
+          ],
+          "cells": 262144,
+          "complete_unique_cell_coverage": true,
+          "all_samples_finite_with_positive_density_and_pressure": true
+        }
+      },
+      "status": "pass-at-gll-nodes",
+      "scope": "Saved Q5 conservative polynomials sampled at each cell GLL6x6 nodes, reconstructed from validated equispaced VTK positions in FP64. Pressure=(gamma-1)*(E-|momentum|^2/(2*rho)) is evaluated only for finite conservative samples with rho>0; other samples are counted unavailable/nonfinite. Minima are over finite values. No positivity claim between nodes, at other sample sets, or at earlier times."
+    },
+    "files": {
+      "selections": {
+        "fp64_two_level": {
+          "target_time": 0.1,
+          "stored_point_fields": [
+            "density",
+            "energy",
+            "momentum",
+            "pressure",
+            "sigma",
+            "velocity"
+          ],
+          "files": [
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/fp64_two_level/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface.pvd",
+              "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff",
+              "bytes": 640
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/fp64_two_level/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/data.pvtu",
+              "sha256": "0a3cf936171aff744826c96a2f4d96d2d6f10bb0e25304b2b20347c07b519a10",
+              "bytes": 1305
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/fp64_two_level/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+              "sha256": "124e5a822f7605dfd9c72f266475fe99035af185f52b9649c0e28c47ba5189ce",
+              "bytes": 1160775042
+            }
+          ],
+          "complete_native_vtu_sha256": "124e5a822f7605dfd9c72f266475fe99035af185f52b9649c0e28c47ba5189ce",
+          "full_polynomial_comparison_source": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/fp64_two_level/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+          "hashed_after_both_timings": true
+        },
+        "tf32_spectral": {
+          "target_time": 0.1,
+          "stored_point_fields": [
+            "density",
+            "energy",
+            "momentum",
+            "pressure",
+            "sigma",
+            "velocity"
+          ],
+          "files": [
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/tf32_spectral/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface.pvd",
+              "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff",
+              "bytes": 640
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/tf32_spectral/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/data.pvtu",
+              "sha256": "0a3cf936171aff744826c96a2f4d96d2d6f10bb0e25304b2b20347c07b519a10",
+              "bytes": 1305
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/tf32_spectral/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+              "sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948",
+              "bytes": 1160775042
+            }
+          ],
+          "complete_native_vtu_sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948",
+          "full_polynomial_comparison_source": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/full-3430525/tf32_spectral/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+          "hashed_after_both_timings": true
+        }
+      },
+      "complete_native_vtu_bytes_identical": false,
+      "after_both_measurements": true
+    }
+  },
+  "profile": {
+    "schema": "igr-dgsem-nsys-observed-hardware-v1",
+    "job": "3430740",
+    "status": "capture-completed",
+    "postprocessing_status": "completed",
+    "node": "gh014",
+    "source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+    "binary_sha256": "7c7a92a88f77cb8871977085724df6ce5c0c121f1834c20ea1bf6feb25b85737",
+    "allocated_gpu": {
+      "index": 0,
+      "uuid": "GPU-bf6ea382-b408-d7a7-47bd-f02652fad714",
+      "inherited_cuda_visible_devices": "0"
+    },
+    "capture_trigger": {
+      "delay_seconds": 281,
+      "duration_seconds": 15,
+      "derived_delay_seconds": 281,
+      "estimated_outside_native_stopwatch_seconds": 78.33220746203426,
+      "boundaries": [
+        {
+          "step": 1000,
+          "time": 0.020692,
+          "elapsed_seconds": 176.799596,
+          "line": 3123
+        },
+        {
+          "step": 1500,
+          "time": 0.030768,
+          "elapsed_seconds": 242.312849,
+          "line": 4641
+        }
+      ],
+      "margin_seconds": 5,
+      "parent_delay_override": false,
+      "parent_delay_reason": null,
+      "formula": "ceil(application_wall - native_done + midpoint(Analysis1000,Analysis1500) - 7.5)",
+      "exact_absolute_RK_index_claim": false,
+      "limit": "Nominal placement only; outside-stopwatch time includes startup and final bookkeeping. Fresh profiling can shift progress; observed ranges must be reviewed."
+    },
+    "trace_seconds": 15.004304384000001,
+    "recorded_kernel_count": 44576,
+    "summed_recorded_kernel_seconds": 14.433236382,
+    "kernel_activity_union_seconds": 14.433236382,
+    "kernel_activity_fraction_of_trace": 0.9619397216035577,
+    "complete_rk_step_count": 113,
+    "no_observed_output_analysis_overlap": true,
+    "output_free_claim": false,
+    "absolute_rk_indices_claimed": false,
+    "native_target_counts": {
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp": 2047,
+      "InteriorFaceDGDiffusionTensorLiftGather2D": 2047,
+      "ToSpectralTensorKernel<float>": 1023,
+      "FromSpectralTensorKernel<float>": 1023,
+      "IGRFusedTensorVolumeKernel": 1705,
+      "IGRTensorVolumeRefreshKernel": 341,
+      "sm90_xmma_gemm_": 4092
+    },
+    "groups": [
+      {
+        "group": "DGSEM characteristic-speed maximum",
+        "calls": 683,
+        "recorded_kernel_seconds": 6.452694688,
+        "share_of_recorded_kernel_duration_percent": 44.70719190913616,
+        "kernel_names": [
+          "mfem::dgsem::<unnamed>::DeterministicMaximumKernel(const double *, unsigned int, double *)"
+        ]
+      },
+      {
+        "group": "IGR generic volume and refresh",
+        "calls": 2046,
+        "recorded_kernel_seconds": 1.5714528,
+        "share_of_recorded_kernel_duration_percent": 10.887736876254536,
+        "kernel_names": [
+          "void igrlab::igr_internal::<unnamed>::IGRFusedTensorVolumeKernel<(bool)0>(int, int, int, int, const int *, const double *, const double *, const double *, const double *, double *)",
+          "igrlab::igr_internal::<unnamed>::IGRTensorVolumeRefreshKernel(int, int, int, const double *, const double *, const double *, const double *, double *, double *)"
+        ]
+      },
+      {
+        "group": "IGR compact face record and gather",
+        "calls": 4094,
+        "recorded_kernel_seconds": 1.345317728,
+        "share_of_recorded_kernel_duration_percent": 9.320970656849871,
+        "kernel_names": [
+          "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp>(int, T1)",
+          "void mfem::CuKernel1D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftGather2D>(int, T1)"
+        ]
+      },
+      {
+        "group": "TF32 spectral GEMMs",
+        "calls": 4092,
+        "recorded_kernel_seconds": 0.861187934,
+        "share_of_recorded_kernel_duration_percent": 5.966700130221701,
+        "kernel_names": [
+          "sm90_xmma_gemm_f32f32_tf32f32_f32_nn_n_tilesize128x128x32_warpgroupsize1x1x1_execute_segment_k_on_kernel__5x_cublas",
+          "sm90_xmma_gemm_f32f32_tf32f32_f32_nt_n_tilesize128x256x32_warpgroupsize2x1x1_execute_segment_k_on_kernel__5x_cublas",
+          "sm90_xmma_gemm_f32f32_tf32f32_f32_tn_n_tilesize128x128x32_warpgroupsize1x1x1_execute_segment_k_off_kernel__5x_cublas"
+        ]
+      },
+      {
+        "group": "FP64 tensor nodal maps",
+        "calls": 2046,
+        "recorded_kernel_seconds": 0.330641792,
+        "share_of_recorded_kernel_duration_percent": 2.2908361177563092,
+        "kernel_names": [
+          "void igrlab::igr_internal::spectral_nodal_detail::ToSpectralTensorKernel<float>(int, int, const int *, const int *, const igrlab::igr_internal::spectral_nodal_detail::FactorPacket *, const double *, const int *, T1 *)",
+          "void igrlab::igr_internal::spectral_nodal_detail::FromSpectralTensorKernel<float>(int, int, const int *, const int *, const igrlab::igr_internal::spectral_nodal_detail::FactorPacket *, const T1 *, const int *, double, double *)"
+        ]
+      },
+      {
+        "group": "DGSEM fused Euler residual",
+        "calls": 342,
+        "recorded_kernel_seconds": 0.461840768,
+        "share_of_recorded_kernel_duration_percent": 3.199842057433297,
+        "kernel_names": [
+          "void mfem::dgsem::<unnamed>::FusedEulerResidualKernel<(int)6, (bool)0, (bool)0>(mfem::dgsem::<unnamed>::FusedResidualData)"
+        ]
+      },
+      {
+        "group": "IGR derivatives",
+        "calls": 341,
+        "recorded_kernel_seconds": 0.48681648000000005,
+        "share_of_recorded_kernel_duration_percent": 3.3728851043215737,
+        "kernel_names": [
+          "void mfem::CuKernel2D<void mfem::internal::quadrature_interpolator::Derivatives2D<(mfem::QVectorLayout)1, (bool)1, (int)0, (int)0, (int)0, (int)1>(int, const double *, const double *, const double *, const double *, double *, int, int, int, int)::[lambda(int) (instance 1)]>(int, T1)"
+        ]
+      },
+      {
+        "group": "IGR face density projection",
+        "calls": 341,
+        "recorded_kernel_seconds": 0.474906496,
+        "share_of_recorded_kernel_duration_percent": 3.2903673398730313,
+        "kernel_names": [
+          "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceSideDensityProjection2D>(int, T1)"
+        ]
+      },
+      {
+        "group": "State value interpolation",
+        "calls": 341,
+        "recorded_kernel_seconds": 0.22019769600000003,
+        "share_of_recorded_kernel_duration_percent": 1.525629388808551,
+        "kernel_names": [
+          "void mfem::CuKernel2D<void mfem::internal::quadrature_interpolator::Values2D<(mfem::QVectorLayout)1, (int)0, (int)0, (int)0, (int)1>(int, const double *, const double *, double *, int, int, int)::[lambda(int) (instance 1)]>(int, T1)"
+        ]
+      },
+      {
+        "group": "Other kernels",
+        "recorded_kernel_seconds": 2.22818,
+        "share_of_recorded_kernel_duration_percent": 15.437840419344973
+      }
+    ],
+    "observed_certificates": {
+      "count": 4143,
+      "last_certificate": {
+        "event": "independent-residual-certificate",
+        "solve_call": "4143",
+        "rk_step": "1380",
+        "rk_stage": "2",
+        "iterations": "3",
+        "reason": "tensor-pipeline",
+        "start": "1",
+        "factor": "1",
+        "relative_limit": "1e-06",
+        "absolute_limit": "0",
+        "true_residual_rel_rhs": "6.4555511e-08",
+        "true_residual_rel_initial": "nan",
+        "residual_replacement_retries": "0",
+        "passed": "1"
+      },
+      "maximum_true_residual_rel_rhs": 9.9961929e-07,
+      "all_observed_passed": true,
+      "scope": "All emitted certificates in retained stdout; a deliberately interrupted solve may have no certificate."
+    },
+    "possible_event_loss": true,
+    "diagnostic_events": [
+      {
+        "timestamp": -281684743456,
+        "timestampType": 1,
+        "source": 2,
+        "severity": 1,
+        "text": "Process was launched by the profiler, see /projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/nsys-tmp-3430740/nvidia/nsight_systems/quadd_session_101790761/streams/pid_1790770_stdout.log and stderr.log for program output",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -280762680160,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Common injection library initialized successfully.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -280717075232,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "OS runtime libraries injection initialized successfully.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -280354659360,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Common injection library initialized successfully.",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": -280350706592,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "OS runtime libraries injection initialized successfully.",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": -279076569056,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -279026851968,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Loaded CUPTI library: /opt/nvidia/hpc_sdk/Linux_aarch64/25.5/profilers/Nsight_Systems/target-linux-sbsa-armv8/libcupti-sbsa.so.12.9",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -279026847200,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 2,
+        "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -279004758400,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Enabling trace for device graph launch",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -279004751808,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "CUDA injection initialized successfully.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": -277976915040,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "NVTX injection initialized successfully.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 0,
+        "timestampType": 1,
+        "source": 3,
+        "severity": 1,
+        "text": "Profiling has started.",
+        "globalPid": -144115188075855872
+      },
+      {
+        "timestamp": 1152980019,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+        "globalPid": -144115188075855872
+      },
+      {
+        "timestamp": 1153021649,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all NVTX events might have been collected.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 1153023825,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of NVTX events collected: \t19895.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 1153025649,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all NVTX events might have been collected.",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": 1153026577,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "No NVTX events collected. Does the process use NVTX?",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": 1153028913,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all CUDA events might have been collected.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 1153029617,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of CUDA events collected: \t170706.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 1153030129,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "CUDA profiling might have not been started correctly.",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": 1153030865,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "No CUDA events collected. Does the process use CUDA?",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": 1153032433,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all OS runtime libraries events might have been collected.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 1153033169,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of OS runtime libraries events collected: \t650.",
+        "globalPid": 311519111806976
+      },
+      {
+        "timestamp": 1153033873,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all OS runtime libraries events might have been collected.",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": 1153034353,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of OS runtime libraries events collected: \t7.",
+        "globalPid": 311519229247488
+      },
+      {
+        "timestamp": 15004304384,
+        "timestampType": 1,
+        "source": 3,
+        "severity": 1,
+        "text": "Profiling has stopped.",
+        "globalPid": -144115188075855872
+      },
+      {
+        "timestamp": 15026015744,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Number of CUPTI events produced: \t171406, CUPTI buffers: 49 of 50. Some CUPTI events might be missing. To make sure all the events are collected, let the application run until it quits, and make sure cudaDeviceReset() is called before exit. Try using the \"Flush data periodically\" checkbox in CUDA trace options.",
+        "globalPid": 311519111806976
+      }
+    ],
+    "measurement_limits": [
+      "Bounded separate continuous evolution with intentional application cutoff; not a full-case performance run.",
+      "Nsight Systems warns CUDA13.2 driver is newer than its12.9 trace support and that CUPTI/NVTX/OS-runtime events may be missing.",
+      "Group shares use only recorded kernel duration, not elapsed application time, SM occupancy, bandwidth or tensor-core utilization.",
+      "Observed kernel activity is not evidence all SMs are busy: the dominant maximum launches one256-thread block.",
+      "No new Nsight Compute hardware counters were collected in this DGSEM qualification."
+    ],
+    "evidence_sha256": {
+      "run.json": "c8f2fad7f49b6135cff983ccb6bf19fa9039cf76648fa98a786f218c79d99655",
+      "kernel-census.json": "4acc42438f7fd0d3727924a98c0f96ae3ff06841572b347deba2f7575fa8d6e1",
+      "capture.nsys-rep": "2cf1aab92423438409cd2136eaed2769f0827127b9e43fcf99779a9948c8e452",
+      "capture.sqlite": "7570d5fbded7bc131efa1f0b92060fcde2a09cd15479eafd2e0ee29e41157b0c"
+    },
+    "independent_attribution": {
+      "reviewer": "phase2_profile_harness",
+      "method": "Unique CUDA runtime correlation IDs matched to containing NVTX range on the launching thread.",
+      "tf32_gemm_launches": 4092,
+      "preconditioner_ranges_with_exactly_four_gemms": 1023,
+      "each_preconditioner_range_has_one_forward_and_one_inverse_nodal_map": true,
+      "values2d_launches": 341,
+      "device_coefficient_ranges_with_exactly_one_values2d": 341,
+      "complete_event_collection_claim": false
+    },
+    "cfl_reduction_diagnosis": {
+      "reviewer": "phase2_euler_audit",
+      "kind": "required characteristic-speed maximum; optional diagnostic scans disabled",
+      "nodal_values": 9437184,
+      "face_values": 3151872,
+      "launch_grid": [
+        1,
+        1,
+        1
+      ],
+      "launch_block": [
+        256,
+        1,
+        1
+      ],
+      "recorded_nodal_calls": 342,
+      "recorded_face_calls": 341,
+      "median_nodal_ms": 14.150656,
+      "median_face_ms": 4.729728,
+      "next_target": "Multi-block partial maxima followed by final reduction, retaining separate outputs, host/MPI combination, cadence, fmax behavior and original ordered zero-result fallback.",
+      "implemented_in_this_phase": false,
+      "new_speedup_claim": null
+    }
+  },
+  "independent_reviews": {
+    "source": {
+      "schema": "igr-dgsem-qualified-source-review-v1",
+      "source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+      "decision": "no-blockers",
+      "scope": "Independent static review plus inspection of existing native receipts; no new builds or GPU runs.",
+      "reviews": [
+        {
+          "reviewer": "phase2_igr_face_audit",
+          "change": "ed8829c scan policy",
+          "findings": [
+            "Default false; factory uses nan_scan OR admissibility_scan.",
+            "Explicit admission and the explicitly requested frozen-sigma algorithm retain scans.",
+            "Local fingerprint and collective semantic hash include the setting.",
+            "No flux/CFL arithmetic changed."
+          ],
+          "limits": [
+            "Bulk early invalid-state rejection is intentionally absent with scans off; existing fmax reductions may ignore individual NaN speed samples.",
+            "MPI consistency reviewed statically; no new multi-rank runtime qualification."
+          ]
+        },
+        {
+          "reviewer": "phase2_euler_audit",
+          "change": "6eb836f GLL oracles and comparison scope",
+          "findings": [
+            "Actual p5 GLL spaces and independently assembled consistent off-diagonal mass.",
+            "Cold/warm current-A solves, changed coefficients, strict inverse gate and retained reference lifetime covered.",
+            "Native receipt binds source and binary and all eight suites passed.",
+            "Physical operators and executable match; three preconditioner selectors plus output paths differ."
+          ],
+          "limits": [
+            "Timing includes I/O and certification, not compute-only.",
+            "Full fields and actual hardware witnesses still require the running campaign results."
+          ]
+        }
+      ]
+    },
+    "timing": {
+      "decision": "accepted",
+      "reviewer": "phase2_euler_audit",
+      "scope": "Independent stdout parsing reproduces paired process/native/five fixed-window timings; environment and clocks/heartbeat examined. No new run or field read."
+    },
+    "fields": {
+      "decision": "accepted",
+      "reviewer": "phase2_igr_face_audit",
+      "scope": "Verified receipt/helper/input hash bindings, full unique-cell coverage, normalization/budget arithmetic and final GLL sign reports; no heavy field reread."
+    },
+    "hardware_and_report": {
+      "decision": "accepted-after-two-wording-rounding-corrections",
+      "reviewer": "phase2_profile_harness",
+      "scope": "Independent raw SQLite launch attribution, kernel duration/configuration and certificate parsing; checks saved receipt/report/database/census hashes.",
+      "corrections": [
+        "Iteration reduction rounds to74.543%.",
+        "Absence of a collocated kernel is described as not recorded, consistent with possible event loss."
+      ]
+    }
+  },
+  "evidence": {
+    "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021",
+    "local_cache": "/home/jarias9/.cache/igrlab-experiments/igr-dgsem-sedov-20261021",
+    "sha256": {
+      "source-manifest.json": "3fec93ea51825ca432b15d9f92504994621e2d55f95e0afdbf59dc66979635bb",
+      "native-config.json": "abfd85d237af9c839fe3c97b6cabaa188a98b4d7ff6ef53f025a57fe5427d3ca",
+      "native-3430371/run.json": "b108947077219d2117d99e93a68d9a9da8e9d1fb797ba7c1f046eb0a782cf75e",
+      "case-spec.json": "2542b9fd3fda4fcbbfc0ad0a7598b6cdd9e390a31b41f3cb1d47526fc03ddc64",
+      "run-pair.py": "69fcbedda2db6dbc9751b03643e4deec8089403706cc4f4dc501682e0131db23",
+      "common.py": "3de9d99bfa4831cfe4eedcf0d063d5d9f51c934c5468e75532395a18d9b41f30",
+      "analyze-dgsem-pair.py": "a82521eceb023ebeabac804553ed1fef80361d62dc88b575c186f3e8622db3a1",
+      "full-3430525/comparison.json": "8425d48d13359e147776477761a0228d1bf70b0417b98bbf190117d8ab21faf8",
+      "full-3430525/pair-run.json": "36b1dae2a37020be5312e3f2f8462ee1ee7b2d1aba32443d6fca62af69f617cc",
+      "full-3430525/offline-analysis.json": "a71248446591a7e281ab595f4a13717e17f27b23aa0fbcac607045a47fe57b78",
+      "full-3430525/final-fields.json": "f528ae9a6435d045d43603b5109648953765eded5bc36474141b08637a5cebff",
+      "full-3430525/field-qualification.json": "27c1b81c4cd3d0049b0a0cebb1c44b19755c866ba1add70bc7f36b3abcd0cabd",
+      "field-plan.json": "8eeb549b9d2b46211cb082273b736ed12477d423a138da9d649ad33056b12bb4",
+      "check-gll-admissibility.py": "30abacaa15d9d79ccbede4717ef51d1d5e330655cb4c2fce3800a6b62d3c2f6a",
+      "full-3430525/fields/conserved.json": "ce13d70160a251b3c7e0a1a26ffeaf59ebe8c04068d48b22d6149eb0a0db75e2",
+      "full-3430525/fields/sigma.json": "0b68c4cf6e0297b9a1f67fa4643cf3381bd6be570c96b833675ef9ff4224beb6",
+      "full-3430525/fields/native-gll.json": "a76e009f89d8df228e201205d41626051c7a713e45d21b24feb8c846e6a76c43",
+      "full-3430525/fields/download-receipt.json": "3a4e603e3c0339acc5c2e85aa6274591baaf2d902f7587c87038f8a6f5c92d72",
+      "nsys-3430740/hardware-summary.json": "d94f8453417006f53a90be37a52ad367c6b27eedaf8b6d1e37b0671a125f148d",
+      "nsys-3430740/run.json": "c8f2fad7f49b6135cff983ccb6bf19fa9039cf76648fa98a786f218c79d99655",
+      "nsys-3430740/kernel-census.json": "4acc42438f7fd0d3727924a98c0f96ae3ff06841572b347deba2f7575fa8d6e1",
+      "profile-nsys.py": "1371d5eb1251848f155f5472ff5cb716f988d8faf85a68dd184e6b984c560ddc",
+      "nsys.slurm": "9b3af25452f38a0701f20c35309d7f7a83ed451dd29f4abdb6c5f655ed13a51c"
+    }
+  },
+  "limits": [
+    "One baseline-first same-GPU pair with unlocked clocks; no repeat-based confidence interval.",
+    "This compares two preconditioner strategies on the current optimized FP64 DGSEM and IGR operators, not precision alone or a historical original implementation.",
+    "Process/native timings include output; predefined VTK-free intervals still include logging/analysis/host work.",
+    "Final-field agreement and sampled-node signs do not establish analytic accuracy, unsaved-time behavior or continuous positivity.",
+    "Cartesian p5 single-GPU qualification does not establish arbitrary geometry, HDG or multi-GPU support."
+  ]
+}
