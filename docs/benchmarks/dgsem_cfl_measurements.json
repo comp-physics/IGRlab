@@ -1,0 +1,1599 @@
+{
+  "schema": "igr-dgsem-cfl-measurements-v1",
+  "status": "native-full-exact-equality-and-hardware-qualified",
+  "base_branch_commit": "8dcbbff883a2af4188b3f4de580107d7666a4493",
+  "tested_source_commit": "2363d0727b979a3241abfd5177d2c3c226c32c24",
+  "branch": "igr-dgsem-cfl-reduction",
+  "comparison_scope": "Fresh matched TF32 spectral DGSEM runs; only the frozen executable and VTK output path differ. Candidate changes the deterministic characteristic-speed maximum reduction.",
+  "case_document": "dgsem_cfl_case.json",
+  "case_document_sha256": "944b6144d55ad18fed8b94adbf34075b120074374537ed0add7c82a99c05f76d",
+  "case": {
+    "mesh_n": 512,
+    "elements": 262144,
+    "order": 5,
+    "euler_dofs": 37748736,
+    "sigma_dofs": 9437184,
+    "target_time": 0.1,
+    "cfl": 0.3,
+    "c_alpha": 0.16666666666666666,
+    "physical_alpha": 6.357828776041666e-07,
+    "linear_rtol": 1e-06,
+    "residual_scale": "rhs",
+    "nan_scan": false,
+    "admissibility_scan": false,
+    "positivity_limiter": "none",
+    "modal_damping_rate": 0,
+    "discretization": "dgsem",
+    "euler_basis": "gll",
+    "sigma_basis": "lgl"
+  },
+  "reduction": {
+    "threads": 256,
+    "single_block_up_to_entries": 4096,
+    "partial_block_rule": "min(ceil(N/1024),1024)",
+    "retained_scratch_max_fp64_bytes": 8192,
+    "two_argument_compatibility_implementation_unchanged": true,
+    "zero_result_retains_literal_ordered_full_input_fallback": true,
+    "host_reads_and_mpi_cadence_unchanged": true,
+    "overintegration_workspace_prepared": true
+  },
+  "native_qualification": {
+    "job": "3430873",
+    "node": "gh011",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-8e7ee02d-7c6f-b268-7b6b-a898c388ee37",
+      "inherited_cuda_visible_devices": "0"
+    },
+    "source_commit": "2363d0727b979a3241abfd5177d2c3c226c32c24",
+    "source_manifest_sha256": "85677d98bca0a0f5e58a32fea6f531d947a0403605a6620c3b4e0ac28c4aad92",
+    "case_spec_sha256": "944b6144d55ad18fed8b94adbf34075b120074374537ed0add7c82a99c05f76d",
+    "native_config_sha256": "da49aa23c844947f07456cd5b6075fdaf5cb027914816901e01667ff6b94a004",
+    "native_checks": [
+      "dg_igr_dgsem_maximum_cpu",
+      "dg_igr_dgsem_maximum_cuda",
+      "dg_igr_dgsem_operator_cuda",
+      "dg_igr_dgsem_igr_tests"
+    ],
+    "native_passed": [
+      "dg_igr_dgsem_maximum_cpu",
+      "dg_igr_dgsem_maximum_cuda",
+      "dg_igr_dgsem_operator_cuda",
+      "dg_igr_dgsem_igr_tests"
+    ],
+    "binary_sha256": "86c0cd82810ef6d002785cc3d065627081c9ec57ca0661438300e2e727157c50",
+    "maximum_fixture_sha256": "8f41b4eebc152d27d71c7cf37b8ebf90be823add823be8856cfbba690ffe92bb",
+    "maximum_benchmark": [
+      {
+        "device": "cuda",
+        "n": "9437184",
+        "warmups_per_variant": "4",
+        "repetitions_per_variant": "32",
+        "order": "alternating-interleaved",
+        "old_one_cta_mean_ms": "14.129521071910858",
+        "retained_hierarchical_mean_ms": "0.030551000265404582",
+        "mean_paired_reduction_percent": "99.783778644988487",
+        "bitwise_equal": "1",
+        "finite_positive_input": "1",
+        "scratch_reused": "1",
+        "host_reads_in_event_interval": "0",
+        "scope": "device-reduction-only"
+      },
+      {
+        "device": "cuda",
+        "n": "3151872",
+        "warmups_per_variant": "4",
+        "repetitions_per_variant": "32",
+        "order": "alternating-interleaved",
+        "old_one_cta_mean_ms": "1.9741510003805161",
+        "retained_hierarchical_mean_ms": "0.011109000013675541",
+        "mean_paired_reduction_percent": "99.437286422322614",
+        "bitwise_equal": "1",
+        "finite_positive_input": "1",
+        "scratch_reused": "1",
+        "host_reads_in_event_interval": "0",
+        "scope": "device-reduction-only"
+      }
+    ],
+    "maximum_benchmark_stdout_sha256": "b22cbf02a83b06f78579b723be6b0defa61b906a8d1a9ee6a673879ee456029c",
+    "native_stdout_sha256": "1413fda87924b585575b67c4dc5a987ef9e06a8cebe9e327e3f0a8aa0e812917",
+    "native_detail_sha256": "bef1ce2cfcb9d6a4da95861a7115837b0ef0131e461a17c6069a210f6061dfda",
+    "source_file_count": 768,
+    "maximum_oracle_cases_per_backend": 360,
+    "canonical_commands": [
+      {
+        "label": "build",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/source/build.sh",
+          "--gpu",
+          "--cuda-arch",
+          "90",
+          "--hdg-runtime",
+          "--nvtx-profile",
+          "--iterate",
+          "--output-root",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/builds",
+          "--no-tests",
+          "--jobs",
+          "4",
+          "--target",
+          "sedov_taylor_blast",
+          "--target",
+          "dg_igr_unit_tests",
+          "--target",
+          "dg_igr_dgsem_maximum_test"
+        ],
+        "returncode": 0
+      },
+      {
+        "label": "native",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/source/build.sh",
+          "--gpu",
+          "--cuda-arch",
+          "90",
+          "--hdg-runtime",
+          "--nvtx-profile",
+          "--iterate",
+          "--output-root",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/builds",
+          "--tests-only",
+          "--jobs",
+          "1",
+          "--test-regex",
+          "^(dg_igr_dgsem_maximum_cpu|dg_igr_dgsem_maximum_cuda|dg_igr_dgsem_operator_cuda|dg_igr_dgsem_igr_tests)$"
+        ],
+        "returncode": 0
+      },
+      {
+        "label": "maximum-benchmark",
+        "argv": [
+          "/opt/nvidia/hpc_sdk/Linux_aarch64/25.5/comm_libs/12.9/hpcx/hpcx-2.20/ompi/bin/mpiexec",
+          "-n",
+          "1",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/builds/worktrees/wt-a1461228aca19424/cuda-sm90/app/build/tests/dg_igr_dgsem_maximum_test",
+          "cuda",
+          "--benchmark"
+        ],
+        "returncode": 0
+      }
+    ],
+    "full_repository_or_multirank_qualification": false
+  },
+  "full_case": {
+    "job": "3430887",
+    "node": "gh069",
+    "comparison": {
+      "schema": "igr-dgsem-cfl-comparison-v1",
+      "status": "passed",
+      "case_spec_sha256": "944b6144d55ad18fed8b94adbf34075b120074374537ed0add7c82a99c05f76d",
+      "comparison_scope": "Fresh matched TF32 spectral DGSEM runs; only the frozen executable and VTK output path differ. Candidate changes the deterministic characteristic-speed maximum reduction.",
+      "native": {
+        "baseline": {
+          "status": "passed",
+          "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/frozen/sedov_taylor_blast",
+          "binary_sha256": "7c7a92a88f77cb8871977085724df6ce5c0c121f1834c20ea1bf6feb25b85737",
+          "source_commit": "ed8829cfb0075ae4e04aae922faf7ac697d6e669",
+          "native_run": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/run.json",
+            "sha256": "b108947077219d2117d99e93a68d9a9da8e9d1fb797ba7c1f046eb0a782cf75e",
+            "bytes": 96046
+          },
+          "build_receipt": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/frozen/build-complete.json",
+            "sha256": "aae4d97921b017ee3215e8cfe71a714a19dc9df90afa97f710218dce6647b8bf",
+            "bytes": 96002
+          },
+          "source_manifest": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/source-manifest.json",
+            "sha256": "3fec93ea51825ca432b15d9f92504994621e2d55f95e0afdbf59dc66979635bb",
+            "bytes": 183476
+          },
+          "native_config": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/native-config.json",
+            "sha256": "abfd85d237af9c839fe3c97b6cabaa188a98b4d7ff6ef53f025a57fe5427d3ca",
+            "bytes": 604
+          },
+          "native_case_spec": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-sedov-20261021/native-3430371/case-spec.json",
+            "sha256": "2542b9fd3fda4fcbbfc0ad0a7598b6cdd9e390a31b41f3cb1d47526fc03ddc64",
+            "bytes": 9230
+          }
+        },
+        "candidate": {
+          "status": "passed",
+          "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/native-3430873/frozen/sedov_taylor_blast",
+          "binary_sha256": "86c0cd82810ef6d002785cc3d065627081c9ec57ca0661438300e2e727157c50",
+          "source_commit": "2363d0727b979a3241abfd5177d2c3c226c32c24",
+          "native_run": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/native-3430873/run.json",
+            "sha256": "485a85c67d7b000daf26a986b4cb8eebce3850bb3f4c939e4d51a00b01a8cf1c",
+            "bytes": 97542
+          },
+          "build_receipt": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/native-3430873/frozen/build-complete.json",
+            "sha256": "75998328fd655aa20bf367e3563b6eb73ed3465051dc9595c1a7fc3ae1cf4c1a",
+            "bytes": 97499
+          },
+          "source_manifest": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/source-manifest.json",
+            "sha256": "85677d98bca0a0f5e58a32fea6f531d947a0403605a6620c3b4e0ac28c4aad92",
+            "bytes": 185338
+          },
+          "native_config": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/native-config.json",
+            "sha256": "da49aa23c844947f07456cd5b6075fdaf5cb027914816901e01667ff6b94a004",
+            "bytes": 646
+          },
+          "native_case_spec": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/case-spec.json",
+            "sha256": "944b6144d55ad18fed8b94adbf34075b120074374537ed0add7c82a99c05f76d",
+            "bytes": 9476
+          }
+        }
+      },
+      "execution_order": [
+        "baseline",
+        "candidate"
+      ],
+      "gpu_uuid": "GPU-6e95f486-4224-1fe4-bba2-c6c5ef04553f",
+      "same_gpu": true,
+      "fresh_both_arms": true,
+      "numerical_equality": {
+        "accepted_steps": true,
+        "rejected_attempts": true,
+        "rhs_evaluations": true,
+        "linear_calls": true,
+        "certificate_count": true,
+        "outer_iterations": true,
+        "maximum_rhs_residual": true,
+        "explicit_summary": true,
+        "closure": true,
+        "volume_summary": true,
+        "certificate_payload_sha256": true,
+        "complete_native_vtu_bytes_identical": true
+      },
+      "final_fields_sha256": "2bf142200ad8b3022d4a6d151cb551718729b0f9f3502f3c2fe8bd109a30a8db",
+      "run_record_sha256": {
+        "baseline": "b95e659a3a21b1efa80c60e61d270fa86dd2e3cdb13261309ed39266a4fb74d0",
+        "candidate": "d2f9898964c305f8471e6b6b41bb493b23500da799f44c673557a41c0000dc08"
+      },
+      "arms": {
+        "baseline": {
+          "application_wall_seconds": 986.7360577390064,
+          "audit": {
+            "certificate_payload_sha256": "4d7a7cfa9b10efcb26238187321f2f76766ac01c999369f73aaf51d94f487c74",
+            "volume_summary": {
+              "event": "summary",
+              "execution": "simt",
+              "coefficient_refreshes": "14818",
+              "submitted_applications": "78810",
+              "collocated_requested": "0",
+              "collocated_enabled": "0",
+              "collocated_reason": "not-requested",
+              "storage": "cached",
+              "precision": "fp64",
+              "fallback": "none"
+            },
+            "status": "passed",
+            "target_time": 0.1,
+            "accepted_steps": 4939,
+            "rejected_attempts": 0,
+            "rhs_evaluations": 14818,
+            "linear_calls": 14818,
+            "certificate_count": 14818,
+            "initial_anchor_certificate_log_omitted": false,
+            "initial_anchor_iterations_proven": null,
+            "initial_anchor_logging_policy": null,
+            "outer_iterations": 49175,
+            "maximum_rhs_residual": 9.9979699e-07,
+            "native_done_seconds": 895.984924394,
+            "explicit_summary": {
+              "event": "run-summary",
+              "steps": "4939",
+              "final_time": "0.10000000000000001",
+              "cfl_control_enabled": "1",
+              "cfl_safety_factor": "0.29999999999999999",
+              "ssp_coefficient": "1",
+              "ssp_scaled_cfl_factor": "0.29999999999999999",
+              "nominal_global_courant": "0.027272727272727271",
+              "rhs_evaluations": "14818",
+              "accepted_attempts": "4939",
+              "rejected_attempts": "0",
+              "rejected_limiter_elements": "0",
+              "rejected_q_sigma_attempts": "0",
+              "rejected_q_sigma_nonpositive_samples": "0",
+              "rejected_q_sigma_nonfinite_samples": "0",
+              "last_q_sigma_rejection_reason": "none",
+              "last_q_sigma_rejection_stage": "-1",
+              "minimum_attempted_dt": "3.8540597717545699e-06",
+              "maximum_attempted_dt": "2.1134790544403307e-05",
+              "minimum_accepted_dt": "3.8540597717545699e-06",
+              "maximum_accepted_dt": "2.1134790544403307e-05",
+              "maximum_accepted_step_growth_ratio": "5.2756321100465664",
+              "characteristic_speed_probes": "4940",
+              "minimum_characteristic_speed": "2.5201158552701575",
+              "maximum_characteristic_speed": "2.6950108295685391",
+              "dt_min_reached": "0",
+              "success": "1",
+              "termination_reason": "target-reached"
+            },
+            "linear_summary": {
+              "event": "run-summary",
+              "calls": "14818",
+              "converged_calls": "14818",
+              "production_calls": "14817",
+              "production_converged_calls": "14817",
+              "output_only_calls": "1",
+              "output_only_converged_calls": "1",
+              "output_only_iters": "5",
+              "output_only_solve_s": "0.024316858000020147",
+              "output_only_igr_s": "0.02804257800002663",
+              "total_iters": "49175",
+              "avg_iters": "3.3185990012147388",
+              "max_iters": "5",
+              "avg_solve_iter_s": "0.0055423959306151478",
+              "avg_krylov_operator_apply_count": "5.3185315157241195",
+              "avg_krylov_preconditioner_apply_count": "3.3185990012147388",
+              "avg_krylov_preconditioner_operator_apply_count": "0",
+              "krylov_operator_apply_count_per_iter": "1.6026436197254703",
+              "krylov_preconditioner_apply_count_per_iter": "1",
+              "krylov_preconditioner_operator_apply_count_per_iter": "0",
+              "avg_assemble_s": "0.0046454659352814179",
+              "avg_form_s": "0.00097513480861114137",
+              "avg_pc_setup_s": "0.00026119749784046835",
+              "avg_solve_s": "0.018392989599676061",
+              "total_assemble_s": "68.836514229000045",
+              "total_form_s": "14.449547593999894",
+              "total_pc_setup_s": "3.8704245230000605",
+              "total_cheb_diag_s": "0",
+              "total_cheb_setup_s": "0",
+              "total_cheb_eigen_reuses": "0",
+              "total_cheb_smoother_reuses": "0",
+              "total_cheb_smoother_builds": "0",
+              "total_krylov_operator_apply_s": "0",
+              "total_krylov_preconditioner_apply_s": "0",
+              "total_krylov_preconditioner_operator_apply_s": "0",
+              "total_krylov_operator_apply_count": "78810",
+              "total_krylov_preconditioner_apply_count": "49175",
+              "total_krylov_preconditioner_operator_apply_count": "0",
+              "total_solve_s": "272.54731988799989",
+              "total_igr_s": "359.7038062339999",
+              "total_update_s": "366.94975764500145",
+              "solve_pct": "30.418739475146573",
+              "total_igr_pct": "40.146189566446758",
+              "solve_pct_stage": "74.273742987908051",
+              "total_igr_pct_stage": "98.025355989467229",
+              "last_solver": "fgmres-cuda-fp64",
+              "last_precond": "tensor-spectral-tf32",
+              "last_cheb_diag_s": "0",
+              "last_cheb_setup_s": "0",
+              "last_cheb_eigen_reused": "0",
+              "last_cheb_smoother_reused": "0",
+              "last_cheb_eigen_estimate": "0",
+              "last_krylov_operator_apply_s": "0",
+              "last_krylov_preconditioner_apply_s": "0",
+              "last_krylov_preconditioner_operator_apply_s": "0",
+              "last_krylov_operator_apply_count": "7",
+              "last_krylov_preconditioner_apply_count": "5",
+              "last_krylov_preconditioner_operator_apply_count": "0",
+              "direct_identity_system": "1",
+              "direct_identity_reason": "active",
+              "direct_identity_uses": "14818",
+              "exact_face_requested": "1",
+              "exact_face_effective": "1",
+              "exact_face_reason": "active",
+              "exact_face_local_nf": "523264",
+              "exact_face_shared_nf": "0",
+              "exact_face_operator_uses": "14818",
+              "exact_face_last_mult_calls": "1"
+            },
+            "closure": {
+              "event": "accepted-state",
+              "scope": "final-committed-accepted-state",
+              "precision": "fp64",
+              "time": "0.10000000000000001",
+              "state_generation": "14817",
+              "solved": "1",
+              "supported": "1",
+              "certified": "1",
+              "residual_rel_rhs": "2.8228554080321248e-07",
+              "run_success": "1",
+              "residual_abs": "2.6211760420038969e-15",
+              "relative_limit": "9.9999999999999995e-07",
+              "absolute_limit": "0",
+              "skipped_nonfinite": "0",
+              "q_sigma_admitted": "1",
+              "q_sigma_nonpositive_samples": "0",
+              "q_sigma_nonfinite_samples": "0"
+            },
+            "dispatch": {
+              "sigma": {
+                "basis": "lgl",
+                "order": "5",
+                "representation": "equivalent-L2-space"
+              },
+              "sigma_gather": {
+                "mode": "exact-nodal-gather",
+                "rows": "9437184",
+                "scalar_dofs": "36",
+                "shared_faces": "dense"
+              },
+              "euler": {
+                "enabled": "1",
+                "precision": "fp64",
+                "contraction": "simt",
+                "elements": "262144",
+                "order": "5",
+                "llf_volume": "0",
+                "unique_face_flux": "1",
+                "packed_output": "1"
+              },
+              "production": {
+                "selected": "mfem-native-packed",
+                "strict": "1",
+                "backend": "cuda",
+                "lvec_mode": "P-x-PT",
+                "volume_dissipation": "none",
+                "llf_volume_active": "0",
+                "frozen_sigma_spectral_speed": "0",
+                "order": "5",
+                "dim": "2"
+              },
+              "face": {
+                "event": "face-density-path",
+                "arithmetic": "cuda",
+                "scope": "local-interior-faces",
+                "geometry_cache": "per-solver"
+              },
+              "volume": {
+                "event": "setup",
+                "execution": "simt",
+                "precision": "fp64",
+                "d1d": "6",
+                "mass_q1d": "6",
+                "diffusion_q1d": "6",
+                "elements": "262144",
+                "geometry": "per-quadrature",
+                "coefficient_policy": "current-stage",
+                "quadrature": "original-separate",
+                "local_true": "identity",
+                "faces": "external",
+                "collocated_requested": "0",
+                "collocated_enabled": "0",
+                "collocated_reason": "not-requested",
+                "storage_requested": "cached",
+                "storage": "cached",
+                "storage_reason": "cached-requested",
+                "geometry_layout": "padded",
+                "mass_geometry_shared": "0",
+                "diffusion_geometry_shared": "0",
+                "owned_geometry_bytes": "536870912",
+                "owned_coefficient_bytes": "536870912",
+                "owned_bytes": "1111493632",
+                "kernel": "fused-one-warp-per-element",
+                "fallback": "none"
+              },
+              "krylov": {
+                "backend": "cuda-fp64",
+                "method": "fgmres",
+                "restart": "50",
+                "residual-scale": "rhs",
+                "orthogonalization": "ordered-mgs",
+                "final-gate": "fp64-true-residual",
+                "convergence-read": "each-iteration",
+                "workspace": "cached"
+              },
+              "preconditioner": {
+                "event": "setup",
+                "precision": "tf32",
+                "operator": "spectral",
+                "cycle": "global-reference-inverse",
+                "coarse_execution": "none",
+                "elements": "262144",
+                "n": "9437184",
+                "cells_x": "512",
+                "cells_y": "512",
+                "topology": "natural-boundary-cartesian",
+                "reference_classes": "9",
+                "matrix_rows": "3072",
+                "matrix_columns": "3072",
+                "operator_probes": "324",
+                "colors": "9",
+                "basis_bytes": "75497472",
+                "field_workspace_bytes": "113246208",
+                "eigen_workspace_bound_bytes": "494118424",
+                "shared_symmetry_rel": "2.4322432e-16",
+                "separable_reference_rel": "2.1796346e-15",
+                "eigen_residual": "1.5554494e-15",
+                "eigen_orthogonality": "5.4109922e-15",
+                "screen_mass": "0.00094607379",
+                "spectral_mean": "0.54588458",
+                "raw_eigen_min": "0.00094607379",
+                "raw_eigen_max": "3.47597",
+                "screen_roundoff_tolerance": "7.9763224e-10",
+                "inverse_floor": "screen-mass-roundoff-only",
+                "clipped_eigenvalues": "0",
+                "basis_setup": "fp64-cusolver-dsyevd",
+                "basis_orthogonal_check_gemms": "2",
+                "gemms_per_application": "4",
+                "gemm_compute": "tf32-explicit",
+                "low_low_term": "not-applicable",
+                "nodal_transform": "tensor-fp64-6x6",
+                "nodal_transform_requested": "1",
+                "nodal_transform_fallback": "none",
+                "nodal_matrix_proof_rel": "0",
+                "alpha": "inherited-fine",
+                "acceptance": "original-current-fp64",
+                "fallback": "none",
+                "tensor_execution": "requires-profile-proof",
+                "setup_seconds": "3.4543847"
+              }
+            },
+            "scan_policy_evidence": "CLI off flags plus frozen-source registered off/on parity test; host-sync counters do not establish zero scans, and CFL/explicit admission checks remain algorithmic."
+          },
+          "telemetry_summary": {
+            "host_max_gap_s": 0.11320323497056961,
+            "host_gaps_over_1_5_s": 0,
+            "process_gpu_uuids": [
+              "GPU-6e95f486-4224-1fe4-bba2-c6c5ef04553f"
+            ],
+            "process_peak_gpu_mib": 19212,
+            "gpu_memory_sample_count": 981,
+            "samples": 987,
+            "errors": [],
+            "all_sampler_threads_stopped": true
+          },
+          "clocks": {
+            "sm_clock_MHz": {
+              "samples": 987,
+              "minimum": 345.0,
+              "median": 1980.0,
+              "maximum": 1980.0
+            },
+            "memory_clock_MHz": {
+              "samples": 987,
+              "minimum": 2619.0,
+              "median": 2619.0,
+              "maximum": 2619.0
+            },
+            "power_W": {
+              "samples": 987,
+              "minimum": 87.25,
+              "median": 363.58,
+              "maximum": 472.33
+            },
+            "temperature_C": {
+              "samples": 987,
+              "minimum": 21.0,
+              "median": 36.0,
+              "maximum": 40.0
+            }
+          }
+        },
+        "candidate": {
+          "application_wall_seconds": 687.7384422740433,
+          "audit": {
+            "certificate_payload_sha256": "4d7a7cfa9b10efcb26238187321f2f76766ac01c999369f73aaf51d94f487c74",
+            "volume_summary": {
+              "event": "summary",
+              "execution": "simt",
+              "coefficient_refreshes": "14818",
+              "submitted_applications": "78810",
+              "collocated_requested": "0",
+              "collocated_enabled": "0",
+              "collocated_reason": "not-requested",
+              "storage": "cached",
+              "precision": "fp64",
+              "fallback": "none"
+            },
+            "status": "passed",
+            "target_time": 0.1,
+            "accepted_steps": 4939,
+            "rejected_attempts": 0,
+            "rhs_evaluations": 14818,
+            "linear_calls": 14818,
+            "certificate_count": 14818,
+            "initial_anchor_certificate_log_omitted": false,
+            "initial_anchor_iterations_proven": null,
+            "initial_anchor_logging_policy": null,
+            "outer_iterations": 49175,
+            "maximum_rhs_residual": 9.9979699e-07,
+            "native_done_seconds": 609.998284028,
+            "explicit_summary": {
+              "event": "run-summary",
+              "steps": "4939",
+              "final_time": "0.10000000000000001",
+              "cfl_control_enabled": "1",
+              "cfl_safety_factor": "0.29999999999999999",
+              "ssp_coefficient": "1",
+              "ssp_scaled_cfl_factor": "0.29999999999999999",
+              "nominal_global_courant": "0.027272727272727271",
+              "rhs_evaluations": "14818",
+              "accepted_attempts": "4939",
+              "rejected_attempts": "0",
+              "rejected_limiter_elements": "0",
+              "rejected_q_sigma_attempts": "0",
+              "rejected_q_sigma_nonpositive_samples": "0",
+              "rejected_q_sigma_nonfinite_samples": "0",
+              "last_q_sigma_rejection_reason": "none",
+              "last_q_sigma_rejection_stage": "-1",
+              "minimum_attempted_dt": "3.8540597717545699e-06",
+              "maximum_attempted_dt": "2.1134790544403307e-05",
+              "minimum_accepted_dt": "3.8540597717545699e-06",
+              "maximum_accepted_dt": "2.1134790544403307e-05",
+              "maximum_accepted_step_growth_ratio": "5.2756321100465664",
+              "characteristic_speed_probes": "4940",
+              "minimum_characteristic_speed": "2.5201158552701575",
+              "maximum_characteristic_speed": "2.6950108295685391",
+              "dt_min_reached": "0",
+              "success": "1",
+              "termination_reason": "target-reached"
+            },
+            "linear_summary": {
+              "event": "run-summary",
+              "calls": "14818",
+              "converged_calls": "14818",
+              "production_calls": "14817",
+              "production_converged_calls": "14817",
+              "output_only_calls": "1",
+              "output_only_converged_calls": "1",
+              "output_only_iters": "5",
+              "output_only_solve_s": "0.024490979999995943",
+              "output_only_igr_s": "0.028258049999999812",
+              "total_iters": "49175",
+              "avg_iters": "3.3185990012147388",
+              "max_iters": "5",
+              "avg_solve_iter_s": "0.005611541373157075",
+              "avg_krylov_operator_apply_count": "5.3185315157241195",
+              "avg_krylov_preconditioner_apply_count": "3.3185990012147388",
+              "avg_krylov_preconditioner_operator_apply_count": "0",
+              "krylov_operator_apply_count_per_iter": "1.6026436197254703",
+              "krylov_preconditioner_apply_count_per_iter": "1",
+              "krylov_preconditioner_operator_apply_count_per_iter": "0",
+              "avg_assemble_s": "0.0045866729301525192",
+              "avg_form_s": "0.00093991405115399155",
+              "avg_pc_setup_s": "0.00024508289796195163",
+              "avg_solve_s": "0.018622455596234253",
+              "total_assemble_s": "67.96531947900003",
+              "total_form_s": "13.927646409999847",
+              "total_pc_setup_s": "3.6316383820001992",
+              "total_cheb_diag_s": "0",
+              "total_cheb_setup_s": "0",
+              "total_cheb_eigen_reuses": "0",
+              "total_cheb_smoother_reuses": "0",
+              "total_cheb_smoother_builds": "0",
+              "total_krylov_operator_apply_s": "0",
+              "total_krylov_preconditioner_apply_s": "0",
+              "total_krylov_preconditioner_operator_apply_s": "0",
+              "total_krylov_operator_apply_count": "78810",
+              "total_krylov_preconditioner_apply_count": "49175",
+              "total_krylov_preconditioner_operator_apply_count": "0",
+              "total_solve_s": "275.94754702499915",
+              "total_igr_s": "361.47215129599925",
+              "total_update_s": "368.67291491599963",
+              "solve_pct": "45.237430046988905",
+              "total_igr_pct": "59.257896417198296",
+              "solve_pct_stage": "74.848879822883788",
+              "total_igr_pct_stage": "98.046842247242111",
+              "last_solver": "fgmres-cuda-fp64",
+              "last_precond": "tensor-spectral-tf32",
+              "last_cheb_diag_s": "0",
+              "last_cheb_setup_s": "0",
+              "last_cheb_eigen_reused": "0",
+              "last_cheb_smoother_reused": "0",
+              "last_cheb_eigen_estimate": "0",
+              "last_krylov_operator_apply_s": "0",
+              "last_krylov_preconditioner_apply_s": "0",
+              "last_krylov_preconditioner_operator_apply_s": "0",
+              "last_krylov_operator_apply_count": "7",
+              "last_krylov_preconditioner_apply_count": "5",
+              "last_krylov_preconditioner_operator_apply_count": "0",
+              "direct_identity_system": "1",
+              "direct_identity_reason": "active",
+              "direct_identity_uses": "14818",
+              "exact_face_requested": "1",
+              "exact_face_effective": "1",
+              "exact_face_reason": "active",
+              "exact_face_local_nf": "523264",
+              "exact_face_shared_nf": "0",
+              "exact_face_operator_uses": "14818",
+              "exact_face_last_mult_calls": "1"
+            },
+            "closure": {
+              "event": "accepted-state",
+              "scope": "final-committed-accepted-state",
+              "precision": "fp64",
+              "time": "0.10000000000000001",
+              "state_generation": "14817",
+              "solved": "1",
+              "supported": "1",
+              "certified": "1",
+              "residual_rel_rhs": "2.8228554080321248e-07",
+              "run_success": "1",
+              "residual_abs": "2.6211760420038969e-15",
+              "relative_limit": "9.9999999999999995e-07",
+              "absolute_limit": "0",
+              "skipped_nonfinite": "0",
+              "q_sigma_admitted": "1",
+              "q_sigma_nonpositive_samples": "0",
+              "q_sigma_nonfinite_samples": "0"
+            },
+            "dispatch": {
+              "sigma": {
+                "basis": "lgl",
+                "order": "5",
+                "representation": "equivalent-L2-space"
+              },
+              "sigma_gather": {
+                "mode": "exact-nodal-gather",
+                "rows": "9437184",
+                "scalar_dofs": "36",
+                "shared_faces": "dense"
+              },
+              "euler": {
+                "enabled": "1",
+                "precision": "fp64",
+                "contraction": "simt",
+                "elements": "262144",
+                "order": "5",
+                "llf_volume": "0",
+                "unique_face_flux": "1",
+                "packed_output": "1"
+              },
+              "production": {
+                "selected": "mfem-native-packed",
+                "strict": "1",
+                "backend": "cuda",
+                "lvec_mode": "P-x-PT",
+                "volume_dissipation": "none",
+                "llf_volume_active": "0",
+                "frozen_sigma_spectral_speed": "0",
+                "order": "5",
+                "dim": "2"
+              },
+              "face": {
+                "event": "face-density-path",
+                "arithmetic": "cuda",
+                "scope": "local-interior-faces",
+                "geometry_cache": "per-solver"
+              },
+              "volume": {
+                "event": "setup",
+                "execution": "simt",
+                "precision": "fp64",
+                "d1d": "6",
+                "mass_q1d": "6",
+                "diffusion_q1d": "6",
+                "elements": "262144",
+                "geometry": "per-quadrature",
+                "coefficient_policy": "current-stage",
+                "quadrature": "original-separate",
+                "local_true": "identity",
+                "faces": "external",
+                "collocated_requested": "0",
+                "collocated_enabled": "0",
+                "collocated_reason": "not-requested",
+                "storage_requested": "cached",
+                "storage": "cached",
+                "storage_reason": "cached-requested",
+                "geometry_layout": "padded",
+                "mass_geometry_shared": "0",
+                "diffusion_geometry_shared": "0",
+                "owned_geometry_bytes": "536870912",
+                "owned_coefficient_bytes": "536870912",
+                "owned_bytes": "1111493632",
+                "kernel": "fused-one-warp-per-element",
+                "fallback": "none"
+              },
+              "krylov": {
+                "backend": "cuda-fp64",
+                "method": "fgmres",
+                "restart": "50",
+                "residual-scale": "rhs",
+                "orthogonalization": "ordered-mgs",
+                "final-gate": "fp64-true-residual",
+                "convergence-read": "each-iteration",
+                "workspace": "cached"
+              },
+              "preconditioner": {
+                "event": "setup",
+                "precision": "tf32",
+                "operator": "spectral",
+                "cycle": "global-reference-inverse",
+                "coarse_execution": "none",
+                "elements": "262144",
+                "n": "9437184",
+                "cells_x": "512",
+                "cells_y": "512",
+                "topology": "natural-boundary-cartesian",
+                "reference_classes": "9",
+                "matrix_rows": "3072",
+                "matrix_columns": "3072",
+                "operator_probes": "324",
+                "colors": "9",
+                "basis_bytes": "75497472",
+                "field_workspace_bytes": "113246208",
+                "eigen_workspace_bound_bytes": "494118424",
+                "shared_symmetry_rel": "2.4322432e-16",
+                "separable_reference_rel": "2.1796346e-15",
+                "eigen_residual": "1.5554494e-15",
+                "eigen_orthogonality": "5.4109922e-15",
+                "screen_mass": "0.00094607379",
+                "spectral_mean": "0.54588458",
+                "raw_eigen_min": "0.00094607379",
+                "raw_eigen_max": "3.47597",
+                "screen_roundoff_tolerance": "7.9763224e-10",
+                "inverse_floor": "screen-mass-roundoff-only",
+                "clipped_eigenvalues": "0",
+                "basis_setup": "fp64-cusolver-dsyevd",
+                "basis_orthogonal_check_gemms": "2",
+                "gemms_per_application": "4",
+                "gemm_compute": "tf32-explicit",
+                "low_low_term": "not-applicable",
+                "nodal_transform": "tensor-fp64-6x6",
+                "nodal_transform_requested": "1",
+                "nodal_transform_fallback": "none",
+                "nodal_matrix_proof_rel": "0",
+                "alpha": "inherited-fine",
+                "acceptance": "original-current-fp64",
+                "fallback": "none",
+                "tensor_execution": "requires-profile-proof",
+                "setup_seconds": "3.2648906"
+              }
+            },
+            "scan_policy_evidence": "CLI off flags plus frozen-source registered off/on parity test; host-sync counters do not establish zero scans, and CFL/explicit admission checks remain algorithmic."
+          },
+          "telemetry_summary": {
+            "host_max_gap_s": 0.10671209503198043,
+            "host_gaps_over_1_5_s": 0,
+            "process_gpu_uuids": [
+              "GPU-6e95f486-4224-1fe4-bba2-c6c5ef04553f"
+            ],
+            "process_peak_gpu_mib": 19212,
+            "gpu_memory_sample_count": 686,
+            "samples": 688,
+            "errors": [],
+            "all_sampler_threads_stopped": true
+          },
+          "clocks": {
+            "sm_clock_MHz": {
+              "samples": 688,
+              "minimum": 345.0,
+              "median": 1965.0,
+              "maximum": 1980.0
+            },
+            "memory_clock_MHz": {
+              "samples": 688,
+              "minimum": 2619.0,
+              "median": 2619.0,
+              "maximum": 2619.0
+            },
+            "power_W": {
+              "samples": 688,
+              "minimum": 88.18,
+              "median": 527.77,
+              "maximum": 540.16
+            },
+            "temperature_C": {
+              "samples": 688,
+              "minimum": 22.0,
+              "median": 45.0,
+              "maximum": 48.0
+            }
+          }
+        }
+      },
+      "fixed_order": true,
+      "confidence_interval": null,
+      "application_speedup": 1.4347548385928692,
+      "application_time_reduction_percent": 30.301681297639217,
+      "measurement_limits": [
+        "One baseline-first sequential pair on one GPU with unlocked clocks; no repeat-based confidence interval.",
+        "Both arms use TF32 spectral preconditioning and identical FP64 DGSEM/IGR settings; only binaries/output paths differ.",
+        "One-second memory/clock samples may miss shorter peaks; host heartbeats are external timing context.",
+        "Native maximum microbenchmarks measure reductions only; they are not whole-case speedups."
+      ]
+    },
+    "timing_comparisons": {
+      "process": {
+        "baseline_seconds": 986.7360577390064,
+        "candidate_seconds": 687.7384422740433,
+        "speedup": 1.4347548385928692,
+        "time_reduction_percent": 30.301681297639217
+      },
+      "native_done": {
+        "baseline_seconds": 895.984924394,
+        "candidate_seconds": 609.998284028,
+        "speedup": 1.468831876833399,
+        "time_reduction_percent": 31.91868887296595
+      },
+      "predefined_vtk_free_aggregate": {
+        "baseline_seconds": 339.78366299999993,
+        "candidate_seconds": 203.184035,
+        "speedup": 1.672295084601504,
+        "time_reduction_percent": 40.201941080375
+      }
+    },
+    "fixed_windows": [
+      {
+        "start_step": 1000,
+        "end_step": 1500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 64.614589,
+          "candidate_seconds": 36.62508799999999,
+          "speedup": 1.7642166211313952,
+          "time_reduction_percent": 43.31761825491145
+        },
+        "work": {
+          "equal_work_required": true,
+          "interpretation": "CFL reduction changes preserve exact numerical work. Duplicate/missing solve IDs, RK metadata, iteration or certificate payload differences withhold timing comparisons; they never select substitute windows or rescale measured times.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "identical_certificate_payloads": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 0,
+          "identical_iteration_work": true,
+          "baseline_total_iterations": 4296,
+          "candidate_total_iterations": 4296
+        }
+      },
+      {
+        "start_step": 2000,
+        "end_step": 2500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 65.32009299999999,
+          "candidate_seconds": 37.36834099999999,
+          "speedup": 1.7480062334049031,
+          "time_reduction_percent": 42.79196601878691
+        },
+        "work": {
+          "equal_work_required": true,
+          "interpretation": "CFL reduction changes preserve exact numerical work. Duplicate/missing solve IDs, RK metadata, iteration or certificate payload differences withhold timing comparisons; they never select substitute windows or rescale measured times.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "identical_certificate_payloads": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 0,
+          "identical_iteration_work": true,
+          "baseline_total_iterations": 4500,
+          "candidate_total_iterations": 4500
+        }
+      },
+      {
+        "start_step": 3000,
+        "end_step": 3500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 68.69719299999997,
+          "candidate_seconds": 40.82772399999999,
+          "speedup": 1.682611379463621,
+          "time_reduction_percent": 40.568570247113286
+        },
+        "work": {
+          "equal_work_required": true,
+          "interpretation": "CFL reduction changes preserve exact numerical work. Duplicate/missing solve IDs, RK metadata, iteration or certificate payload differences withhold timing comparisons; they never select substitute windows or rescale measured times.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "identical_certificate_payloads": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 0,
+          "identical_iteration_work": true,
+          "baseline_total_iterations": 5466,
+          "candidate_total_iterations": 5466
+        }
+      },
+      {
+        "start_step": 4000,
+        "end_step": 4500,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 74.368604,
+          "candidate_seconds": 45.17328299999997,
+          "speedup": 1.6462961968028769,
+          "time_reduction_percent": 39.25758912995063
+        },
+        "work": {
+          "equal_work_required": true,
+          "interpretation": "CFL reduction changes preserve exact numerical work. Duplicate/missing solve IDs, RK metadata, iteration or certificate payload differences withhold timing comparisons; they never select substitute windows or rescale measured times.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "identical_certificate_payloads": true,
+          "common_solve_count": 1500,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 0,
+          "identical_iteration_work": true,
+          "baseline_total_iterations": 6604,
+          "candidate_total_iterations": 6604
+        }
+      },
+      {
+        "start_step": 4500,
+        "end_step": 4939,
+        "both_vtk_free": true,
+        "timing": {
+          "baseline_seconds": 66.783184,
+          "candidate_seconds": 43.189599000000044,
+          "speedup": 1.546279325260694,
+          "time_reduction_percent": 35.3286315309554
+        },
+        "work": {
+          "equal_work_required": true,
+          "interpretation": "CFL reduction changes preserve exact numerical work. Duplicate/missing solve IDs, RK metadata, iteration or certificate payload differences withhold timing comparisons; they never select substitute windows or rescale measured times.",
+          "unique_ids": true,
+          "identical_solve_id_sets": true,
+          "identical_certificate_payloads": true,
+          "common_solve_count": 1317,
+          "rk_metadata_mismatch_count": 0,
+          "iteration_mismatch_count": 0,
+          "identical_iteration_work": true,
+          "baseline_total_iterations": 6585,
+          "candidate_total_iterations": 6585
+        }
+      }
+    ],
+    "cost_per_conserved_dof_step": {
+      "baseline": {
+        "conserved_dofs": 37748736,
+        "steps": 4939,
+        "process_ns_per_conserved_dof_step": 5.292484057375789,
+        "native_ns_per_conserved_dof_step": 4.805728837831284
+      },
+      "candidate": {
+        "conserved_dofs": 37748736,
+        "steps": 4939,
+        "process_ns_per_conserved_dof_step": 3.6887724055814126,
+        "native_ns_per_conserved_dof_step": 3.271803202005514
+      }
+    },
+    "fields": {
+      "selections": {
+        "baseline": {
+          "target_time": 0.1,
+          "stored_point_fields": [
+            "density",
+            "energy",
+            "momentum",
+            "pressure",
+            "sigma",
+            "velocity"
+          ],
+          "files": [
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/baseline/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface.pvd",
+              "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff",
+              "bytes": 640
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/baseline/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/data.pvtu",
+              "sha256": "0a3cf936171aff744826c96a2f4d96d2d6f10bb0e25304b2b20347c07b519a10",
+              "bytes": 1305
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/baseline/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+              "sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948",
+              "bytes": 1160775042
+            }
+          ],
+          "complete_native_vtu_sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948",
+          "full_polynomial_comparison_source": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/baseline/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+          "hashed_after_both_timings": true
+        },
+        "candidate": {
+          "target_time": 0.1,
+          "stored_point_fields": [
+            "density",
+            "energy",
+            "momentum",
+            "pressure",
+            "sigma",
+            "velocity"
+          ],
+          "files": [
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/candidate/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface.pvd",
+              "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff",
+              "bytes": 640
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/candidate/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/data.pvtu",
+              "sha256": "0a3cf936171aff744826c96a2f4d96d2d6f10bb0e25304b2b20347c07b519a10",
+              "bytes": 1305
+            },
+            {
+              "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/candidate/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+              "sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948",
+              "bytes": 1160775042
+            }
+          ],
+          "complete_native_vtu_sha256": "8959b8153f4b004e96faea77b389f7725db5f94e8edc8257cbb5800b88953948",
+          "full_polynomial_comparison_source": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/full-3430887/candidate/vtk/sedov_taylor_blast_p_5_ref_4_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+          "hashed_after_both_timings": true
+        }
+      },
+      "complete_native_vtu_bytes_identical": true,
+      "after_both_measurements": true
+    }
+  },
+  "profile": {
+    "schema": "igr-dgsem-cfl-hardware-v1",
+    "job": "3431084",
+    "status": "capture-completed",
+    "postprocessing_status": "completed",
+    "source_commit": "2363d0727b979a3241abfd5177d2c3c226c32c24",
+    "binary_sha256": "86c0cd82810ef6d002785cc3d065627081c9ec57ca0661438300e2e727157c50",
+    "node": "gh007",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-170bd4bd-7ee7-10c9-f627-f1bd79608ef2",
+      "inherited_cuda_visible_devices": "0"
+    },
+    "trace_seconds": 15.005384480000002,
+    "recorded_kernel_count": 78987,
+    "summed_recorded_kernel_seconds": 14.041576465,
+    "kernel_activity_union_seconds": 14.041576465,
+    "complete_rk_step_count": 197,
+    "no_observed_output_analysis_overlap": true,
+    "unconditional_output_free_claim": false,
+    "native_target_counts": {
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp": 3571,
+      "InteriorFaceDGDiffusionTensorLiftGather2D": 3571,
+      "ToSpectralTensorKernel<float>": 1786,
+      "FromSpectralTensorKernel<float>": 1785,
+      "IGRFusedTensorVolumeKernel": 2976,
+      "IGRTensorVolumeRefreshKernel": 596,
+      "sm90_xmma_gemm_": 7143,
+      "FusedEulerResidualKernel": 596,
+      "DeterministicMaximumPartialsKernel": 1192,
+      "DeterministicMaximumFinalizeKernel": 1192
+    },
+    "maximum_configurations": [
+      {
+        "name": "mfem::dgsem::<unnamed>::DeterministicMaximumPartialsKernel(const double *, unsigned int, double *)",
+        "grid": [
+          1024,
+          1,
+          1
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "static_shared": 2048,
+        "dynamic_shared": 0,
+        "calls": 1192,
+        "summed_seconds": 0.023462496000000003
+      },
+      {
+        "name": "mfem::dgsem::<unnamed>::DeterministicMaximumFinalizeKernel(const double *, unsigned int, const double *, unsigned int, double *)",
+        "grid": [
+          1,
+          1,
+          1
+        ],
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "static_shared": 2048,
+        "dynamic_shared": 0,
+        "calls": 1192,
+        "summed_seconds": 0.002439104
+      }
+    ],
+    "old_single_block_maximum_recorded_calls": 0,
+    "groups": [
+      {
+        "group": "CFL partial and final maxima",
+        "calls": 2384,
+        "recorded_kernel_seconds": 0.025901600000000004,
+        "share_of_recorded_kernel_duration_percent": 0.18446361820243098,
+        "kernel_names": [
+          "mfem::dgsem::<unnamed>::DeterministicMaximumPartialsKernel(const double *, unsigned int, double *)",
+          "mfem::dgsem::<unnamed>::DeterministicMaximumFinalizeKernel(const double *, unsigned int, const double *, unsigned int, double *)"
+        ]
+      },
+      {
+        "group": "IGR generic volume and refresh",
+        "calls": 3572,
+        "recorded_kernel_seconds": 2.774022049,
+        "share_of_recorded_kernel_duration_percent": 19.755773548038007,
+        "kernel_names": [
+          "void igrlab::igr_internal::<unnamed>::IGRFusedTensorVolumeKernel<(bool)0>(int, int, int, int, const int *, const double *, const double *, const double *, const double *, double *)",
+          "igrlab::igr_internal::<unnamed>::IGRTensorVolumeRefreshKernel(int, int, int, const double *, const double *, const double *, const double *, double *, double *)"
+        ]
+      },
+      {
+        "group": "IGR compact face record and gather",
+        "calls": 7142,
+        "recorded_kernel_seconds": 2.367748088,
+        "share_of_recorded_kernel_duration_percent": 16.86240924515736,
+        "kernel_names": [
+          "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp>(int, T1)",
+          "void mfem::CuKernel1D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftGather2D>(int, T1)"
+        ]
+      },
+      {
+        "group": "TF32 spectral GEMMs",
+        "calls": 7143,
+        "recorded_kernel_seconds": 1.5253743050000002,
+        "share_of_recorded_kernel_duration_percent": 10.863269582316093,
+        "kernel_names": [
+          "sm90_xmma_gemm_f32f32_tf32f32_f32_nn_n_tilesize128x128x32_warpgroupsize1x1x1_execute_segment_k_on_kernel__5x_cublas",
+          "sm90_xmma_gemm_f32f32_tf32f32_f32_nt_n_tilesize128x256x32_warpgroupsize2x1x1_execute_segment_k_on_kernel__5x_cublas",
+          "sm90_xmma_gemm_f32f32_tf32f32_f32_tn_n_tilesize128x128x32_warpgroupsize1x1x1_execute_segment_k_off_kernel__5x_cublas"
+        ]
+      },
+      {
+        "group": "FP64 tensor nodal maps",
+        "calls": 3571,
+        "recorded_kernel_seconds": 0.5766661430000001,
+        "share_of_recorded_kernel_duration_percent": 4.106847578243061,
+        "kernel_names": [
+          "void igrlab::igr_internal::spectral_nodal_detail::ToSpectralTensorKernel<float>(int, int, const int *, const int *, const igrlab::igr_internal::spectral_nodal_detail::FactorPacket *, const double *, const int *, T1 *)",
+          "void igrlab::igr_internal::spectral_nodal_detail::FromSpectralTensorKernel<float>(int, int, const int *, const int *, const igrlab::igr_internal::spectral_nodal_detail::FactorPacket *, const T1 *, const int *, double, double *)"
+        ]
+      },
+      {
+        "group": "DGSEM fused Euler residual",
+        "calls": 596,
+        "recorded_kernel_seconds": 0.809258401,
+        "share_of_recorded_kernel_duration_percent": 5.763301599483189,
+        "kernel_names": [
+          "void mfem::dgsem::<unnamed>::FusedEulerResidualKernel<(int)6, (bool)0, (bool)0>(mfem::dgsem::<unnamed>::FusedResidualData)"
+        ]
+      },
+      {
+        "group": "IGR derivatives",
+        "calls": 596,
+        "recorded_kernel_seconds": 0.847301308,
+        "share_of_recorded_kernel_duration_percent": 6.034232054441901,
+        "kernel_names": [
+          "void mfem::CuKernel2D<void mfem::internal::quadrature_interpolator::Derivatives2D<(mfem::QVectorLayout)1, (bool)1, (int)0, (int)0, (int)0, (int)1>(int, const double *, const double *, const double *, const double *, double *, int, int, int, int)::[lambda(int) (instance 1)]>(int, T1)"
+        ]
+      },
+      {
+        "group": "IGR face density projection",
+        "calls": 596,
+        "recorded_kernel_seconds": 0.8313771820000001,
+        "share_of_recorded_kernel_duration_percent": 5.920825087356031,
+        "kernel_names": [
+          "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceSideDensityProjection2D>(int, T1)"
+        ]
+      },
+      {
+        "group": "State value interpolation",
+        "calls": 596,
+        "recorded_kernel_seconds": 0.385845023,
+        "share_of_recorded_kernel_duration_percent": 2.747875382523867,
+        "kernel_names": [
+          "void mfem::CuKernel2D<void mfem::internal::quadrature_interpolator::Values2D<(mfem::QVectorLayout)1, (int)0, (int)0, (int)0, (int)1>(int, const double *, const double *, double *, int, int, int)::[lambda(int) (instance 1)]>(int, T1)"
+        ]
+      },
+      {
+        "group": "Other kernels",
+        "recorded_kernel_seconds": 3.898082366,
+        "share_of_recorded_kernel_duration_percent": 27.761002304238065
+      }
+    ],
+    "observed_certificates": {
+      "count": 4356,
+      "last_certificate": {
+        "event": "independent-residual-certificate",
+        "solve_call": "4356",
+        "rk_step": "1451",
+        "rk_stage": "2",
+        "iterations": "3",
+        "reason": "tensor-pipeline",
+        "start": "1",
+        "factor": "1",
+        "relative_limit": "1e-06",
+        "absolute_limit": "0",
+        "true_residual_rel_rhs": "6.9927953e-08",
+        "true_residual_rel_initial": "nan",
+        "residual_replacement_retries": "0",
+        "passed": "1"
+      },
+      "maximum_true_residual_rel_rhs": 9.9961929e-07,
+      "all_observed_passed": true,
+      "scope": "All emitted certificates in retained stdout; a deliberately interrupted solve may have no certificate."
+    },
+    "possible_event_loss": true,
+    "diagnostic_events": [
+      {
+        "timestamp": -204719336096,
+        "timestampType": 1,
+        "source": 2,
+        "severity": 1,
+        "text": "Process was launched by the profiler, see /projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021/nsys-tmp-3431084/nvidia/nsight_systems/quadd_session_10325846/streams/pid_325855_stdout.log and stderr.log for program output",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203886872544,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Common injection library initialized successfully.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203839857792,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "OS runtime libraries injection initialized successfully.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203806490080,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Common injection library initialized successfully.",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": -203802753856,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "OS runtime libraries injection initialized successfully.",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": -203271820256,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203236415552,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Loaded CUPTI library: /opt/nvidia/hpc_sdk/Linux_aarch64/25.5/profilers/Nsight_Systems/target-linux-sbsa-armv8/libcupti-sbsa.so.12.9",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203236411552,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 2,
+        "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203211629632,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Enabling trace for device graph launch",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -203211616320,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "CUDA injection initialized successfully.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": -202761611616,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "NVTX injection initialized successfully.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 0,
+        "timestampType": 1,
+        "source": 3,
+        "severity": 1,
+        "text": "Profiling has started.",
+        "globalPid": -144115188075855872
+      },
+      {
+        "timestamp": 1101596056,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+        "globalPid": -144115188075855872
+      },
+      {
+        "timestamp": 1101637239,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all NVTX events might have been collected.",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": 1101639191,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "No NVTX events collected. Does the process use NVTX?",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": 1101640439,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all NVTX events might have been collected.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 1101641494,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of NVTX events collected: \t34697.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 1101644022,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "CUDA profiling might have not been started correctly.",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": 1101644790,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "No CUDA events collected. Does the process use CUDA?",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": 1101645494,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all CUDA events might have been collected.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 1101646102,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of CUDA events collected: \t300462.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 1101647574,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all OS runtime libraries events might have been collected.",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": 1101648470,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of OS runtime libraries events collected: \t7.",
+        "globalPid": 286942017093632
+      },
+      {
+        "timestamp": 1101649206,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 2,
+        "text": "Not all OS runtime libraries events might have been collected.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 1101649942,
+        "timestampType": 2,
+        "source": 3,
+        "severity": 1,
+        "text": "Number of OS runtime libraries events collected: \t916.",
+        "globalPid": 286941916430336
+      },
+      {
+        "timestamp": 15005384480,
+        "timestampType": 1,
+        "source": 3,
+        "severity": 1,
+        "text": "Profiling has stopped.",
+        "globalPid": -144115188075855872
+      },
+      {
+        "timestamp": 15017183360,
+        "timestampType": 1,
+        "source": 1,
+        "severity": 1,
+        "text": "Number of CUPTI events produced: \t301794, CUPTI buffers: 49 of 50. Some CUPTI events might be missing. To make sure all the events are collected, let the application run until it quits, and make sure cudaDeviceReset() is called before exit. Try using the \"Flush data periodically\" checkbox in CUDA trace options.",
+        "globalPid": 286941916430336
+      }
+    ],
+    "previous_profile_context": {
+      "job": "3430740",
+      "node": "gh014",
+      "old_maximum_recorded_kernel_share_percent": 44.70719190913616,
+      "new_share_percent": 0.18446361820243098,
+      "same_gpu_comparison": false,
+      "application_speedup_inferred": false
+    },
+    "scope": "Recorded kernel durations/routes from a bounded evolved candidate trace; not complete event counts, hardware throughput or whole-application speedup. Different native capture lengths in physical steps and possible CUPTI/NVTX loss limit cross-capture comparisons.",
+    "evidence_sha256": {
+      "run.json": "54806d97a742c915ac80a94617de11ca97407789e12f288ba9550142801d3963",
+      "kernel-census.json": "dee571e575411c1db6f52850083c7410781e463c9fba4104e4836e084075babd",
+      "capture.nsys-rep": "591183d36f56001a854324c11631ed4d71b2c168264ef75540da7451b1c9b905",
+      "capture.sqlite": "16847eefb6214747f027718ab5ce4ef9a8fdfce1b9dd9e6c2530dcf3fd0085a7"
+    },
+    "independent_review": {
+      "reviewer": "phase2_igr_face_audit",
+      "decision": "accepted",
+      "method": "Raw SQLite/census/report/input hash checks and CUDA-runtime correlation to complete DG/Mult scopes; no new GPU execution.",
+      "complete_dg_mult_scopes_with_expected_four_maximum_launches": 595,
+      "unmatched_complete_scopes": 0,
+      "maximum_launches_outside_complete_scopes": 4,
+      "call_order_for_role_assignment": [
+        "nodal partials",
+        "nodal finalize",
+        "face partials",
+        "face finalize"
+      ],
+      "nodal_partial_plus_final_mean_us": 31.8495731,
+      "nodal_partial_plus_final_median_us": 31.776,
+      "face_partial_plus_final_mean_us": 11.6087395,
+      "face_partial_plus_final_median_us": 11.52,
+      "excludes_scalar_transfers_and_synchronization": true,
+      "all_4356_stdout_certificates_pass": true,
+      "partial_tf32_set_at_capture_end_confirmed": true
+    }
+  },
+  "review": {
+    "source": "Parent independent review of production/test implementation; production author independently reviewed test oracle/timing.",
+    "measurement": "phase2_euler_audit independently parsed logs and verified receipt/hash bindings, fixed windows and exact numerical work; passed.",
+    "profile_helper": "phase2_euler_audit independently reviewed bounded capture and qualification gates; passed.",
+    "hardware": "phase2_igr_face_audit independently checked raw SQLite/configurations, receipt/report hashes and launch correlation; accepted.",
+    "final_report": "phase2_profile_harness independently checked report arithmetic, receipt bindings, field equality and profile limitations; accepted. Minor wording clarified that no host-wide pauses were observed."
+  },
+  "evidence": {
+    "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dgsem-cfl-20261021",
+    "local_cache": "/home/jarias9/.cache/igrlab-experiments/igr-dgsem-cfl-20261021",
+    "sha256": {
+      "source-manifest.json": "85677d98bca0a0f5e58a32fea6f531d947a0403605a6620c3b4e0ac28c4aad92",
+      "case-spec.json": "944b6144d55ad18fed8b94adbf34075b120074374537ed0add7c82a99c05f76d",
+      "native-config.json": "da49aa23c844947f07456cd5b6075fdaf5cb027914816901e01667ff6b94a004",
+      "native-3430873/run.json": "485a85c67d7b000daf26a986b4cb8eebce3850bb3f4c939e4d51a00b01a8cf1c",
+      "native-3430873/maximum-benchmark.stdout.log": "b22cbf02a83b06f78579b723be6b0defa61b906a8d1a9ee6a673879ee456029c",
+      "full-3430887/comparison.json": "87490d6887e280b8331cd6d3217fbaf72e6ec566ed3171fa73c15ecd855ec25c",
+      "full-3430887/pair-run.json": "eed7b4720caf9d180ea063ecd83a85c3cfa5cea60b2b4aeaedfbb6400ec28cde",
+      "full-3430887/final-fields.json": "2bf142200ad8b3022d4a6d151cb551718729b0f9f3502f3c2fe8bd109a30a8db",
+      "full-3430887/offline-analysis.json": "47f2e59aca92e417e9eaeabe65ad0c92bee0ee5d4ccbdda7f9e99d3a9cb5a91a",
+      "run-pair.py": "2fa01bf22009000b20ec10a03fed3b340aad86b58354045f4479d923475ab93e",
+      "common.py": "3de9d99bfa4831cfe4eedcf0d063d5d9f51c934c5468e75532395a18d9b41f30",
+      "analyze-cfl-pair.py": "766ab0d72746414ab86c89789117c3cb925aa4ae157706d119f32065ae718f71",
+      "profile-nsys.py": "703e69d1040267f191d8a576f1faedbd53209f5548da91b48d52d991dc8d8922",
+      "nsys-3431084/hardware-summary.json": "1f34f30aa8d11f8d451ccf4c87902fb5d447e25a4b599b50745c5abcc33b32e7",
+      "nsys-3431084/run.json": "54806d97a742c915ac80a94617de11ca97407789e12f288ba9550142801d3963",
+      "nsys-3431084/kernel-census.json": "dee571e575411c1db6f52850083c7410781e463c9fba4104e4836e084075babd"
+    }
+  },
+  "limits": [
+    "One baseline-first sequential pair on one GPU with unlocked clocks; no repeat-based confidence interval.",
+    "Both arms use TF32 spectral preconditioning and identical FP64 DGSEM/IGR settings; only binaries/output paths differ.",
+    "One-second memory/clock samples may miss shorter peaks; host heartbeats are external timing context.",
+    "Native maximum microbenchmarks measure reductions only; they are not whole-case speedups."
+  ]
+}
