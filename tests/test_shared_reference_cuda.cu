@@ -586,9 +586,11 @@ void DGConservativeFusionStressOracle(bool permuted, int order = 5,
                     std::isinf(a[i]) == std::isinf(b[i]),
                   "Fusion changed per-cell nonfinite classification: " << label << " phase=" << phase);
       if (std::isfinite(b[i]))
+      {
         MFEM_VERIFY(std::memcmp(a+i,b+i,sizeof(double)) == 0,
                     "Fusion changed buffered FP64 result bits: " << label << " phase=" << phase
                     << " coefficient=" << i);
+      }
       else
       {
         ++nonfinite;
