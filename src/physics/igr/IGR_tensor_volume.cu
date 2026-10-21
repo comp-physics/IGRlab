@@ -1,4 +1,5 @@
 #include "IGR_tensor_volume.hpp"
+#include "utils/config/env_flags.hpp"
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <algorithm>
@@ -128,6 +129,127 @@ __global__ void IGRFusedTensorVolumeKernel(
   }
 }
 
+// Admission proves that both interpolation maps are diagonal, not that they
+// equal the identity. Retain each actual diagonal multiply at its original
+// forward/transpose stage. Only the four derivative contractions remain dense.
+template <int D>
+__global__ void IGRFusedCollocatedTensorVolumeKernel(
+  int ne, const int* dof_map, const double* maps, const double* mass,
+  const double* diffusion, const double* x, double* y)
+{
+  constexpr int points = D*D;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int e = blockIdx.x * warps + warp;
+  __shared__ double g[points], bm[D], bd[D];
+  __shared__ double u[warps][points], fx[warps][points], fy[warps][points];
+  for (int i = threadIdx.x; i < points; i += blockDim.x)
+  {
+    g[i] = maps[4*tile_size + i%D + side*(i/D)];
+  }
+  if (threadIdx.x < D)
+  {
+    const int i = threadIdx.x;
+    bm[i] = maps[i + side*i];
+    bd[i] = maps[2*tile_size + i + side*i];
+  }
+  // Every warp must participate before a partial final CTA can return.
+  __syncthreads();
+  if (e >= ne) { return; }
+  for (int i = lane; i < points; i += 32)
+  {
+    const int index = dof_map[e*points+i];
+    u[warp][i] = index >= 0 ? x[index] : -x[-1-index];
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int r = i%D, c = i/D;
+    double gx = 0.0, gy = 0.0;
+#pragma unroll
+    for (int k = 0; k < D; ++k)
+    {
+      gx += g[r+D*k] * u[warp][k+D*c];
+      const double by = bd[r] * u[warp][r+D*k];
+      gy += by * g[c+D*k];
+    }
+    gx *= bd[c];
+    const double* metric = diffusion + e*3*tile_size + r + side*c;
+    fx[warp][i] = metric[0]*gx + metric[tile_size]*gy;
+    fy[warp][i] = metric[tile_size]*gx + metric[2*tile_size]*gy;
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int r = i%D, c = i/D;
+    double dx = 0.0, dy = 0.0;
+#pragma unroll
+    for (int k = 0; k < D; ++k)
+    {
+      dx += g[k+D*r] * fx[warp][k+D*c];
+      const double by = bd[r] * fy[warp][r+D*k];
+      dy += by * g[k+D*c];
+    }
+    dx *= bd[c];
+    double value = bm[r] * u[warp][i];
+    value *= bm[c];
+    value *= mass[e*tile_size+r+side*c];
+    value = bm[r] * value;
+    value *= bm[c];
+    value += dx + dy;
+    const int index = dof_map[e*points+i];
+    if (index >= 0) { y[index] = value; }
+    else { y[-1-index] = -value; }
+  }
+}
+
+// Instantiate compact shared-memory fields for every admitted D1D.
+template <int D = 1>
+void LaunchCollocatedTensorVolumeKernel(
+  int d, int ne, const int* dof_map, const double* maps, const double* mass,
+  const double* diffusion, const double* x, double* y)
+{
+  if (d == D)
+  {
+    IGRFusedCollocatedTensorVolumeKernel<D><<<(ne+warps-1)/warps,32*warps>>>(
+      ne,dof_map,maps,mass,diffusion,x,y);
+  }
+  else if constexpr (D < side)
+  {
+    LaunchCollocatedTensorVolumeKernel<D+1>(d,ne,dof_map,maps,mass,diffusion,x,y);
+  }
+  else
+  {
+    MFEM_ABORT("Invalid collocated IGR tensor volume D1D.");
+  }
+}
+
+const char* CollocatedMapRejection(const mfem::DofToQuad& map, int d)
+{
+  const int entries = d*d;
+  if (map.B.Size() != entries || map.Bt.Size() != entries ||
+      map.G.Size() != entries || map.Gt.Size() != entries)
+  {
+    return "map-size";
+  }
+  const double* b = map.B.HostRead(); const double* bt = map.Bt.HostRead();
+  const double* g = map.G.HostRead(); const double* gt = map.Gt.HostRead();
+  for (int j = 0; j < d; ++j) for (int i = 0; i < d; ++i)
+  {
+    const int forward = i+d*j, transpose = j+d*i;
+    if (!std::isfinite(b[forward]) || !std::isfinite(bt[transpose]) ||
+        !std::isfinite(g[forward]) || !std::isfinite(gt[transpose]))
+    {
+      return "nonfinite-map";
+    }
+    if (i != j && b[forward] != 0.0) { return "nonzero-b-offdiagonal"; }
+    if (b[forward] != bt[transpose] || g[forward] != gt[transpose])
+    {
+      return "transpose-mismatch";
+    }
+  }
+  return nullptr;
+}
+
 __global__ void IGRTensorVolumeRefreshKernel(
   int ne, int qm, int qd, const double* mass_geometry,
   const double* diffusion_geometry, const double* invrho, const double* ck,
@@ -185,6 +307,8 @@ public:
                        const mfem::QuadratureFunction& ck,
                        const std::string& execution)
     : mfem::Operator(fes.GetVSize()), fes_(fes), execution_(execution),
+      collocated_requested_(::igrlab::EnvFlagEnabledDefault(
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED", false)),
       mass_space_(&CheckQF(invrho, fes)), diffusion_space_(&CheckQF(ck, fes))
   {
     static_assert(sizeof(mfem::real_t) == sizeof(double), "FP64 MFEM required");
@@ -259,7 +383,12 @@ public:
               << " diffusion_q1d=" << qd_ << " elements=" << ne_
               << " geometry=per-quadrature coefficient_policy=current-stage"
               << " quadrature=original-separate local_true=identity faces=external"
-              << " kernel=fused-one-warp-per-element fallback=none" << std::endl;
+              << " collocated_requested=" << int(collocated_requested_)
+              << " collocated_enabled=" << int(collocated_enabled_)
+              << " collocated_reason=" << collocated_reason_
+              << " kernel=" << (collocated_enabled_ ? "collocated-simt-one-warp-per-element" :
+                                                    "fused-one-warp-per-element")
+              << " fallback=none" << std::endl;
   }
 
   void Refresh(const mfem::QuadratureFunction& invrho, const mfem::QuadratureFunction& ck)
@@ -287,6 +416,11 @@ public:
       IGRFusedTensorVolumeKernel<true><<<(ne_+warps-1)/warps,32*warps>>>(
         ne_,d_,qm_,qd_,dof_map_.Read(),maps_.Read(),mass_.Read(),diffusion_.Read(),input,output);
     }
+    else if (collocated_enabled_)
+    {
+      LaunchCollocatedTensorVolumeKernel(
+        d_,ne_,dof_map_.Read(),maps_.Read(),mass_.Read(),diffusion_.Read(),input,output);
+    }
     else
     {
       IGRFusedTensorVolumeKernel<false><<<(ne_+warps-1)/warps,32*warps>>>(
@@ -301,6 +435,9 @@ public:
   {
     std::cout << "[igr-tensor-volume] event=summary execution=" << execution_
               << " coefficient_refreshes=" << refreshes_ << " submitted_applications=" << applications_
+              << " collocated_requested=" << int(collocated_requested_)
+              << " collocated_enabled=" << int(collocated_enabled_)
+              << " collocated_reason=" << collocated_reason_
               << " precision=fp64 fallback=none" << std::endl;
   }
 
@@ -320,6 +457,18 @@ private:
     const auto& diff = fe.GetDofToQuad(diffusion_space_->GetIntRule(0), mfem::DofToQuad::TENSOR);
     MFEM_VERIFY(mass.ndof == d_ && diff.ndof == d_ && mass.nqpt == qm_ && diff.nqpt == qd_,
                 "IGR tensor basis/quadrature mismatch.");
+    if (collocated_requested_)
+    {
+      if (execution_ != "simt") { collocated_reason_ = "execution-not-simt"; }
+      else if (d_ != qm_ || d_ != qd_) { collocated_reason_ = "unequal-d1d-q1d"; }
+      else
+      {
+        const char* reason = CollocatedMapRejection(mass, d_);
+        if (!reason) { reason = CollocatedMapRejection(diff, d_); }
+        collocated_enabled_ = !reason;
+        collocated_reason_ = reason ? reason : "admitted";
+      }
+    }
     maps_.SetSize(6*tile_size); maps_ = 0.0; double* out = maps_.HostReadWrite();
     auto store = [&](const mfem::Array<mfem::real_t>& values, int q, int block)
     {
@@ -372,6 +521,9 @@ private:
   }
   mfem::ParFiniteElementSpace& fes_;
   const std::string execution_;
+  const bool collocated_requested_;
+  bool collocated_enabled_=false;
+  const char* collocated_reason_="not-requested";
   const mfem::QuadratureSpace *mass_space_, *diffusion_space_;
   int ne_=0,d_=0,qm_=0,qd_=0;
   long space_sequence_=0,mesh_sequence_=0,nodes_sequence_=0;
