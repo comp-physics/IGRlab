@@ -2340,9 +2340,13 @@ void ComponentSumsDevice(const DenseMatrix& values, Vector& sums)
                });
 }
 
-#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
 namespace
 {
+constexpr int kMaximumReductionSingleBlockLimit = 4096;
+constexpr int kMaximumReductionItemsPerBlock = 1024;
+constexpr int kMaximumReductionMaxBlocks = 1024;
+
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
 constexpr int kMaximumReductionThreads = 256;
 
 __global__ void DeterministicMaximumKernel(const real_t* value,
@@ -2384,8 +2388,86 @@ __global__ void DeterministicMaximumKernel(const real_t* value,
     result[0] = current;
   }
 }
-} // namespace
+
+__global__ void DeterministicMaximumPartialsKernel(const real_t* value,
+                                                   unsigned int size,
+                                                   real_t* result)
+{
+  __shared__ real_t partial[kMaximumReductionThreads];
+  real_t current = 0.0;
+  const unsigned int stride = blockDim.x * gridDim.x;
+  // The bounded grid and an int-sized vector keep the last unsigned stride
+  // below UINT_MAX, even for the largest supported Vector length.
+  for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < size; i += stride)
+  {
+    current = fmax(current, value[i]);
+  }
+  partial[threadIdx.x] = current;
+  __syncthreads();
+  for (int offset = kMaximumReductionThreads / 2; offset > 0; offset /= 2)
+  {
+    if (threadIdx.x < offset)
+    {
+      partial[threadIdx.x] =
+        fmax(partial[threadIdx.x], partial[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { result[blockIdx.x] = partial[0]; }
+}
+
+__global__ void DeterministicMaximumFinalizeKernel(const real_t* partials,
+                                                   unsigned int count,
+                                                   const real_t* value,
+                                                   unsigned int size,
+                                                   real_t* result)
+{
+  __shared__ real_t partial[kMaximumReductionThreads];
+  real_t current = 0.0;
+  for (unsigned int i = threadIdx.x; i < count; i += blockDim.x)
+  {
+    current = fmax(current, partials[i]);
+  }
+  partial[threadIdx.x] = current;
+  __syncthreads();
+  for (int offset = kMaximumReductionThreads / 2; offset > 0; offset /= 2)
+  {
+    if (threadIdx.x < offset)
+    {
+      partial[threadIdx.x] =
+        fmax(partial[threadIdx.x], partial[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+  {
+    current = partial[0];
+    // Positive maxima, including +Inf, are independent of partition/order.
+    // A zero result must retain the original full-array signed-zero order;
+    // replaying only the partial maxima would not preserve that contract.
+    if (current == 0.0)
+    {
+      current = 0.0;
+      for (unsigned int i = 0; i < size; ++i)
+      {
+        current = fmax(current, value[i]);
+      }
+    }
+    result[0] = current;
+  }
+}
 #endif
+} // namespace
+
+int DeterministicMaximumWorkspaceSize(int value_count)
+{
+  MFEM_VERIFY(value_count >= 0, "Maximum input length must be nonnegative.");
+  if (value_count <= kMaximumReductionSingleBlockLimit) { return 0; }
+  // Subtract before the ceiling division so INT_MAX cannot overflow.
+  const int blocks = 1 + (value_count - 1) / kMaximumReductionItemsPerBlock;
+  return blocks < kMaximumReductionMaxBlocks ? blocks : kMaximumReductionMaxBlocks;
+}
 
 void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
 {
@@ -2416,6 +2498,39 @@ void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
                  }
                  result[0] = current;
                });
+}
+
+void DeterministicMaximumDevice(const Vector& values,
+                                Vector& maximum,
+                                Vector& workspace)
+{
+  MFEM_VERIFY(&values != &maximum && &values != &workspace &&
+                &maximum != &workspace,
+              "Maximum input, output and workspace must be distinct vectors.");
+  const int blocks = DeterministicMaximumWorkspaceSize(values.Size());
+  MFEM_VERIFY(workspace.Size() >= blocks,
+              "Maximum workspace must be prepared for the input length.");
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  if (blocks > 0 && Device::Allows(Backend::CUDA) &&
+      !Device::Allows(Backend::RAJA_CUDA))
+  {
+    if (maximum.Size() != 1) { maximum.SetSize(1); }
+    maximum.UseDevice(true);
+    workspace.UseDevice(true);
+    const real_t* value = values.Read();
+    real_t* partials = workspace.Write();
+    real_t* result = maximum.Write();
+    DeterministicMaximumPartialsKernel<<<blocks, kMaximumReductionThreads>>>(
+      value, static_cast<unsigned int>(values.Size()), partials);
+    MFEM_GPU_CHECK(cudaGetLastError());
+    DeterministicMaximumFinalizeKernel<<<1, kMaximumReductionThreads>>>(
+      partials, static_cast<unsigned int>(blocks), value,
+      static_cast<unsigned int>(values.Size()), result);
+    MFEM_GPU_CHECK(cudaGetLastError());
+    return;
+  }
+#endif
+  DeterministicMaximumDevice(values, maximum);
 }
 
 } // namespace dgsem

@@ -1050,11 +1050,14 @@ real_t ReducePackedCharacteristicSpeed(
   const Vector& face_speeds,
   Vector& nodal_maximum,
   Vector& face_maximum,
+  Vector& maximum_workspace,
   std::int64_t& host_synchronizations,
   std::int64_t& mpi_reductions)
 {
-  DeterministicMaximumDevice(nodal_speeds, nodal_maximum);
-  DeterministicMaximumDevice(face_speeds, face_maximum);
+  // Default-stream ordering lets both reductions reuse one retained scratch
+  // vector while their distinct scalar outputs remain live for HostRead().
+  DeterministicMaximumDevice(nodal_speeds, nodal_maximum, maximum_workspace);
+  DeterministicMaximumDevice(face_speeds, face_maximum, maximum_workspace);
 
   ++host_synchronizations;
   const real_t nodal_max = nodal_maximum.HostRead()[0];
@@ -1184,6 +1187,7 @@ struct DGSEMProductionCache
   DenseMatrix strong;
   Vector nodal_max;
   Vector face_max;
+  Vector maximum_workspace;
   Array<double> state_scan_slots;
   Array<double> state_scan_result;
   Vector empty_face_neighbor;
@@ -1319,6 +1323,13 @@ void PrepareOverintegratedVolume(DGSEMProductionCache& c,
   c.volume_quadrature_sigma.SetSize(qrows);c.volume_quadrature_sigma.UseDevice(true);
   c.volume_quadrature_speeds.SetSize(qrows);c.volume_quadrature_speeds.UseDevice(true);
   c.volume_quadrature_max.SetSize(1);c.volume_quadrature_max.UseDevice(true);
+  const int maximum_workspace_size=DeterministicMaximumWorkspaceSize(qrows);
+  if(c.maximum_workspace.Size()<maximum_workspace_size)
+  {
+    c.maximum_workspace.SetSize(maximum_workspace_size);
+    c.maximum_workspace.UseDevice(true);
+    c.maximum_workspace=0.0;
+  }
   c.overintegration_order=requested;c.overintegration_nodes_sequence=mesh->GetNodesSequence();
   c.workspace_evidence=DGSEMProductionWorkspaceEvidence{};
   std::cout<<"[dgsem-overintegrated-volume] enabled=1 precision=fp64 elements="<<c.ne
@@ -1375,6 +1386,7 @@ DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   AppendMatrixWorkspace(cache.strong, evidence);
   AppendVectorWorkspace(cache.nodal_max, evidence);
   AppendVectorWorkspace(cache.face_max, evidence);
+  AppendVectorWorkspace(cache.maximum_workspace, evidence);
   evidence.size_signature = HashCombine(
     evidence.size_signature,
     static_cast<std::uint64_t>(cache.state_scan_slots.Size()));
@@ -3230,6 +3242,10 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.strong.SetSize(c.rows, c.equations);
     c.nodal_max.SetSize(1);
     c.face_max.SetSize(1);
+    c.maximum_workspace.SetSize(DeterministicMaximumWorkspaceSize(
+      std::max({c.rows,nfaces,c.volume_quadrature_speeds.Size()})));
+    c.maximum_workspace.UseDevice(true);
+    c.maximum_workspace=0.0;
     c.state_scan_slots.SetSize(kDGSEMDeviceStateScanWorkspaceSize);
     c.state_scan_result.SetSize(6);
     c.empty_face_neighbor.SetSize(0);
@@ -3609,6 +3625,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
         c.face_speeds,
         c.nodal_max,
         c.face_max,
+        c.maximum_workspace,
         c.counters.host_synchronizations,
         c.counters.mpi_reductions);
       if(overintegrated_volume)
@@ -3618,7 +3635,8 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
           c.volume_quadrature_sigma,c.volume_quadrature_speeds,c.frozen_sigma_spectral_speed);
         result.max_characteristic_speed=std::max(result.max_characteristic_speed,
           ReducePackedCharacteristicSpeed(context,c.volume_quadrature_speeds,c.face_speeds,
-            c.volume_quadrature_max,c.face_max,c.counters.host_synchronizations,c.counters.mpi_reductions));
+            c.volume_quadrature_max,c.face_max,c.maximum_workspace,
+            c.counters.host_synchronizations,c.counters.mpi_reductions));
       }
     }
     result.executed = true;
@@ -3830,13 +3848,14 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     c.face_speeds,
     c.nodal_max,
     c.face_max,
+    c.maximum_workspace,
     c.counters.host_synchronizations,
     c.counters.mpi_reductions);
 
   if(overintegrated_volume)
     max_speed=std::max(max_speed,ReducePackedCharacteristicSpeed(
       context,c.volume_quadrature_speeds,c.face_speeds,c.volume_quadrature_max,
-      c.face_max,c.counters.host_synchronizations,c.counters.mpi_reductions));
+      c.face_max,c.maximum_workspace,c.counters.host_synchronizations,c.counters.mpi_reductions));
 
   // This is the first write to the caller-owned output in the whole stage.
   ScatterElementStateDevice(c.ne,
