@@ -670,23 +670,11 @@ public:
       detail::ReportCudaSetupFailure(evidence.rank, "numerics-initialize");
       return false;
     }
-    const bool residual_policy_bound = numerics_.CollectiveContinue(
-        numerics_.PublicationResidualPolicyMatches(
-            publication_local_solve_, publication_accuracy_,
-            publication_true_residual_limit_));
-    if (!residual_policy_bound)
-    {
-      evidence.status = CudaRunStatus::setup_failure;
-      evidence.setup_origin = FailureReason::collective_protocol;
-      detail::ReportCudaSetupFailure(evidence.rank, "residual-policy-binding");
-      return false;
-    }
     StateCoordinates initial{};
     initial.dt = 0.0;
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
                       initial, numerics_.Resources(), 0,
-                      CollectivePolicy(communicator_),
-                      publication_true_residual_limit_);
+                      CollectivePolicy(communicator_));
     if (contract_->status() != RunStatus::ready)
     {
       evidence.status = CudaRunStatus::setup_failure;
@@ -1356,8 +1344,7 @@ public:
     StateCoordinates initial{};
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
                       initial, numerics_.Resources(), restored_frontier,
-                      CollectivePolicy(communicator_),
-                      publication_true_residual_limit_);
+                      CollectivePolicy(communicator_));
     const RestoreOutcome restored =
         contract_->Restore(checkpoint.descriptor, loaded);
     if (!restored.restored)
@@ -1365,8 +1352,7 @@ public:
       contract_.reset();
       contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
                         initial, numerics_.Resources(), 0,
-                        CollectivePolicy(communicator_),
-                        publication_true_residual_limit_);
+                        CollectivePolicy(communicator_));
       next_attempt_sequence_ = 0;
     }
     else if (!numerics_.AdoptPreparedCandidateMetadata(loaded))
@@ -1469,8 +1455,7 @@ public:
     StateCoordinates initial{};
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
                       initial, numerics_.Resources(), restored_frontier,
-                      CollectivePolicy(communicator_),
-                      publication_true_residual_limit_);
+                      CollectivePolicy(communicator_));
     const RestoreOutcome restored =
         contract_->Restore(metadata.descriptor, loaded);
     if (!restored.restored)
@@ -1478,8 +1463,7 @@ public:
       contract_.reset();
       contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
                         initial, numerics_.Resources(), 0,
-                        CollectivePolicy(communicator_),
-                        publication_true_residual_limit_);
+                        CollectivePolicy(communicator_));
       next_attempt_sequence_ = 0;
     }
     else if (!numerics_.AdoptPreparedCandidateMetadata(loaded))
@@ -2097,17 +2081,6 @@ private:
     AppendConfigValue(descriptor, cursor, complete, trace_policy_.rank_count);
     AppendConfigValue(
         descriptor, cursor, complete, trace_policy_.polynomial_order);
-    // The opt-in physical residual limit is part of collective configuration,
-    // not an unreported relaxation at publication. Preserve strict descriptor
-    // bytes, including its zero-initialized suffix. Numerical setup still owns
-    // complete mode/rank/time/precision admission before a contract exists.
-    if (publication_accuracy_ != detail::CudaCoupledAccuracyKind::strict)
-    {
-      AppendConfigValue(descriptor, cursor, complete, publication_local_solve_);
-      AppendConfigValue(descriptor, cursor, complete, publication_accuracy_);
-      AppendConfigValue(descriptor, cursor, complete,
-                        publication_true_residual_limit_);
-    }
     return complete;
   }
 
@@ -2756,15 +2729,6 @@ private:
 
   CudaConfig config_{};
   CudaTracePolicyDescriptor trace_policy_{};
-  // Freeze the opt-in declaration once. The collective descriptor and every
-  // contract incarnation use exactly this limit; admitted numerics must match.
-  const detail::CudaLocalSolveKind publication_local_solve_ =
-      detail::SelectedCudaLocalSolve();
-  const detail::CudaCoupledAccuracyKind publication_accuracy_ =
-      detail::SelectedCudaCoupledAccuracy();
-  const double publication_true_residual_limit_ =
-      detail::CudaCoupledAcceptanceTolerance(
-          publication_accuracy_, contract_type::true_relative_residual_limit);
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};

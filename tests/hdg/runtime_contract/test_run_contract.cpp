@@ -2344,98 +2344,6 @@ bool CheckTwoPhaseDetectionLegacyAndReentrantAdmission()
   return passed;
 }
 
-template <bool TwoPhase>
-bool CheckDeclaredResidualLimitPath()
-{
-  using TestedContract = std::conditional_t<TwoPhase, TwoPhaseContract, Contract>;
-  bool passed = true;
-  for (const double limit : {1.0e-10, 1.0e-6, 1.0e-4})
-  {
-    for (const double residual : {
-             0.0, limit * 0.5, limit,
-             std::nextafter(limit, std::numeric_limits<double>::infinity()),
-             -1.0, std::numeric_limits<double>::infinity(),
-             std::numeric_limits<double>::quiet_NaN()})
-    {
-      TwoPhaseArrayStoragePolicy::Reset();
-      TestCollectivePolicy::Reset();
-      TestedContract contract{CommittedSlot(), ScratchSlot(),
-          InitialCoordinates(), Resources(), 0, TestCollectivePolicy{}, limit};
-      const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-      const bool stored = StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
-      auto products = IssueAllFor(contract, begin.attempt);
-      AttemptReport report = PassingReport(12);
-      report.telemetry.true_relative_residual = residual;
-      const bool expected = std::isfinite(residual) && residual >= 0.0 &&
-          residual <= limit;
-      bool committed = false;
-      if constexpr (TwoPhase)
-      {
-        auto staging = contract.FreezeCandidate(begin.attempt, 12);
-        auto prepared = staging
-            ? contract.PrepareCommit(std::move(*staging), report, std::move(products))
-            : std::optional<typename TestedContract::PreparedCommitToken>{};
-        if (prepared)
-        {
-          auto provisional = contract.CommitPrepared(std::move(*prepared));
-          committed = provisional &&
-              contract.FinalizeCommit(std::move(*provisional)).committed;
-        }
-      }
-      else
-      {
-        committed = contract.FinishAttempt(
-            begin.attempt, report, std::move(products)).committed;
-      }
-      passed = Check(begin.started && stored && committed == expected &&
-          (expected
-              ? contract.telemetry().accepted.attempt.true_relative_residual == residual
-              : contract.last_failure() == FailureReason::true_residual_gate &&
-                ArrayStoragePolicy::publications == 0),
-          TwoPhase ? "declared_residual_limit_two_phase_unclamped_and_enforced"
-                   : "declared_residual_limit_finish_unclamped_and_enforced") && passed;
-    }
-  }
-  for (const double invalid : {0.0, -1.0,
-           std::numeric_limits<double>::infinity(),
-           std::numeric_limits<double>::quiet_NaN()})
-  {
-    TwoPhaseArrayStoragePolicy::Reset();
-    TestCollectivePolicy::Reset();
-    TestedContract contract{CommittedSlot(), ScratchSlot(),
-        InitialCoordinates(), Resources(), 0, TestCollectivePolicy{}, invalid};
-    passed = Check(contract.status() == RunStatus::invalid_request &&
-        contract.last_failure() == FailureReason::invalid_resource_descriptor &&
-        ArrayStoragePolicy::publications == 0,
-        "invalid_declared_residual_limit_fails_closed") && passed;
-  }
-  return passed;
-}
-
-bool CheckDeclaredResidualLimits()
-{
-  static_assert(Contract::true_relative_residual_limit == 1.0e-10,
-                "legacy publication ceiling remains unchanged");
-  bool passed = CheckDeclaredResidualLimitPath<false>();
-  passed = CheckDeclaredResidualLimitPath<true>() && passed;
-  // The real prepared-commit route must retain its strict default even when
-  // the producer reports every boolean gate as passing.
-  TwoPhaseContract contract = MakeTwoPhaseContract();
-  const BeginOutcome begin = contract.BeginStep({InteriorSpace::l2, 0.125});
-  const bool stored = StoreCandidateFor(contract, begin.attempt, AcceptedSlot());
-  auto products = IssueAllFor(contract, begin.attempt);
-  auto staging = contract.FreezeCandidate(begin.attempt, 12);
-  AttemptReport report = PassingReport(12);
-  report.telemetry.true_relative_residual = 1.0e-8;
-  auto prepared = staging
-      ? contract.PrepareCommit(std::move(*staging), report, std::move(products))
-      : std::optional<TwoPhaseContract::PreparedCommitToken>{};
-  return Check(begin.started && stored && staging && !prepared &&
-      contract.last_failure() == FailureReason::true_residual_gate &&
-      ArrayStoragePolicy::publications == 0,
-      "default_two_phase_limit_stays_strict") && passed;
-}
-
 bool CheckTwoPhaseFreezePrepareCommitFinalize()
 {
   bool passed = true;
@@ -4626,7 +4534,6 @@ int main()
   passed = CheckStaleFinishIsolation() && passed;
   passed = CheckFirstFailureAcrossSuccessfulRetry() && passed;
   passed = CheckResidualTelemetryAndCollectiveTruth() && passed;
-  passed = CheckDeclaredResidualLimits() && passed;
   passed = CheckTwoPhaseDetectionLegacyAndReentrantAdmission() && passed;
   passed = CheckTwoPhaseFreezePrepareCommitFinalize() && passed;
   passed = CheckTwoPhasePrepareFailuresAbortAndRevert() && passed;

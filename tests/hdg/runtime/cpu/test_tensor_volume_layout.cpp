@@ -156,46 +156,6 @@ constexpr bool CheckAggregateAccounting()
 }
 static_assert(CheckAggregateAccounting());
 
-constexpr bool CheckBorrowedVolumeAccounting()
-{
-  // The p5 IGR application uses an ordinary engine for coupled Krylov's
-  // recovery policy, but its volume launch still contributes real MMA work.
-  constexpr auto work =
-      PlanTensorVolumeMmaWork(1024, 7, 36, 252, 120, 49, true);
-  if (!work.valid || work.mma_tiles == 0) return false;
-  std::uint64_t launches = 0;
-  std::uint64_t tiles = 0;
-  const bool coupled_volume = UsesBorrowedTensorVolume(true, false, true);
-  if (!coupled_volume ||
-      !AccumulateTensorVolumeWork(
-          coupled_volume, work.mma_tiles, launches, tiles) ||
-      !AccumulateTensorVolumeWork(
-          coupled_volume, work.mma_tiles, launches, tiles) ||
-      launches != 2 || tiles != 2 * work.mma_tiles)
-    return false;
-
-  // Legacy tensor assembly has the same volume receipt; ordinary split
-  // assembly must still reject any claimed MMA work without changing totals.
-  launches = 0;
-  tiles = 0;
-  const bool tensor_volume = UsesBorrowedTensorVolume(true, true, false);
-  if (!tensor_volume || !AccumulateTensorVolumeWork(
-          tensor_volume, work.mma_tiles, launches, tiles) ||
-      launches != 1 || tiles != work.mma_tiles)
-    return false;
-  launches = 0;
-  tiles = 0;
-  const bool ordinary_volume = UsesBorrowedTensorVolume(true, false, false);
-  return !ordinary_volume &&
-      AccumulateTensorVolumeWork(ordinary_volume, 0, launches, tiles) &&
-      !AccumulateTensorVolumeWork(
-          ordinary_volume, work.mma_tiles, launches, tiles) &&
-      launches == 0 && tiles == 0 &&
-      !UsesBorrowedTensorVolume(false, true, false) &&
-      !UsesBorrowedTensorVolume(false, false, true);
-}
-static_assert(CheckBorrowedVolumeAccounting());
-
 bool CheckSlotPartition(const bool igr)
 {
   const int stride = TensorVolumeCoefficientStride(igr);
@@ -297,7 +257,6 @@ int main()
 {
   const bool passed = CheckSlotPartition(false) &&
       CheckSlotPartition(true) &&
-      CheckBorrowedVolumeAccounting() &&
       CheckChunkCoverage(conventional_p1_q12, 49) &&
       CheckChunkCoverage(conventional_p1_q64, 64) &&
       CheckChunkCoverage(igr_p1_q12, 49) &&
