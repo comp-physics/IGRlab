@@ -17,6 +17,18 @@ namespace igrlab
 {
 namespace shared_reference
 {
+namespace
+{
+// Frozen source variants qualify launch width and shared-field padding without
+// adding runtime policy or changing the conservative map's numerical contract.
+constexpr int kDGConservativeFusionThreads = 128;
+constexpr int kDGConservativeFusionSharedPitch = 72;
+static_assert(kDGConservativeFusionThreads == 64 || kDGConservativeFusionThreads == 128,
+              "Conservative fusion tuning supports 64 or 128 threads.");
+static_assert(kDGConservativeFusionSharedPitch == 72 || kDGConservativeFusionSharedPitch == 73,
+              "Conservative fusion tuning supports shared pitch 72 or 73.");
+}
+
 Precision RequestedPrecision()
 {
   const char* value = ::igrlab::GetEnv("DG_IGR_SHARED_OPERATOR_PRECISION");
@@ -143,21 +155,25 @@ __global__ void DGSharedConservativeFusionP5FP32Kernel(
   double* residual)
 {
   constexpr int n = 6, dof = n*n, equations = 4, rows = 2*dof;
+  constexpr int pitch = kDGConservativeFusionSharedPitch;
   const int e = blockIdx.x, lane = threadIdx.x;
-  __shared__ double centered[equations*rows], output[equations*dof];
+  __shared__ double centered[equations*pitch], output[equations*dof];
   __shared__ double anchors[2*equations], correction[equations];
   for (int entry = lane; entry < equations*rows; entry += blockDim.x)
-    centered[entry] = flux[e*equations*rows+entry];
+    centered[(entry/rows)*pitch+entry%rows] = flux[e*equations*rows+entry];
   if (lane < 2*equations)
     anchors[lane] = flux[e*equations*rows+rows*(lane/2)+lane%2];
   __syncthreads();
   for (int entry = lane; entry < equations*rows; entry += blockDim.x)
-    centered[entry] = centered[entry]-anchors[2*(entry/rows)+entry%2];
+  {
+    const int shared_entry = (entry/rows)*pitch+entry%rows;
+    centered[shared_entry] = centered[shared_entry]-anchors[2*(entry/rows)+entry%2];
+  }
   __syncthreads();
   for (int entry = lane; entry < equations*dof; entry += blockDim.x)
   {
     const int node = entry%dof, equation = entry/dof, i = node%n, j = node/n;
-    const int offset = rows*equation;
+    const int offset = pitch*equation;
     float x = 0, y = 0;
     // Preserve the buffered SIMT expressions, cast points, k order and FMA
     // opportunities. Do not drop zero metric products on nonfinite inputs.
@@ -178,7 +194,7 @@ __global__ void DGSharedConservativeFusionP5FP32Kernel(
     double observed = 0.0, expected = 0.0;
     for (int i = 0; i < dof; ++i) { observed += output[i+dof*lane]; }
     for (int j = 0; j < rows; ++j)
-      expected += column_sums[j]*centered[j+rows*lane];
+      expected += column_sums[j]*centered[j+pitch*lane];
     correction[lane] = expected-observed;
   }
   __syncthreads();
@@ -452,6 +468,8 @@ void Map::LogConfiguration() const
                 tensor_derivative_.Size()+tensor_weights_.Size()+tensor_adjugate_.Size()) * sizeof(double)+
                std::size_t(tensor_lex_to_local_.Size())*sizeof(int)
             << " conservative_fusion=" << int(conservative_fusion_)
+            << " conservative_fusion_threads=" << kDGConservativeFusionThreads
+            << " conservative_fusion_shared_pitch=" << kDGConservativeFusionSharedPitch
             << " tensor_proof=requires-profile" << std::endl;
 }
 
@@ -515,7 +533,7 @@ void Map::ApplyDGConservativeFusion(const mfem::Vector& flux,
                 residual.Size() == elements*dof*4,
               "Conservative DG fusion received incompatible packed arrays.");
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
-  DGSharedConservativeFusionP5FP32Kernel<<<elements,128>>>(
+  DGSharedConservativeFusionP5FP32Kernel<<<elements,kDGConservativeFusionThreads>>>(
     tensor_lex_to_local_.Read(), tensor_derivative_.Read(), tensor_weights_.Read(),
     tensor_adjugate_.Read(), flux.Read(), column_sums.Read(), row_sums.Read(),
     mass_fractions.Read(), state_map.Read(), residual.ReadWrite());
