@@ -192,6 +192,260 @@ void CheckTensor(TestContext& ctx, int dim, int basis)
   CheckCellMeans(ctx, fes, rhs, label);
 }
 
+constexpr real_t curved_x_amplitude = 0.8;
+constexpr real_t curved_y_amplitude = 0.6;
+
+// The left cell is the identity map. The right cell is
+// (1+s, t) + (0.8, 0.6) s(1-s)t(1-t), an exactly Q2 geometry.
+// Its signed determinant is analytic and bounded below by 0.65.
+real_t CurvedTestJacobian(int element, const mfem::IntegrationPoint& ip)
+{
+  if (element == 0) { return 1.0; }
+  return 1.0 + curved_x_amplitude * (1.0 - 2.0 * ip.x) * ip.y * (1.0 - ip.y) +
+    curved_y_amplitude * ip.x * (1.0 - ip.x) * (1.0 - 2.0 * ip.y);
+}
+
+void CheckCurvedTestGeometry(TestContext& ctx, mfem::FiniteElementSpace& fes,
+                             const std::string& label)
+{
+  real_t maximum_geometry_error = 0.0;
+  real_t minimum_determinant = 1.0;
+  std::array<real_t, 2> jacobian_variation{{0.0, 0.0}};
+  const auto& rule = mfem::IntRules.Get(mfem::Geometry::SQUARE, 22);
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    auto* transformation = fes.GetElementTransformation(e);
+    transformation->SetIntPoint(&rule.IntPoint(0));
+    const mfem::DenseMatrix first(transformation->Jacobian());
+    mfem::Vector point(2);
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      const auto& ip = rule.IntPoint(q);
+      const real_t bubble = e == 0 ? 0.0 :
+        ip.x * (1.0 - ip.x) * ip.y * (1.0 - ip.y);
+      const real_t bubble_x = e == 0 ? 0.0 :
+        (1.0 - 2.0 * ip.x) * ip.y * (1.0 - ip.y);
+      const real_t bubble_y = e == 0 ? 0.0 :
+        ip.x * (1.0 - ip.x) * (1.0 - 2.0 * ip.y);
+      transformation->Transform(ip, point);
+      maximum_geometry_error = std::max({maximum_geometry_error,
+        std::abs(point(0) - (e + ip.x + curved_x_amplitude * bubble)),
+        std::abs(point(1) - (ip.y + curved_y_amplitude * bubble))});
+      transformation->SetIntPoint(&ip);
+      const auto& jacobian = transformation->Jacobian();
+      const std::array<real_t, 4> expected{{
+        1.0 + curved_x_amplitude * bubble_x, curved_y_amplitude * bubble_x,
+        curved_x_amplitude * bubble_y, 1.0 + curved_y_amplitude * bubble_y}};
+      for (int j = 0; j < 2; ++j)
+      {
+        for (int i = 0; i < 2; ++i)
+        {
+          maximum_geometry_error = std::max(maximum_geometry_error,
+            std::abs(jacobian(i, j) - expected[i + 2 * j]));
+          jacobian_variation[e] = std::max(jacobian_variation[e],
+            std::abs(jacobian(i, j) - first(i, j)));
+        }
+      }
+      const real_t determinant = jacobian(0, 0) * jacobian(1, 1) -
+                                 jacobian(0, 1) * jacobian(1, 0);
+      minimum_determinant = std::min(minimum_determinant, determinant);
+      maximum_geometry_error = std::max(maximum_geometry_error,
+        std::abs(determinant - CurvedTestJacobian(e, ip)));
+    }
+  }
+  ctx.Check(maximum_geometry_error < 5.0e-13 && minimum_determinant > 0.6,
+            label + " has the intended positive analytic Q2 geometry");
+  ctx.Check(jacobian_variation[0] < 5.0e-13 && jacobian_variation[1] > 0.01,
+            label + " contains both an affine and a non-affine cell");
+}
+
+void CheckCurvedPhysicalInvariants(TestContext& ctx, mfem::FiniteElementSpace& fes,
+                                   const mfem::Vector& state,
+                                   const mfem::Vector& source, real_t rate,
+                                   const std::string& label)
+{
+  const real_t* state_data = state.HostRead();
+  const real_t* source_data = source.HostRead();
+  real_t maximum_scaled_mean = 0.0;
+  real_t maximum_scaled_power = 0.0;
+  real_t maximum_scaled_rate_defect = 0.0;
+  real_t maximum_relative_energy_increase = 0.0;
+  bool strictly_dissipative = true;
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    const auto& fe = *fes.GetFE(e);
+    // Higher quadrature than the physical Gram construction, using the
+    // independently known signed Jacobian rather than its cached metric.
+    const auto& rule = mfem::IntRules.Get(fe.GetGeomType(), 2 * fe.GetOrder() + 12);
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(e, dofs);
+    mfem::Vector shape(fe.GetDof());
+    for (int c = 0; c < fes.GetVDim(); ++c)
+    {
+      real_t mean = 0.0;
+      real_t source_l1 = 0.0;
+      real_t energy = 0.0;
+      real_t power = 0.0;
+      real_t source_energy = 0.0;
+      real_t updated_energy = 0.0;
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const auto& ip = rule.IntPoint(q);
+        fe.CalcShape(ip, shape);
+        real_t value = 0.0;
+        real_t derivative = 0.0;
+        for (int i = 0; i < dofs.Size(); ++i)
+        {
+          const int vdof = fes.DofToVDof(dofs[i], c);
+          value += shape(i) * state_data[vdof];
+          derivative += shape(i) * source_data[vdof];
+        }
+        const real_t weight = ip.weight * CurvedTestJacobian(e, ip);
+        const real_t updated = value + derivative / rate;
+        mean += weight * derivative;
+        source_l1 += weight * std::abs(derivative);
+        energy += weight * value * value;
+        power += weight * value * derivative;
+        source_energy += weight * derivative * derivative;
+        updated_energy += weight * updated * updated;
+      }
+      maximum_scaled_mean = std::max(maximum_scaled_mean,
+        std::abs(mean) / std::max(real_t(1.0), source_l1));
+      maximum_scaled_power = std::max(maximum_scaled_power,
+        power / std::max(real_t(1.0), rate * energy));
+      // For a self-adjoint damping operator with eigenrates <= rate,
+      // ||source||_M^2 <= -rate <state, source>_M.
+      maximum_scaled_rate_defect = std::max(maximum_scaled_rate_defect,
+        (source_energy + rate * power) /
+          std::max(real_t(1.0), rate * rate * energy));
+      maximum_relative_energy_increase = std::max(maximum_relative_energy_increase,
+        (updated_energy - energy) / std::max(real_t(1.0), energy));
+      strictly_dissipative = strictly_dissipative && std::isfinite(energy) &&
+        std::isfinite(power) && std::isfinite(source_energy) &&
+        std::isfinite(updated_energy) && power < 0.0 && updated_energy < energy;
+    }
+  }
+  ctx.Check(maximum_scaled_mean < 2.0e-11,
+            label + " preserves every physical cell/component mean (scaled error=" +
+              dg_igr_tests::FormatSci(maximum_scaled_mean) + ")");
+  ctx.Check(maximum_scaled_power < 3.0e-12 && strictly_dissipative,
+            label + " dissipates the independently integrated physical quadratic energy");
+  ctx.Check(maximum_scaled_rate_defect < 3.0e-12,
+            label + " respects the physical damping-rate bound");
+  ctx.Check(maximum_relative_energy_increase < 5.0e-12 && strictly_dissipative,
+            label + " is physically contractive for forward Euler at dt=1/rate");
+}
+
+void CheckCurvedTensor(TestContext& ctx, int basis, int ordering)
+{
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+    2, 1, mfem::Element::QUADRILATERAL, true, 2.0, 1.0);
+  serial.SetCurvature(2, false, 2, mfem::Ordering::byNODES);
+  serial.Transform([](const mfem::Vector& reference, mfem::Vector& physical)
+  {
+    physical = reference;
+    if (reference(0) > 1.0)
+    {
+      const real_t s = reference(0) - 1.0;
+      const real_t t = reference(1);
+      const real_t bubble = s * (1.0 - s) * t * (1.0 - t);
+      physical(0) += curved_x_amplitude * bubble;
+      physical(1) += curved_y_amplitude * bubble;
+    }
+  });
+  mfem::ParMesh mesh(MPI_COMM_SELF, serial);
+  mfem::L2_FECollection fec(5, 2, basis);
+  mfem::ParFiniteElementSpace fes(&mesh, &fec, 4, ordering);
+  const std::string label = std::string("mixed Q2 p5 ") +
+    (basis == mfem::BasisType::GaussLobatto ? "LGL" : "GL") +
+    (ordering == mfem::Ordering::byNODES ? " byNODES" : " byVDIM");
+  CheckCurvedTestGeometry(ctx, fes, label);
+  constexpr real_t rate = 80000.0;
+  mfem::ConservativeModalDamping damping(fes, rate);
+  mfem::Vector state, rhs(fes.GetVSize()), original_rhs;
+  Sample(fes, [](int e, int c, const mfem::IntegrationPoint&)
+  {
+    return 0.5 + (e + 1) * (c + 1);
+  }, state);
+  rhs = 3.0;
+  original_rhs = rhs;
+  damping.AddMult(state, rhs);
+  CheckVectors(ctx, rhs, original_rhs, 0.0,
+                label + " gives exact zero damping for cellwise constants");
+
+  real_t maximum_low_mode_error = 0.0;
+  for (int block = 0; block < 4; ++block)
+  {
+    Sample(fes, [block](int e, int c, const mfem::IntegrationPoint& ip)
+    {
+      const int mode = 4 * block + c;
+      return (e + 1) * (c + 1) *
+        Legendre(mode % 4, 2.0 * ip.x - 1.0) *
+        Legendre(mode / 4, 2.0 * ip.y - 1.0);
+    }, state);
+    rhs = 0.0;
+    damping.AddMult(state, rhs);
+    maximum_low_mode_error = std::max(maximum_low_mode_error,
+      rhs.Normlinf() / std::max(real_t(1.0), state.Normlinf()));
+  }
+  ctx.Check(maximum_low_mode_error < 5.0e-9,
+            label + " leaves the complete reference Q3 subspace unchanged");
+
+  for (int probe = 0; probe < 2; ++probe)
+  {
+    Sample(fes, [probe](int e, int c, const mfem::IntegrationPoint& ip)
+    {
+      const real_t x = 2.0 * ip.x - 1.0;
+      const real_t y = 2.0 * ip.y - 1.0;
+      const real_t amplitude = 0.1 * (e + 1) * (c + 1);
+      // The first probe is anti-dissipative under an ordinary reference
+      // diagonal filter on this curved cell, despite preserving its mean.
+      const real_t polynomial = probe == 0
+        ? 20.0 * Legendre(3, x) + Legendre(4, x)
+        : 0.6 * Legendre(3, x) * Legendre(3, y) +
+          0.7 * Legendre(5, x) * Legendre(2, y) -
+          0.4 * Legendre(1, x) * Legendre(5, y) +
+          0.3 * Legendre(4, x) * Legendre(4, y);
+      return 1.0 + c + amplitude * polynomial;
+    }, state);
+    rhs = 0.0;
+    damping.AddMult(state, rhs);
+    const std::string probe_label = label + " probe " + std::to_string(probe);
+    CheckCurvedPhysicalInvariants(ctx, fes, state, rhs, rate, probe_label);
+
+    mfem::Vector affine_expected;
+    Sample(fes, [probe](int e, int c, const mfem::IntegrationPoint& ip)
+    {
+      const real_t x = 2.0 * ip.x - 1.0;
+      const real_t y = 2.0 * ip.y - 1.0;
+      const real_t amplitude = 0.1 * (e + 1) * (c + 1);
+      // At p5 the independent M16 k4 weight is (11/50)^4.
+      constexpr real_t q4 = 0.00234256;
+      const real_t polynomial = probe == 0
+        ? q4 * Legendre(4, x)
+        : 0.7 * Legendre(5, x) * Legendre(2, y) -
+          0.4 * Legendre(1, x) * Legendre(5, y) +
+          0.3 * q4 * Legendre(4, x) * Legendre(4, y);
+      return -80000.0 * amplitude * polynomial;
+    }, affine_expected);
+    mfem::Array<int> affine_dofs;
+    fes.GetElementDofs(0, affine_dofs);
+    real_t maximum_affine_error = 0.0;
+    for (int c = 0; c < fes.GetVDim(); ++c)
+    {
+      for (int i = 0; i < affine_dofs.Size(); ++i)
+      {
+        const int vdof = fes.DofToVDof(affine_dofs[i], c);
+        maximum_affine_error = std::max(maximum_affine_error,
+          std::abs(rhs(vdof) - affine_expected(vdof)));
+      }
+    }
+    ctx.Check(maximum_affine_error < 3.0e-11 *
+                std::max(real_t(1.0), affine_expected.Normlinf()),
+              probe_label + " retains the affine tensor filter on the same mesh");
+  }
+}
+
 void CheckConstantsAndZeroRate(TestContext& ctx)
 {
   mfem::Mesh mesh = mfem::Mesh::MakeCartesian1D(2, 1.0);
@@ -382,6 +636,7 @@ int main(int argc, char** argv)
     for (int ordering : {mfem::Ordering::byNODES, mfem::Ordering::byVDIM})
     {
       CheckP39(ctx, basis, ordering);
+      CheckCurvedTensor(ctx, basis, ordering);
     }
     CheckTensor(ctx, 2, basis);
     CheckTensor(ctx, 3, basis);

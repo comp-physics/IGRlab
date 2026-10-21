@@ -76,6 +76,17 @@ public:
   /// Clamp for rho to avoid division by very small numbers (default IGRDefaults::kRhoFloor).
   void SetRhoFloor(double rho_floor);
 
+  /// Opt in to routine nonfinite diagnostics without changing residual gates.
+  void SetDiagnosticNanScan(bool enabled)
+  {
+    if (enabled && !diagnostic_nan_scan_)
+    {
+      device_coeff_diagnostics_logged_ = false;
+    }
+    diagnostic_nan_scan_ = enabled;
+  }
+  bool GetDiagnosticNanScan() const { return diagnostic_nan_scan_; }
+
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
   void SetDirichletBC(const mfem::Array<int>& ess_bdr);
 
@@ -172,6 +183,7 @@ public:
     SetAlpha(cfg.alpha);
     SetAlphaLengthScalePolicy(cfg.alpha_length_scale_policy);
     SetRhoFloor(cfg.rho_floor);
+    SetDiagnosticNanScan(cfg.nan_scan);
     SetGradBackend(cfg.backend);
     SetIPKind(cfg.ip_kind);
 
@@ -612,6 +624,8 @@ private:
   // Device/QF coefficient cache.
   bool using_device_coeffs_ = false;
   bool device_coeff_logged_ = false;
+  bool diagnostic_nan_scan_ = false;
+  bool device_coeff_diagnostics_logged_ = false;
   long device_mesh_sequence_ = -1;
   long device_sfes_sequence_ = -1;
   long device_vfes_sequence_ = -1;
@@ -620,6 +634,10 @@ private:
   int device_diff_qorder_ = 0;
   int device_rhs_qorder_ = 0;
   int device_face_qorder_ = 0;
+  // Cache-setup proofs for reusing current byVDIM state interpolation owners.
+  bool device_diff_values_share_mass_ = false;
+  bool device_rhs_values_share_mass_ = false;
+  bool device_rhs_values_share_diff_ = false;
 
   std::unique_ptr<mfem::QuadratureSpace> mass_qs_;
   std::unique_ptr<mfem::QuadratureSpace> sigma_qs_;
@@ -629,6 +647,7 @@ private:
   std::unique_ptr<mfem::QuadratureFunction> u_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_face_qf_;
+  // Diagnostic-only diffusion gradient, allocated on explicit demand.
   std::unique_ptr<mfem::QuadratureFunction> grad_u_qf_;
   std::unique_ptr<mfem::QuadratureFunction> grad_u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> invrho_qf_;
@@ -720,8 +739,16 @@ private:
   std::string two_level_coarse_mode_;
   std::unique_ptr<mfem::Solver> screened_patch_preconditioner_;
   std::string screened_patch_key_;
+  // Opt-in tensor pipeline. Preconditioner data can be deliberately lagged;
+  // current coefficients and the original FP64 residual remain authoritative.
+  std::unique_ptr<mfem::Solver> tensor_multigrid_preconditioner_;
+  std::string tensor_multigrid_key_;
+  std::unique_ptr<mfem::Operator> tensor_volume_operator_;
+  std::string tensor_volume_mode_;
   std::unique_ptr<mfem::IterativeSolver> stationary_correction_;
   int stationary_sweeps_ = 0;
+  // Cached rank-one CUDA FGMRES workspace; selected only by explicit opt-in.
+  std::unique_ptr<mfem::IterativeSolver> device_fgmres_;
   NonconvergencePolicy nonconvergence_policy_ =
     NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;

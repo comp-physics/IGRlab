@@ -148,11 +148,85 @@ struct InteriorFaceShapeDictionary2D
   }
 };
 
+// Reference derivatives repeat even when physical normal derivatives do not.
+// Preserve each face's FP64 geometry packet and deduplicate only byte-identical
+// reference blocks.  Geometry and coefficient revisions are separate: the first
+// application after a geometry rebuild retains the original dense action.
+struct InteriorFaceDGDiffusionFactorization2D
+{
+  mfem::Vector reference_dshape; // [component][side][q][dof][slot]
+  mfem::Vector normal_geometry;  // [component][side][q][face]
+  mfem::Array<int> face_slots;
+  int dof = 0, nq = 0, nf = 0, slot_count = 0;
+  std::uint64_t geometry_revision = 0;
+  std::uint64_t coefficient_revision = 0;
+  DGDiffusionFaceScaling coefficient_scaling = DGDiffusionFaceScaling::Arithmetic;
+  // Independently proved/deduplicated 1D packs, never keyed by DShape slots.
+  mfem::Vector tensor_endpoint; // [value/derivative][i][side][slot]
+  mfem::Vector tensor_tangent;  // [value/derivative][t][q][side][slot]
+  mfem::Array<int> tensor_axes; // [side][slot], reference normal axis
+  mfem::Array<int> tensor_face_slots;
+  mfem::Array<int> tensor_lex_to_native;
+  /// Inverse of the independently proved tensor/native bijection.
+  mfem::Array<int> tensor_native_to_lex;
+  int tensor_n = 0, tensor_slot_count = 0;
+  std::uint64_t tensor_geometry_revision = 0;
+  std::uint64_t tensor_inverse_geometry_revision = 0;
+
+  void ResetTensor()
+  {
+    tensor_endpoint.Destroy();
+    tensor_tangent.Destroy();
+    tensor_axes.DeleteAll();
+    tensor_face_slots.DeleteAll();
+    tensor_lex_to_native.DeleteAll();
+    tensor_native_to_lex.DeleteAll();
+    tensor_n = tensor_slot_count = 0;
+    tensor_geometry_revision = 0;
+    tensor_inverse_geometry_revision = 0;
+  }
+
+  void Reset()
+  {
+    reference_dshape.Destroy();
+    normal_geometry.Destroy();
+    face_slots.DeleteAll();
+    dof = nq = nf = slot_count = 0;
+    geometry_revision = coefficient_revision = 0;
+    coefficient_scaling = DGDiffusionFaceScaling::Arithmetic;
+    ResetTensor();
+  }
+
+  bool Matches(const InteriorFaceDGDiffusionApplyInfo& info) const
+  {
+    return info.dim == 2 && geometry_revision != 0 &&
+      geometry_revision == info.connectivity_revision &&
+      dof == info.dof && nq == info.nq && nf == info.nf &&
+      slot_count > 0 && slot_count < nf && face_slots.Size() == nf &&
+      std::size_t(reference_dshape.Size()) ==
+        4u * std::size_t(nq) * std::size_t(dof) * std::size_t(slot_count) &&
+      std::size_t(normal_geometry.Size()) ==
+        4u * std::size_t(nq) * std::size_t(nf);
+  }
+
+  bool TensorMatches(const InteriorFaceDGDiffusionApplyInfo& info) const
+  {
+    return Matches(info) && info.vdim == 1 && info.dof == 36 && info.nq == 6 &&
+      tensor_n == 6 && tensor_slot_count > 0 && tensor_slot_count <= 64 &&
+      tensor_geometry_revision == info.connectivity_revision &&
+      tensor_endpoint.Size() == 24 * tensor_slot_count &&
+      tensor_tangent.Size() == 144 * tensor_slot_count &&
+      tensor_axes.Size() == 2 * tensor_slot_count &&
+      tensor_face_slots.Size() == nf && tensor_lex_to_native.Size() == 36;
+  }
+};
+
 struct InteriorFaceDGDiffusionApplyScratch
 {
   mfem::Vector shape;
   InteriorFaceShapeDictionary2D shape_dictionary;
-  mfem::Vector weighted_normal_dshape;
+  InteriorFaceDGDiffusionFactorization2D normal_factorization;
+  mutable mfem::Vector weighted_normal_dshape;
   mfem::Vector penalty;
   /// Geometry-only normal derivative used to refresh state-dependent qdata.
   mfem::Vector normal_dshape_base;
@@ -160,6 +234,15 @@ struct InteriorFaceDGDiffusionApplyScratch
   mfem::Vector penalty_metric;
   /// Persistent copy of the current [side][quadrature][face] alpha/rho data.
   mfem::Vector side_coefficient;
+  /// Optional tensor-path qdata reduction; exact dense host geometry is kept.
+  bool compact_qdata = false;
+  /// Optional FP64 tensor lifts; independent of coefficient qdata storage.
+  bool compact_lift = false;
+  /// Independent stage generation: a geometry revision is not a state revision.
+  std::uint64_t coefficient_geometry_revision = 0;
+  std::uint64_t coefficient_generation = 0;
+  mutable std::uint64_t dense_normal_generation = 0;
+  DGDiffusionFaceScaling coefficient_scaling = DGDiffusionFaceScaling::Arithmetic;
   mfem::Array<int> face_elements;
   mfem::Array<int> element_vdof_map;
   /// Fixed-order element-to-(face,side) CSR used by the CUDA row gather.
@@ -170,7 +253,63 @@ struct InteriorFaceDGDiffusionApplyScratch
   mutable std::uint64_t incidence_connectivity_revision = 0;
   /// Per-face row contributions written without atomics before the gather.
   mutable mfem::Vector face_contribution;
+  /// Compact [a/b][tangent][side][face] FP64 lifts, 24 entries per face.
+  mutable mfem::Vector tensor_lift;
 };
+
+inline bool HasCurrentInteriorFaceDGDiffusionTensorData2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  const auto& factor = work.normal_factorization;
+  return factor.TensorMatches(info) &&
+    factor.coefficient_revision == info.connectivity_revision &&
+    std::size_t(work.side_coefficient.Size()) ==
+      2u * std::size_t(info.nq) * std::size_t(info.nf) &&
+    (factor.coefficient_scaling == DGDiffusionFaceScaling::Arithmetic ||
+     factor.coefficient_scaling == DGDiffusionFaceScaling::Max ||
+     factor.coefficient_scaling == DGDiffusionFaceScaling::Sum);
+}
+
+inline bool UsesOrdinaryCUDAForDGDiffusionFaces2D()
+{
+#if defined(MFEM_USE_CUDA)
+  const unsigned long alternative_backends =
+    mfem::Backend::OMP_MASK | mfem::Backend::RAJA_MASK |
+    mfem::Backend::OCCA_MASK | mfem::Backend::CEED_MASK |
+    mfem::Backend::HIP_MASK | mfem::Backend::DEBUG_DEVICE;
+  return mfem::Device::Allows(mfem::Backend::CUDA) &&
+    !mfem::Device::Allows(alternative_backends);
+#else
+  return false;
+#endif
+}
+
+// This private witness is also the dispatch predicate. Its inverse-map proof
+// belongs to the geometry build; applies only compare revisions and sizes.
+inline bool UsesInteriorFaceDGDiffusionCompactLift2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  const auto& factor = work.normal_factorization;
+  return work.compact_lift && UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+    HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work) &&
+    factor.tensor_native_to_lex.Size() == 36 &&
+    factor.tensor_inverse_geometry_revision == info.connectivity_revision;
+#else
+  (void)info;
+  (void)work;
+  return false;
+#endif
+}
+
+// A tensor refresh may leave the full normal table from an older stage. Every
+// dense reader must materialize it from exact host geometry and current Q,
+// independently of whether the optional factorization is still admitted.
+void EnsureInteriorFaceDGDiffusionDenseNormals2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work);
 
 inline void PrepareInteriorFaceShapeDictionary2D(
   const InteriorFaceDGDiffusionApplyInfo& info,
@@ -1020,9 +1159,12 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic,
   mfem::Vector* normal_dshape_base = nullptr,
   mfem::Vector* side_penalty_metric = nullptr,
-  InteriorFaceShapeDictionary2D* shape_dictionary = nullptr)
+  InteriorFaceShapeDictionary2D* shape_dictionary = nullptr,
+  InteriorFaceDGDiffusionFactorization2D* normal_factorization = nullptr,
+  std::size_t factorization_memory_budget = 256u * 1024u * 1024u)
 {
   if (shape_dictionary) { shape_dictionary->Reset(); }
+  if (normal_factorization) { normal_factorization->Reset(); }
   std::string reason;
   MFEM_VERIFY(SupportsInteriorFaceScalarTraceProjection2D(sfes, fqs, &reason),
               "Unsupported exact DG diffusion face apply: " << reason);
@@ -1043,6 +1185,238 @@ BuildInteriorFaceDGDiffusionApplyData2D(
 
   MFEM_VERIFY(side_q.Size() == 2 * info.nq * info.nf,
               "Exact DG diffusion face apply received mismatched side qdata.");
+
+  // Stream one reference block through a bounded dictionary while the existing
+  // geometry builder already evaluates DShape.  Never stage a full extra
+  // per-face DShape table.  Charge both final host/device copies and temporary
+  // storage against the optional cache budget; decline to the dense path.
+  auto* factor_cache = normal_factorization;
+  mfem::Vector factor_reference;
+  std::vector<mfem::real_t> factor_values;
+  std::vector<std::uint64_t> factor_hashes;
+  std::size_t factor_max_slots = 0;
+  const std::size_t factor_block_entries =
+    4u * std::size_t(info.nq) * std::size_t(info.dof);
+  const std::size_t factor_block_bytes = factor_block_entries * sizeof(mfem::real_t);
+  const std::size_t factor_geometry_entries = 4u * std::size_t(info.nq) * info.nf;
+  const std::size_t factor_geometry_bytes = factor_geometry_entries * sizeof(mfem::real_t);
+  const std::size_t factor_map_bytes = std::size_t(info.nf) * sizeof(int);
+  const std::size_t factor_dense_bytes =
+    std::size_t(info.weighted_normal_dshape_size) * sizeof(mfem::real_t);
+  auto decline_factorization = [&]()
+  {
+    if (factor_cache) { factor_cache->Reset(); }
+    factor_cache = nullptr;
+    factor_reference.Destroy();
+    std::vector<mfem::real_t>().swap(factor_values);
+    std::vector<std::uint64_t>().swap(factor_hashes);
+  };
+  if (factor_cache)
+  {
+    const std::size_t budget = std::min(factorization_memory_budget,
+                                       std::size_t(256u * 1024u * 1024u));
+    // The extra face map is charged on host/device; 1 MiB bounds both final
+    // copies and all staging for at most 64 independent 1D packs and FE proof.
+    const std::size_t tensor_reserve = info.dof == 36 && info.nq == 6
+      ? 2u * factor_map_bytes + 1024u * 1024u : 0u;
+    const std::size_t fixed_bytes =
+      2u * factor_geometry_bytes + 2u * factor_map_bytes + factor_block_bytes +
+      tensor_reserve + 8192u;
+    const std::size_t max_entries = std::size_t(std::numeric_limits<int>::max());
+    if (info.dof <= 0 || info.nq <= 0 || info.nq > 16 || info.nf <= 1 ||
+        face_scaling == DGDiffusionFaceScaling::HarmonicWeighted ||
+        factor_geometry_entries > max_entries || factor_block_entries > max_entries ||
+        fixed_bytes >= budget || factor_block_bytes == 0)
+    { decline_factorization(); }
+    else
+    {
+      factor_max_slots = std::min(std::size_t(info.nf - 1),
+        (budget - fixed_bytes) / (4u * factor_block_bytes + 2u * sizeof(std::uint64_t)));
+      factor_max_slots = std::min(factor_max_slots, max_entries / factor_block_entries);
+      if (factor_max_slots == 0) { decline_factorization(); }
+      else
+      {
+        try
+        {
+          factor_cache->normal_geometry.SetSize(int(factor_geometry_entries));
+          factor_cache->face_slots.SetSize(info.nf);
+          factor_reference.SetSize(int(factor_block_entries));
+          factor_values.reserve(factor_max_slots * factor_block_entries);
+          factor_hashes.reserve(factor_max_slots);
+        }
+        catch (const std::bad_alloc&) { decline_factorization(); }
+      }
+    }
+  }
+  auto factor_geometry = mfem::Reshape(
+    factor_cache ? factor_cache->normal_geometry.HostWrite() : nullptr,
+    2, 2, info.nq, info.nf);
+  auto factor_dshape = mfem::Reshape(
+    factor_cache ? factor_reference.HostWrite() : nullptr, 2, 2, info.nq, info.dof);
+  int* factor_slots = factor_cache ? factor_cache->face_slots.HostWrite() : nullptr;
+  auto finish_factorized_face = [&](int face)
+  {
+    if (!factor_cache) { return; }
+    const mfem::real_t* block = factor_reference.HostRead();
+    const auto* bytes = reinterpret_cast<const unsigned char*>(block);
+    std::uint64_t hash = UINT64_C(14695981039346656037);
+    for (std::size_t b = 0; b < factor_block_bytes; ++b)
+    { hash ^= bytes[b]; hash *= UINT64_C(1099511628211); }
+    std::size_t slot = 0;
+    for (; slot < factor_hashes.size(); ++slot)
+    {
+      if (factor_hashes[slot] == hash &&
+          std::memcmp(block, factor_values.data() + slot * factor_block_entries,
+                      factor_block_bytes) == 0) { break; }
+    }
+    if (slot == factor_hashes.size())
+    {
+      if (slot >= factor_max_slots ||
+          (slot + 1u) * factor_block_bytes + factor_geometry_bytes +
+            factor_map_bytes >= factor_dense_bytes)
+      { decline_factorization(); return; }
+      factor_hashes.push_back(hash);
+      factor_values.insert(factor_values.end(), block, block + factor_block_entries);
+    }
+    factor_slots[face] = int(slot);
+  };
+
+  // One fixed p5/Q6 candidate: prove the actual tensor FE and its native
+  // permutation, then build each side from its mapped reference points.
+  bool tensor_active = factor_cache && info.dof == 36 && info.nq == 6 && info.vdim == 1;
+  const auto& tensor_reference = *sfes.GetFE(0);
+  const auto* tensor_fe = dynamic_cast<const mfem::NodalTensorFiniteElement*>(&tensor_reference);
+  int tensor_native[36] = {};
+  if (tensor_active)
+  {
+    tensor_active = tensor_fe && tensor_reference.GetOrder() == 5 &&
+      tensor_reference.GetGeomType() == mfem::Geometry::SQUARE &&
+      tensor_reference.GetMapType() == mfem::FiniteElement::VALUE &&
+      tensor_reference.GetRangeType() == mfem::FiniteElement::SCALAR &&
+      tensor_reference.GetNodes().Size() == 36 &&
+      (tensor_fe->GetBasisType() == mfem::BasisType::GaussLegendre ||
+       tensor_fe->GetBasisType() == mfem::BasisType::GaussLobatto);
+    if (tensor_active)
+    {
+      const auto& permutation = tensor_fe->GetDofMap();
+      tensor_active = permutation.Size() == 0 || permutation.Size() == 36;
+      const mfem::real_t* nodes = mfem::poly1d.GetPoints(5, tensor_fe->GetBasisType());
+      bool used[36] = {};
+      for (int lex = 0; tensor_active && lex < 36; ++lex)
+      {
+        const int native = permutation.Size() ? permutation[lex] : lex;
+        if (native < 0 || native >= 36 || used[native]) { tensor_active = false; break; }
+        used[native] = true;
+        tensor_native[lex] = native;
+        const auto& point = tensor_reference.GetNodes().IntPoint(native);
+        if (point.x != nodes[lex % 6] || point.y != nodes[lex / 6])
+        { tensor_active = false; }
+      }
+      for (int e = 0; tensor_active && e < info.ne; ++e)
+      { if (sfes.GetFE(e) != &tensor_reference) { tensor_active = false; } }
+    }
+  }
+  // Staging is bounded independently of face count and of reference slots.
+  constexpr int tensor_pack_entries = 24 + 144;
+  mfem::real_t tensor_pack[tensor_pack_entries] = {};
+  int tensor_pack_axes[2] = {};
+  mfem::real_t tensor_fixed[2] = {};
+  std::vector<mfem::real_t> tensor_packs;
+  std::vector<int> tensor_pack_axes_all;
+  mfem::Vector tensor_b(6), tensor_d(6);
+  auto decline_tensor = [&]()
+  {
+    tensor_active = false;
+    if (factor_cache) { factor_cache->ResetTensor(); }
+    std::vector<mfem::real_t>().swap(tensor_packs);
+    std::vector<int>().swap(tensor_pack_axes_all);
+  };
+  if (tensor_active)
+  {
+    try
+    {
+      factor_cache->tensor_lex_to_native.SetSize(36);
+      std::memcpy(factor_cache->tensor_lex_to_native.HostWrite(), tensor_native, sizeof(tensor_native));
+      factor_cache->tensor_native_to_lex.SetSize(36);
+      int* inverse = factor_cache->tensor_native_to_lex.HostWrite();
+      for (int lex = 0; lex < 36; ++lex) { inverse[tensor_native[lex]] = lex; }
+      factor_cache->tensor_face_slots.SetSize(info.nf);
+      tensor_packs.reserve(64 * tensor_pack_entries);
+      tensor_pack_axes_all.reserve(128);
+    }
+    catch (const std::bad_alloc&) { decline_tensor(); }
+  }
+  auto prepare_tensor_side = [&](int side, int q, const mfem::IntegrationPoint& point,
+                                  const mfem::Vector& exact_shape,
+                                  const mfem::DenseMatrix& exact_dshape)
+  {
+    if (!factor_cache || !tensor_active) { return; }
+    const int axis = (point.x == 0.0 || point.x == 1.0) ? 0 :
+      (point.y == 0.0 || point.y == 1.0) ? 1 : -1;
+    if (axis < 0) { decline_tensor(); return; }
+    const mfem::real_t fixed = axis == 0 ? point.x : point.y;
+    const mfem::real_t tangent = axis == 0 ? point.y : point.x;
+    if (!std::isfinite(tangent)) { decline_tensor(); return; }
+    if (q == 0)
+    {
+      tensor_pack_axes[side] = axis;
+      tensor_fixed[side] = fixed;
+      tensor_fe->GetBasis1D().Eval(fixed, tensor_b, tensor_d);
+      for (int i = 0; i < 6; ++i)
+      {
+        tensor_pack[2 * (i + 6 * side)] = tensor_b(i);
+        tensor_pack[1 + 2 * (i + 6 * side)] = tensor_d(i);
+      }
+    }
+    else if (axis != tensor_pack_axes[side] || fixed != tensor_fixed[side])
+    { decline_tensor(); return; }
+    tensor_fe->GetBasis1D().Eval(tangent, tensor_b, tensor_d);
+    for (int t = 0; t < 6; ++t)
+    {
+      tensor_pack[24 + 2 * (t + 6 * (q + 6 * side))] = tensor_b(t);
+      tensor_pack[25 + 2 * (t + 6 * (q + 6 * side))] = tensor_d(t);
+    }
+    // Verify this full 1D representation against the existing FE evaluations;
+    // DShape-slot equality alone cannot prove a tensor contraction layout.
+    const mfem::real_t tolerance = 64 * 36 * std::numeric_limits<mfem::real_t>::epsilon();
+    for (int t = 0; t < 6; ++t) for (int i = 0; i < 6; ++i)
+    {
+      const int native = tensor_native[axis == 0 ? i + 6 * t : t + 6 * i];
+      const mfem::real_t bn = tensor_pack[2 * (i + 6 * side)];
+      const mfem::real_t dn = tensor_pack[1 + 2 * (i + 6 * side)];
+      const mfem::real_t reconstructed[3] =
+        {bn * tensor_b(t), dn * tensor_b(t), bn * tensor_d(t)};
+      const mfem::real_t expected[3] =
+        {exact_shape(native), exact_dshape(native, axis), exact_dshape(native, 1 - axis)};
+      for (int k = 0; k < 3; ++k)
+      {
+        if (!std::isfinite(reconstructed[k]) || !std::isfinite(expected[k]) ||
+            std::abs(reconstructed[k] - expected[k]) >
+              tolerance * std::max(mfem::real_t(1.0), std::abs(expected[k])))
+        { decline_tensor(); return; }
+      }
+    }
+  };
+  auto finish_tensor_face = [&](int face)
+  {
+    if (!factor_cache || !tensor_active) { return; }
+    const int count = int(tensor_pack_axes_all.size() / 2);
+    int slot = 0;
+    for (; slot < count; ++slot)
+    {
+      if (tensor_pack_axes_all[2 * slot] == tensor_pack_axes[0] &&
+          tensor_pack_axes_all[2 * slot + 1] == tensor_pack_axes[1] &&
+          std::memcmp(tensor_pack, tensor_packs.data() + slot * tensor_pack_entries,
+                      sizeof(tensor_pack)) == 0) { break; }
+    }
+    if (slot == count)
+    {
+      if (count == 64) { decline_tensor(); return; }
+      tensor_packs.insert(tensor_packs.end(), tensor_pack, tensor_pack + tensor_pack_entries);
+      tensor_pack_axes_all.insert(tensor_pack_axes_all.end(), tensor_pack_axes, tensor_pack_axes + 2);
+    }
+    factor_cache->tensor_face_slots.HostWrite()[face] = slot;
+  };
 
   shape.SetSize(info.shape_size);
   weighted_normal_dshape.SetSize(info.weighted_normal_dshape_size);
@@ -1134,6 +1508,7 @@ BuildInteriorFaceDGDiffusionApplyData2D(
 
         fe.CalcShape(eip, side_shape);
         fe.CalcDShape(eip, side_dshape);
+        prepare_tensor_side(side, q, eip, side_shape, side_dshape);
 
         const mfem::real_t base_weight =
           ip.weight * static_cast<mfem::real_t>(0.5) / elem_tr.Weight();
@@ -1144,6 +1519,15 @@ BuildInteriorFaceDGDiffusionApplyData2D(
         mfem::CalcAdjugate(elem_tr.Jacobian(), adjJ);
         adjJ.Mult(ni, nh);
         side_dshape.Mult(nh, side_dshape_dn);
+        if (factor_cache)
+        {
+          for (int component = 0; component < 2; ++component)
+          {
+            factor_geometry(component, side, q, of) = nh(component);
+            for (int d = 0; d < info.dof; ++d)
+            { factor_dshape(component, side, q, d) = side_dshape(d, component); }
+          }
+        }
         penalty_metric[side] = side_q_value * penalty_factor_value;
 
         if (side_penalty_metric)
@@ -1196,10 +1580,57 @@ BuildInteriorFaceDGDiffusionApplyData2D(
       }
       penalty_out(q, of) = kappa * penalty_q;
     }
+    finish_factorized_face(of);
+    finish_tensor_face(of);
     of++;
   }
   MFEM_VERIFY(of == info.nf,
               "Exact DG diffusion face apply packed face count mismatch.");
+  if (factor_cache)
+  {
+    try
+    {
+      factor_cache->reference_dshape.SetSize(int(factor_values.size()));
+      std::memcpy(factor_cache->reference_dshape.HostWrite(), factor_values.data(),
+                  factor_values.size() * sizeof(mfem::real_t));
+      factor_cache->reference_dshape.UseDevice(true);
+      factor_cache->normal_geometry.UseDevice(true);
+      factor_cache->face_slots.GetMemory().UseDevice(true);
+      factor_cache->dof = info.dof;
+      factor_cache->nq = info.nq;
+      factor_cache->nf = info.nf;
+      factor_cache->slot_count = int(factor_hashes.size());
+      factor_cache->geometry_revision = info.connectivity_revision;
+      if (tensor_active)
+      {
+        const int count = int(tensor_pack_axes_all.size() / 2);
+        factor_cache->tensor_endpoint.SetSize(24 * count);
+        factor_cache->tensor_tangent.SetSize(144 * count);
+        factor_cache->tensor_axes.SetSize(2 * count);
+        for (int slot = 0; slot < count; ++slot)
+        {
+          const auto* pack = tensor_packs.data() + slot * tensor_pack_entries;
+          std::memcpy(factor_cache->tensor_endpoint.HostWrite() + 24 * slot, pack,
+                      24 * sizeof(mfem::real_t));
+          std::memcpy(factor_cache->tensor_tangent.HostWrite() + 144 * slot, pack + 24,
+                      144 * sizeof(mfem::real_t));
+        }
+        std::memcpy(factor_cache->tensor_axes.HostWrite(), tensor_pack_axes_all.data(),
+                    tensor_pack_axes_all.size() * sizeof(int));
+        factor_cache->tensor_endpoint.UseDevice(true);
+        factor_cache->tensor_tangent.UseDevice(true);
+        factor_cache->tensor_axes.GetMemory().UseDevice(true);
+        factor_cache->tensor_face_slots.GetMemory().UseDevice(true);
+        factor_cache->tensor_lex_to_native.GetMemory().UseDevice(true);
+        factor_cache->tensor_native_to_lex.GetMemory().UseDevice(true);
+        factor_cache->tensor_n = 6;
+        factor_cache->tensor_slot_count = count;
+        factor_cache->tensor_geometry_revision = info.connectivity_revision;
+        factor_cache->tensor_inverse_geometry_revision = info.connectivity_revision;
+      }
+    }
+    catch (const std::bad_alloc&) { decline_factorization(); }
+  }
 
   face_elements.GetMemory().UseDevice(true);
   BuildNativeElementVDofMap(sfes, element_vdof_map);
@@ -1728,11 +2159,37 @@ struct InteriorFaceDGDiffusionRecord2D
 // Each side/q projection retains the original ascending-d sum, the side-pair
 // terms retain their operation order, and each output retains its ascending-q
 // sum.  The subsequent deterministic element incidence gather is unchanged.
+template <bool FactorizedNormals = false>
 struct InteriorFaceDGDiffusionRecord2DWarp
 {
   InteriorFaceDGDiffusionRecord2D record;
   const int* shape_face_slots = nullptr;
   int shape_face_count = 0;
+  const mfem::real_t* reference_dshape = nullptr;
+  const mfem::real_t* normal_geometry = nullptr;
+  const int* normal_face_slots = nullptr;
+  int reference_face_count = 0;
+  const mfem::real_t* side_coefficient = nullptr;
+
+  MFEM_HOST_DEVICE static mfem::real_t ReconstructNormal(
+    mfem::real_t dx, mfem::real_t dy, mfem::real_t nx, mfem::real_t ny,
+    mfem::real_t coefficient)
+  {
+    // DenseMatrix::Mult visits its two columns in this order.  Keep the
+    // coefficient product rounded before the original DOF/lift accumulation.
+    // Host/device contraction can differ by FP64 roundoff; no sum is factored.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+    const mfem::real_t normal = __fma_rn(ny, dy, __dmul_rn(nx, dx));
+    return __dmul_rn(coefficient, normal);
+#elif defined(__CUDA_ARCH__) && defined(MFEM_USE_SINGLE)
+    const mfem::real_t normal = __fmaf_rn(ny, dy, __fmul_rn(nx, dx));
+    return __fmul_rn(coefficient, normal);
+#else
+    mfem::real_t normal = nx * dx;
+    normal += ny * dy;
+    return coefficient * normal;
+#endif
+  }
 
   MFEM_HOST_DEVICE void operator()(int face) const
   {
@@ -1743,6 +2200,11 @@ struct InteriorFaceDGDiffusionRecord2DWarp
                            shape_face_slots ? shape_face_count : record.nf);
     auto N = mfem::Reshape(record.weighted_normal_dshape,
                            2, record.nq, record.dof, record.nf);
+    const int normal_face = FactorizedNormals ? normal_face_slots[face] : 0;
+    auto RD = mfem::Reshape(reference_dshape,
+                            2, 2, record.nq, record.dof, reference_face_count);
+    auto G = mfem::Reshape(normal_geometry, 2, 2, record.nq, record.nf);
+    auto Q = mfem::Reshape(side_coefficient, 2, record.nq, record.nf);
     auto P = mfem::Reshape(record.penalty, record.nq, record.nf);
     auto F = mfem::Reshape(record.face_elements, 2, record.nf);
     auto D = mfem::Reshape(record.element_vdof_map,
@@ -1758,11 +2220,21 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       const int side = lane / record.nq;
       const int q = lane - side * record.nq;
       const int e = F(side, face);
+      const mfem::real_t nx = FactorizedNormals ? G(0, side, q, face) : 0.0;
+      const mfem::real_t ny = FactorizedNormals ? G(1, side, q, face) : 0.0;
+      const mfem::real_t coefficient = FactorizedNormals ? Q(side, q, face) : 0.0;
       for (int d = 0; d < record.dof; ++d)
       {
         const mfem::real_t dof_value = record.x[D(d, 0, e)];
         value += S(side, q, d, shape_face) * dof_value;
-        normal_flux += N(side, q, d, face) * dof_value;
+        mfem::real_t normal_value;
+        if constexpr (FactorizedNormals)
+        {
+          normal_value = ReconstructNormal(RD(0, side, q, d, normal_face),
+            RD(1, side, q, d, normal_face), nx, ny, coefficient);
+        }
+        else { normal_value = N(side, q, d, face); }
+        normal_flux += normal_value * dof_value;
       }
     }
 
@@ -1818,11 +2290,20 @@ struct InteriorFaceDGDiffusionRecord2DWarp
           if (owns_row[i])
           {
             const int d = dofs[i];
-            if (sides[i] == 0)
+            const int side = sides[i];
+            mfem::real_t normal_value;
+            if constexpr (FactorizedNormals)
+            {
+              normal_value = ReconstructNormal(RD(0, side, q, d, normal_face),
+                RD(1, side, q, d, normal_face), G(0, side, q, face),
+                G(1, side, q, face), Q(side, q, face));
+            }
+            else { normal_value = N(side, q, d, face); }
+            if (side == 0)
             {
               const mfem::real_t y0 =
                 -S(0, q, d, shape_face) * avg_flux +
-                record.ip_sigma * N(0, q, d, face) * jump +
+                record.ip_sigma * normal_value * jump +
                 S(0, q, d, shape_face) * penalty_jump;
               sums[i] += y0;
             }
@@ -1830,7 +2311,7 @@ struct InteriorFaceDGDiffusionRecord2DWarp
             {
               const mfem::real_t y1 =
                 S(1, q, d, shape_face) * avg_flux +
-                record.ip_sigma * N(1, q, d, face) * jump -
+                record.ip_sigma * normal_value * jump -
                 S(1, q, d, shape_face) * penalty_jump;
               sums[i] += y1;
             }
@@ -1847,6 +2328,150 @@ struct InteriorFaceDGDiffusionRecord2DWarp
     record(face);
 #endif
   }
+};
+
+// Fixed p5/Q6 tensor contractions: each warp owns one face.  Lanes 0..11
+// hold side/t or side/q scalars; every lane executes every full-mask shuffle.
+// There are no order-sized per-thread arrays and no additional quadrature weight.
+struct InteriorFaceDGDiffusionTensorRecord2DWarp
+{
+  InteriorFaceDGDiffusionRecord2D record;
+  const mfem::real_t* endpoint = nullptr;
+  const mfem::real_t* tangent = nullptr;
+  const int* axes = nullptr;
+  const int* face_slots = nullptr;
+  const int* lex_to_native = nullptr;
+  const mfem::real_t* normal_geometry = nullptr;
+  const mfem::real_t* side_coefficient = nullptr;
+  int slot_count = 0;
+
+  template <bool CompactLift>
+  MFEM_HOST_DEVICE void Apply(int face) const
+  {
+#if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x;
+    const bool active = lane < 12;
+    const int side = active ? lane / 6 : 0;
+    const int index = active ? lane % 6 : 0;
+    const int slot = face_slots[face];
+    auto E = mfem::Reshape(endpoint, 2, 6, 2, slot_count);
+    auto T = mfem::Reshape(tangent, 2, 6, 6, 2, slot_count);
+    auto Axis = mfem::Reshape(axes, 2, slot_count);
+    auto G = mfem::Reshape(normal_geometry, 2, 2, 6, record.nf);
+    auto Q = mfem::Reshape(side_coefficient, 2, 6, record.nf);
+    auto P = mfem::Reshape(record.penalty, 6, record.nf);
+    auto F = mfem::Reshape(record.face_elements, 2, record.nf);
+    auto D = mfem::Reshape(record.element_vdof_map, 36, record.vdim, record.ne);
+    const int axis = Axis(side, slot);
+
+    mfem::real_t trace = 0.0, normal_trace = 0.0;
+    if (active)
+    {
+      const int element = F(side, face);
+#pragma unroll 1
+      for (int i = 0; i < 6; ++i)
+      {
+        const int native = lex_to_native[axis == 0 ? i + 6 * index : index + 6 * i];
+        const mfem::real_t x = record.x[D(native, 0, element)];
+        trace += E(0, i, side, slot) * x;
+        normal_trace += E(1, i, side, slot) * x;
+      }
+    }
+    mfem::real_t value = 0.0, gn = 0.0, gt = 0.0;
+#pragma unroll 1
+    for (int t = 0; t < 6; ++t)
+    {
+      const mfem::real_t a = __shfl_sync(0xffffffffu, trace, 6 * side + t);
+      const mfem::real_t b = __shfl_sync(0xffffffffu, normal_trace, 6 * side + t);
+      if (active)
+      {
+        const mfem::real_t bt = T(0, t, index, side, slot);
+        value += bt * a;
+        gn += bt * b;
+        gt += T(1, t, index, side, slot) * a;
+      }
+    }
+    mfem::real_t flux = 0.0;
+    if (active)
+    {
+      flux = Q(side, index, face) *
+        (G(axis, side, index, face) * gn + G(1 - axis, side, index, face) * gt);
+    }
+    const int other = 6 * (1 - side) + index;
+    const mfem::real_t other_value = __shfl_sync(0xffffffffu, value, other);
+    const mfem::real_t other_flux = __shfl_sync(0xffffffffu, flux, other);
+    mfem::real_t cs = 0.0, cn = 0.0, ct = 0.0;
+    if (active)
+    {
+      const mfem::real_t jump = side == 0 ? value - other_value : other_value - value;
+      const mfem::real_t average = side == 0 ? flux + other_flux : other_flux + flux;
+      const mfem::real_t penalty_jump = P(index, face) * jump;
+      cs = side == 0 ? -average + penalty_jump : average - penalty_jump;
+      const mfem::real_t scaled_jump = record.ip_sigma * jump * Q(side, index, face);
+      cn = scaled_jump * G(axis, side, index, face);
+      ct = scaled_jump * G(1 - axis, side, index, face);
+    }
+    mfem::real_t lift_a = 0.0, lift_b = 0.0;
+#pragma unroll 1
+    for (int q = 0; q < 6; ++q)
+    {
+      const mfem::real_t qs = __shfl_sync(0xffffffffu, cs, 6 * side + q);
+      const mfem::real_t qn = __shfl_sync(0xffffffffu, cn, 6 * side + q);
+      const mfem::real_t qt = __shfl_sync(0xffffffffu, ct, 6 * side + q);
+      if (active)
+      {
+        const mfem::real_t bt = T(0, index, q, side, slot);
+        lift_a += bt * qs + T(1, index, q, side, slot) * qt;
+        lift_b += bt * qn;
+      }
+    }
+    if constexpr (CompactLift)
+    {
+      auto L = mfem::Reshape(record.contribution, 2, 6, 2, record.nf);
+      if (active)
+      {
+        L(0, index, side, face) = lift_a;
+        L(1, index, side, face) = lift_b;
+      }
+    }
+    else
+    {
+      auto C = mfem::Reshape(record.contribution, 36, 2, record.nf);
+#pragma unroll 1
+      for (int base = 0; base < 72; base += 32)
+      {
+        const int row = base + lane;
+        const bool owns = row < 72;
+        const int output_side = owns ? row / 36 : 0;
+        const int i = owns ? row % 6 : 0;
+        const int t = owns ? (row % 36) / 6 : 0;
+        const mfem::real_t a = __shfl_sync(0xffffffffu, lift_a, 6 * output_side + t);
+        const mfem::real_t b = __shfl_sync(0xffffffffu, lift_b, 6 * output_side + t);
+        if (owns)
+        {
+          const int output_axis = Axis(output_side, slot);
+          const int native = lex_to_native[output_axis == 0 ? i + 6 * t : t + 6 * i];
+          C(native, output_side, face) =
+            E(0, i, output_side, slot) * a + E(1, i, output_side, slot) * b;
+        }
+      }
+    }
+#else
+    if constexpr (CompactLift)
+    {
+      MFEM_ABORT_KERNEL("Compact FP64 tensor face records require native CUDA.");
+    }
+    else { record(face); }
+#endif
+  }
+
+  MFEM_HOST_DEVICE void operator()(int face) const { Apply<false>(face); }
+};
+
+struct InteriorFaceDGDiffusionTensorLiftRecord2DWarp
+  : InteriorFaceDGDiffusionTensorRecord2DWarp
+{
+  MFEM_HOST_DEVICE void operator()(int face) const { Apply<true>(face); }
 };
 
 struct InteriorFaceDGDiffusionGather2D
@@ -1898,6 +2523,69 @@ struct InteriorFaceDGDiffusionGather2D
     else
     {
       y[output] += sum;
+    }
+  }
+};
+
+struct InteriorFaceDGDiffusionTensorLiftGather2D
+  : InteriorFaceDGDiffusionGather2D
+{
+  const mfem::real_t* endpoint = nullptr;
+  const int* axes = nullptr;
+  const int* face_slots = nullptr;
+  const int* native_to_lex = nullptr;
+  int slot_count = 0;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int element = row / 36;
+    const int native = row - element * 36;
+    const int lex = native_to_lex[native];
+    auto D = mfem::Reshape(element_vdof_map, 36, vdim, ne);
+    auto E = mfem::Reshape(endpoint, 2, 6, 2, slot_count);
+    auto Axis = mfem::Reshape(axes, 2, slot_count);
+    auto L = mfem::Reshape(contribution, 2, 6, 2, nf);
+    mfem::real_t sum = 0.0;
+    for (int incidence = element_face_offsets[element];
+         incidence < element_face_offsets[element + 1]; ++incidence)
+    {
+      const int side = element_face_sides[incidence];
+      const int face = element_face_ids[incidence];
+      // Read the current independent tensor slot, including renumbered packs.
+      const int slot = face_slots[face];
+      const int axis = Axis(side, slot);
+      const int i = axis == 0 ? lex % 6 : lex / 6;
+      const int t = axis == 0 ? lex / 6 : lex % 6;
+      const mfem::real_t a = L(0, t, side, face);
+      const mfem::real_t b = L(1, t, side, face);
+      const mfem::real_t face_value =
+        E(0, i, side, slot) * a + E(1, i, side, slot) * b;
+      // The old record stores one rounded FP64 contribution before the ordered
+      // gather. Explicit add prevents contraction into that reconstruction.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      sum = __dadd_rn(sum, face_value);
+#else
+      volatile mfem::real_t rounded_face_value = face_value;
+      sum += rounded_face_value;
+#endif
+    }
+    const int output = D(native, 0, element);
+    if (add_to_base)
+    {
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      y[output] = __dadd_rn(y[output], __dadd_rn(0.0, sum));
+#else
+      const mfem::real_t scratch_value = mfem::real_t(0.0) + sum;
+      y[output] += scratch_value;
+#endif
+    }
+    else
+    {
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      y[output] = __dadd_rn(y[output], sum);
+#else
+      y[output] += sum;
+#endif
     }
   }
 };
@@ -2013,6 +2701,57 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
               "Deterministic exact DG face gather requires one uniquely "
               "owned scalar row per discontinuous element dof.");
   EnsureInteriorFaceElementIncidence2D(info, work);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  if (UsesInteriorFaceDGDiffusionCompactLift2D(info, work))
+  {
+    const auto& factor = work.normal_factorization;
+    // Keep only the selected live scratch format. A pooled allocator can retain
+    // the released block, so this logical reduction need not lower GPU residency.
+    if (work.face_contribution.Size()) { work.face_contribution.Destroy(); }
+    work.tensor_lift.SetSize(24 * info.nf);
+    work.tensor_lift.UseDevice(true);
+    InteriorFaceDGDiffusionRecord2D record;
+    record.dof = info.dof;
+    record.vdim = info.vdim;
+    record.nq = info.nq;
+    record.nf = info.nf;
+    record.ne = info.ne;
+    record.ip_sigma = ip_sigma;
+    record.penalty = work.penalty.Read();
+    record.face_elements = work.face_elements.Read();
+    record.element_vdof_map = work.element_vdof_map.Read();
+    record.x = scalar.Read();
+    record.contribution = work.tensor_lift.Write();
+    const InteriorFaceDGDiffusionTensorRecord2DWarp tensor_record{
+      record, factor.tensor_endpoint.Read(), factor.tensor_tangent.Read(),
+      factor.tensor_axes.Read(), factor.tensor_face_slots.Read(),
+      factor.tensor_lex_to_native.Read(), factor.normal_geometry.Read(),
+      work.side_coefficient.Read(), factor.tensor_slot_count};
+    mfem::forall_2D_batch(info.nf, 32, 1, 4,
+      InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record});
+
+    InteriorFaceDGDiffusionTensorLiftGather2D gather;
+    gather.dof = info.dof;
+    gather.vdim = info.vdim;
+    gather.ne = info.ne;
+    gather.nf = info.nf;
+    gather.element_vdof_map = work.element_vdof_map.Read();
+    gather.element_face_offsets = work.element_face_offsets.Read();
+    gather.element_face_ids = work.element_face_ids.Read();
+    gather.element_face_sides = work.element_face_sides.Read();
+    gather.contribution = work.tensor_lift.Read();
+    gather.y = y.ReadWrite();
+    gather.add_to_base = add_to_base;
+    gather.endpoint = factor.tensor_endpoint.Read();
+    gather.axes = factor.tensor_axes.Read();
+    gather.face_slots = factor.tensor_face_slots.Read();
+    gather.native_to_lex = factor.tensor_native_to_lex.Read();
+    gather.slot_count = factor.tensor_slot_count;
+    mfem::forall(info.ne * info.dof, gather);
+    return;
+  }
+#endif
+  if (work.tensor_lift.Size()) { work.tensor_lift.Destroy(); }
   work.face_contribution.SetSize(2 * info.dof * info.nf);
   work.face_contribution.UseDevice(true);
 
@@ -2023,7 +2762,6 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   record.nf = info.nf;
   record.ne = info.ne;
   record.ip_sigma = ip_sigma;
-  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
   record.penalty = work.penalty.Read();
   record.face_elements = work.face_elements.Read();
   record.element_vdof_map = work.element_vdof_map.Read();
@@ -2034,19 +2772,37 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       mfem::Device::Allows(mfem::Backend::CUDA) &&
       !mfem::Device::Allows(mfem::Backend::RAJA_CUDA))
   {
-    const bool compact_shape = work.shape_dictionary.Matches(info);
-    record.shape = compact_shape ? work.shape_dictionary.values.Read()
-                                 : work.shape.Read();
-    mfem::forall_2D_batch(
-      info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp{
-        record,
-        compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr,
-        compact_shape ? work.shape_dictionary.slot_count : info.nf});
+    const auto& factor = work.normal_factorization;
+    const bool factorized = UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+      HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work);
+    if (factorized)
+    {
+      mfem::forall_2D_batch(
+        info.nf, 32, 1, 4, InteriorFaceDGDiffusionTensorRecord2DWarp{
+          record, factor.tensor_endpoint.Read(), factor.tensor_tangent.Read(),
+          factor.tensor_axes.Read(), factor.tensor_face_slots.Read(),
+          factor.tensor_lex_to_native.Read(), factor.normal_geometry.Read(),
+          work.side_coefficient.Read(), factor.tensor_slot_count});
+    }
+    else
+    {
+      EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
+      const bool compact_shape = work.shape_dictionary.Matches(info);
+      record.shape = compact_shape ? work.shape_dictionary.values.Read() : work.shape.Read();
+      const int* shape_slots = compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr;
+      const int shape_count = compact_shape ? work.shape_dictionary.slot_count : info.nf;
+      record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
+      mfem::forall_2D_batch(
+        info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp<false>{
+          record, shape_slots, shape_count});
+    }
   }
   else
 #endif
   {
+    EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
     record.shape = work.shape.Read();
+    record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
     mfem::forall(info.nf, record);
   }
 
@@ -2451,6 +3207,7 @@ AddInteriorFaceDGDiffusionApply2D(
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
+  EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,
@@ -2550,6 +3307,7 @@ inline void AddInteriorFaceDGDiffusionApply2D(
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
+  EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,
@@ -2628,6 +3386,60 @@ inline void AddInteriorFaceDGDiffusionDiagonal2D(
   mfem::real_t ip_sigma,
   mfem::Vector& diag)
 {
+  if (work.compact_qdata && UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+      work.coefficient_geometry_revision == info.connectivity_revision &&
+      work.coefficient_generation != 0 &&
+      HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work))
+  {
+    // Reconstruct only each diagonal entry. Materializing the full current N
+    // table here would undo both the refresh and device-residency reduction.
+    const auto& factor = work.normal_factorization;
+    const auto E = mfem::Reshape(factor.tensor_endpoint.HostRead(),
+                                  2, 6, 2, factor.tensor_slot_count);
+    const auto T = mfem::Reshape(factor.tensor_tangent.HostRead(),
+                                  2, 6, 6, 2, factor.tensor_slot_count);
+    const auto Axis = mfem::Reshape(factor.tensor_axes.HostRead(),
+                                     2, factor.tensor_slot_count);
+    const int* slots = factor.tensor_face_slots.HostRead();
+    const int* native = factor.tensor_lex_to_native.HostRead();
+    const auto G = mfem::Reshape(factor.normal_geometry.HostRead(), 2, 2, 6, info.nf);
+    const auto Q = mfem::Reshape(work.side_coefficient.HostRead(), 2, 6, info.nf);
+    const auto P = mfem::Reshape(work.penalty.HostRead(), 6, info.nf);
+    const auto F = mfem::Reshape(work.face_elements.HostRead(), 2, info.nf);
+    const auto D = mfem::Reshape(work.element_vdof_map.HostRead(), 36, 1, info.ne);
+    mfem::real_t* diag_data = diag.HostReadWrite();
+    for (int face = 0; face < info.nf; ++face)
+    {
+      const int slot = slots[face];
+      for (int side = 0; side < 2; ++side)
+      {
+        const int axis = Axis(side, slot), element = F(side, face);
+        for (int q = 0; q < 6; ++q)
+        {
+          for (int t = 0; t < 6; ++t) for (int i = 0; i < 6; ++i)
+          {
+            const int d = native[axis == 0 ? i + 6 * t : t + 6 * i];
+            const int vdof = D(d, 0, element);
+            MFEM_VERIFY(vdof >= 0 && vdof < diag.Size(),
+                        "Compact interior exact-face diagonal vdof out of range.");
+            const mfem::real_t bn = E(0, i, side, slot), bt = T(0, t, q, side, slot);
+            const mfem::real_t dn = E(1, i, side, slot) * bt;
+            const mfem::real_t dt = bn * T(1, t, q, side, slot);
+            const mfem::real_t dx = axis == 0 ? dn : dt;
+            const mfem::real_t dy = axis == 0 ? dt : dn;
+            // Preserve the physical x/y normal accumulation order.
+            mfem::real_t normal = G(0, side, q, face) * dx;
+            normal += G(1, side, q, face) * dy;
+            normal *= Q(side, q, face);
+            diag_data[vdof] += DGDiffusionFaceDiagonalEntry2D(
+              side, bn * bt, normal, P(q, face), ip_sigma);
+          }
+        }
+      }
+    }
+    return;
+  }
+  EnsureInteriorFaceDGDiffusionDenseNormals2D(info, work);
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,

@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -36,6 +37,122 @@ namespace dg_igr_tests
 int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
+
+  // --- Diagnostic state scans are opt-in and have paired CLI controls ---
+  {
+    const dg_sim::CommonOptions defaults;
+    const dg_sim::TimeLoopConfig loop_defaults;
+    ctx.Check(!defaults.nan_scan && !defaults.admissibility_scan &&
+                !loop_defaults.nan_scan,
+              "diagnostic scans: runtime and time-loop defaults are disabled");
+
+    for (const bool enable_scans : {false, true})
+    {
+      char program_name[] = "test";
+      char nan_enable_name[] = "--nan-scan";
+      char nan_disable_name[] = "--no-nan-scan";
+      char admissibility_enable_name[] = "--admissibility-scan";
+      char admissibility_disable_name[] = "--no-admissibility-scan";
+      char* scan_argv[] = {
+        program_name,
+        enable_scans ? nan_enable_name : nan_disable_name,
+        enable_scans ? admissibility_enable_name : admissibility_disable_name};
+      dg_sim::CommonOptions opts;
+      opts.nan_scan = !enable_scans;
+      opts.admissibility_scan = !enable_scans;
+      mfem::OptionsParser parser(3, scan_argv);
+      dg_sim::AddCommonOptions(parser, opts, "Test mesh.");
+      parser.Parse();
+      ctx.Check(parser.Good() && opts.nan_scan == enable_scans &&
+                  opts.admissibility_scan == enable_scans,
+                enable_scans
+                  ? "diagnostic scans: explicit enable flags opt in"
+                  : "diagnostic scans: explicit off flags override enabled values");
+
+      const dg_sim::RunConfig parsed_run = dg_sim::MakeRunConfig(
+        dg_sim::CaseConfig{}, opts, dg_sim::IGROptions{});
+      const dg_sim::TimeLoopConfig parsed_loop =
+        dg_sim::MakeTimeLoopConfig(parsed_run);
+      ctx.Check(parsed_run.opts.nan_scan == enable_scans &&
+                  parsed_run.opts.admissibility_scan == enable_scans &&
+                  parsed_loop.nan_scan == enable_scans,
+                enable_scans
+                  ? "diagnostic scans: enabled CLI policy reaches the run and loop"
+                  : "diagnostic scans: disabled CLI policy reaches the run and loop");
+    }
+  }
+
+  // Conservation integration must preserve the original physical/discrete
+  // measure for affine GL/GLL, curved geometry, and continuous fallback spaces.
+  // The point-query oracle intentionally retains the former general algorithm.
+  for (int fixture = 0; fixture < 5; ++fixture)
+  {
+    const bool dgsem = fixture == 1 || fixture == 3;
+    const bool curved = fixture == 2 || fixture == 3;
+    const bool continuous = fixture == 4;
+    mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      4, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+    if (curved)
+    {
+      mesh.SetCurvature(2);
+      mfem::VectorFunctionCoefficient mapping(2, [](const mfem::Vector& x, mfem::Vector& y)
+      {
+        y.SetSize(2);
+        y(0) = x(0) + 0.04 * std::sin(3.14159265358979323846 * x(0)) *
+                                std::sin(3.14159265358979323846 * x(1));
+        y(1) = x(1) + 0.03 * std::sin(6.28318530717958647692 * x(0)) *
+                                std::sin(3.14159265358979323846 * x(1));
+      });
+      mesh.Transform(mapping);
+    }
+    std::unique_ptr<mfem::FiniteElementCollection> collection;
+    if (continuous) { collection = std::make_unique<mfem::H1_FECollection>(2, 2); }
+    else
+    {
+      collection = std::make_unique<mfem::L2_FECollection>(5, 2,
+        dgsem ? mfem::BasisType::GaussLobatto : mfem::BasisType::GaussLegendre);
+    }
+    mfem::ParFiniteElementSpace fes(&mesh, collection.get(), 4, mfem::Ordering::byNODES);
+    mfem::ParGridFunction state(&fes);
+    auto* nodal = state.HostWrite();
+    for (int i = 0; i < state.Size(); ++i)
+    { nodal[i] = 1.0 + 0.17 * std::sin(0.13 * i) + 0.09 * std::cos(0.21 * i); }
+    mfem::Vector local(5), expected(5), value(4);
+    local = 0.0;
+    static mfem::IntegrationRules lgl(0, mfem::Quadrature1D::GaussLobatto);
+    for (int e = 0; e < fes.GetNE(); ++e)
+    {
+      const auto* fe = fes.GetFE(e);
+      auto* tr = fes.GetElementTransformation(e);
+      const auto& rule = dgsem
+        ? lgl.Get(fe->GetGeomType(), std::max(1, 2 * fe->GetOrder() - 1))
+        : mfem::IntRules.Get(fe->GetGeomType(), 2 * fe->GetOrder() + tr->OrderW() + 2);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const auto& point = rule.IntPoint(q);
+        tr->SetIntPoint(&point);
+        state.GetVectorValue(*tr, point, value);
+        const double weight = point.weight * tr->Weight();
+        for (int c = 0; c < 4; ++c) { local(c) += weight * value(c); }
+        local(4) += weight;
+      }
+    }
+    MPI_Allreduce(local.GetData(), expected.GetData(), 5,
+                  mfem::MPITypeMap<mfem::real_t>::mpi_type, MPI_SUM, fes.GetComm());
+    if (mfem::Device::Allows(mfem::Backend::CUDA))
+    { state.UseDevice(true); (void)state.ReadWrite(); }
+    const auto actual = dg_sim::detail::IntegrateEulerConservedState(
+      state, dgsem ? dg_sim::DGBackend::DGSEM : dg_sim::DGBackend::DG);
+    for (int c = 0; c < 4; ++c)
+    {
+      ctx.CheckNear(actual.components(c), expected(c), 5e-12,
+                    "Conservation optimized integral matches point queries for fixture " +
+                      std::to_string(fixture) + " component " + std::to_string(c));
+    }
+    ctx.CheckNear(actual.domain_measure, expected(4), 5e-12,
+                  "Conservation optimized measure retains the selected quadrature.");
+  }
 
   // Canonical runtime names must coexist with older case-launch scripts.
   {
@@ -1809,6 +1926,18 @@ int RunTimeDefaultsTests(TestContext& ctx)
       t += dt;
     }
   };
+  struct TimeLoopScheduleStepper
+  {
+    std::vector<mfem::real_t> accepted_dts;
+    long double integrated_dt = 0.0L;
+
+    void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
+    {
+      accepted_dts.push_back(dt);
+      integrated_dt += static_cast<long double>(dt);
+      t += dt;
+    }
+  };
   struct TimeLoopGrowthBoundOperator
   {
     mfem::real_t previous_accepted_dt =
@@ -2618,7 +2747,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "time loop failure output: restart save retains checkpoint time");
   }
 
-  // --- non-finite post-accept CFL dt emits the finite committed state ---
+  // --- Non-finite CFL dt scans and failure snapshots require opt-in ---
+  for (const bool nan_scan : {false, true})
   {
     TimeLoopOverflowDtOperator op;
     TimeLoopCountingStepper stepper;
@@ -2628,9 +2758,11 @@ int RunTimeDefaultsTests(TestContext& ctx)
     cfg.dt_min = 0.0;
     cfg.cfl = 0.3;
     cfg.order = 1;
+    cfg.nan_scan = nan_scan;
     cfg.vtk_save = true;
     cfg.dt_save = 100.0;
 
+    int save_calls = 0;
     int final_save_calls = 0;
     int final_save_step = -1;
     mfem::real_t final_save_time = -1.0;
@@ -2640,6 +2772,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
                         int,
                         bool is_final)
     {
+      ++save_calls;
       if (is_final)
       {
         ++final_save_calls;
@@ -2652,14 +2785,38 @@ int RunTimeDefaultsTests(TestContext& ctx)
       op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
     ctx.Check(!result.success &&
                 result.termination_reason == "nonfinite-cfl-dt" &&
-                result.steps == 1 && stepper.calls == 1,
-              "time loop failure output: overflowed CFL update is typed");
-    ctx.Check(final_save_calls == 1 && final_save_step == result.steps,
-              "time loop failure output: post-accept state is saved once");
-    ctx.CheckNear(final_save_time,
-                  result.final_time,
-                  0.0,
-                  "time loop failure output: saved time is committed time");
+                result.steps == 1 && result.segment_steps == 1 &&
+                result.accepted_attempts == 1 && stepper.calls == 1 &&
+                result.final_time > 0.0 && result.final_time < cfg.t_final,
+              nan_scan
+                ? "time loop diagnostics: overflowed CFL update is typed with scans on"
+                : "time loop diagnostics: overflowed CFL update is typed with scans off");
+    if (nan_scan)
+    {
+      ctx.Check(result.non_finite_count == 1 &&
+                  std::isfinite(result.non_finite_min) &&
+                  std::isfinite(result.non_finite_max) &&
+                  result.non_finite_min <= result.non_finite_max,
+                "time loop diagnostics: enabled failure scan records finite extrema");
+      ctx.Check(save_calls == 1 && final_save_calls == 1 &&
+                  final_save_step == result.steps,
+                "time loop failure output: scanned post-accept state is saved once");
+      ctx.CheckNear(final_save_time,
+                    result.final_time,
+                    0.0,
+                    "time loop failure output: saved time is committed time");
+    }
+    else
+    {
+      ctx.Check(result.non_finite_count == 0 &&
+                  result.non_finite_min ==
+                    std::numeric_limits<double>::infinity() &&
+                  result.non_finite_max ==
+                    -std::numeric_limits<double>::infinity(),
+                "time loop diagnostics: disabled scans leave state evidence unobserved");
+      ctx.Check(save_calls == 0,
+                "time loop failure output: disabled scan emits no failure snapshot");
+    }
   }
 
   // --- clipped/snap dt_real below dt_min is allowed (bookkeeping policy) ---
@@ -2926,6 +3083,178 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.0,
                   1.0e-14,
                   "time loop: zero-step exit keeps initial final_time");
+  }
+
+  // --- decimal output intervals must not introduce roundoff-sized RHS steps ---
+  for (const int total_steps : {100, 1000})
+  {
+    for (const bool resumed : {false, true})
+    {
+      TimeLoopDummyOperator op;
+      TimeLoopScheduleStepper stepper;
+      dg_sim::TimeLoopConfig cfg;
+      cfg.dt = 1.0e-4;
+      cfg.t_final = total_steps * cfg.dt;
+      cfg.vtk_save = true;
+      cfg.dt_save = (total_steps / 4) * cfg.dt;
+      cfg.initial_step = resumed ? total_steps / 4 : 0;
+      cfg.initial_time = resumed ? cfg.dt_save : 0.0;
+      cfg.next_save_time = cfg.initial_time + cfg.dt_save;
+      cfg.initial_state_saved = true;
+      cfg.save_index_offset = resumed ? 2 : 1;
+
+      std::vector<int> save_steps;
+      std::vector<int> save_cycles;
+      std::vector<mfem::real_t> save_times;
+      int final_saves = 0;
+      dg_sim::TimeLoopHooks hooks;
+      hooks.on_save = [&](int step, mfem::real_t time, int cycle, bool final)
+      {
+        save_steps.push_back(step);
+        save_cycles.push_back(cycle);
+        save_times.push_back(time);
+        final_saves += final ? 1 : 0;
+      };
+      const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+      const int segment_steps = total_steps - cfg.initial_step;
+      ctx.Check(result.success && result.steps == total_steps &&
+                  result.segment_steps == segment_steps &&
+                  result.accepted_attempts == segment_steps &&
+                  result.rejected_attempts == 0 &&
+                  stepper.accepted_dts.size() ==
+                    static_cast<std::size_t>(segment_steps),
+                "time loop roundoff: decimal checkpoints preserve physical "
+                "step and attempt counts, including restart");
+      ctx.Check(result.final_time == cfg.t_final && final_saves == 1 &&
+                  result.minimum_accepted_dt > 0.999 * cfg.dt &&
+                  result.maximum_accepted_dt <= cfg.dt,
+                "time loop roundoff: no artificial tiny step or enlarged dt "
+                "and the final clock is exact");
+      const int expected_saves = resumed ? 3 : 4;
+      bool correct_saves =
+        save_steps.size() == static_cast<std::size_t>(expected_saves);
+      for (std::size_t i = 0; i < save_steps.size(); ++i)
+      {
+        const int expected_step =
+          cfg.initial_step + static_cast<int>(i + 1) * (total_steps / 4);
+        correct_saves = correct_saves && save_steps[i] == expected_step &&
+                        save_cycles[i] ==
+                          cfg.save_index_offset + static_cast<int>(i) &&
+                        std::abs(save_times[i] - expected_step * cfg.dt) <=
+                          8.0 * std::numeric_limits<mfem::real_t>::epsilon() *
+                            cfg.t_final;
+      }
+      ctx.Check(correct_saves,
+                "time loop roundoff: every checkpoint is emitted once at "
+                "its physical step with monotone save numbering");
+      ctx.Check(std::abs(stepper.integrated_dt -
+                         static_cast<long double>(cfg.t_final -
+                                                  cfg.initial_time)) <=
+                  512.0L * std::numeric_limits<mfem::real_t>::epsilon() *
+                    cfg.t_final,
+                "time loop roundoff: accepted integration spans the horizon "
+                "up to clock accumulation roundoff");
+    }
+  }
+
+  // --- final-time snapping works with no output or an output every step ---
+  for (const mfem::real_t dt : {mfem::real_t{1.0e-4}, mfem::real_t{1.0e-5}})
+  {
+    for (const bool save_every_step : {false, true})
+    {
+      TimeLoopDummyOperator op;
+      TimeLoopScheduleStepper stepper;
+      dg_sim::TimeLoopConfig cfg;
+      cfg.dt = dt;
+      cfg.t_final = 1000 * dt;
+      cfg.vtk_save = save_every_step;
+      cfg.dt_save = dt;
+      int save_calls = 0;
+      dg_sim::TimeLoopHooks hooks;
+      hooks.on_save = [&](int, mfem::real_t, int, bool) { ++save_calls; };
+      const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+      ctx.Check(result.success && result.steps == 1000 &&
+                  stepper.accepted_dts.size() == 1000 &&
+                  result.minimum_accepted_dt > 0.999 * dt &&
+                  result.final_time == cfg.t_final &&
+                  save_calls == (save_every_step ? 1000 : 0),
+                "time loop roundoff: decimal horizon has exactly 1000 "
+                "physical steps with no output or with frequent output");
+    }
+  }
+
+  // --- small but resolved physical intervals must not be treated as roundoff ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopScheduleStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.dt = 1.0e-4;
+    cfg.t_final = 1.0e-3 + 2.5e-13;
+    cfg.vtk_save = true;
+    cfg.dt_save = 5.0e-4 + 1.25e-13;
+    std::vector<int> save_steps;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step, mfem::real_t, int, bool)
+    {
+      save_steps.push_back(step);
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && result.steps == 12 &&
+                save_steps == std::vector<int>({6, 12}) &&
+                result.minimum_accepted_dt > 1.0e-13 &&
+                result.minimum_accepted_dt < 1.5e-13 &&
+                result.final_time == cfg.t_final,
+              "time loop roundoff: genuine sub-picosecond save/final clips "
+              "remain accepted physical steps");
+  }
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopScheduleStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.dt = 1.0e-15;
+    cfg.t_final = 4.0e-15;
+    cfg.vtk_save = true;
+    cfg.dt_save = cfg.dt;
+    cfg.initial_state_saved = true;
+    int save_calls = 0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int, mfem::real_t, int, bool) { ++save_calls; };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && result.steps == 4 && save_calls == 4 &&
+                result.final_time == cfg.t_final,
+              "time loop roundoff: no absolute time floor skips a small "
+              "physical horizon or suppresses its final output");
+  }
+
+  // --- a rejected save-boundary attempt must not snap its shorter retry ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRetryStepper stepper(/*failures=*/1);
+    const mfem::Vector state_before(bundle.sol);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.dt = 1.0e-4;
+    cfg.t_final = 2.0e-4;
+    cfg.vtk_save = true;
+    cfg.dt_save = 1.0e-4;
+    std::vector<int> save_steps;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step, mfem::real_t, int, bool)
+    {
+      save_steps.push_back(step);
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && result.steps == 4 &&
+                result.rejected_attempts == 1 && stepper.calls == 5 &&
+                save_steps == std::vector<int>({2, 4}) &&
+                result.final_time == cfg.t_final,
+              "time loop roundoff: output boundaries follow accepted retries "
+              "rather than rejected nominal endpoints");
+    bundle.sol = state_before;
   }
 
   // --- save-boundary snapping advances even when on_save hook is missing ---

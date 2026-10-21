@@ -76,7 +76,45 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
   mfem::Vector local(components);
   local = 0.0;
   double local_measure = 0.0;
-  mfem::Vector value(components);
+  mfem::DenseMatrix values;
+  mfem::Array<int> vdofs;
+  mfem::Vector element_values, shape, nodal_scale;
+  const mfem::FiniteElement* cached_fe = nullptr;
+  const mfem::IntegrationRule* nodal_rule = nullptr;
+  const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(fes->FEColl());
+  // Read the owning state once. Component views and repeated point queries
+  // otherwise cross this same host/device boundary implicitly.
+  (void)state.HostRead();
+  const auto affine_quad_weight = [](mfem::ElementTransformation& tr,
+                                     double& weight)
+  {
+    const auto* iso = dynamic_cast<const mfem::IsoparametricTransformation*>(&tr);
+    if (!iso || !iso->GetFE() || iso->GetFE()->GetOrder() != 1 ||
+        iso->GetFE()->GetGeomType() != mfem::Geometry::SQUARE ||
+        tr.GetSpaceDim() != 2)
+    { return false; }
+    mfem::IntegrationPoint center;
+    center.Set2(0.5, 0.5);
+    tr.SetIntPoint(&center);
+    const mfem::DenseMatrix& initial = tr.Jacobian();
+    const double jacobian[4] = {initial(0, 0), initial(1, 0), initial(0, 1), initial(1, 1)};
+    weight = tr.Weight();
+    if (!std::isfinite(weight) || weight <= 0.0) { return false; }
+    // A Q1 quadrilateral has an affine map exactly when its Jacobian is
+    // constant. Compare all entries at its corners without a geometry tolerance.
+    for (int corner = 0; corner < 4; ++corner)
+    {
+      mfem::IntegrationPoint point;
+      point.Set2(corner % 2, corner / 2);
+      tr.SetIntPoint(&point);
+      const mfem::DenseMatrix& current = tr.Jacobian();
+      for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i)
+      {
+        if (current(i, j) != jacobian[i + 2 * j]) { return false; }
+      }
+    }
+    return true;
+  };
   for (int element = 0; element < fes->GetNE(); ++element)
   {
     const mfem::FiniteElement* fe = fes->GetFE(element);
@@ -84,6 +122,66 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
       fes->GetElementTransformation(element);
     MFEM_VERIFY(fe != nullptr && transformation != nullptr,
                 "Euler conservation integration is missing element data.");
+    if (fe != cached_fe)
+    {
+      cached_fe = fe;
+      nodal_rule = nullptr;
+      if (l2 && fe->GetGeomType() == mfem::Geometry::SQUARE &&
+          fe->GetMapType() == mfem::FiniteElement::VALUE &&
+          ((backend == DGBackend::DG && l2->GetBasisType() == mfem::BasisType::GaussLegendre) ||
+           (backend == DGBackend::DGSEM && l2->GetBasisType() == mfem::BasisType::GaussLobatto)))
+      {
+        static mfem::IntegrationRules nodal_lgl_rules(0, mfem::Quadrature1D::GaussLobatto);
+        const mfem::IntegrationRule& candidate = backend == DGBackend::DGSEM
+          ? nodal_lgl_rules.Get(fe->GetGeomType(), std::max(1, 2 * fe->GetOrder() - 1))
+          : mfem::IntRules.Get(fe->GetGeomType(), 2 * fe->GetOrder());
+        const int dof = fe->GetDof();
+        bool collocated = candidate.GetNPoints() == dof && fe->GetNodes().GetNPoints() == dof;
+        shape.SetSize(dof);
+        nodal_scale.SetSize(dof);
+        for (int q = 0; collocated && q < dof; ++q)
+        {
+          const auto& point = candidate.IntPoint(q);
+          const auto& node = fe->GetNodes().IntPoint(q);
+          collocated = point.x == node.x && point.y == node.y;
+          fe->CalcShape(point, shape);
+          for (int j = 0; collocated && j < dof; ++j)
+          {
+            collocated = std::isfinite(shape(j)) && (j == q || shape(j) == 0.0);
+          }
+          nodal_scale(q) = shape(q);
+        }
+        if (collocated) { nodal_rule = &candidate; }
+      }
+    }
+    double affine_weight = 0.0;
+    if (nodal_rule && affine_quad_weight(*transformation, affine_weight))
+    {
+      mfem::DofTransformation dof_transformation;
+      fes->GetElementVDofs(element, vdofs, dof_transformation);
+      state.GetSubVector(vdofs, element_values);
+      dof_transformation.InvTransformPrimal(element_values);
+      bool finite = true;
+      for (int i = 0; finite && i < element_values.Size(); ++i)
+      { finite = std::isfinite(element_values(i)); }
+      if (finite)
+      {
+        const int dof = fe->GetDof();
+        for (int q = 0; q < dof; ++q)
+        {
+          const double weight = nodal_rule->IntPoint(q).weight * affine_weight;
+          MFEM_VERIFY(std::isfinite(weight) && weight >= 0.0,
+                      "Euler conservation integration produced an invalid nodal weight.");
+          local_measure += weight;
+          for (int component = 0; component < components; ++component)
+          {
+            local(component) += weight *
+                (nodal_scale(q) * element_values(component * dof + q));
+          }
+        }
+        continue;
+      }
+    }
     const mfem::IntegrationRule* rule = nullptr;
     if (backend == DGBackend::DGSEM)
     {
@@ -103,18 +201,20 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
         2 * fe->GetOrder() + transformation->OrderW() + 2;
       rule = &mfem::IntRules.Get(fe->GetGeomType(), integration_order);
     }
+    // Preserve the original quadrature for curved, continuous, noncollocated,
+    // and exceptional states. Gather each element once instead of per point.
+    state.GetVectorValues(*transformation, *rule, values);
     for (int q = 0; q < rule->GetNPoints(); ++q)
     {
       const mfem::IntegrationPoint& point = rule->IntPoint(q);
       transformation->SetIntPoint(&point);
-      state.GetVectorValue(*transformation, point, value);
       const double weight = point.weight * transformation->Weight();
       MFEM_VERIFY(std::isfinite(weight) && weight >= 0.0,
                   "Euler conservation integration produced an invalid weight.");
       local_measure += weight;
       for (int component = 0; component < components; ++component)
       {
-        local(component) += weight * value(component);
+        local(component) += weight * values(component, q);
       }
     }
   }
@@ -762,6 +862,7 @@ RunEulerCase(ExampleContext& ctx,
                         &bundle,
                         &rk3,
                         &op,
+                        nan_scan = run_cfg.opts.nan_scan,
                         sigma_certification_supported,
                         &final_sigma_prepared,
                         &final_sigma_certification_skipped_nonfinite,
@@ -784,7 +885,7 @@ RunEulerCase(ExampleContext& ctx,
       {
         return SigmaOutputPreparation{0.0, false};
       }
-      if (is_final)
+      if (is_final && nan_scan)
       {
         ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
         const mfem::igrlab::NonFiniteSummary final_nonfinite =
@@ -929,21 +1030,25 @@ RunEulerCase(ExampleContext& ctx,
   // the conservative state and IGR cadence provenance; certification must not
   // depend on whether a final VTK hook ran. Never replace a typed nonfinite
   // transport failure with an algebraic-solver abort.
-  bool final_state_finite = true;
+  // With diagnostics disabled, a nonfinite scalar failure supplies no
+  // evidence that the conservative state can enter final reconstruction.
+  const bool unscanned_nonfinite_failure =
+    !run_cfg.opts.nan_scan &&
+    result.termination_reason.compare(0, 10, "nonfinite-") == 0;
   if (sigma_provider && !final_sigma_prepared &&
-      !final_sigma_certification_skipped_nonfinite)
+      !final_sigma_certification_skipped_nonfinite && run_cfg.opts.nan_scan)
   {
     ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
     const mfem::igrlab::NonFiniteSummary final_nonfinite =
       mfem::igrlab::ScanNonFinite(bundle.sol);
-    final_state_finite = final_nonfinite.global_non_finite == 0;
+    if (final_nonfinite.global_non_finite != 0)
+    {
+      final_sigma_certification_skipped_nonfinite = true;
+    }
   }
-  if (sigma_provider && !final_sigma_prepared && !final_state_finite)
-  {
-    final_sigma_certification_skipped_nonfinite = true;
-  }
-  if (sigma_provider && !final_sigma_prepared && final_state_finite &&
-      !final_sigma_certification_skipped_nonfinite)
+  if (sigma_provider && !final_sigma_prepared &&
+      !final_sigma_certification_skipped_nonfinite &&
+      !unscanned_nonfinite_failure)
   {
     ::igrlab::NVTXRange range("Solver/final-sigma-preparation");
     final_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
@@ -1206,25 +1311,27 @@ RunEulerCase(ExampleContext& ctx,
   const bool report_q_sigma =
     run_cfg.igr_opts.igr_invariant_domain_flux ||
     report_extrapolated_q_sigma;
-  if (report_q_sigma)
+  const bool report_dgsem_admission = sigma_provider &&
+    run_cfg.dg_backend == DGBackend::DGSEM && run_cfg.opts.admissibility_scan;
+  const auto* q_sigma_provider =
+    dynamic_cast<const mfem::IGRFrozenSigmaTelemetryProvider*>(&op);
+  MFEM_VERIFY(!report_q_sigma || q_sigma_provider,
+              "Selected IGR transport is missing q_sigma telemetry.");
+  if ((report_q_sigma || report_dgsem_admission) && q_sigma_provider)
   {
-    const auto* q_sigma_provider =
-      dynamic_cast<const mfem::IGRFrozenSigmaTelemetryProvider*>(&op);
-    MFEM_VERIFY(q_sigma_provider,
-                "Selected IGR transport is missing q_sigma "
-                "telemetry.");
     const mfem::IGRFrozenSigmaTelemetry q_sigma =
       q_sigma_provider->GetGlobalFrozenSigmaTelemetry();
-    MFEM_VERIFY(q_sigma.enabled,
+    MFEM_VERIFY(!report_q_sigma || q_sigma.enabled,
                 "Selected IGR q_sigma telemetry was not enabled.");
-    if (communicator_root)
+    if (communicator_root && q_sigma.enabled)
     {
       std::cout << std::setprecision(17)
                 << "[igr-q-sigma] event=run-summary"
                 << " scope="
                 << (report_extrapolated_q_sigma
                       ? "application-total-attempted-frozen-sigma-work"
-                      : "application-total-attempted-speed-work")
+                      : (report_q_sigma ? "application-total-attempted-speed-work"
+                                        : "application-total-attempted-sigma-flux-work"))
                 << " rejected_attempts_included=1"
                 << " precision=fp64"
                 << " sample_count=" << q_sigma.sample_count
@@ -1843,15 +1950,42 @@ struct Solver
         static_source->UseDevice(
           run_cfg.device_backend == DeviceBackend::CUDA);
         static_source->ProjectCoefficient(*static_source_coefficient);
-        const mfem::igrlab::NonFiniteSummary source_scan =
-          mfem::igrlab::ScanNonFinite(*static_source);
-        MFEM_VERIFY(source_scan.global_non_finite == 0,
-                    "Projected CaseSpec static source contains non-finite "
-                    "values.");
-        const double source_max_abs =
-          std::max(std::abs(source_scan.global_min),
-                   std::abs(source_scan.global_max));
-        if (source_max_abs == 0.0)
+        bool source_is_zero = false;
+        if (run_cfg.opts.nan_scan)
+        {
+          const mfem::igrlab::NonFiniteSummary source_scan =
+            mfem::igrlab::ScanNonFinite(*static_source);
+          MFEM_VERIFY(source_scan.global_non_finite == 0,
+                      "Projected CaseSpec static source contains non-finite "
+                      "values.");
+          const double source_max_abs =
+            std::max(std::abs(source_scan.global_min),
+                     std::abs(source_scan.global_max));
+          source_is_zero = source_max_abs == 0.0;
+        }
+        else
+        {
+          // Source-free dispatch needs an exact zero test even when optional
+          // diagnostics are off. NaNs and tiny nonzero values cannot pass it.
+          int source_has_nonzero = 0;
+          const auto* source_data = static_source->HostRead();
+          for (int i = 0; i < static_source->Size(); ++i)
+          {
+            if (source_data[i] != 0.0)
+            {
+              source_has_nonzero = 1;
+              break;
+            }
+          }
+          MPI_Allreduce(MPI_IN_PLACE,
+                        &source_has_nonzero,
+                        1,
+                        mfem::MPITypeMap<int>::mpi_type,
+                        MPI_MAX,
+                        ctx.Mesh().GetComm());
+          source_is_zero = source_has_nonzero == 0;
+        }
+        if (source_is_zero)
         {
           // Preserve the source-free operator path exactly: no retained field,
           // RHS branch body, device vector add, or memory traffic.

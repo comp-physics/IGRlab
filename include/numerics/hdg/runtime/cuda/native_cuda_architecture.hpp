@@ -4,8 +4,10 @@
 // runtime and its consumers.  An explicit supported selection is required.
 #ifndef DG_IGR_HDG_NATIVE_CUDA_ARCH
 #error "HDG CUDA requires DG_IGR_HDG_NATIVE_CUDA_ARCH from its build target"
-#elif DG_IGR_HDG_NATIVE_CUDA_ARCH != 80 && DG_IGR_HDG_NATIVE_CUDA_ARCH != 120
-#error "HDG CUDA supports only native SM80 or SM120"
+#elif DG_IGR_HDG_NATIVE_CUDA_ARCH != 80 && \
+      DG_IGR_HDG_NATIVE_CUDA_ARCH != 90 && \
+      DG_IGR_HDG_NATIVE_CUDA_ARCH != 120
+#error "HDG CUDA supports only native SM80, SM90, or SM120"
 #endif
 
 #if defined(__CUDA_ARCH__) && \

@@ -24,17 +24,23 @@
  * details, refer to the documentation of DGHyperbolicConservationLaws::Mult.
  */
 
+#include <array>
 #include <functional>
 #include <cstdint>
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/modal_damping.hpp"
 #include "numerics/dgsem/dgsem_production.hpp"
+#include "numerics/shared_reference_map.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
 #include "physics/igr/igr_flux.hpp"
 
 namespace mfem
 {
+namespace dg_igr_detail
+{
+struct TensorFaceData;
+}
 namespace dgsem
 {
 class DGSEMOperator;
@@ -361,6 +367,9 @@ private:
   std::vector<DenseMatrix> invmass; ///< inverse local mass matrices (dof × dof)
   std::vector<DenseMatrix>
     weakdiv; ///< local weak-divergence (dof × (dof*dim); columns grouped by node then dim)
+  /// Tensor-line opt-in stores one genuinely assembled reference matrix after
+  /// proving identical affine geometry and local Gauss-Legendre bases.
+  bool weakdiv_reference_only_ = false;
 
   // --- Runtime state ---
   mutable real_t max_char_speed =
@@ -426,6 +435,8 @@ private:
   /// Preassemble the weak-divergence operator on each element (optional).
   /// The layout is (test dof) × (trial node × dim), i.e. ByDim grouped per node.
   void ComputeWeakDivergence();
+  /// Admit every cell before replacing per-element weak-divergence storage.
+  void ValidateSharedWeakDivTensorGeometry_() const;
 
   /// Build packed data required by the inverse-mass apply path.
   void BuildInvMassApplyData_();
@@ -445,6 +456,12 @@ private:
 
   /// Build packed interior/boundary face data for device DG surface assembly.
   void BuildFaceApplyData_();
+
+  /// Try the opt-in FP64 reference-tensor trace/flux/lift face layout.
+  bool BuildTensorFaceApplyData_();
+  bool AddTensorFaceContributions_(const Vector& x_in, Vector& z_out,
+                                   real_t& max_face_speed,
+                                   bool capture_boundary_flux) const;
 
   /// Build interpolation data for sigma(e, face-qpoint) sampling on device.
   bool BuildFaceSigmaData_(const ParGridFunction& sigma) const;
@@ -534,6 +551,10 @@ private:
   int face_int_order_offset_ = 1;
   /// Packed DG face apply is ready when all required metadata exists.
   bool face_apply_ready_ = false;
+  /// Keep storage private to the face translation unit while preserving the
+  /// operator's existing out-of-line default move and destructor definitions.
+  mutable std::shared_ptr<dg_igr_detail::TensorFaceData> face_tensor_data_;
+  bool face_tensor_requested_ = false;
   /// Only the standard constructor establishes sign/quadrature equivalence.
   bool standard_face_integrator_ = false;
   const NumericalFlux* standard_face_flux_ = nullptr;
@@ -665,8 +686,18 @@ private:
   int weakdiv_elem_dof_ = 0;
   /// Flattened per-element weak-divergence blocks (row-major dof x (dof*dim)).
   Vector weakdiv_data_flat_;
+  mutable std::unique_ptr<::igrlab::shared_reference::Map> weakdiv_shared_map_;
+  mutable DenseMatrix weakdiv_shared_row_sums_;
+  mutable Vector weakdiv_shared_column_sums_;
+  mutable Vector weakdiv_shared_mass_fractions_;
+  mutable Vector weakdiv_shared_moment_correction_;
+  mutable Vector weakdiv_shared_flux_;
+  /// Fixed shared flux launch policy for the lifetime of the packed setup.
+  mutable int weakdiv_shared_flux_execution_ = -1;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;
+  /// Optional pointwise speed scratch for the shared Euler flux preparation.
+  mutable Vector weakdiv_point_speed_;
   /// Persistent per-volume-node q_sigma aggregates (five FP64 scalars/slot).
   mutable Array<double> weakdiv_q_sigma_telemetry_;
   /// Reduction workspace for the volume-node maximum speed.
@@ -676,16 +707,21 @@ private:
 
   /// Per-element scalar dof count for sigma interpolation.
   mutable int weakdiv_sigma_ldof_ = 0;
-  /// Per-element sigma scalar-dof map (for packed interpolation).
+  /// Sigma global-dof map, in state-node order for an exact nodal gather.
   mutable Array<int> weakdiv_sigma_elem_dof_map_;
-  /// Interpolation weights from sigma dofs to state nodes per element.
+  /// Interpolation weights, either per element or one shared reference table.
   mutable Vector weakdiv_sigma_interp_;
+  /// Exact scalar VALUE nodal identity, including the local-node permutation.
+  mutable bool weakdiv_sigma_exact_nodes_ = false;
+  /// Element stride in the interpolation table; zero for shared reference rows.
+  mutable int weakdiv_sigma_interp_stride_ = 0;
   /// Whether packed sigma interpolation data is available.
   mutable bool weakdiv_sigma_ready_ = false;
-  /// Sigma space pointer used to build interpolation data.
-  mutable const FiniteElementSpace* weakdiv_sigma_fes_ = nullptr;
-  /// Sigma FE-space sequence used to build interpolation data.
-  mutable long weakdiv_sigma_fes_sequence_ = -1;
+  /// Exact cache keys cover both spaces, mesh updates, sizes, ordering and policy.
+  /// Object entries: sigma FES, both meshes, both reference FEs, both FE collections.
+  mutable std::array<const void*, 7> weakdiv_sigma_cache_objects_{};
+  /// Scalar entries are constructed alongside the cache lookup in weakdiv.cpp.
+  mutable std::array<long, 17> weakdiv_sigma_cache_metadata_{};
 
   /// Persistent per-face-quadrature-point q_sigma aggregates.
   mutable Array<double> face_int_q_sigma_telemetry_;

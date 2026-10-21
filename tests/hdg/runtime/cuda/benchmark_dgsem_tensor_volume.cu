@@ -264,9 +264,10 @@ static_assert(Tf32RoundBits(0x7f7fffffu)==0x7f800000u &&
 __device__ float Tf32(float value)
 {
 #if __CUDA_ARCH__ >= 900
-  float result;
-  asm("cvt.rn.tf32.f32 %0, %1;" : "=f"(result) : "f"(value));
-  return result;
+  // PTX encodes a TF32 destination in a .b32 register, not an .f32 register.
+  unsigned result;
+  asm("cvt.rn.tf32.f32 %0, %1;" : "=r"(result) : "f"(value));
+  return __uint_as_float(result);
 #elif __CUDA_ARCH__ >= 800
   // PTX cvt.rn.tf32 requires SM90; SM80's .rna uses ties away from zero.
   return __uint_as_float(Tf32RoundBits(__float_as_uint(value)));

@@ -268,9 +268,10 @@ function(dg_igr_require_hdg_cuda17_profile)
             "HDG CUDA expected architecture must be numeric or sm_<num>.")
   endif()
   if(NOT _dg_igr_hdg_expected_arch STREQUAL "80" AND
+     NOT _dg_igr_hdg_expected_arch STREQUAL "90" AND
      NOT _dg_igr_hdg_expected_arch STREQUAL "120")
     message(FATAL_ERROR
-            "HDG CUDA components require native architecture 80 or 120.")
+            "HDG CUDA components require native architecture 80, 90, or 120.")
   endif()
   if(NOT DG_IGR_HDG_NATIVE_CUDA_ARCH STREQUAL "${_dg_igr_hdg_expected_arch}")
     message(FATAL_ERROR
