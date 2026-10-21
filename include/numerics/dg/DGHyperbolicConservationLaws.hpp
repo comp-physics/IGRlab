@@ -694,6 +694,8 @@ private:
   mutable Vector weakdiv_shared_flux_;
   /// Fixed shared flux launch policy for the lifetime of the packed setup.
   mutable int weakdiv_shared_flux_execution_ = -1;
+  /// Freeze conservative-tail workspace ownership until packed setup rebuilds.
+  mutable int weakdiv_shared_conservative_fusion_request_ = -1;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;
   /// Optional pointwise speed scratch for the shared Euler flux preparation.

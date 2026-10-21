@@ -17,6 +17,18 @@ namespace igrlab
 {
 namespace shared_reference
 {
+namespace
+{
+// Frozen source variants qualify launch width and shared-field padding without
+// adding runtime policy or changing the conservative map's numerical contract.
+constexpr int kDGConservativeFusionThreads = 64;
+constexpr int kDGConservativeFusionSharedPitch = 73;
+static_assert(kDGConservativeFusionThreads == 64 || kDGConservativeFusionThreads == 128,
+              "Conservative fusion tuning supports 64 or 128 threads.");
+static_assert(kDGConservativeFusionSharedPitch == 72 || kDGConservativeFusionSharedPitch == 73,
+              "Conservative fusion tuning supports shared pitch 72 or 73.");
+}
+
 Precision RequestedPrecision()
 {
   const char* value = ::igrlab::GetEnv("DG_IGR_SHARED_OPERATOR_PRECISION");
@@ -134,6 +146,68 @@ __global__ void DGSharedTensorLinesSIMTKernel(
                                 weights[i]*static_cast<double>(y);
 }
 
+// One CTA owns one cell and all four physical equation columns. The native
+// row order in the serial FP64 moment sums is part of the existing method.
+__global__ void DGSharedConservativeFusionP5FP32Kernel(
+  const int* local, const double* derivative, const double* weights,
+  const double* adjugate, const double* flux, const double* column_sums,
+  const double* row_sums, const double* mass_fractions, const int* state_map,
+  double* residual)
+{
+  constexpr int n = 6, dof = n*n, equations = 4, rows = 2*dof;
+  constexpr int pitch = kDGConservativeFusionSharedPitch;
+  const int e = blockIdx.x, lane = threadIdx.x;
+  __shared__ double centered[equations*pitch], output[equations*dof];
+  __shared__ double anchors[2*equations], correction[equations];
+  for (int entry = lane; entry < equations*rows; entry += blockDim.x)
+    centered[(entry/rows)*pitch+entry%rows] = flux[e*equations*rows+entry];
+  if (lane < 2*equations)
+    anchors[lane] = flux[e*equations*rows+rows*(lane/2)+lane%2];
+  __syncthreads();
+  for (int entry = lane; entry < equations*rows; entry += blockDim.x)
+  {
+    const int shared_entry = (entry/rows)*pitch+entry%rows;
+    centered[shared_entry] = centered[shared_entry]-anchors[2*(entry/rows)+entry%2];
+  }
+  __syncthreads();
+  for (int entry = lane; entry < equations*dof; entry += blockDim.x)
+  {
+    const int node = entry%dof, equation = entry/dof, i = node%n, j = node/n;
+    const int offset = pitch*equation;
+    float x = 0, y = 0;
+    // Preserve the buffered SIMT expressions, cast points, k order and FMA
+    // opportunities. Do not drop zero metric products on nonfinite inputs.
+    for (int k = 0; k < n; ++k)
+    {
+      const int xn = 2*local[k+n*j]+offset, yn = 2*local[i+n*k]+offset;
+      const double bx = adjugate[0]*centered[xn]+adjugate[2]*centered[xn+1];
+      const double by = adjugate[1]*centered[yn]+adjugate[3]*centered[yn+1];
+      x += static_cast<float>(derivative[i+n*k])*static_cast<float>(bx);
+      y += static_cast<float>(derivative[j+n*k])*static_cast<float>(by);
+    }
+    output[local[node]+dof*equation] = weights[j]*static_cast<double>(x)+
+                                     weights[i]*static_cast<double>(y);
+  }
+  __syncthreads();
+  if (lane < equations)
+  {
+    double observed = 0.0, expected = 0.0;
+    for (int i = 0; i < dof; ++i) { observed += output[i+dof*lane]; }
+    for (int j = 0; j < rows; ++j)
+      expected += column_sums[j]*centered[j+pitch*lane];
+    correction[lane] = expected-observed;
+  }
+  __syncthreads();
+  for (int entry = lane; entry < equations*dof; entry += blockDim.x)
+  {
+    const int i = entry%dof, equation = entry/dof;
+    double value = output[entry]+mass_fractions[e*dof+i]*correction[equation];
+    for (int d = 0; d < 2; ++d)
+      value += row_sums[i+dof*d]*anchors[2*equation+d];
+    residual[state_map[(e*dof+i)*equations+equation]] += value;
+  }
+}
+
 // A warp owns 16 distinct element/field columns. Each transverse line is a
 // genuine RHS of the same 1D weak derivative; both directions accumulate on
 // chip. Padding supplies only missing rows/columns, never replicated states.
@@ -245,7 +319,7 @@ void Map::Configure(const mfem::DenseMatrix& matrix, int columns,
 }
 
 void Map::ConfigureStorage(const mfem::DenseMatrix& matrix, int columns,
-                          Precision precision, const char* method)
+                          Precision precision, const char* method, bool buffered)
 {
   MFEM_VERIFY(!Ready() && precision != Precision::Off &&
                 sizeof(mfem::real_t) == sizeof(double),
@@ -273,10 +347,16 @@ void Map::ConfigureStorage(const mfem::DenseMatrix& matrix, int columns,
   }
   matrix_ = matrix;
   matrix_.GetMemory().UseDevice(true);
-  input_.SetSize(k, columns); input_.GetMemory().UseDevice(true);
-  output_.SetSize(m, columns); output_.GetMemory().UseDevice(true);
+  columns_ = columns;
+  if (buffered)
+  {
+    input_.SetSize(k, columns); input_.GetMemory().UseDevice(true);
+    output_.SetSize(m, columns); output_.GetMemory().UseDevice(true);
+    input_.Write(); output_.Write();
+  }
   // Materialize all device buffers during setup. Subsequent Apply does not resize.
-  matrix_.Read(); input_.Write(); output_.Write();
+  matrix_.Read();
+  conservative_fusion_ = !buffered;
   precision_ = precision; method_ = method;
 #else
   MFEM_ABORT("Shared reference maps require a CUDA-compiled application.");
@@ -285,7 +365,8 @@ void Map::ConfigureStorage(const mfem::DenseMatrix& matrix, int columns,
 
 void Map::ConfigureDGTensorLines(const mfem::DenseMatrix& matrix, int columns,
                                Precision precision, const mfem::FiniteElement& fe,
-                               const mfem::DenseMatrix& adjugate)
+                               const mfem::DenseMatrix& adjugate,
+                               bool conservative_fusion)
 {
   const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
   const int n = fe.GetOrder()+1, dof = n*n;
@@ -358,7 +439,9 @@ void Map::ConfigureDGTensorLines(const mfem::DenseMatrix& matrix, int columns,
   MFEM_VERIFY(norm > 0.0 && difference <= limit*norm,
               "DG tensor lines disagree with the original assembled weak divergence: relative="
               << difference/norm << " limit=" << limit);
-  ConfigureStorage(matrix, columns, precision, "dg-weakdiv");
+  const bool fusion_admitted = conservative_fusion && n == 6 &&
+    precision == Precision::FP32 && columns % 4 == 0;
+  ConfigureStorage(matrix, columns, precision, "dg-weakdiv", !fusion_admitted);
   tensor_n1d_ = n;
   tensor_lex_to_local_.GetMemory().UseDevice(true); tensor_derivative_.UseDevice(true);
   tensor_weights_.UseDevice(true); tensor_adjugate_.UseDevice(true);
@@ -372,7 +455,7 @@ void Map::ConfigureDGTensorLines(const mfem::DenseMatrix& matrix, int columns,
 
 void Map::LogConfiguration() const
 {
-  const int m = matrix_.Height(), k = matrix_.Width(), columns = input_.Width();
+  const int m = matrix_.Height(), k = matrix_.Width(), columns = columns_;
   std::cout << "[shared-reference-map] event=setup method=" << method_
             << " precision=" << PrecisionName(precision_)
             << " m=" << m << " k=" << k << " real_columns=" << columns
@@ -380,17 +463,23 @@ void Map::LogConfiguration() const
             << " backend=" << (precision_ == Precision::TF32 ? "wmma-m16n16k8" : "simt")
             << " state=fp64 nonlinear_flux=fp64 faces=fp64 centering=fp64-anchor"
             << " matrix_shared=1 fallback=none workspace_bytes="
-            << (std::size_t(m) * k + std::size_t(m + k) * columns+
+            << (std::size_t(m) * k + std::size_t(input_.Height()) * input_.Width()+
+                std::size_t(output_.Height()) * output_.Width()+
                 tensor_derivative_.Size()+tensor_weights_.Size()+tensor_adjugate_.Size()) * sizeof(double)+
                std::size_t(tensor_lex_to_local_.Size())*sizeof(int)
+            << " conservative_fusion=" << int(conservative_fusion_)
+            << " conservative_fusion_threads=" << kDGConservativeFusionThreads
+            << " conservative_fusion_shared_pitch=" << kDGConservativeFusionSharedPitch
             << " tensor_proof=requires-profile" << std::endl;
 }
 
 void Map::Apply()
 {
   MFEM_VERIFY(Ready(), "Shared reference map was not configured.");
+  MFEM_VERIFY(!conservative_fusion_,
+              "Fused DG map requires its conservative flux/residual apply.");
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
-  const int m = matrix_.Height(), k = matrix_.Width(), n = input_.Width();
+  const int m = matrix_.Height(), k = matrix_.Width(), n = columns_;
   const mfem::real_t* a = matrix_.Read(); const mfem::real_t* b = input_.Read();
   mfem::real_t* c = output_.Write();
   if (UsesDGTensorLines())
@@ -423,6 +512,35 @@ void Map::Apply()
   ++applications_;
 #else
   MFEM_ABORT("Shared reference map apply requires CUDA.");
+#endif
+}
+
+void Map::ApplyDGConservativeFusion(const mfem::Vector& flux,
+                                  const mfem::Vector& column_sums,
+                                  const mfem::DenseMatrix& row_sums,
+                                  const mfem::Vector& mass_fractions,
+                                  const mfem::Array<int>& state_map,
+                                  mfem::Vector& residual)
+{
+  MFEM_VERIFY(Ready() && conservative_fusion_ && tensor_n1d_ == 6 &&
+                precision_ == Precision::FP32 && columns_ % 4 == 0,
+              "Conservative DG fusion requires its configured p5 FP32 tensor map.");
+  const int elements = columns_/4, dof = 36;
+  MFEM_VERIFY(flux.Size() == 2*dof*columns_ && column_sums.Size() == 2*dof &&
+                row_sums.Height() == dof && row_sums.Width() == 2 &&
+                mass_fractions.Size() == elements*dof &&
+                state_map.Size() == elements*dof*4 &&
+                residual.Size() == elements*dof*4,
+              "Conservative DG fusion received incompatible packed arrays.");
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  DGSharedConservativeFusionP5FP32Kernel<<<elements,kDGConservativeFusionThreads>>>(
+    tensor_lex_to_local_.Read(), tensor_derivative_.Read(), tensor_weights_.Read(),
+    tensor_adjugate_.Read(), flux.Read(), column_sums.Read(), row_sums.Read(),
+    mass_fractions.Read(), state_map.Read(), residual.ReadWrite());
+  MFEM_VERIFY(cudaGetLastError() == cudaSuccess, "Conservative DG fusion launch failed.");
+  ++applications_;
+#else
+  MFEM_ABORT("Conservative DG fusion requires a CUDA-compiled application.");
 #endif
 }
 

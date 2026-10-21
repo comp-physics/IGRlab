@@ -4,10 +4,15 @@
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_device.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "../examples/sedov_taylor_blast/sedov_taylor_blast.hpp"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -239,7 +244,7 @@ void FillEuler(mfem::ParFiniteElementSpace& fes, Vector& state,
 }
 
 void DGProductionOracle(int order, Precision precision, const char* layout = "dense",
-                        bool sheared = false)
+                        bool sheared = false, bool conservative_fusion = false)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
     4, 4, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
@@ -268,6 +273,7 @@ void DGProductionOracle(int order, Precision precision, const char* layout = "de
   mfem::RusanovFluxWithSides flux(physical);
   setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
+  setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", "0", 1);
   mfem::DGHyperbolicConservationLaws baseline(fes, flux, 2, true);
   const bool tensor_lines = std::string(layout) == "tensor-lines";
   // Build an independent full-storage control before enabling the constructor
@@ -277,6 +283,7 @@ void DGProductionOracle(int order, Precision precision, const char* layout = "de
     full_setup = std::make_unique<mfem::DGHyperbolicConservationLaws>(fes,flux,2,true);
   setenv("IGRLAB_SHARED_EULER_LAYOUT", layout, 1);
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", igrlab::shared_reference::PrecisionName(precision), 1);
+  setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", conservative_fusion ? "1" : "0", 1);
   mfem::DGHyperbolicConservationLaws candidate(fes, flux, 2, true);
   baseline.SetDGSEMGamma(1.4); candidate.SetDGSEMGamma(1.4);
   baseline.SetInvariantDomainVolumeSpeedTracking(true);
@@ -313,6 +320,7 @@ void DGProductionOracle(int order, Precision precision, const char* layout = "de
     FillEuler(fes, state, sigma, phase);
     setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
     setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
+    setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", "0", 1);
     baseline.Mult(state, expected);
     if (phase == 2 && full_setup)
     {
@@ -322,6 +330,7 @@ void DGProductionOracle(int order, Precision precision, const char* layout = "de
     setenv("IGRLAB_SHARED_OPERATOR_PRECISION", igrlab::shared_reference::PrecisionName(precision), 1);
     if (phase == 2 && full_setup) { candidate.Update(); }
     if (full_setup) { full_setup->Mult(state, full_result); }
+    setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", conservative_fusion ? "1" : "0", 1);
     candidate.Mult(state, actual);
     MFEM_VERIFY(std::isfinite(candidate.GetMaxCharSpeed()) &&
                   candidate.GetMaxCharSpeed() == baseline.GetMaxCharSpeed(),
@@ -400,6 +409,7 @@ void DGProductionOracle(int order, Precision precision, const char* layout = "de
   }
   setenv("IGRLAB_SHARED_EULER_LAYOUT", "dense", 1);
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
+  setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", "0", 1);
 }
 
 // Reverse the scalar local basis, including its node rule, so matching nodes
@@ -439,6 +449,373 @@ public:
       mfem::L2_FECollection::FiniteElementForGeometry(geometry);
   }
 };
+
+// Also expose the reversed lexicographic-to-native map when using the
+// permuted FE for the Euler state, rather than only for scalar gathering.
+class PermutedFusionElement : public PermutedSigmaElement
+{
+public:
+  explicit PermutedFusionElement(int order)
+    : PermutedSigmaElement(order, mfem::BasisType::GaussLegendre)
+  {
+    dof_map.SetSize(GetDof()); inv_dof_map.SetSize(GetDof());
+    for (int i = 0; i < GetDof(); ++i)
+    { dof_map[i] = GetDof()-1-i; inv_dof_map[GetDof()-1-i] = i; }
+  }
+};
+
+class PermutedFusionCollection : public mfem::L2_FECollection
+{
+  PermutedFusionElement square;
+public:
+  explicit PermutedFusionCollection(int order)
+    : mfem::L2_FECollection(order, 2, mfem::BasisType::GaussLegendre), square(order) {}
+  const mfem::FiniteElement* FiniteElementForGeometry(mfem::Geometry::Type geometry) const override
+  {
+    return geometry == mfem::Geometry::SQUARE ? &square :
+      mfem::L2_FECollection::FiniteElementForGeometry(geometry);
+  }
+};
+
+void SelectDGConservativeFusion(bool enabled, Precision precision = Precision::FP32,
+                                const char* layout = "tensor-lines")
+{
+  setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", enabled ? "1" : "0", 1);
+  setenv("IGRLAB_SHARED_OPERATOR_PRECISION", igrlab::shared_reference::PrecisionName(precision), 1);
+  setenv("IGRLAB_SHARED_EULER_LAYOUT", layout, 1);
+  setenv("IGRLAB_WEAKDIV_SIGMA_STORAGE", "auto", 1);
+  setenv("IGRLAB_SHARED_EULER_FLUX_EXECUTION", "pointwise", 1);
+  setenv("IGRLAB_DG_TENSOR_FACE", "fp64", 1);
+}
+
+std::string ApplyFusionFixture(mfem::DGHyperbolicConservationLaws& op,
+                               const Vector& state, Vector& result)
+{
+  std::ostringstream captured;
+  {
+    struct RestoreOutput
+    {
+      std::streambuf* previous;
+      ~RestoreOutput() { std::cout.rdbuf(previous); }
+    } restore{std::cout.rdbuf(captured.rdbuf())};
+    op.Mult(state, result);
+  }
+  std::cout << captured.str();
+  return captured.str();
+}
+
+void DGConservativeFusionStressOracle(bool permuted, int order = 5,
+                                     Precision precision = Precision::FP32,
+                                     const char* layout = "tensor-lines")
+{
+  // Fifteen cells exercise the 144-output / 128-thread CTA tail without
+  // relying on any multiple of the previous forall block or warp batch.
+  // Both spacings are exactly 0.25, preserving the production guard's
+  // bitwise-identical affine edge contract on every cell.
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+    5, 3, mfem::Element::QUADRILATERAL, false, 1.25, 0.75, false);
+  std::vector<Vector> translations = {Vector({1.25,0.0}), Vector({0.0,0.75})};
+  mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
+    serial, serial.CreatePeriodicVertexMapping(translations));
+  mfem::ParMesh mesh(MPI_COMM_SELF, periodic);
+  std::unique_ptr<mfem::FiniteElementCollection> collection;
+  if (permuted) { collection = std::make_unique<PermutedFusionCollection>(order); }
+  else
+    collection = std::make_unique<mfem::L2_FECollection>(order,2,mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(&mesh, collection.get(), 4, mfem::Ordering::byNODES);
+  mfem::ParFiniteElementSpace sfes(&mesh, collection.get());
+  mfem::ParGridFunction sigma(&sfes);
+  mfem::EulerFlux euler(2,1.4);
+  mfem::FluxWithIGR physical(euler,1.4);
+  physical.SetSigmaField(&sigma); physical.SetInvariantDomainFlux(true);
+  physical.SetSigmaAwareCFL(true); physical.SetSigmaAwareRusanov(true);
+  mfem::RusanovFluxWithSides numerical(physical);
+  SelectDGConservativeFusion(false, precision, layout);
+  mfem::DGHyperbolicConservationLaws buffered(fes,numerical,1,true);
+  SelectDGConservativeFusion(true, precision, layout);
+  mfem::DGHyperbolicConservationLaws candidate(fes,numerical,1,true);
+  buffered.SetDGSEMGamma(1.4); candidate.SetDGSEMGamma(1.4);
+  buffered.SetInvariantDomainVolumeSpeedTracking(true);
+  candidate.SetInvariantDomainVolumeSpeedTracking(true);
+  const bool admitted = order == 5 && precision == Precision::FP32 &&
+    std::string(layout) == "tensor-lines";
+  const std::string label = "order="+std::to_string(order)+
+    " precision="+igrlab::shared_reference::PrecisionName(precision)+
+    " layout="+layout+" permuted="+std::to_string(permuted);
+  Vector state(fes.GetVSize()), expected(fes.GetVSize()), actual(fes.GetVSize());
+  for (int phase = 0; phase < (admitted ? 7 : 2); ++phase)
+  {
+    FillEuler(fes,state,sigma,phase == 0 ? 0 : 1);
+    if (phase == 2)
+    {
+      double* values = state.HostReadWrite();
+      for (int dof = 0; dof < fes.GetNDofs(); ++dof)
+        values[fes.DofToVDof(dof,3)] += std::ldexp(1.0,40);
+    }
+    if (phase >= 3 && phase <= 5)
+    {
+      mfem::Array<int> dofs; fes.GetElementDofs(7,dofs);
+      state.HostReadWrite()[fes.DofToVDof(dofs[0],3)] = phase == 3
+        ? std::numeric_limits<double>::quiet_NaN() : phase == 4
+        ? std::numeric_limits<double>::infinity() : 1e100;
+    }
+    // Return from invalid input to a new finite current sigma/state; no
+    // stale shared output/correction may survive the earlier failure.
+    if (phase == 6) { FillEuler(fes,state,sigma,2); }
+    SelectDGConservativeFusion(false,precision,layout);
+    const std::string before = ApplyFusionFixture(buffered,state,expected);
+    SelectDGConservativeFusion(true,precision,layout);
+    const std::string after = ApplyFusionFixture(candidate,state,actual);
+    if (phase == 0)
+    {
+      MFEM_VERIFY(before.find("selected=buffered reason=disabled") != std::string::npos,
+                  "Fusion fixture buffered control did not disable fusion: " << label);
+      MFEM_VERIFY(after.find(admitted ? "selected=fused-p5-fp32 reason=admitted" :
+                                        "selected=buffered reason=requires-") != std::string::npos,
+                  "Fusion fixture did not execute its admission/fallback: " << label);
+      if (admitted)
+      {
+        const std::size_t removed = std::size_t(mesh.GetNE())*4*(72+36+1)*sizeof(double);
+        MFEM_VERIFY(after.find("eliminated_scratch_bytes="+std::to_string(removed)) != std::string::npos,
+                    "Fusion fixture did not omit the configured scratch: " << label);
+      }
+    }
+    const double* a = actual.HostRead(); const double* b = expected.HostRead();
+    int nonfinite = 0;
+    for (int i = 0; i < actual.Size(); ++i)
+    {
+      MFEM_VERIFY(std::isnan(a[i]) == std::isnan(b[i]) &&
+                    std::isinf(a[i]) == std::isinf(b[i]),
+                  "Fusion changed per-cell nonfinite classification: " << label << " phase=" << phase);
+      if (std::isfinite(b[i]))
+      {
+        MFEM_VERIFY(std::memcmp(a+i,b+i,sizeof(double)) == 0,
+                    "Fusion changed buffered FP64 result bits: " << label << " phase=" << phase
+                    << " coefficient=" << i);
+      }
+      else
+      {
+        ++nonfinite;
+        MFEM_VERIFY(!std::isinf(b[i]) || std::signbit(a[i]) == std::signbit(b[i]),
+                    "Fusion changed an infinity sign: " << label);
+      }
+    }
+    MFEM_VERIFY((phase >= 3 && phase <= 5) ? nonfinite > 0 && nonfinite < actual.Size()
+                                          : nonfinite == 0,
+                "Fusion fixture lacks localized invalid-input or finite recovery evidence: " << label);
+    if (phase < 3 || phase == 6)
+      MFEM_VERIFY(candidate.GetMaxCharSpeed() == buffered.GetMaxCharSpeed(),
+                  "Fusion changed finite characteristic speeds: " << label);
+  }
+#ifdef MFEM_USE_EXCEPTIONS
+  if (admitted)
+  {
+    SelectDGConservativeFusion(false,precision,layout);
+    const auto previous = mfem::get_error_action();
+    mfem::set_error_action(mfem::MFEM_ERROR_THROW);
+    bool rejected = false;
+    try { candidate.Mult(state,actual); }
+    catch (const mfem::ErrorException&) { rejected = true; }
+    mfem::set_error_action(previous);
+    MFEM_VERIFY(rejected,"A live DG map changed conservative-fusion ownership without rebuilding.");
+    candidate.Update();
+    const std::string rebuilt = ApplyFusionFixture(candidate,state,actual);
+    MFEM_VERIFY(rebuilt.find("selected=buffered reason=disabled") != std::string::npos &&
+                  std::memcmp(actual.HostRead(),expected.HostRead(),
+                              std::size_t(actual.Size())*sizeof(double)) == 0,
+                "DG setup rebuild did not restore the buffered ownership/action.");
+  }
+#endif
+  std::cout << "dg_conservative_fusion_stress " << label << " passed\n";
+  SelectDGConservativeFusion(false);
+}
+
+void DGConservativeFusionOwnershipOracle()
+{
+  mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+    1,1,mfem::Element::QUADRILATERAL,false,1.0,1.0,false);
+  mfem::L2_FECollection collection(5,2,mfem::BasisType::GaussLegendre);
+  const auto& fe = *collection.FiniteElementForGeometry(mfem::Geometry::SQUARE);
+  auto* transformation = mesh.GetElementTransformation(0);
+  mfem::TransposeIntegrator weak(new mfem::GradientIntegrator());
+  DenseMatrix assembled, matrix(36,72), adjugate(2);
+  weak.AssembleElementMatrix2(fe,fe,*transformation,assembled);
+  for (int i = 0; i < 36; ++i) for (int j = 0; j < 36; ++j)
+    for (int d = 0; d < 2; ++d) { matrix(i,2*j+d) = assembled(i,36*d+j); }
+  transformation->SetIntPoint(&mfem::Geometries.GetCenter(mfem::Geometry::SQUARE));
+  mfem::CalcAdjugate(transformation->Jacobian(),adjugate);
+  Map fused;
+  fused.ConfigureDGTensorLines(matrix,28,Precision::FP32,fe,adjugate,true);
+  MFEM_VERIFY(fused.UsesDGConservativeFusion(),"Explicit fused Map ownership was not admitted.");
+  for (Precision precision : {Precision::FP64,Precision::FP32,Precision::TF32})
+  {
+    Map buffered;
+    // FP32 with a partial equation group is unsupported; both other
+    // precisions retain their original ordinary buffered apply contract.
+    const int columns = precision == Precision::FP32 ? 29 : 28;
+    buffered.ConfigureDGTensorLines(matrix,columns,precision,fe,adjugate,true);
+    MFEM_VERIFY(!buffered.UsesDGConservativeFusion() &&
+                  buffered.Input().Height() == 72 && buffered.Input().Width() == columns &&
+                  buffered.Output().Height() == 36 && buffered.Output().Width() == columns,
+                "Unadmitted conservative Map lost its buffered workspace contract.");
+  }
+#ifdef MFEM_USE_EXCEPTIONS
+  const auto previous = mfem::get_error_action();
+  mfem::set_error_action(mfem::MFEM_ERROR_THROW);
+  bool apply_rejected = false, input_rejected = false, failed_setup = false;
+  try { fused.Apply(); } catch (const mfem::ErrorException&) { apply_rejected = true; }
+  try { (void)fused.Input(); } catch (const mfem::ErrorException&) { input_rejected = true; }
+  Map recovered;
+  try { recovered.ConfigureDGTensorLines(matrix,0,Precision::FP32,fe,adjugate,true); }
+  catch (const mfem::ErrorException&) { failed_setup = true; }
+  mfem::set_error_action(previous);
+  recovered.Configure(matrix,4,Precision::FP32,"fixture-recovered-buffered");
+  MFEM_VERIFY(apply_rejected && input_rejected && failed_setup &&
+                !recovered.UsesDGConservativeFusion() && recovered.Input().Width() == 4,
+              "Fused Map guards or failed-setup ownership recovery are inconsistent.");
+  const char* negative_guards = "passed";
+#else
+  const char* negative_guards = "not-executed-no-exceptions";
+#endif
+  std::cout << "dg_conservative_fusion_ownership passed negative_guards="
+            << negative_guards << "\n";
+}
+
+void DGConservativeFusionOracles()
+{
+  DGConservativeFusionOwnershipOracle();
+  // Preserve the existing independent assembled-RHS and M1 moment gates.
+  DGProductionOracle(5,Precision::FP32,"tensor-lines",false,true);
+  DGProductionOracle(5,Precision::FP32,"tensor-lines",true,true);
+  DGConservativeFusionStressOracle(false);
+  DGConservativeFusionStressOracle(true);
+  DGConservativeFusionStressOracle(false,3);
+  DGConservativeFusionStressOracle(false,5,Precision::FP64);
+  DGConservativeFusionStressOracle(false,5,Precision::TF32);
+  DGConservativeFusionStressOracle(false,5,Precision::FP32,"dense");
+  SelectDGConservativeFusion(false,Precision::Off,"dense");
+  setenv("IGRLAB_DG_TENSOR_FACE","off",1);
+  setenv("IGRLAB_WEAKDIV_SIGMA_STORAGE","dense",1);
+  setenv("IGRLAB_SHARED_EULER_FLUX_EXECUTION","element",1);
+#ifdef MFEM_USE_EXCEPTIONS
+  const char* exception_checks = "passed";
+#else
+  const char* exception_checks = "not-executed-no-exceptions";
+#endif
+  std::cout << "dg_conservative_fusion_test passed p5_fp32=true original_cell_moment=true "
+               "constant=true high_background=true native_permutation=true partial_cta=true "
+               "nan_inf_fp32_overflow=true finite_recovery=true selector_freeze="
+            << exception_checks << " ownership_negative_guards=" << exception_checks
+            << " fallback=true\n";
+}
+
+void DGConservativeFusionBenchmark(const char* mesh_path)
+{
+  mfem::Mesh serial(mesh_path,1,1);
+  for (int refinement = 0; refinement < 4; ++refinement) { serial.UniformRefinement(); }
+  MFEM_VERIFY(serial.Dimension() == 2 && serial.GetNE() == 512*512,
+              "Fusion benchmark requires the canonical 32-square Sedov mesh with four refinements.");
+  mfem::ParMesh mesh(MPI_COMM_SELF,serial);
+  mfem::L2_FECollection collection(5,2,mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(&mesh,&collection,4,mfem::Ordering::byNODES);
+  mfem::ParFiniteElementSpace sfes(&mesh,&collection);
+  mfem::ParGridFunction state(&fes), sigma(&sfes);
+  // The application's Gaussian uses the original 32x32 width even after
+  // refinement. Initial zero velocity gives the frozen current sigma = 0.
+  auto initial = mfem::SedovTaylorBlastInitialCondition(1.4,1.0,32,32);
+  state.ProjectCoefficient(initial); sigma = 0.0;
+  mfem::EulerFlux euler(2,1.4);
+  mfem::FluxWithIGR physical(euler,1.4);
+  physical.SetSigmaField(&sigma); physical.SetInvariantDomainFlux(false);
+  physical.SetSigmaAwareCFL(false); physical.SetSigmaAwareRusanov(false);
+  mfem::RusanovFluxWithSides numerical(physical);
+  std::unique_ptr<mfem::DGHyperbolicConservationLaws> operators[2];
+  mfem::Array<int> boundaries(mesh.bdr_attributes.Max()); boundaries = 1;
+  Vector results[2] = {Vector(fes.GetVSize()),Vector(fes.GetVSize())};
+  for (int variant = 0; variant < 2; ++variant)
+  {
+    SelectDGConservativeFusion(variant != 0);
+    operators[variant] = std::make_unique<mfem::DGHyperbolicConservationLaws>(fes,numerical,1,true);
+    operators[variant]->SetDGSEMGamma(1.4);
+    operators[variant]->SetInvariantDomainVolumeSpeedTracking(true);
+    operators[variant]->AddBdrFaceIntegrator(new mfem::BdrHyperbolicFluxIntegrator(
+      numerical,std::make_unique<mfem::SlipWallState>(2,1e-12,1e-12),1),boundaries);
+    const std::string setup = ApplyFusionFixture(*operators[variant],state,results[variant]);
+    MFEM_VERIFY(setup.find(variant ? "selected=fused-p5-fp32 reason=admitted" :
+                                    "selected=buffered reason=disabled") != std::string::npos,
+                "Fusion benchmark did not select the requested production path.");
+    MFEM_VERIFY(setup.find("[dg-tensor-face] event=setup selected=fp64") != std::string::npos &&
+                  setup.find("[dg-tensor-face] event=fallback") == std::string::npos,
+                "Fusion benchmark did not admit the requested FP64 tensor-face path.");
+    if (variant)
+      MFEM_VERIFY(setup.find("workspace_bytes=21248 conservative_fusion=1") != std::string::npos,
+                  "Fused p5 Map allocated more than its fixed reference metadata.");
+  }
+  const auto check_outputs = [&](const char* phase)
+  {
+    const double* buffered = results[0].HostRead();
+    const double* fused = results[1].HostRead();
+    double maximum = 0.0;
+    for (int i = 0; i < fes.GetVSize(); ++i)
+    {
+      MFEM_VERIFY(std::isfinite(buffered[i]) && std::isfinite(fused[i]),
+                  "Fusion benchmark produced nonfinite output " << phase << ".");
+      maximum = std::max(maximum,std::abs(buffered[i]));
+    }
+    MFEM_VERIFY(maximum > 0.0 &&
+                  std::memcmp(buffered,fused,std::size_t(fes.GetVSize())*sizeof(double)) == 0,
+                "Fusion benchmark controls are zero or differ " << phase << ".");
+    return maximum;
+  };
+  const double maximum_before = check_outputs("before timing");
+  constexpr int warmups = 4, repetitions = 64;
+  for (int repeat = 0; repeat < warmups; ++repeat)
+    for (int variant = 0; variant < 2; ++variant)
+    {
+      SelectDGConservativeFusion(variant != 0);
+      operators[variant]->Mult(state,results[variant]);
+    }
+  MFEM_VERIFY(cudaDeviceSynchronize() == cudaSuccess, "Fusion benchmark warmup failed.");
+  cudaEvent_t begin, end;
+  MFEM_VERIFY(cudaEventCreate(&begin) == cudaSuccess && cudaEventCreate(&end) == cudaSuccess,
+              "Fusion benchmark event creation failed.");
+  double total_ms[2] = {0.0,0.0};
+  for (int repeat = 0; repeat < repetitions; ++repeat)
+    for (int arm = 0; arm < 2; ++arm)
+    {
+      const int variant = (repeat+arm)%2; // alternate pair order
+      SelectDGConservativeFusion(variant != 0);
+      MFEM_VERIFY(cudaEventRecord(begin) == cudaSuccess, "Fusion benchmark start event failed.");
+      // Mult initializes its face residual, adds volume, and overwrites the
+      // output. No extra reset, setup, field transfer or output is timed.
+      operators[variant]->Mult(state,results[variant]);
+      MFEM_VERIFY(cudaEventRecord(end) == cudaSuccess && cudaEventSynchronize(end) == cudaSuccess,
+                  "Fusion benchmark end event failed.");
+      float elapsed = 0.0f;
+      MFEM_VERIFY(cudaEventElapsedTime(&elapsed,begin,end) == cudaSuccess,
+                  "Fusion benchmark elapsed-time query failed.");
+      total_ms[variant] += elapsed;
+    }
+  MFEM_VERIFY(cudaEventDestroy(begin) == cudaSuccess && cudaEventDestroy(end) == cudaSuccess,
+              "Fusion benchmark event cleanup failed.");
+  const double maximum_after = check_outputs("after timing");
+  const std::size_t removed = std::size_t(mesh.GetNE())*4*(72+36+1)*sizeof(double);
+  std::cout << std::setprecision(12)
+            << "dg_conservative_fusion_benchmark scope=full-dg-spatial-action "
+            << "state=canonical-initial-gaussian frozen_sigma=0 evolved_state=false igr_solve=false "
+            << "mesh=" << mesh_path << " refinements=4 elements=" << mesh.GetNE()
+            << " order=5 precision=fp32-tensor-lines nonlinear_flux=fp64 faces=fp64 "
+            << "invariant_domain_flux=false sigma_aware_cfl=false sigma_aware_rusanov=false "
+            << "parity=bitwise finite=true nonzero=true maximum_before=" << maximum_before
+            << " maximum_after=" << maximum_after << " "
+            << "warmups=" << warmups << " repetitions=" << repetitions
+            << " buffered_ms=" << total_ms[0]/repetitions
+            << " fused_ms=" << total_ms[1]/repetitions
+            << " eliminated_scratch_bytes=" << removed
+            << " speedup=" << total_ms[0]/total_ms[1]
+            << " whole_case_speedup_claim=false\n";
+  SelectDGConservativeFusion(false,Precision::Off,"dense");
+}
 
 // Keep the sigma and Euler fills separate: a warm operator must observe new
 // scalar coefficients even when the Euler state and both FE spaces are fixed.
@@ -1206,8 +1583,21 @@ int main(int argc, char** argv)
   setenv("IGRLAB_SHARED_OPERATOR_PRECISION", "off", 1);
   unsetenv("DG_IGR_WEAKDIV_SIGMA_STORAGE");
   unsetenv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
+  unsetenv("DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION");
+  setenv("IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION", "0", 1);
   unsetenv("DG_IGR_DG_TENSOR_FACE");
   setenv("IGRLAB_DG_TENSOR_FACE", "off", 1);
+  if (argc > 1 && std::string(argv[1]) == "--dg-conservative-fusion-benchmark")
+  {
+    MFEM_VERIFY(argc == 3, "Usage: --dg-conservative-fusion-benchmark <sedov_taylor.msh>");
+    DGConservativeFusionBenchmark(argv[2]);
+    return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--dg-conservative-fusion-only")
+  {
+    DGConservativeFusionOracles();
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "--dg-tensor-face-only")
   {
     DGTensorFaceOracles();
@@ -1219,6 +1609,7 @@ int main(int argc, char** argv)
     return 0;
   }
   DGVolumeMemoryOracles();
+  DGConservativeFusionOracles();
   ReferenceSetupRejection();
   for (Precision precision : {Precision::FP64, Precision::FP32, Precision::TF32})
   {
