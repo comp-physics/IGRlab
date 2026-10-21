@@ -282,6 +282,8 @@ void CheckSelfNeighbor()
 {
   InteriorFaceDGDiffusionApplyInfo info;
   info.dim = 2; info.vdim = 1; info.ne = 1; info.nf = 1; info.nq = 2; info.dof = 4;
+  info.shape_size = info.weighted_normal_dshape_size = 16;
+  info.penalty_size = 2; info.face_element_size = 2; info.element_vdof_map_size = 4;
   info.connectivity_revision = NextDGFaceConnectivityRevision();
   InteriorFaceDGDiffusionApplyScratch work;
   work.face_elements.SetSize(2); work.face_elements = 0;
@@ -299,15 +301,56 @@ void CheckSelfNeighbor()
   constexpr double sigma = -1.0;
   ::igrlab::igr_internal::AddExactFaceBlocks(info, work, sigma, blocks);
   const double* data = blocks.HostRead();
-  Vector basis(4), actual(4), measured(4);
+  const double* shape = work.shape.HostRead();
+  const double* normal = work.weighted_normal_dshape.HostRead();
+  const double* penalty = work.penalty.HostRead();
+  Vector basis(4), actual(4), measured(4), mathematical(4);
+  basis.UseDevice(true); actual.UseDevice(true);
+  double maximum_error = 0.0;
+  long double cross_side_witness = 0.0L;
   for (int j = 0; j < 4; ++j)
   {
-    basis = 0.0; basis[j] = 1.0; actual = 0.0;
+    // A previous CUDA Read promotes UseDevice. Writing basis[j] directly
+    // after a device zero would leave the next column stale on the device.
+    double* input = basis.HostWrite();
+    std::fill(input, input + 4, 0.0);
+    input[j] = 1.0;
+    actual = 0.0;
     LaunchInteriorFaceDGDiffusionApply2D(info, work, basis, sigma, actual);
-    for (int i = 0; i < 4; ++i) { measured[i] = data[i + 4 * j]; }
-    MFEM_VERIFY(RelativeDifference(measured, actual) < 1.0e-12,
-                "Periodic self-neighbor lost a row/column side contribution.");
+    double* column = measured.HostWrite();
+    double* expected = mathematical.HostWrite();
+    for (int i = 0; i < 4; ++i)
+    {
+      // Independent bilinear form for one global element on both sides:
+      // J = S0-S1, F = N0+N1, A = -J^T F + sigma F^T J + J^T P J.
+      // This sums neither the production CSR nor its four side-pair entries.
+      long double entry = 0.0L, same_side_only = 0.0L;
+      for (int q = 0; q < 2; ++q)
+      {
+        const int ri = 2 * (q + 2 * i), cj = 2 * (q + 2 * j);
+        const long double si0 = shape[ri], si1 = shape[ri + 1];
+        const long double sj0 = shape[cj], sj1 = shape[cj + 1];
+        const long double ni0 = normal[ri], ni1 = normal[ri + 1];
+        const long double nj0 = normal[cj], nj1 = normal[cj + 1];
+        const long double jump_i = si0 - si1, jump_j = sj0 - sj1;
+        entry += -jump_i * (nj0 + nj1) + sigma * (ni0 + ni1) * jump_j +
+                 penalty[q] * jump_i * jump_j;
+        same_side_only += -si0 * nj0 + sigma * ni0 * sj0 + penalty[q] * si0 * sj0 +
+                           si1 * nj1 - sigma * ni1 * sj1 + penalty[q] * si1 * sj1;
+      }
+      cross_side_witness += std::abs(entry - same_side_only);
+      column[i] = data[i + 4 * j];
+      expected[i] = static_cast<double>(entry);
+    }
+    maximum_error = std::max(maximum_error, RelativeDifference(measured, mathematical));
+    maximum_error = std::max(maximum_error, RelativeDifference(actual, mathematical));
+    MFEM_VERIFY(maximum_error < 1.0e-12,
+                "Periodic self-neighbor differs from the independent jump/normal-sum form: " << maximum_error);
   }
+  MFEM_VERIFY(cross_side_witness > 1.0e-3L,
+              "Self-neighbor fixture does not distinguish omitted cross-side terms.");
+  std::cout << "element_block_jacobi_self_neighbor passed columns=4 independent_jump_normal_sum=true"
+            << " explicit_device_column_writes=true relative_error=" << maximum_error << '\n';
 }
 
 class LifecycleEnvironment
