@@ -401,6 +401,16 @@ void RunDGSEMUnusedWeakDivergenceTests(TestContext& ctx)
   {
     mfem::DGSEMSurfaceFlux numerical_flux(igr);
     numerical_flux.SetSurfaceFluxType(type);
+    for (int scan_policy = 0; scan_policy < 4; ++scan_policy)
+    {
+      config.opts.nan_scan = (scan_policy & 1) != 0;
+      config.opts.admissibility_scan = (scan_policy & 2) != 0;
+      auto configured = dg_sim::MakeDGOperator(example, numerical_flux);
+      ctx.Check(configured.GetDGSEMDiagnosticStateScan() == (scan_policy != 0),
+                "DGSEM application factory wires only explicitly requested scan options");
+    }
+    config.opts.nan_scan = false;
+    config.opts.admissibility_scan = false;
     auto actual = dg_sim::MakeDGOperator(example, numerical_flux);
     auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
       numerical_flux, 2);

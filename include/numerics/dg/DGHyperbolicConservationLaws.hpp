@@ -202,6 +202,19 @@ public:
     return dgsem_entropy_jacobian_analytic_;
   }
 
+  /** Opt into bulk DGSEM state/face diagnostic scans before residual work.
+   * Explicit admission calls and the typed frozen-sigma spectral policy keep
+   * their required q_sigma checks independently of this default-off option.
+   */
+  void SetDGSEMDiagnosticStateScan(bool enabled)
+  {
+    dgsem_diagnostic_state_scan_ = enabled;
+  }
+  bool GetDGSEMDiagnosticStateScan() const
+  {
+    return dgsem_diagnostic_state_scan_;
+  }
+
   /**
    * @brief Set a custom face integration rule for surface flux evaluation.
    *
@@ -247,9 +260,9 @@ public:
    *
    * Counts include CFL probes, accepted-stage evaluations, and work from
    * rejected attempts. Ordinary DG exact-mode paths sample their active
-   * volume/face speed points. Packed DGSEM independently scans each
-   * element-owned LGL node in FP64; its face nodes are a subset and shared
-   * neighbors are owned by another rank. MPI sums rank-local work samples.
+   * volume/face speed points. Packed DGSEM records FP64 node/face samples
+   * only for requested diagnostics, explicit admission, or its typed frozen-
+   * sigma spectral policy. MPI sums rank-local work samples.
    */
   IGRFrozenSigmaTelemetry GetGlobalFrozenSigmaTelemetry() const override;
 
@@ -379,6 +392,7 @@ private:
   std::unique_ptr<ConservativeModalDamping> modal_damping_;
   bool static_source_requires_rebind_ = false;
   bool invariant_domain_volume_speed_tracking_ = false;
+  bool dgsem_diagnostic_state_scan_ = false;
   mutable bool physical_boundary_flux_integral_armed_ = false;
   mutable bool physical_boundary_flux_integral_available_ = false;
   mutable Vector physical_boundary_flux_integral_;

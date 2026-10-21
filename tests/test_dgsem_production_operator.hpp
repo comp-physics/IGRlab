@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -495,6 +496,7 @@ inline void CheckPolicyFingerprintNegatives(TestContext& ctx,
                        int wall_dimension,
                        bool add_boundary = true)
   {
+    oper.SetDGSEMDiagnosticStateScan(true);
     oper.SetNumericalFlux(&numerical_flux);
     oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
@@ -748,6 +750,7 @@ inline void CheckCollectiveRejectionSemantics(TestContext& ctx,
                        const mfem::NumericalFlux& numerical_flux,
                        int wall_dimension)
   {
+    oper.SetDGSEMDiagnosticStateScan(true);
     oper.SetNumericalFlux(&numerical_flux);
     oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
@@ -850,6 +853,19 @@ inline void CheckCollectiveRejectionSemantics(TestContext& ctx,
                      IsSentinel(output, 7412.0),
                      "asymmetric-output-size",
                      true);
+
+    oper.SetDGSEMDiagnosticStateScan(rank != 0);
+    const auto mismatched_policy = production.BindProductionPolicy(true);
+    state_output = 7412.0;
+    const auto mismatched_result =
+      production.AssembleProductionResidual(state, state_output, true);
+    ctx.Check(!mismatched_policy.supported &&
+                mismatched_policy.reason == DGSEMProductionReason::CollectivePolicyMismatch &&
+                !mismatched_result.executed &&
+                mismatched_result.reason == DGSEMProductionReason::CollectivePolicyMismatch &&
+                IsSentinel(state_output, 7412.0),
+              "DGSEM rank-disagreeing diagnostic policy rejects before branch-dependent collectives");
+    oper.SetDGSEMDiagnosticStateScan(true);
   }
 
   {
@@ -1057,6 +1073,7 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
     const DGSEMProductionReason expected =
       group == 0 ? DGSEMProductionReason::InvalidDensity
                  : DGSEMProductionReason::OutputSizeMismatch;
+    oper.SetDGSEMDiagnosticStateScan(true);
     if (group == 0 && local_rank == 0)
     {
       mfem::Array<int> vdofs;
@@ -1508,6 +1525,9 @@ inline void CheckDGSEMProductionMultSerialIdentityAndMove(TestContext& ctx)
               bridge.production_mult_calls == 1,
             "DGSEM production Mult preserves serial identity-vector semantics");
 
+  ctx.Check(!oper.GetDGSEMDiagnosticStateScan(),
+            "DGSEM bulk diagnostics default off for direct library callers");
+  oper.SetDGSEMDiagnosticStateScan(true);
   mfem::DGHyperbolicConservationLaws moved(std::move(oper));
   mfem::Vector moved_output(vfes.GetTrueVSize());
   moved_output = -7200.0;
@@ -1517,7 +1537,8 @@ inline void CheckDGSEMProductionMultSerialIdentityAndMove(TestContext& ctx)
   const auto moved_selection = moved.GetDGSEMProductionSelection();
   const auto moved_bridge = moved.GetDGSEMProductionBridgeEvidence();
   const auto moved_counters = moved.GetDGSEMProductionCacheCounters();
-  ctx.Check(moved_selection.supported && moved_selection.strict &&
+  ctx.Check(moved.GetDGSEMDiagnosticStateScan() &&
+              moved_selection.supported && moved_selection.strict &&
               moved_difference.Norml2() < 2.0e-10 &&
               std::abs(moved.GetMaxCharSpeed() - expected_speed) < 5.0e-13 &&
               moved_bridge.operator_constructions == 1 &&
@@ -1526,6 +1547,9 @@ inline void CheckDGSEMProductionMultSerialIdentityAndMove(TestContext& ctx)
               moved_counters.topology_builds == 1 &&
               moved_counters.workspace_builds == 1,
             "DGSEM persistent production bridge rebinds safely after parent move");
+  moved.Update();
+  ctx.Check(moved.GetDGSEMDiagnosticStateScan(),
+            "DGSEM diagnostic policy survives packed setup Update");
 }
 
 inline void CheckDGSEMProductionMixedEulerBoundaries(TestContext& ctx)
@@ -1907,6 +1931,116 @@ inline void CheckDGSEMProductionStaticSource(TestContext& ctx)
             "DGSEM strong static source is exact on the selected CPU/CUDA path");
 }
 
+inline void CheckDGSEMDiagnosticScanPolicy(
+  TestContext& ctx, mfem::DGHyperbolicConservationLaws& oper,
+  mfem::FiniteElementSpace& vfes, const mfem::Vector& state_local,
+  bool has_sigma)
+{
+  using mfem::dgsem::DGSEMProductionReason;
+  struct RestorePolicy
+  {
+    mfem::DGHyperbolicConservationLaws& op;
+    bool value;
+    ~RestorePolicy() { op.SetDGSEMDiagnosticStateScan(value); }
+  } restore{oper, oper.GetDGSEMDiagnosticStateScan()};
+  ScopedEnvironment shared_precision("IGRLAB_SHARED_OPERATOR_PRECISION", "off");
+  ScopedEnvironment subcell("IGRLAB_DGSEM_SUBCELL_BLEND", "0");
+  ScopedEnvironment dmma("IGRLAB_DGSEM_FUSED_DMMA", "0");
+  for (int mode = 0; mode < 3; ++mode)
+  {
+    const bool fused = mode == 2;
+    if (fused && !mfem::Device::Allows(mfem::Backend::CUDA_MASK)) { continue; }
+    const bool overintegrated = mode == 1;
+    // The existing coupling fixture deliberately pairs p5 Euler with p1
+    // sigma. Overintegration admits matching scalar order only; cover its
+    // diagnostic gating with the pure-Euler cohort instead.
+    if (overintegrated && has_sigma)
+    {
+      std::cout << "[DGSEM_SCAN_POLICY] order=5 sigma=1 overintegrated=1"
+                << " status=skipped reason=mismatched-sigma-order\n";
+      continue;
+    }
+    ScopedEnvironment fused_mode("IGRLAB_DGSEM_FUSED_RESIDUAL", fused ? "1" : "0");
+    ScopedEnvironment quadrature("IGRLAB_DGSEM_VOLUME_QUADRATURE_MIN_ORDER",
+                                 overintegrated ? "14" : "0");
+    oper.SetDGSEMDiagnosticStateScan(false);
+    mfem::dgsem::DGSEMOperator production(oper);
+    const auto selection = production.BindProductionPolicy(true);
+    ctx.Check(selection.supported && !selection.frozen_sigma_spectral_speed,
+              "DGSEM scan policy fixture selects ordinary finite-state transport");
+    if (!selection.supported) { continue; }
+    mfem::Vector off(vfes.GetVSize()), on(vfes.GetVSize());
+    off = -91.0; on = -73.0;
+    const auto warm = production.AssembleProductionResidual(state_local, off, true);
+    ctx.Check(warm.executed, "DGSEM scan-off fixture initializes its numerical workspaces");
+    const auto before_off = production.GetProductionCacheCounters();
+    const auto telemetry_before = oper.GetGlobalFrozenSigmaTelemetry();
+    const auto result_off = production.AssembleProductionResidual(state_local, off, true);
+    const auto after_off = production.GetProductionCacheCounters();
+    const auto telemetry_off = oper.GetGlobalFrozenSigmaTelemetry();
+
+    oper.SetDGSEMDiagnosticStateScan(true);
+    production.BindProductionPolicy(true);
+    const auto before_on = production.GetProductionCacheCounters();
+    const auto result_on = production.AssembleProductionResidual(state_local, on, true);
+    const auto after_on = production.GetProductionCacheCounters();
+    const auto telemetry_on = oper.GetGlobalFrozenSigmaTelemetry();
+    const double* off_values = off.HostRead();
+    const double* on_values = on.HostRead();
+    bool finite = true;
+    for (int i = 0; i < off.Size(); ++i)
+      finite = finite && std::isfinite(off_values[i]) && std::isfinite(on_values[i]);
+    ctx.Check(result_off.executed && result_on.executed && finite &&
+                std::memcmp(off_values, on_values, std::size_t(off.Size()) * sizeof(double)) == 0 &&
+                result_off.max_characteristic_speed == result_on.max_characteristic_speed,
+              "DGSEM scan off/on preserves finite residual bits and CFL speed");
+    const auto off_syncs = after_off.host_synchronizations - before_off.host_synchronizations;
+    const auto on_syncs = after_on.host_synchronizations - before_on.host_synchronizations;
+    ctx.Check(on_syncs - off_syncs == (overintegrated ? 3 : 2) &&
+                telemetry_off.sample_count == telemetry_before.sample_count &&
+                telemetry_off.nonfinite_count == telemetry_before.nonfinite_count &&
+                (!has_sigma || telemetry_on.sample_count > telemetry_off.sample_count),
+              "DGSEM default-off residual omits node/face/quadrature scans and their synchronizations");
+
+    oper.SetDGSEMDiagnosticStateScan(false);
+    mfem::Vector sentinel(vfes.GetVSize()); sentinel = 8765.25;
+    const auto before_admission = production.GetProductionCacheCounters();
+    const auto admission = production.AssembleProductionResidual(
+      state_local, sentinel, true, nullptr, /*admission_only=*/true);
+    const auto after_admission = production.GetProductionCacheCounters();
+    ctx.Check(admission.executed && IsSentinel(sentinel, 8765.25) &&
+                std::abs(admission.max_characteristic_speed -
+                         result_off.max_characteristic_speed) < 5.0e-13 &&
+                after_admission.stage_calls == before_admission.stage_calls &&
+                after_admission.admission_calls == before_admission.admission_calls + 1 &&
+                after_admission.output_scatters == before_admission.output_scatters &&
+                (!has_sigma || (admission.admission_q_sigma.enabled &&
+                  admission.admission_q_sigma.sample_count > 0)),
+              "DGSEM explicit admission forces fresh scans and CFL without caller output when diagnostics are off");
+
+    mfem::Vector invalid(state_local);
+    mfem::Array<int> first_vdofs; vfes.GetElementVDofs(0, first_vdofs);
+    invalid.HostReadWrite()[AbsoluteDof(first_vdofs[0])] = 0.0;
+    sentinel = 8765.25;
+    const auto invalid_admission = production.AssembleProductionResidual(
+      invalid, sentinel, true, nullptr, /*admission_only=*/true);
+    ctx.Check(!invalid_admission.executed &&
+                invalid_admission.reason == DGSEMProductionReason::InvalidDensity &&
+                IsSentinel(sentinel, 8765.25),
+              "DGSEM explicit admission still rejects invalid density with diagnostic scans off");
+    mfem::Vector wrong_size(vfes.GetVSize() - 1); wrong_size = 8765.25;
+    const auto structural = production.AssembleProductionResidual(state_local, wrong_size, true);
+    ctx.Check(!structural.executed &&
+                structural.reason == DGSEMProductionReason::OutputSizeMismatch &&
+                IsSentinel(wrong_size, 8765.25),
+              "DGSEM structural no-write checks remain active with diagnostic scans off");
+    std::cout << "[DGSEM_SCAN_POLICY] order=5 sigma=" << int(has_sigma)
+              << " fused=" << int(fused) << " overintegrated=" << int(overintegrated)
+              << " finite_action=bitwise cfl=identical extra_scan_syncs=" << on_syncs - off_syncs
+              << " explicit_admission=forced\n";
+  }
+}
+
 inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 {
   RunDGSEMProductionMultStrictRejectionProbe(ctx);
@@ -2059,6 +2193,9 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
           std::make_unique<mfem::HyperbolicFormIntegrator>(numerical_flux, 2);
         mfem::DGHyperbolicConservationLaws oper(
           vfes, std::move(form_integrator), true);
+        // These existing fixtures explicitly request numeric rejection and
+        // cumulative q_sigma diagnostics; ordinary library residuals do not.
+        oper.SetDGSEMDiagnosticStateScan(true);
         oper.SetNumericalFlux(&numerical_flux);
         oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
         oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
@@ -2211,6 +2348,11 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
         state.GetTrueDofs(state_true);
         mfem::Vector state_local;
         true_to_local(state_true, state_local);
+
+        if (world_size == 1 && dim == 2 && order == 5 && geometry_mode == 0)
+        {
+          CheckDGSEMDiagnosticScanPolicy(ctx, oper, vfes, state_local, sigma_mode != 0);
+        }
 
         mfem::Vector host_local;
         mfem::Vector host_weak;
@@ -2806,6 +2948,9 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                     "samples for stage admission");
           *sigma = sigma_backup;
 
+          // The typed spectral policy supplies per-stage admission telemetry
+          // independently of the optional diagnostic scan setting.
+          oper.SetDGSEMDiagnosticStateScan(false);
           igr_flux->SetFrozenSigmaSpectralSpeed(true);
           oper.SetDGSEMVolumeDissipation(
             mfem::DGSEMVolumeDissipation::LLF);
@@ -2819,9 +2964,14 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                         frozen_spectral_host,
                         frozen_spectral_host_speed,
                         nullptr);
+          const auto before_frozen_stage = oper.GetGlobalFrozenSigmaTelemetry();
           const auto frozen_spectral_result =
             frozen_spectral_operator.AssembleProductionResidual(
               state_local, frozen_spectral_packed, true);
+          const auto after_frozen_stage = oper.GetGlobalFrozenSigmaTelemetry();
+          ctx.Check(!oper.GetDGSEMDiagnosticStateScan() &&
+                      after_frozen_stage.sample_count > before_frozen_stage.sample_count,
+                    "Typed frozen-sigma stage admission retains fresh q_sigma work with diagnostics off");
           const mfem::IGRFrozenSigmaTelemetry endpoint_admission =
             oper.InspectFrozenSigmaStateForAdmission(state_true);
           const double endpoint_admission_speed = oper.GetMaxCharSpeed();
@@ -2868,6 +3018,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
           oper.SetDGSEMVolumeDissipation(
             mfem::DGSEMVolumeDissipation::None);
           igr_flux->SetFrozenSigmaSpectralSpeed(false);
+          oper.SetDGSEMDiagnosticStateScan(true);
 
           igr_flux->SetSigmaAwareRusanov(true);
           const auto unsupported_sigma_policy =

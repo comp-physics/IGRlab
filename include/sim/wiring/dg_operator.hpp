@@ -120,6 +120,8 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
   }
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
   {
+    op.SetDGSEMDiagnosticStateScan(ctx.run_cfg.opts.nan_scan ||
+                                   ctx.run_cfg.opts.admissibility_scan);
     op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
     op.SetDGSEMVolumeFlux(to_mfem_vol(ctx.run_cfg.dgsem_volume_flux));
     op.SetDGSEMVolumeDissipation(

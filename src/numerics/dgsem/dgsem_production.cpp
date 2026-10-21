@@ -1539,6 +1539,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     flux_igr && flux_igr->GetSigmaAwareRusanov();
   const bool frozen_sigma_spectral_speed =
     flux_igr && flux_igr->GetFrozenSigmaSpectralSpeed();
+  const bool diagnostic_state_scan = op_->GetDGSEMDiagnosticStateScan();
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
   const bool llf_volume_selected =
     op_->GetDGSEMVolumeDissipation() == DGSEMVolumeDissipation::LLF;
@@ -1606,6 +1607,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   fingerprint = HashCombine(fingerprint, sigma_aware_rusanov ? 1 : 0);
   fingerprint = HashCombine(
     fingerprint, frozen_sigma_spectral_speed ? 1 : 0);
+  fingerprint = HashCombine(fingerprint, diagnostic_state_scan ? 1 : 0);
   fingerprint = HashCombine(fingerprint, cuda ? 1 : 0);
   if(volume_quadrature_order>0)
   {
@@ -1640,6 +1642,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   semantic = HashCombine(semantic, sigma_aware_cfl ? 1 : 0);
   semantic = HashCombine(semantic, sigma_aware_rusanov ? 1 : 0);
   semantic = HashCombine(semantic, frozen_sigma_spectral_speed ? 1 : 0);
+  semantic = HashCombine(semantic, diagnostic_state_scan ? 1 : 0);
   semantic = HashCombine(semantic, cuda ? 1 : 0);
 
   int surface_type = -1;
@@ -3317,6 +3320,10 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   DGSEMProductionCache& c = *production_;
   const ProductionCommunicator context =
     GetProductionCommunicator(op_->vfes);
+  // The extrapolated frozen-sigma method consumes fresh per-RHS q_sigma
+  // telemetry for mathematical stage admission even with diagnostics off.
+  const bool scan_state = admission_only || op_->GetDGSEMDiagnosticStateScan() ||
+    c.frozen_sigma_spectral_speed;
   if (admission_only)
   {
     ++c.counters.admission_calls;
@@ -3389,38 +3396,26 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     c.shared_sigma = 0.0;
   }
 
-  // Validate owned stage data before any MPI exchange. The packed fields stay
-  // resident; only the six-scalar FP64 admission summary is synchronized.
-  const DGSEMDeviceStateScan owned_scan = ScanDGSEMProductionStateDevice(
-    op_->dim,
-    c.gamma,
-    c.velocity_density_floor,
-    true,
-    false,
-    c.states,
-    c.sigma_nodes,
-    c.left_states,
-    c.left_sigma,
-    c.right_states,
-    c.right_sigma,
-    c.state_scan_slots,
-    c.state_scan_result);
-  ++c.counters.host_synchronizations;
-  const DGSEMProductionReason owned_state_reason = ReduceReason(
-    context,
-    owned_scan.reason,
-    c.counters.stage_reason_reductions);
-  if (owned_state_reason != DGSEMProductionReason::None)
+  if (scan_state)
   {
-    result.reason = owned_state_reason;
-    return result;
-  }
-  if (c.sigma_field)
-  {
-    op_->dgsem_q_sigma_telemetry_.Merge(owned_scan.q_sigma);
-    if (admission_only)
+    // Keep packed fields resident; synchronize only the requested six-scalar
+    // FP64 admission/diagnostic summary before any MPI exchange.
+    const DGSEMDeviceStateScan owned_scan = ScanDGSEMProductionStateDevice(
+      op_->dim, c.gamma, c.velocity_density_floor, true, false,
+      c.states, c.sigma_nodes, c.left_states, c.left_sigma,
+      c.right_states, c.right_sigma, c.state_scan_slots, c.state_scan_result);
+    ++c.counters.host_synchronizations;
+    const DGSEMProductionReason owned_state_reason = ReduceReason(
+      context, owned_scan.reason, c.counters.stage_reason_reductions);
+    if (owned_state_reason != DGSEMProductionReason::None)
     {
-      result.admission_q_sigma.Merge(owned_scan.q_sigma);
+      result.reason = owned_state_reason;
+      return result;
+    }
+    if (c.sigma_field)
+    {
+      op_->dgsem_q_sigma_telemetry_.Merge(owned_scan.q_sigma);
+      if (admission_only) { result.admission_q_sigma.Merge(owned_scan.q_sigma); }
     }
   }
 
@@ -3429,21 +3424,24 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     overintegration_internal::InterpolateVolumeState2DDevice(c.ne,c.dof,
       c.volume_interpolation,c.states,c.sigma_nodes,
       c.volume_quadrature_states,c.volume_quadrature_sigma);
-    const DGSEMDeviceStateScan volume_scan=ScanDGSEMProductionStateDevice(
-      op_->dim,c.gamma,c.velocity_density_floor,true,false,
-      c.volume_quadrature_states,c.volume_quadrature_sigma,
-      c.left_states,c.left_sigma,c.right_states,c.right_sigma,
-      c.state_scan_slots,c.state_scan_result);
-    ++c.counters.host_synchronizations;
-    const auto volume_reason=ReduceReason(context,volume_scan.reason,c.counters.stage_reason_reductions);
-    if(volume_reason!=DGSEMProductionReason::None)
+    if (scan_state)
     {
-      result.reason=volume_reason;return result;
-    }
-    if(c.sigma_field)
-    {
-      op_->dgsem_q_sigma_telemetry_.Merge(volume_scan.q_sigma);
-      if(admission_only)result.admission_q_sigma.Merge(volume_scan.q_sigma);
+      const DGSEMDeviceStateScan volume_scan=ScanDGSEMProductionStateDevice(
+        op_->dim,c.gamma,c.velocity_density_floor,true,false,
+        c.volume_quadrature_states,c.volume_quadrature_sigma,
+        c.left_states,c.left_sigma,c.right_states,c.right_sigma,
+        c.state_scan_slots,c.state_scan_result);
+      ++c.counters.host_synchronizations;
+      const auto volume_reason=ReduceReason(context,volume_scan.reason,c.counters.stage_reason_reductions);
+      if(volume_reason!=DGSEMProductionReason::None)
+      {
+        result.reason=volume_reason;return result;
+      }
+      if(c.sigma_field)
+      {
+        op_->dgsem_q_sigma_telemetry_.Merge(volume_scan.q_sigma);
+        if(admission_only)result.admission_q_sigma.Merge(volume_scan.q_sigma);
+      }
     }
   }
 
@@ -3540,38 +3538,26 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                 c.left_sigma,
                                 c.right_sigma);
 
-  // Validate and qualify every numerical-flux input, including prescribed
-  // boundary ghosts, after exchange and before evaluating a physical flux.
-  const DGSEMDeviceStateScan face_scan = ScanDGSEMProductionStateDevice(
-    op_->dim,
-    c.gamma,
-    c.velocity_density_floor,
-    false,
-    true,
-    c.states,
-    c.sigma_nodes,
-    c.left_states,
-    c.left_sigma,
-    c.right_states,
-    c.right_sigma,
-    c.state_scan_slots,
-    c.state_scan_result);
-  ++c.counters.host_synchronizations;
-  const DGSEMProductionReason state_reason = ReduceReason(
-    context,
-    face_scan.reason,
-    c.counters.stage_reason_reductions);
-  if (state_reason != DGSEMProductionReason::None)
+  if (scan_state)
   {
-    result.reason = state_reason;
-    return result;
-  }
-  if (c.sigma_field)
-  {
-    op_->dgsem_q_sigma_telemetry_.Merge(face_scan.q_sigma);
-    if (admission_only)
+    // Optional diagnostics or required explicit admission qualify all flux
+    // inputs, including ghosts, after exchange and before physical flux work.
+    const DGSEMDeviceStateScan face_scan = ScanDGSEMProductionStateDevice(
+      op_->dim, c.gamma, c.velocity_density_floor, false, true,
+      c.states, c.sigma_nodes, c.left_states, c.left_sigma,
+      c.right_states, c.right_sigma, c.state_scan_slots, c.state_scan_result);
+    ++c.counters.host_synchronizations;
+    const DGSEMProductionReason state_reason = ReduceReason(
+      context, face_scan.reason, c.counters.stage_reason_reductions);
+    if (state_reason != DGSEMProductionReason::None)
     {
-      result.admission_q_sigma.Merge(face_scan.q_sigma);
+      result.reason = state_reason;
+      return result;
+    }
+    if (c.sigma_field)
+    {
+      op_->dgsem_q_sigma_telemetry_.Merge(face_scan.q_sigma);
+      if (admission_only) { result.admission_q_sigma.Merge(face_scan.q_sigma); }
     }
   }
 
