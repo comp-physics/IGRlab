@@ -510,9 +510,11 @@ void DGConservativeFusionStressOracle(bool permuted, int order = 5,
 {
   // Fifteen cells exercise the 144-output / 128-thread CTA tail without
   // relying on any multiple of the previous forall block or warp batch.
+  // Both spacings are exactly 0.25, preserving the production guard's
+  // bitwise-identical affine edge contract on every cell.
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-    5, 3, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
-  std::vector<Vector> translations = {Vector({1.0,0.0}), Vector({0.0,1.0})};
+    5, 3, mfem::Element::QUADRILATERAL, false, 1.25, 0.75, false);
+  std::vector<Vector> translations = {Vector({1.25,0.0}), Vector({0.0,0.75})};
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
     serial, serial.CreatePeriodicVertexMapping(translations));
   mfem::ParMesh mesh(MPI_COMM_SELF, periodic);
