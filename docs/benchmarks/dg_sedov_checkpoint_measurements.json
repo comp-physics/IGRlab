@@ -1,0 +1,683 @@
+{
+  "schema": "igr-checkpoint-performance-attribution-v1",
+  "audited_source_commit": "8853754c2253861833a5495e5b23e6f0820bd2db",
+  "measured_final_application_source_commit": "e6be5c69250e4db415766216b06119bf5cfccd91",
+  "scope": "Read-only local audit; no repository edits, builds, jobs or remote access.",
+  "case": {
+    "ordinary_dg": true,
+    "mesh_elements_xy": [
+      512,
+      512
+    ],
+    "p": 5,
+    "conserved_dofs": 37748736,
+    "scalar_igr_dofs": 9437184,
+    "gpu": "one GH200",
+    "mpi_ranks": 1,
+    "final_time": 0.1,
+    "cfl": 0.3,
+    "physical_alpha": 6.357828776041666e-07,
+    "time_integration": "SSP RK3, sigma refreshed every stage",
+    "linear_solver": "CUDA FP64 FGMRES, RHS-relative rtol 1e-6, atol 0",
+    "vtk_cadence": 0.02,
+    "optional_scans_limiting_and_modal_damping": "off"
+  },
+  "attribution_rule": "Each fraction uses its own row baseline. Rows overlap or were measured in different jobs; never add saved seconds/fractions or multiply ratios. No exact allocation of final cumulative saved seconds among tranches is supported.",
+  "rows": [
+    {
+      "id": "original_to_fp32",
+      "label": "Original GPU paths \u2192 optimized FP32 pipeline",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "candidate_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "baseline_wall_seconds": 4254.267723860219,
+      "candidate_wall_seconds": 1082.192001300864,
+      "baseline_wall_seconds_decimal": "4254.267723860219",
+      "candidate_wall_seconds_decimal": "1082.192001300864",
+      "job_id": "3407624",
+      "documentation": "igr_sedov_original_gpu_comparison.md",
+      "meaning": "Cumulative algorithm/backend and Euler transport changes; not spectral-only.",
+      "limitations": [
+        "One run per variant in original/FP32/TF32 order on gh009.",
+        "Same executable with different backend selectors. Original is a retained GPU path, not a dev checkout.",
+        "Original initial zero-iteration call omits its extra post-solve certificate.",
+        "No independent tranche composition."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-original-20261018/scanoff-v2/comparison.json",
+          "sha256": "f9d4dca946a074e59b1e419f26770687af467851186396c9644cb97b3dd540cc"
+        }
+      ],
+      "saved_seconds": 3172.075722559355,
+      "saved_fraction_of_row_baseline": 0.745622026740031,
+      "saved_percent_of_row_baseline": 74.5622026740031,
+      "speedup": 3.931157981898145,
+      "saved_seconds_decimal": "3172.075722559355",
+      "saved_fraction_decimal": "0.745622026740030993056455859344602088",
+      "outer_iterations": [
+        232116,
+        47514
+      ],
+      "baseline_variant": "original",
+      "candidate_variant": "fp32"
+    },
+    {
+      "id": "fp32_to_tf32",
+      "label": "Optimized FP32 \u2192 optimized TF32 spectral inverse",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "candidate_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "baseline_wall_seconds": 1082.192001300864,
+      "candidate_wall_seconds": 887.8653372200206,
+      "baseline_wall_seconds_decimal": "1082.192001300864",
+      "candidate_wall_seconds_decimal": "887.8653372200206",
+      "job_id": "3407624",
+      "documentation": "igr_sedov_original_gpu_comparison.md",
+      "meaning": "Isolates spectral precision selection, including changed outer iteration counts.",
+      "limitations": [
+        "One run per variant in original/FP32/TF32 order on gh009.",
+        "Same executable with different backend selectors. Original is a retained GPU path, not a dev checkout.",
+        "Original initial zero-iteration call omits its extra post-solve certificate.",
+        "No independent tranche composition."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-original-20261018/scanoff-v2/comparison.json",
+          "sha256": "f9d4dca946a074e59b1e419f26770687af467851186396c9644cb97b3dd540cc"
+        }
+      ],
+      "saved_seconds": 194.3266640808434,
+      "saved_fraction_of_row_baseline": 0.17956764035148137,
+      "saved_percent_of_row_baseline": 17.956764035148137,
+      "speedup": 1.2188695243912733,
+      "saved_seconds_decimal": "194.3266640808434",
+      "saved_fraction_decimal": "0.179567640351481364768738399379666354",
+      "outer_iterations": [
+        47514,
+        51739
+      ],
+      "baseline_variant": "fp32",
+      "candidate_variant": "tf32"
+    },
+    {
+      "id": "original_to_tf32",
+      "label": "Original GPU paths \u2192 initial optimized TF32 pipeline",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "candidate_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "baseline_wall_seconds": 4254.267723860219,
+      "candidate_wall_seconds": 887.8653372200206,
+      "baseline_wall_seconds_decimal": "4254.267723860219",
+      "candidate_wall_seconds_decimal": "887.8653372200206",
+      "job_id": "3407624",
+      "documentation": "igr_sedov_original_gpu_comparison.md",
+      "meaning": "Cumulative three-way endpoint; overlaps the preceding two comparisons and all transport changes.",
+      "limitations": [
+        "One run per variant in original/FP32/TF32 order on gh009.",
+        "Same executable with different backend selectors. Original is a retained GPU path, not a dev checkout.",
+        "Original initial zero-iteration call omits its extra post-solve certificate.",
+        "No independent tranche composition."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-original-20261018/scanoff-v2/comparison.json",
+          "sha256": "f9d4dca946a074e59b1e419f26770687af467851186396c9644cb97b3dd540cc"
+        }
+      ],
+      "saved_seconds": 3366.4023866401985,
+      "saved_fraction_of_row_baseline": 0.7913000791557159,
+      "saved_percent_of_row_baseline": 79.13000791557158,
+      "speedup": 4.79156865970315,
+      "saved_seconds_decimal": "3366.4023866401984",
+      "saved_fraction_decimal": "0.791300079155715851314971243077474453",
+      "outer_iterations": [
+        232116,
+        51739
+      ],
+      "baseline_variant": "original",
+      "candidate_variant": "tf32"
+    },
+    {
+      "id": "dg_transport_volume",
+      "label": "Euler volume preparation",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "2eced6988305d77da2fd63c31bcaef9e082bfa58",
+      "candidate_source_commit": "2eced6988305d77da2fd63c31bcaef9e082bfa58",
+      "baseline_wall_seconds": 1263.6133381798863,
+      "candidate_wall_seconds": 1119.7977100377902,
+      "baseline_wall_seconds_decimal": "1263.6133381798863",
+      "candidate_wall_seconds_decimal": "1119.7977100377902",
+      "job_id": "3406572",
+      "documentation": "igr_dg_transport_memory.md",
+      "meaning": "Current sigma direct gathering and pointwise FP64 nonlinear volume-flux preparation; both arms retain TF32 inverse/FP32 Euler contractions.",
+      "limitations": [
+        "Same frozen executable in both arms; selector comparison.",
+        "Historical supporting comparison already included in initial optimized FP32/TF32 pipeline; do not add again.",
+        "Volume-only and combined pairs use different allocations/binaries; their difference is not an isolated face result.",
+        "These historical snapshots precede the c13928b complete scan-off correction.",
+        "Frozen source manifest matches stated commit except comment-only IGR_tensor_multigrid.hpp documentation."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/volume-v2-legacy/result.json",
+          "sha256": "f56d56b2fd8dc108aec92b4dca3ac5802956e5d7ed37f2553916a3f5a037cb67"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/volume-v2-volume/result.json",
+          "sha256": "68ebec01a965833676f9f3235eeed2fc89f9371f0e7a5973a264969b67d82f5a"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/source-manifest-volume-v2.json",
+          "sha256": "daf82662154a67bc65655ffc35877abf6d3563392beaa269f31ee057e3fd8bfe"
+        }
+      ],
+      "saved_seconds": 143.8156281420961,
+      "saved_fraction_of_row_baseline": 0.11381300259876072,
+      "saved_percent_of_row_baseline": 11.381300259876072,
+      "speedup": 1.1284300073602067,
+      "saved_seconds_decimal": "143.8156281420961",
+      "saved_fraction_decimal": "0.113813002598760713675387423483792916",
+      "source_identity_kind": "frozen_manifest_with_implementation_commit",
+      "source_manifest": {
+        "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/source-manifest-volume-v2.json",
+        "sha256": "daf82662154a67bc65655ffc35877abf6d3563392beaa269f31ee057e3fd8bfe"
+      },
+      "binary_sha256": "4233286e004a16fc77bd77a21eb1bd252b4294c57c8b1a17d5b0063b6a62e26e",
+      "peak_gpu_mib": [
+        28006,
+        25412
+      ],
+      "baseline_variant": "legacy",
+      "candidate_variant": "volume"
+    },
+    {
+      "id": "dg_transport_combined",
+      "label": "Euler volume + tensor faces",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "00f1245bfa5d64016336e69eb90148664d1839ad",
+      "candidate_source_commit": "00f1245bfa5d64016336e69eb90148664d1839ad",
+      "baseline_wall_seconds": 1303.0043079470051,
+      "candidate_wall_seconds": 913.3022463959933,
+      "baseline_wall_seconds_decimal": "1303.0043079470051",
+      "candidate_wall_seconds_decimal": "913.3022463959933",
+      "job_id": "3406831",
+      "documentation": "igr_dg_transport_memory.md",
+      "meaning": "Combined Euler volume preparation plus FP64 tensor face traces, canonical flux and deterministic lift; not face-only.",
+      "limitations": [
+        "Same frozen executable in both arms; selector comparison.",
+        "Historical supporting comparison already included in initial optimized FP32/TF32 pipeline; do not add again.",
+        "Volume-only and combined pairs use different allocations/binaries; their difference is not an isolated face result.",
+        "These historical snapshots precede the c13928b complete scan-off correction.",
+        "Frozen source manifest matches stated commit except comment-only IGR_tensor_multigrid.hpp documentation."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/face-v3-legacy/result.json",
+          "sha256": "f482c295eac09abc195c7a4102c52754fb039147521bbe4aed106af11d4c6adf"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/face-v3-face/result.json",
+          "sha256": "bf62cedc2694aa32074d6e4e9d4bb14769ee5a92e9f2b8d60404785c17b1775b"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/source-manifest-face-v3.json",
+          "sha256": "23f0cea57cba8e60cf5cbacf720e5f4a1a8dfe81bf6eede86a03e20abc5bddaa"
+        }
+      ],
+      "saved_seconds": 389.7020615510118,
+      "saved_fraction_of_row_baseline": 0.29907964169744056,
+      "saved_percent_of_row_baseline": 29.90796416974406,
+      "speedup": 1.4266956126395458,
+      "saved_seconds_decimal": "389.7020615510118",
+      "saved_fraction_decimal": "0.299079641697440570322190901981398111",
+      "source_identity_kind": "frozen_manifest_with_implementation_commit",
+      "source_manifest": {
+        "path": "/home/jarias9/.cache/igrlab-experiments/dg-transport-20261018/source-manifest-face-v3.json",
+        "sha256": "23f0cea57cba8e60cf5cbacf720e5f4a1a8dfe81bf6eede86a03e20abc5bddaa"
+      },
+      "binary_sha256": "b2828014dd1b464658836cbab22bf2ec3c718a44a02581edfbe342c27b3f5664",
+      "peak_gpu_mib": [
+        28154,
+        22444
+      ],
+      "baseline_variant": "legacy",
+      "candidate_variant": "face"
+    },
+    {
+      "id": "coefficient_prep",
+      "label": "Coefficient preparation",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "candidate_source_commit": "a6cfdc1d3b3c26a0eaeb3a5412b51cb05796f022",
+      "baseline_wall_seconds": 897.5581181590096,
+      "candidate_wall_seconds": 848.4472223650082,
+      "baseline_wall_seconds_decimal": "897.5581181590096",
+      "candidate_wall_seconds_decimal": "848.4472223650082",
+      "job_id": "3414609",
+      "documentation": "igr_coefficient_prep_optimization.md",
+      "meaning": "Combined removal of unused diagnostic gradients and reuse of matching state interpolation; identical final VTU.",
+      "limitations": [
+        "One pair, full setup/output/finalization included; no repeat distribution or confidence interval.",
+        "Dynamic clocks and possible application/filesystem variance remain."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-coefficient-prep-20261019/comparison-3414609/comparison.json",
+          "sha256": "aa424a32ab5e91ed19faf2e6dceeefe275ce813b213ab38eae5abcdf1c08501b"
+        }
+      ],
+      "saved_seconds": 49.1108957940014,
+      "saved_fraction_of_row_baseline": 0.05471611787628109,
+      "saved_percent_of_row_baseline": 5.471611787628109,
+      "speedup": 1.0578832654518062,
+      "saved_seconds_decimal": "49.1108957940014",
+      "saved_fraction_decimal": "0.0547161178762810900039563726511879187",
+      "binary_sha256": [
+        "c6f91d544b831499ebe96dbcf35306aa6e145d83e1c6333c46f8ec115a145d42",
+        "2f858af42e59acdf66deca72e6c7ebcee309b57eb5b641b3ed410cfdfc759dd6"
+      ],
+      "peak_gpu_mib": [
+        22444,
+        21286
+      ],
+      "outer_iterations": [
+        51739,
+        51739
+      ],
+      "execution_order": "baseline-first"
+    },
+    {
+      "id": "face_factorization",
+      "label": "IGR tensor face contractions",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "a6cfdc1d3b3c26a0eaeb3a5412b51cb05796f022",
+      "candidate_source_commit": "c4a7498b3aa52778f19a02be9a09f644342fcb02",
+      "baseline_wall_seconds": 846.7865490149707,
+      "candidate_wall_seconds": 757.7200576229952,
+      "baseline_wall_seconds_decimal": "846.7865490149707",
+      "candidate_wall_seconds_decimal": "757.7200576229952",
+      "job_id": "3421875",
+      "documentation": "igr_face_factorization_optimization.md",
+      "meaning": "Admitted FP64 1D tensor contractions replace dense IGR face projection/lift work; record kernel local speedup 2.49178x.",
+      "limitations": [
+        "One pair, full setup/output/finalization included; no repeat distribution or confidence interval.",
+        "Dynamic clocks and possible application/filesystem variance remain.",
+        "Seven fewer outer iterations; sampled peak rises 96 MiB."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-face-factorization-20261020/tensor-v2/comparison-3421875/comparison.json",
+          "sha256": "b7f3b03ad0cae0568968ce81620667376f52b73ba373e3c66c11ca49a5297184"
+        }
+      ],
+      "saved_seconds": 89.0664913919755,
+      "saved_fraction_of_row_baseline": 0.10518175034261303,
+      "saved_percent_of_row_baseline": 10.518175034261303,
+      "speedup": 1.1175453790564571,
+      "saved_seconds_decimal": "89.0664913919755",
+      "saved_fraction_decimal": "0.105181750342613030299972139858929440",
+      "binary_sha256": [
+        "2f858af42e59acdf66deca72e6c7ebcee309b57eb5b641b3ed410cfdfc759dd6",
+        "5ca34c4e03bd2c04353b0f05555c9f86b5da7c6804cde597e9deb620f07d3fd4"
+      ],
+      "peak_gpu_mib": [
+        21286,
+        21382
+      ],
+      "outer_iterations": [
+        51739,
+        51732
+      ],
+      "execution_order": "baseline-first"
+    },
+    {
+      "id": "face_qdata",
+      "label": "Compact IGR face qdata",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "c4a7498b3aa52778f19a02be9a09f644342fcb02",
+      "candidate_source_commit": "14cb9ffea660053d02cfb5584db7279fa5f401f0",
+      "baseline_wall_seconds": 776.2036667447537,
+      "candidate_wall_seconds": 739.0876639001071,
+      "baseline_wall_seconds_decimal": "776.2036667447537",
+      "candidate_wall_seconds_decimal": "739.0876639001071",
+      "job_id": "3422767",
+      "documentation": "igr_face_qdata_optimization.md",
+      "meaning": "Avoid dense weighted-normal refresh and release device allocations; identical final VTU.",
+      "limitations": [
+        "One pair, full setup/output/finalization included; no repeat distribution or confidence interval.",
+        "Dynamic clocks and possible application/filesystem variance remain.",
+        "Tested source 14cb9ff includes only test-oracle setup repair beyond production 7b61250."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-face-qdata-20261020/comparison-3422767/comparison.json",
+          "sha256": "a2147142b075819dbee647140f9cb46d34ee758b7f599a4aa15cd4500af76276"
+        }
+      ],
+      "saved_seconds": 37.1160028446466,
+      "saved_fraction_of_row_baseline": 0.04781735056767234,
+      "saved_percent_of_row_baseline": 4.781735056767234,
+      "speedup": 1.0502186745328537,
+      "saved_seconds_decimal": "37.1160028446466",
+      "saved_fraction_decimal": "0.0478173505676723398012512408635813809",
+      "binary_sha256": [
+        "5ca34c4e03bd2c04353b0f05555c9f86b5da7c6804cde597e9deb620f07d3fd4",
+        "596f341e13da8da88bdff7044d242c47d061440158e84730978b02d980935e44"
+      ],
+      "peak_gpu_mib": [
+        21382,
+        18376
+      ],
+      "outer_iterations": [
+        51732,
+        51732
+      ],
+      "execution_order": [
+        "baseline-qdata",
+        "compact-qdata"
+      ]
+    },
+    {
+      "id": "spectral_nodal",
+      "label": "Spectral tensor nodal conversions",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "14cb9ffea660053d02cfb5584db7279fa5f401f0",
+      "candidate_source_commit": "01140046e5fa2a35f56bf12d2f1340350f484ab9",
+      "baseline_wall_seconds": 729.6354936450007,
+      "candidate_wall_seconds": 724.0393353979998,
+      "baseline_wall_seconds_decimal": "729.6354936450007",
+      "candidate_wall_seconds_decimal": "724.0393353979998",
+      "job_id": "3424855",
+      "documentation": "igr_spectral_nodal_optimization.md",
+      "meaning": "Reversed-order repeat; tensor factorizations around unchanged TF32 GEMMs.",
+      "limitations": [
+        "One pair, full setup/output/finalization included; no repeat distribution or confidence interval.",
+        "Dynamic clocks and possible application/filesystem variance remain.",
+        "Candidate ran first.",
+        "Fifteen more outer iterations.",
+        "Original job 3423168 baseline suffered long pauses: exclude its 23.24% process-time result from causal attribution.",
+        "Matched no-save intervals: 183.114398 to 174.498570 s, 4.70516% less; not GPU-only.",
+        "Isolated float conversion pair 2.1572x faster; one repeat does not statistically establish a sub-percent solver gain."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/sedov-spectral-nodal-repeat-20261020/repeat-3424855/comparison.json",
+          "sha256": "13f25a204d2cc19c4522d65aca0e864820dc553ca4a838efee8c781b1bd0dc14"
+        }
+      ],
+      "saved_seconds": 5.5961582470009,
+      "saved_fraction_of_row_baseline": 0.007669799914810167,
+      "saved_percent_of_row_baseline": 0.7669799914810166,
+      "speedup": 1.0077290804151195,
+      "saved_seconds_decimal": "5.5961582470009",
+      "saved_fraction_decimal": "0.00766979991481016629503178838997089464",
+      "binary_sha256": [
+        "596f341e13da8da88bdff7044d242c47d061440158e84730978b02d980935e44",
+        "0acd87c208d6b2de440a72c021d26ca1a87a63c2c2e3377b6a233f9800caa5c5"
+      ],
+      "peak_gpu_mib": [
+        18376,
+        18376
+      ],
+      "outer_iterations": [
+        51732,
+        51747
+      ],
+      "execution_order": [
+        "tensor-nodal",
+        "baseline-nodal"
+      ]
+    },
+    {
+      "id": "compact_face_lift",
+      "label": "Compact IGR face lift",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "01140046e5fa2a35f56bf12d2f1340350f484ab9",
+      "candidate_source_commit": "519b33997399f2adadfac62d4505bbe3ab536f38",
+      "baseline_wall_seconds": 734.0703738005832,
+      "candidate_wall_seconds": 723.1365444269031,
+      "baseline_wall_seconds_decimal": "734.0703738005832",
+      "candidate_wall_seconds_decimal": "723.1365444269031",
+      "job_id": "3425661",
+      "documentation": "igr_compact_face_lift_optimization.md",
+      "meaning": "24 stored FP64 face-lift values replace 72 expanded rows; identical final VTU and certificates.",
+      "limitations": [
+        "One pair, full setup/output/finalization included; no repeat distribution or confidence interval.",
+        "Dynamic clocks and possible application/filesystem variance remain.",
+        "Dynamic busy SM clock was 0.59% higher for candidate; no frequency-normalized claim.",
+        "Five no-VTK intervals: 222.435549 to 215.541291 s, 3.10% less.",
+        "Record+gather local kernel time fell 10.01%; whole-process sampled peak unchanged."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-current-operator-20261020/comparison-3425661/comparison.json",
+          "sha256": "7675d5b55425a63982e682f1a7fe5e53afd5597dd65d106589f192852901f2d2"
+        }
+      ],
+      "saved_seconds": 10.9338293736801,
+      "saved_fraction_of_row_baseline": 0.014894797234590989,
+      "saved_percent_of_row_baseline": 1.4894797234590988,
+      "speedup": 1.0151200066680979,
+      "saved_seconds_decimal": "10.9338293736801",
+      "saved_fraction_decimal": "0.0148947972345909886851951666863452897",
+      "binary_sha256": [
+        "0acd87c208d6b2de440a72c021d26ca1a87a63c2c2e3377b6a233f9800caa5c5",
+        "9ca494cfae7acdda163c3dea29f90db19e913e3e90ec20026012882dba1e4c57"
+      ],
+      "peak_gpu_mib": [
+        18376,
+        18376
+      ],
+      "outer_iterations": [
+        51747,
+        51747
+      ],
+      "execution_order": [
+        "full-rows",
+        "compact-lift"
+      ]
+    },
+    {
+      "id": "volume_operator",
+      "label": "Collocated cached FP64 volume operator",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "519b33997399f2adadfac62d4505bbe3ab536f38",
+      "candidate_source_commit": "3125e796afc600d622454856f94ff99ef665439a",
+      "baseline_wall_seconds": 711.5110023058951,
+      "candidate_wall_seconds": 694.2448414629325,
+      "baseline_wall_seconds_decimal": "711.5110023058951",
+      "candidate_wall_seconds_decimal": "694.2448414629325",
+      "job_id": "3426538",
+      "documentation": "igr_volume_operator_optimization.md",
+      "meaning": "Fuses current IGR mass/diffusion application with admitted collocation; isolated operator 2.55588x faster.",
+      "limitations": [
+        "One pair, full setup/output/finalization included; no repeat distribution or confidence interval.",
+        "Dynamic clocks and possible application/filesystem variance remain.",
+        "Five fewer outer iterations.",
+        "Five no-VTK intervals: 212.891282 to 201.950142 s, 5.1393% less.",
+        "Peak sampled process GPU memory rises 1072 MiB.",
+        "Candidate busy SM clock 0.54% lower; no frequency-normalized causal estimate."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-operator-20261020/comparison-3426538/comparison.json",
+          "sha256": "1c322c068849e2b55a9f4b643492377e5e0f957220c22bf6985fb6aec3d8affc"
+        }
+      ],
+      "saved_seconds": 17.2661608429626,
+      "saved_fraction_of_row_baseline": 0.02426689227152594,
+      "saved_percent_of_row_baseline": 2.4266892271525937,
+      "speedup": 1.0248704200762642,
+      "saved_seconds_decimal": "17.2661608429626",
+      "saved_fraction_decimal": "0.0242668922715259384870514565759441988",
+      "binary_sha256": [
+        "9ca494cfae7acdda163c3dea29f90db19e913e3e90ec20026012882dba1e4c57",
+        "a721149b79c23ce888bfcd6f5b9a5976f0a428b7a54b0f4e1945421f7104218c"
+      ],
+      "peak_gpu_mib": [
+        18376,
+        19448
+      ],
+      "outer_iterations": [
+        51747,
+        51742
+      ],
+      "execution_order": [
+        "volume-off",
+        "volume-candidate"
+      ]
+    },
+    {
+      "id": "final_cumulative",
+      "label": "Pinned original GPU paths \u2192 cumulative direct-storage checkpoint",
+      "measurement_kind": "unprofiled_full_application_pair",
+      "baseline_source_commit": "c13928be284a511a1d170a2b9a5b3cd27cc0fac0",
+      "candidate_source_commit": "e6be5c69250e4db415766216b06119bf5cfccd91",
+      "baseline_wall_seconds": 4260.630240748986,
+      "candidate_wall_seconds": 688.3385195939918,
+      "baseline_wall_seconds_decimal": "4260.630240748986",
+      "candidate_wall_seconds_decimal": "688.3385195939918",
+      "job_id": "3428588",
+      "documentation": "igr_volume_storage_and_final_comparison.md",
+      "meaning": "Direct original/current measurement of the full cumulative implementation; final endpoint is not a newly measured dev checkout.",
+      "limitations": [
+        "One original-first pair on gh019, same physical GPU; no confidence interval.",
+        "Original omits initial zero-iteration extra certificate; all observed and final actual FP64 RHS-relative residuals <=1e-6.",
+        "Normal VTK output, setup and finalization included.",
+        "Historical tranche results are not added or multiplied."
+      ],
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/comparison-3428588/comparison.json",
+          "sha256": "5b030f240183476b428e04d7c120177b8b28ce01f2770815c45bd8733a571c4f"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/comparison-3428588/original-audit.json",
+          "sha256": "1f936fb9245ee0d26b8fd49e9e000910764e178d23c5c982ec66338ce670c5d1"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/comparison-3428588/current-audit.json",
+          "sha256": "d868557805ac71226758adeca831d10d9d3f6ed653786985963db62dbd52c592"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/comparison-3428588/field-comparison.json",
+          "sha256": "f38cf929dce6113a941d479fe0d791665b921a55bfaf3c863d7ecc0b114b6a17"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/comparison-3428588/analysis/timing-telemetry-review.json",
+          "sha256": "3d5d23484808cf97c042da150cd1c18f32ba30d833e7dd46cf97f0b46273009a"
+        }
+      ],
+      "saved_seconds": 3572.2917211549943,
+      "saved_fraction_of_row_baseline": 0.8384420893860559,
+      "saved_percent_of_row_baseline": 83.84420893860559,
+      "speedup": 6.18973095281965,
+      "saved_seconds_decimal": "3572.2917211549942",
+      "saved_fraction_decimal": "0.838442089386055902668309356430816125",
+      "peak_gpu_mib": [
+        39506,
+        18708
+      ],
+      "outer_iterations": [
+        232116,
+        51742
+      ],
+      "matched_no_vtk_intervals": {
+        "baseline_seconds": 2010.022775,
+        "candidate_seconds": 203.250514,
+        "steps": 2439,
+        "speedup": 9.889385937789067,
+        "time_reduction_percent": 89.88814870518071,
+        "scope": "Includes analysis callbacks, logging and host work; not GPU-only."
+      },
+      "final_field_agreement": {
+        "max_conserved_relative_l2": 3.542059178550181e-09,
+        "max_conserved_sampled_relative_linf": 2.0051754547462147e-08,
+        "conserved_budgets": {
+          "normalized_l2": 0.001,
+          "normalized_linf_at_gl_points": 0.01,
+          "all_conservative_components_pass": true,
+          "meaning": "engineering comparison budgets, not analytic Sedov error bounds"
+        },
+        "current_final_vtu_byte_identical_to_preceding_cached_volume": true
+      }
+    },
+    {
+      "id": "direct_volume_storage",
+      "label": "Direct IGR volume storage",
+      "measurement_kind": "owned_persistent_array_count_and_native_operator_benchmark",
+      "baseline_source_commit": "3125e796afc600d622454856f94ff99ef665439a",
+      "baseline_report_checkpoint": "d59f056a3755f7dcec51bcad643db9de5acb3cf7",
+      "candidate_source_commit": "e6be5c69250e4db415766216b06119bf5cfccd91",
+      "baseline_wall_seconds": null,
+      "candidate_wall_seconds": null,
+      "saved_fraction_of_row_baseline": null,
+      "speedup": null,
+      "job_id": "3428469",
+      "final_cumulative_job_id": "3428588",
+      "baseline_owned_array_bytes": 1111493632,
+      "candidate_owned_array_bytes": 339741696,
+      "saved_owned_array_bytes": 771751936,
+      "saved_owned_array_mib": 736,
+      "meaning": "Direct QF reads, compact immutable geometry and elimination of owned weighted-coefficient arrays/refresh kernel.",
+      "limitations": [
+        "No isolated cached/direct whole-application pair.",
+        "Final job 3428588 is cumulative original/current; its ratio is not a storage-only gain.",
+        "Direct apply is slower than cached, offset by refresh removal only for suitable reuse counts.",
+        "Predicted 2.31\u20132.82 seconds saved over preceding workload is a model, not a measured physical-run speedup.",
+        "736 MiB is exact owned-array reduction; cross-job sampled peaks differ by 740 MiB and are a different metric."
+      ],
+      "documentation": "igr_volume_storage_and_final_comparison.md",
+      "evidence": [
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/native-3428469/benchmark-result.json",
+          "sha256": "c6fb1275d8a9dfee5dc54109bd643181a8df7713013b6b9266dfb21bcf337413"
+        },
+        {
+          "path": "/home/jarias9/.cache/igrlab-experiments/igr-volume-storage-20261021/native-3428469/frozen-current/build-complete.json",
+          "sha256": "ccd62e7cbacb892ca7cf50ab751863ef567fe75c9624022d3d8173818366d7b8"
+        }
+      ]
+    }
+  ],
+  "verified_origin": "https://github.com/comp-physics/IGRlab.git",
+  "audited_documentation": [
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_sedov_original_gpu_comparison.md",
+      "sha256": "a2beabfcef8f048054b745246278daea3595de3db46f445843edfd1c7d25cb08"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_dg_transport_memory.md",
+      "sha256": "4fe64ba4693782b08940698b3bc9aff6cca200d64ebcf541f8ab4b4365460fa5"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_coefficient_prep_optimization.md",
+      "sha256": "c7983ddacb1d8ec5b407f596a46462764cfd51cc3514b176796e8ce524ec51ef"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_face_factorization_optimization.md",
+      "sha256": "113e8e0bf4b1af1e4d842d3f169d3cc65d5a979ee669fce6d4fa335edad654e9"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_face_qdata_optimization.md",
+      "sha256": "2b52f2c2358736d246ffdb3ec34b02af5bb29d950860148019d1c1926dfedf51"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_spectral_nodal_optimization.md",
+      "sha256": "e82a144877c10aea408d000455a73ab0abe38ff6a39666a53e69dabce7ac048c"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_compact_face_lift_optimization.md",
+      "sha256": "a59179a5f1c4c4638d83976af7e7f0f22c72cfb1d140ff92fc1948b30773f29d"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_volume_operator_optimization.md",
+      "sha256": "7f590bdc9e371e36460724ce45af4e7f691f4abe4941bcc3100fea5e4e861c7b"
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_volume_storage_and_final_comparison.md",
+      "sha256": "8659a9e5602e7677503f85921ec6c5d0ed66854d20ca143e307729d1adbb89e0"
+    }
+  ]
+}

@@ -72,6 +72,7 @@ development. The [current A100 results](docs/a100.md#current-architecture-multio
 report field comparisons across orders, targeted CUDA/MPI checks, and
 DOF-normalized end-to-end timings for the recorded source and configurations.
 
+- [Large DG/IGR checkpoint](docs/igr_dg_checkpoint_integration.md) — 6.19× measured application speedup on the fixed 512² p5 GH200 Sedov case, with exact controls and tranche attribution.
 - [Numerical validation](docs/numerical-validation.md) — how changes are assessed.
 - [GPU studies](docs/gpu-studies.md) — reproducible comparisons and Nsight profiling.
 - [Validation records](docs/consolidation/validation.md) — selected CPU and SM120 checks.
