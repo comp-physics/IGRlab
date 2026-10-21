@@ -1,6 +1,6 @@
 # DG/IGR checkpoint integration
 
-This checkpoint integrates the cumulative DG/IGR acceleration campaign into `dev` for review. Its integration source is `b9921a314c6aeffb2777adf1566e93f2f40b4a04`, derived from `igr-volume-storage-opt` at `8853754c2253861833a5495e5b23e6f0820bd2db`; the refreshed `dev` target is `ea12d1ffb2bd3f260586dc74f551058fd6ba5649`, already an ancestor. No dev/main merge is performed by preparing this branch.
+This checkpoint integrates the cumulative DG/IGR acceleration campaign into `dev` for review. Its integration source is `5499c0dad18af7940e614019825113f3f52d5906` (DG/IGR arithmetic unchanged from the scope-trim commit `b9921a3`), derived from `igr-volume-storage-opt` at `8853754c2253861833a5495e5b23e6f0820bd2db`; the refreshed `dev` target is `ea12d1ffb2bd3f260586dc74f551058fd6ba5649`, already an ancestor. No dev/main merge is performed by preparing this branch.
 
 ## Scope and configuration
 
@@ -22,7 +22,7 @@ For the accelerated configuration, state, sigma, current IGR operator, Krylov al
 
 ## Integrated-branch validation
 
-Validation is in progress on committed integration source `b9921a314c6aeffb2777adf1566e93f2f40b4a04`, DeltaAI job `3429113`. This section will be completed from the native outputs and full final fields before the PR is marked ready for review. Historical performance below is attributed to its recorded sources, not to an unmeasured integrated executable.
+The canonical incremental rebuild and all 32 numerical/native tests passed on `b9921a3` in DeltaAI job `3429113`. The separate build-policy fixture selected system Python 3.6 rather than module Python 3.11; test-only repair `59c4908` preserves the selected interpreter and isolates fixture settings. Its next execution reached the existing 30-second limit in `3429133`; `5499c0d` gives that fixture a bounded 120 seconds. Continuation job `3429144` is validating this policy check, explicit cooperative two-level execution and the complete 512² p5 Sedov evolution. The application arithmetic did not change in either test repair. Final results will be recorded here before marking the PR ready. Historical performance below remains attributed to its recorded sources.
 
 ## Measured checkpoint performance and attribution
 

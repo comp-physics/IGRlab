@@ -280,5 +280,6 @@
     "Set both IGRLAB_VTK_PREFIX_PATH and DG_IGR_VTK_PREFIX_PATH to a distinct output directory.",
     "Run the specified pinned executable once on the allocated CUDA device, retaining the scheduler CUDA_VISIBLE_DEVICES.",
     "Original means retained original GPU paths in c13928b, already using CUDA FP64 outer FGMRES and cooperative coarse CG; it is not dev/main."
-  ]
+  ],
+  "benchmark_id": "dg-sedov-cartesian-n512-p5-gl-calpha1over6-t0p1-gh200-v1"
 }

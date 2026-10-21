@@ -679,5 +679,6 @@
       "path": "/home/jarias9/.codex/worktrees/dgsem-next-architecture/IGRlab/docs/igr_volume_storage_and_final_comparison.md",
       "sha256": "8659a9e5602e7677503f85921ec6c5d0ed66854d20ca143e307729d1adbb89e0"
     }
-  ]
+  ],
+  "benchmark_id": "dg-sedov-cartesian-n512-p5-gl-calpha1over6-t0p1-gh200-v1"
 }
