@@ -595,6 +595,7 @@ RunEulerCase(ExampleContext& ctx,
               << " reusable_stage0="
               << (initial_sigma_preparation.reusable_stage0 ? 1 : 0)
               << " vtk_enabled=" << (run_cfg.opts.vtk_save ? 1 : 0)
+              << " jacobi_blocks=" << ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks)
               << " certification_supported=0 certified=0 approximate=1\n";
   }
   if (restart_info && sigma_provider && communicator_root)
@@ -1141,6 +1142,9 @@ RunEulerCase(ExampleContext& ctx,
                 << final_q_sigma_nonpositive
                 << " q_sigma_nonfinite_samples="
                 << final_q_sigma_nonfinite
+                << (fixed_element_jacobi ? " jacobi_blocks=" : "")
+                << (fixed_element_jacobi
+                      ? ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks) : "")
                 << (fixed_element_jacobi
                       ? " solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps"
                       : "") << "\n";
@@ -2479,6 +2483,10 @@ struct Solver
                 << igr->GetExactFaceOperatorUseCount()
                 << " exact_face_last_mult_calls="
                 << igr->GetLastExactFaceOperatorMultCalls()
+                << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
+                      ? " jacobi_blocks=" : "")
+                << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
+                      ? ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks) : "")
                 << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
                       ? " solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps"
                       : "") << "\n";

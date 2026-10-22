@@ -42,6 +42,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
   {
     const ::igrlab::IGRConfig defaults;
     ctx.Check(defaults.solve_mode == ::igrlab::IGRSolveMode::Krylov &&
+                !defaults.element_jacobi_reference_blocks &&
+                dg_sim::IGROptions{}.element_jacobi_blocks == "current" &&
                 defaults.regular_sweeps == mfem::igrlab::IGRDefaults::kRegularSweeps &&
                 defaults.warm_start_sweeps == mfem::igrlab::IGRDefaults::kWarmStartSweeps,
               "fixed element Jacobi: legacy mode and sweep defaults are unchanged");
@@ -50,10 +52,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 std::string(dg_sim::IGRSolveModeToString(
                   ::igrlab::IGRSolveMode::FixedElementJacobi)) == "element-block-jacobi",
               "fixed element Jacobi: explicit mode parses and round-trips");
+    ctx.Check(!dg_sim::ParseIGRElementJacobiReferenceBlocks("current") &&
+                dg_sim::ParseIGRElementJacobiReferenceBlocks("REFERENCE"),
+              "fixed element Jacobi: current/reference block choices parse explicitly");
     std::vector<std::string> arguments = {
       "test", "--igr-solve-mode", "element-block-jacobi",
       "--igr-sweeps", "2", "--igr-initial-sweeps", "50",
-      "--igr-jacobi-omega", "0.7", "--igr-sigma-cadence", "every-stage"};
+      "--igr-jacobi-omega", "0.7", "--igr-jacobi-blocks", "current",
+      "--igr-sigma-cadence", "every-stage"};
     std::vector<char*> argv;
     for (auto& argument : arguments) { argv.push_back(argument.data()); }
     dg_sim::IGROptions options;
@@ -65,10 +71,12 @@ int RunTimeDefaultsTests(TestContext& ctx)
     options.grad = "BrokenL2";
     options.exact_dg_face_operator = true;
     ::igrlab::IGRConfig configured;
+    configured.element_jacobi_reference_blocks = true;
     dg_sim::ApplyIGRRuntimeOptionOverrides(options, configured);
     ctx.Check(configured.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi &&
                 configured.regular_sweeps == 2 && configured.warm_start_sweeps == 50 &&
-                configured.element_jacobi_omega == 0.7,
+                configured.element_jacobi_omega == 0.7 &&
+                !configured.element_jacobi_reference_blocks,
               "fixed element Jacobi: exact 2/50 sweep counts and damping reach solver config");
     dg_sim::CommonOptions common;
     common.device = "cuda";
@@ -79,6 +87,42 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::Regularization::IGR);
     ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(candidate).empty(),
               "fixed element Jacobi: ordinary-DG every-stage candidate is admitted");
+    std::vector<std::string> reference_arguments = {
+      "test", "--igr-jacobi-blocks", "reference"};
+    std::vector<char*> reference_argv;
+    for (auto& argument : reference_arguments)
+    { reference_argv.push_back(argument.data()); }
+    auto reference_options = options;
+    mfem::OptionsParser reference_parser(
+      static_cast<int>(reference_argv.size()), reference_argv.data());
+    dg_sim::AddIGROptions(reference_parser, reference_options);
+    reference_parser.Parse();
+    ::igrlab::IGRConfig reference_config;
+    dg_sim::ApplyIGRRuntimeOptionOverrides(reference_options, reference_config);
+    ctx.Check(reference_parser.Good() && reference_config.element_jacobi_reference_blocks &&
+                reference_config.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi &&
+                reference_config.regular_sweeps == 2 &&
+                reference_config.warm_start_sweeps == 50,
+              "fixed element Jacobi: reference CLI reaches config without changing sweeps");
+    auto reference_run = candidate;
+    reference_run.igr_opts = reference_options;
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(reference_run).empty(),
+              "fixed element Jacobi: explicit reference inverse mode is admitted");
+    for (const char* other_mode : {"krylov", "smoother"})
+    {
+      auto ignored_selection = reference_run;
+      ignored_selection.igr_opts.solve_mode = other_mode;
+      ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(ignored_selection).empty(),
+                "fixed element Jacobi: reference blocks cannot be ignored by another solver");
+    }
+    reference_options.solve_mode = "krylov";
+    ctx.Check(!dg_sim::ValidateHdgIGRSigmaCadence(
+                dg_sim::Discretization::HDG, dg_sim::Regularization::IGR,
+                dg_sim::CaseConfig{}, reference_options).empty(),
+              "fixed element Jacobi: reference choice cannot disappear at HDG dispatch");
+    reference_run.igr_opts.sigma_cadence = "every-step";
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(reference_run).empty(),
+              "fixed element Jacobi: reference blocks retain every-stage admission");
     for (const char* cadence : {"every-step", "every-n-steps", "extrapolated-every-step"})
     {
       auto unsupported = candidate;

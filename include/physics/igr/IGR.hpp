@@ -115,6 +115,13 @@ public:
   void SetSmoother(SmootherType t);
   void SetSweeps(int regular_sweeps, int warm_start_sweeps);
   void SetElementJacobiDamping(double omega);
+  void SetElementJacobiReferenceBlocks(bool reference)
+  {
+    MFEM_VERIFY(!element_jacobi_blocks_ ||
+                  reference == element_jacobi_reference_blocks_,
+                "Cannot change element-Jacobi block policy on a live cache.");
+    element_jacobi_reference_blocks_ = reference;
+  }
 
   // ---- Recommended Krylov-solve knobs ----
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
@@ -191,6 +198,7 @@ public:
     SetSmoother(cfg.smoot);
     SetSweeps(cfg.regular_sweeps, cfg.warm_start_sweeps);
     SetElementJacobiDamping(cfg.element_jacobi_omega);
+    SetElementJacobiReferenceBlocks(cfg.element_jacobi_reference_blocks);
 
     SetSolveMode(cfg.solve_mode);
     SetLinearSolver(cfg.lin_solver_type);
@@ -730,8 +738,9 @@ private:
   bool first_call_ = true;
 
   // Fixed-sweep closure keeps production history separate from output-only
-  // evaluations. Numerical element blocks are refreshed for every new state.
+  // evaluations. Blocks either refresh every state or retain a reference inverse.
   double element_jacobi_omega_ = 0.7;
+  bool element_jacobi_reference_blocks_ = false;
   std::unique_ptr<mfem::Solver> element_jacobi_blocks_;
   mfem::Vector element_jacobi_history_;
   mfem::Vector element_jacobi_residual_, element_jacobi_correction_;

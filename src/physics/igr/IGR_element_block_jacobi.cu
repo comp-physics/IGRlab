@@ -36,11 +36,28 @@ __global__ void CheckFactorInfo(int count, const int* info, int* failure)
   { atomicCAS(failure, 0, element + 1); }
 }
 
+__global__ void ApplyElementInverse(int dof, const int* map, const double* inverse,
+                                    const double* input, double* output)
+{
+  const int element = blockIdx.x, row = threadIdx.x;
+  __shared__ double rhs[256];
+  if (row < dof) { rhs[row] = input[map[element * dof + row]]; }
+  __syncthreads();
+  if (row >= dof) { return; }
+  double value = 0.0;
+  for (int j = 0; j < dof; ++j)
+  {
+    value += inverse[(std::size_t(element) * dof + j) * dof + row] * rhs[j];
+  }
+  output[map[element * dof + row]] = value;
+}
+
 class CurrentElementBlockJacobi final : public ElementBlockJacobi
 {
 public:
-  explicit CurrentElementBlockJacobi(mfem::ParFiniteElementSpace& space)
+  CurrentElementBlockJacobi(mfem::ParFiniteElementSpace& space, bool explicit_inverse)
     : ElementBlockJacobi(space.GetVSize()), space_(space),
+      explicit_inverse_(explicit_inverse),
       ne_(space.GetNE()), dof_(ne_ ? space.GetFE(0)->GetDof() : 0),
       space_sequence_(space.GetSequence()),
       mesh_sequence_(space.GetMesh() ? space.GetMesh()->GetSequence() : -1)
@@ -92,12 +109,21 @@ public:
     blocks_.SetSize(dof_, dof_, ne_);
     blocks_.GetMemory().UseDevice(true);
     factor_pointers_.SetSize(ne_);
-    rhs_pointers_.SetSize(ne_);
     pivots_.SetSize(height);
     factor_info_.SetSize(ne_);
     failure_.SetSize(1);
-    rhs_.SetSize(height);
-    rhs_.UseDevice(true);
+    if (explicit_inverse_)
+    {
+      inverse_.SetSize(dof_, dof_, ne_);
+      inverse_.GetMemory().UseDevice(true);
+      inverse_pointers_.SetSize(ne_);
+    }
+    else
+    {
+      rhs_pointers_.SetSize(ne_);
+      rhs_.SetSize(height);
+      rhs_.UseDevice(true);
+    }
     CheckBLAS(cublasCreate(&handle_));
     CheckBLAS(cublasSetStream(handle_, nullptr));
     CheckBLAS(cublasSetPointerMode(handle_, CUBLAS_POINTER_MODE_HOST));
@@ -134,6 +160,16 @@ public:
     // and dimensions are unchanged. EA shares the actual domain integrators.
     ea_->Assemble();
     ea_->GetElementMatrices(blocks_, mfem::ElementDofOrdering::NATIVE, false);
+    if (explicit_inverse_)
+    {
+      // Reference mode releases its build-only storage after inversion. A
+      // subsequent explicit refresh is still supported (and uses current A).
+      blocks_.GetMemory().UseDevice(true);
+      factor_pointers_.SetSize(ne_);
+      pivots_.SetSize(height);
+      factor_info_.SetSize(ne_);
+      inverse_pointers_.SetSize(ne_);
+    }
     MFEM_VERIFY(blocks_.SizeI() == dof_ && blocks_.SizeJ() == dof_ &&
                   blocks_.SizeK() == ne_, "Unexpected EA element block layout.");
     prepared_ = true;
@@ -154,6 +190,30 @@ public:
     MFEM_GPU_CHECK(cudaGetLastError());
     MFEM_VERIFY(failure_.HostRead()[0] == 0,
                 "Current element LU factorization failed at element " << failure_.HostRead()[0] - 1);
+    if (explicit_inverse_)
+    {
+      PrepareFactorPointers<<<1 + (ne_ - 1) / 256, 256>>>(
+        dof_, inverse_.Write(), inverse_pointers_.Write(), ne_);
+      MFEM_GPU_CHECK(cudaGetLastError());
+      const double** factors = const_cast<const double**>(
+        reinterpret_cast<const double* const*>(factor_pointers_.Read()));
+      CheckBLAS(cublasDgetriBatched(handle_, dof_, factors, dof_, pivots_.Read(),
+        inverse_pointers_.ReadWrite(), dof_, factor_info_.Write(), ne_));
+      failure_.HostWrite()[0] = 0;
+      CheckFactorInfo<<<1 + (ne_ - 1) / 256, 256>>>(ne_, factor_info_.Read(), failure_.ReadWrite());
+      MFEM_GPU_CHECK(cudaGetLastError());
+      MFEM_VERIFY(failure_.HostRead()[0] == 0,
+                  "Explicit element inverse failed at element " << failure_.HostRead()[0] - 1);
+      // The checked device info above synchronizes inversion. Neither the
+      // inverse application nor a future assembly needs the old EA/LU data.
+      ea_.reset();
+      form_ = nullptr;
+      blocks_.Clear();
+      factor_pointers_.DeleteAll();
+      inverse_pointers_.DeleteAll();
+      pivots_.DeleteAll();
+      factor_info_.DeleteAll();
+    }
     ready_ = true;
     prepared_ = false;
   }
@@ -168,6 +228,14 @@ public:
     const int d = dof_;
     const int* map = element_dofs_.Read();
     const double* input = r.Read();
+    if (explicit_inverse_)
+    {
+      int threads = 32;
+      while (threads < d) { threads *= 2; }
+      ApplyElementInverse<<<ne_, threads>>>(d, map, inverse_.Read(), input, z.Write());
+      MFEM_GPU_CHECK(cudaGetLastError());
+      return;
+    }
     double* packed = rhs_.Write();
     double** pointers = rhs_pointers_.Write();
     mfem::forall(height, [=] MFEM_HOST_DEVICE(int entry)
@@ -200,13 +268,14 @@ private:
   }
 
   mfem::ParFiniteElementSpace& space_;
+  const bool explicit_inverse_;
   const int ne_, dof_;
   const long space_sequence_, mesh_sequence_;
   mfem::BilinearForm* form_ = nullptr;
   std::unique_ptr<mfem::EABilinearFormExtension> ea_;
-  mfem::DenseTensor blocks_;
+  mfem::DenseTensor blocks_, inverse_;
   mfem::Array<int> element_dofs_, pivots_, factor_info_, failure_;
-  mfem::Array<double*> factor_pointers_;
+  mfem::Array<double*> factor_pointers_, inverse_pointers_;
   mutable mfem::Array<double*> rhs_pointers_;
   mutable mfem::Vector rhs_;
   cublasHandle_t handle_ = nullptr;
@@ -274,9 +343,10 @@ struct AddFaceBlocks
 };
 }
 
-std::unique_ptr<ElementBlockJacobi> MakeElementBlockJacobi(mfem::ParFiniteElementSpace& space)
+std::unique_ptr<ElementBlockJacobi> MakeElementBlockJacobi(mfem::ParFiniteElementSpace& space,
+                                                         bool explicit_inverse)
 {
-  return std::make_unique<CurrentElementBlockJacobi>(space);
+  return std::make_unique<CurrentElementBlockJacobi>(space, explicit_inverse);
 }
 
 void AddExactFaceBlocks(const dg_face::InteriorFaceDGDiffusionApplyInfo& info,

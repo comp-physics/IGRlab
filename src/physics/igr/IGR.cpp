@@ -352,6 +352,13 @@ bool IGRSolver::ReclassifyPendingStage0PrefetchAsOutputOnly(
     last_linear_final_norm_ = pending_stage0_prefetch_last_final_norm_;
   }
   AddOutputOnlyAccounting_(pending_stage0_prefetch_accounting_);
+  if (solve_mode_ == SolveMode::FixedElementJacobi &&
+      element_jacobi_reference_blocks_ && !element_jacobi_history_valid_)
+  {
+    // An abandoned initialization must not choose the reference operator for
+    // the first production solve from an output-only state.
+    element_jacobi_blocks_.reset();
+  }
   pending_stage0_prefetch_accounting_ = {};
   return true;
 }
@@ -364,6 +371,9 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   MFEM_VERIFY(!pending_stage0_prefetch_accounting_.valid,
               "A stage-0 sigma prefetch must be consumed or reclassified "
               "before another IGR solve.");
+  MFEM_VERIFY(!element_jacobi_reference_blocks_ ||
+                solve_mode_ == SolveMode::FixedElementJacobi,
+              "Reference element blocks require fixed element-block Jacobi.");
   if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)
   {
     pending_stage0_prefetch_sigma_checkpoint_ = sigma_;
@@ -464,6 +474,11 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   if (purpose == IGRSolvePurpose::OutputOnly)
   {
     AddOutputOnlyAccounting_(delta);
+    if (solve_mode_ == SolveMode::FixedElementJacobi &&
+        element_jacobi_reference_blocks_ && !element_jacobi_history_valid_)
+    {
+      element_jacobi_blocks_.reset();
+    }
   }
   else if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)
   {

@@ -52,6 +52,11 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   }
   ApplyGradOption(igr_opts.grad, cfg);
   cfg.solve_mode = ParseIGRSolveMode(igr_opts.solve_mode);
+  cfg.element_jacobi_reference_blocks =
+    ParseIGRElementJacobiReferenceBlocks(igr_opts.element_jacobi_blocks);
+  MFEM_VERIFY(!cfg.element_jacobi_reference_blocks ||
+                cfg.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi,
+              "Reference element blocks require the fixed element-block Jacobi mode.");
   if (igr_opts.regular_sweeps != -1)
   {
     cfg.regular_sweeps = igr_opts.regular_sweeps;

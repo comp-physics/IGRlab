@@ -2752,18 +2752,24 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (fixed_element_jacobi)
   {
 #ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
-    // Cache structure/storage only. The element diagonal includes the current
-    // volume coefficients and both SIPG self-face contributions at this stage.
+    // Current policy refreshes exact diagonal blocks every state. Reference
+    // policy freezes the initial element inverse; A and b still refresh above.
+    const bool refresh_blocks = !element_jacobi_reference_blocks_ ||
+                                !element_jacobi_blocks_;
     auto* exact_face = dynamic_cast<ExactL2DGFaceOperator*>(
       &exact_face_sum_op->FaceOperator());
     MFEM_VERIFY(exact_face, "Fixed element Jacobi requires exact L2 face data.");
     if (!element_jacobi_blocks_)
     {
-      element_jacobi_blocks_ = MakeElementBlockJacobi(sfes_);
+      element_jacobi_blocks_ = MakeElementBlockJacobi(
+        sfes_, element_jacobi_reference_blocks_);
       if (mfem::Mpi::Root())
       {
         std::cout << "[igr-element-block-jacobi] event=setup"
-                  << " blocks=current-fp64"
+                  << " blocks="
+                  << (element_jacobi_reference_blocks_ ? "reference-fp64" : "current-fp64")
+                  << " refresh="
+                  << (element_jacobi_reference_blocks_ ? "initial-only" : "every-state")
                   << " regular_sweeps=" << regular_sweeps_
                   << " initial_sweeps=" << warm_start_sweeps_
                   << " omega=" << element_jacobi_omega_
@@ -2772,14 +2778,17 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       }
     }
     auto& blocks = dynamic_cast<ElementBlockJacobi&>(*element_jacobi_blocks_);
+    if (refresh_blocks)
     {
-      ::igrlab::NVTXRange block_range("IGR/element-block-assembly");
-      auto& matrices = blocks.PrepareVolumeBlocks(*a_);
-      exact_face->AddElementBlocks(matrices);
-    }
-    {
-      ::igrlab::NVTXRange factor_range("IGR/element-block-factor");
-      blocks.FactorBlocks();
+      {
+        ::igrlab::NVTXRange block_range("IGR/element-block-assembly");
+        auto& matrices = blocks.PrepareVolumeBlocks(*a_);
+        exact_face->AddElementBlocks(matrices);
+      }
+      {
+        ::igrlab::NVTXRange factor_range("IGR/element-block-factor");
+        blocks.FactorBlocks();
+      }
     }
     last_pc_setup_seconds_ = ElapsedSeconds(pc_setup_start);
     total_pc_setup_seconds_ += last_pc_setup_seconds_;
@@ -2847,7 +2856,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     X_.SyncAliasMemory(sigma_);
     last_linear_iters_ = sweeps;
     last_linear_solver_name_ = "fixed-element-jacobi";
-    last_precond_name_ = "current-element-lu-fp64";
+    last_precond_name_ = element_jacobi_reference_blocks_
+      ? "reference-element-inverse-fp64" : "current-element-lu-fp64";
     last_linear_solve_seconds_ = ElapsedSeconds(sweep_start);
     total_linear_solve_seconds_ += last_linear_solve_seconds_;
     ++linear_solve_calls_;

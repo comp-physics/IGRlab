@@ -42,6 +42,7 @@ struct IGROptions
   int regular_sweeps = -1;
   int initial_sweeps = -1;
   double element_jacobi_omega = -1.0;
+  std::string element_jacobi_blocks = "current";
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
   std::string nonconvergence_policy = "";
@@ -412,6 +413,15 @@ inline ::igrlab::IGRSolveMode ParseIGRSolveMode(const std::string& value)
               "Invalid IGR solve mode '" << value
                 << "'. Use 'smoother', 'krylov', or 'element-block-jacobi'.");
   return ::igrlab::IGRSolveMode::Krylov;
+}
+
+inline bool ParseIGRElementJacobiReferenceBlocks(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  MFEM_VERIFY(lower == "current" || lower == "reference",
+              "Invalid IGR Jacobi block selection '" << value
+                << "'. Use 'current' or 'reference'.");
+  return lower == "reference";
 }
 
 inline ::igrlab::IGRLinearSolverType
@@ -1771,6 +1781,10 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-ijw", "--igr-jacobi-omega",
                  "Fixed element-block Jacobi damping in (0,1] "
                  "(-1 keeps the case default).");
+  args.AddOption(&igr_opts.element_jacobi_blocks,
+                 "-ijb", "--igr-jacobi-blocks",
+                 "Fixed element-block Jacobi blocks: current | reference. "
+                 "Reference retains the initial FP64 element inverse.");
   args.AddOption(
     &igr_opts.linear_solver,
     "-ils",
@@ -2082,6 +2096,12 @@ inline std::string ValidateHdgIGRSigmaCadence(
   const IGROptions& igr_opts)
 {
   if (discretization == Discretization::HDG &&
+      ParseIGRElementJacobiReferenceBlocks(igr_opts.element_jacobi_blocks))
+  {
+    return "--igr-jacobi-blocks reference requires ordinary DG with "
+           "--igr-solve-mode element-block-jacobi.";
+  }
+  if (discretization == Discretization::HDG &&
       ParseIGRSolveMode(igr_opts.solve_mode) ==
         ::igrlab::IGRSolveMode::FixedElementJacobi)
   {
@@ -2117,8 +2137,16 @@ inline std::string ValidateHdgIGRSigmaCadence(
 inline std::string ValidateFixedElementJacobiIGRSelection(
   const RunConfig& run_cfg)
 {
-  if (ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) !=
-      ::igrlab::IGRSolveMode::FixedElementJacobi)
+  const bool reference = ParseIGRElementJacobiReferenceBlocks(
+    run_cfg.igr_opts.element_jacobi_blocks);
+  const bool fixed = ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) ==
+    ::igrlab::IGRSolveMode::FixedElementJacobi;
+  if (reference && !fixed)
+  {
+    return "--igr-jacobi-blocks reference requires "
+           "--igr-solve-mode element-block-jacobi.";
+  }
+  if (!fixed)
   {
     return {};
   }

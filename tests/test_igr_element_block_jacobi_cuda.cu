@@ -104,7 +104,7 @@ double RelativeDifference(const Vector& x, const Vector& y)
   return std::sqrt(static_cast<double>(delta / std::max(scale, 1.0e-300L)));
 }
 
-void CheckCase(int order, bool curved)
+void CheckCase(int order, bool curved, bool explicit_inverse = false)
 {
   Mesh serial = Mesh::MakeCartesian2D(curved ? 6 : 4, 3,
     Element::QUADRILATERAL, true, 1.0, 0.8);
@@ -149,7 +149,7 @@ void CheckCase(int order, bool curved)
   BilinearForm volume(&space);
   AddDomain(volume, mass, diffusion, mass_rule, diffusion_rule);
   volume.SetAssemblyLevel(AssemblyLevel::PARTIAL);
-  auto backend = ::igrlab::igr_internal::MakeElementBlockJacobi(space);
+  auto backend = ::igrlab::igr_internal::MakeElementBlockJacobi(space, explicit_inverse);
   InteriorFaceDGDiffusionApplyScratch work;
   work.compact_qdata = true;
   work.compact_lift = true;
@@ -215,12 +215,32 @@ void CheckCase(int order, bool curved)
     Vector expected_view(expected.HostWrite(), expected.TotalSize());
     const double block_error = RelativeDifference(actual_view, expected_view);
     MFEM_VERIFY(block_error < 5.0e-11, "Current exact element blocks differ from assembled MFEM: " << block_error);
+    double nonsymmetric_ratio = 0.0;
+    if (pass == 2)
+    {
+      long double difference = 0.0L, scale = 0.0L;
+      for (int e = 0; e < space.GetNE(); ++e)
+        for (int j = 0; j < d; ++j)
+          for (int i = 0; i < d; ++i)
+          {
+            const long double a = expected_data[i + d * (j + d * e)];
+            const long double b = expected_data[j + d * (i + d * e)];
+            difference += (a - b) * (a - b);
+            scale += a * a;
+          }
+      nonsymmetric_ratio = std::sqrt(static_cast<double>(difference / scale));
+      MFEM_VERIFY(nonsymmetric_ratio > 1.0e-8,
+                  "IIPG fixture must distinguish an inverse from its transpose.");
+    }
     if (pass == 0) { prior_blocks = actual_view; }
     if (pass == 1)
     {
       MFEM_VERIFY(RelativeDifference(actual_view, prior_blocks) > 0.05,
                   "Changed coefficients did not refresh the current blocks.");
     }
+    // The explicit inverse releases blocks after factorization. End this
+    // non-owning host view before that release.
+    actual_view.Destroy();
 
     // Independent current-operator column oracle after EA has refreshed the
     // same domain integrators. No full-operator probing is used in production.
@@ -248,6 +268,8 @@ void CheckCase(int order, bool curved)
     MFEM_VERIFY(column_error < 5.0e-11, "Full current-A column oracle differs: " << column_error);
 
     backend->FactorBlocks();
+    MFEM_VERIFY(!explicit_inverse || blocks.TotalSize() == 0,
+                "Explicit inverse retained its build-only block matrices.");
     Vector rhs(n), actual(n), reference(n);
     for (int i = 0; i < n; ++i) { rhs[i] = std::sin(0.13 * (i + 1)) + 0.2 * std::cos(0.07 * i); }
     backend->Mult(rhs, actual);
@@ -264,17 +286,19 @@ void CheckCase(int order, bool curved)
       for (int i = 0; i < d; ++i) { reference[dofs[i]] = local_solution[i]; }
     }
     const double solve_error = RelativeDifference(actual, reference);
-    MFEM_VERIFY(solve_error < 1.0e-10, "Batched FP64 LU differs from independent block solves: " << solve_error);
+    MFEM_VERIFY(solve_error < 1.0e-10, "FP64 element application differs from independent block solves: " << solve_error);
     rhs *= -0.25;
     reference *= -0.25;
     backend->Mult(rhs, actual);
     MFEM_VERIFY(RelativeDifference(actual, reference) < 1.0e-10,
                 "Reused current factors produced a stale solve.");
     std::cout << "element_block_jacobi_case p=" << order << " curved=" << int(curved)
+              << " explicit_inverse=" << int(explicit_inverse)
               << " coefficient_phase=" << phase << " ip_sigma=" << ip_sigma
               << " compact_normal=" << int(compact_normal)
               << " block_relative=" << block_error << " current_A_columns_relative=" << column_error
-              << " solve_relative=" << solve_error << " passed\n";
+              << " solve_relative=" << solve_error
+              << " nonsymmetric_ratio=" << nonsymmetric_ratio << " passed\n";
   }
 }
 
@@ -389,7 +413,7 @@ private:
   std::vector<Entry> entries_;
 };
 
-void CheckLifecycle()
+void CheckLifecycle(bool reference_blocks)
 {
   LifecycleEnvironment environment;
   Mesh serial = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL, true, 1.0, 1.0);
@@ -417,6 +441,7 @@ void CheckLifecycle()
   config.solve_mode = ::igrlab::IGRSolveMode::FixedElementJacobi;
   config.regular_sweeps = 2; config.warm_start_sweeps = 50;
   config.element_jacobi_omega = 0.7;
+  config.element_jacobi_reference_blocks = reference_blocks;
   config.exact_dg_face_operator = true;
   config.sigma_cadence = ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   config.lin_solver_type = ::igrlab::IGRLinearSolverType::FGMRES;
@@ -430,12 +455,13 @@ void CheckLifecycle()
     solver->ApplyConfig(config);
     return solver;
   };
-  const auto check_solve = [](const ::igrlab::IGRSolver& solver, int sweeps, bool warm)
+  const auto check_solve = [reference_blocks](const ::igrlab::IGRSolver& solver, int sweeps, bool warm)
   {
     MFEM_VERIFY(solver.GetLastLinearIters() == sweeps && !solver.GetLastLinearConverged() &&
                   solver.GetLastWarmStartEffective() == warm &&
                   solver.GetLastLinearSolverName() == "fixed-element-jacobi" &&
-                  solver.GetLastPrecondName() == "current-element-lu-fp64" &&
+                  solver.GetLastPrecondName() == (reference_blocks
+                    ? "reference-element-inverse-fp64" : "current-element-lu-fp64") &&
                   std::isfinite(solver.GetLastLinearTrueResidualRelRHS()),
                 "Fixed-sweep lifecycle was relabeled, cold-started or changed its update budget.");
   };
@@ -463,18 +489,48 @@ void CheckLifecycle()
                             std::size_t(scalar_space.GetVSize()) * sizeof(double)) == 0,
               "Output-only work changed subsequent production sigma or sweep accounting.");
 
-  // A discarded prefetch must not commit approximate production history.
-  auto discarded = make_solver();
-  discarded->UpdateFromState(state, true, ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch);
-  check_solve(*discarded, 50, false);
-  MFEM_VERIFY(discarded->HasPendingStage0PrefetchAccounting() &&
-                discarded->ReclassifyPendingStage0PrefetchAsOutputOnly(true),
-              "Fixture did not discard its pending stage-zero prefetch.");
-  discarded->UpdateFromState(state, true);
-  check_solve(*discarded, 50, false);
-  MFEM_VERIFY(discarded->GetProductionLinearIterations() == 50 &&
-                discarded->GetOutputOnlyLinearIterations() == 50,
-              "Discarded prefetch committed initialization history.");
+  const auto same_sigma = [&](const ::igrlab::IGRSolver& a, const ::igrlab::IGRSolver& b)
+  {
+    return std::memcmp(a.GetSigma().HostRead(), b.GetSigma().HostRead(),
+                       std::size_t(scalar_space.GetVSize()) * sizeof(double)) == 0;
+  };
+  // Before production history exists, a different-state output/prefetch must
+  // seed neither sigma history nor the retained reference block inverse.
+  for (bool prefetch : {false, true})
+  {
+    auto fresh = make_solver(), temporary = make_solver();
+    phase = 0;
+    state.ProjectCoefficient(initial);
+    temporary->UpdateFromState(state, true, prefetch
+      ? ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch
+      : ::igrlab::IGRSolvePurpose::OutputOnly);
+    check_solve(*temporary, 50, false);
+    if (prefetch)
+    {
+      MFEM_VERIFY(temporary->HasPendingStage0PrefetchAccounting() &&
+                    temporary->ReclassifyPendingStage0PrefetchAsOutputOnly(true),
+                  "Fixture did not discard its pending initialization prefetch.");
+    }
+    phase = 3;
+    state.ProjectCoefficient(initial);
+    fresh->UpdateFromState(state, true);
+    temporary->UpdateFromState(state, true);
+    check_solve(*fresh, 50, false); check_solve(*temporary, 50, false);
+    MFEM_VERIFY(same_sigma(*fresh, *temporary),
+                "Different-state initial output/prefetch seeded production history or reference blocks.");
+    // The next two-sweep update also witnesses which reference matrix was
+    // retained, even if fifty initialization sweeps nearly solved the system.
+    phase = 4;
+    state.ProjectCoefficient(initial);
+    fresh->UpdateFromState(state, true);
+    temporary->UpdateFromState(state, true);
+    check_solve(*fresh, 2, true); check_solve(*temporary, 2, true);
+    MFEM_VERIFY(same_sigma(*fresh, *temporary) &&
+                  fresh->GetProductionLinearIterations() == 52 &&
+                  temporary->GetProductionLinearIterations() == 52 &&
+                  temporary->GetOutputOnlyLinearIterations() == 50,
+                "Uncommitted initialization changed later production sigma/reference blocks.");
+  }
 
   // Real ordinary-DG wrapper: initialization is prefetched once, then consumed
   // by stage zero without another solve; the next stage performs two sweeps.
@@ -511,9 +567,11 @@ void CheckLifecycle()
                 wrapped_solver->GetProductionLinearIterations() == 52 &&
                 wrapped_solver->GetProductionLinearConvergedCalls() == 0,
               "Real wrapper changed fixed sweep counts or claimed convergence.");
-  std::cout << "element_block_jacobi_lifecycle passed initial_sweeps=50 regular_sweeps=2 "
+  std::cout << "element_block_jacobi_lifecycle passed reference_blocks=" << int(reference_blocks)
+            << " initial_sweeps=50 regular_sweeps=2 "
                "omega=0.7 output_history=bitwise prefetch=consume-only "
-               "discarded_prefetch=uncommitted convergence_claim=false fallback=none\n";
+               "discarded_prefetch=uncommitted different_state_initial_output=uncommitted "
+               "reference_cache_history=bitwise convergence_claim=false fallback=none\n";
 }
 }
 
@@ -526,10 +584,13 @@ int main(int argc, char** argv)
               "Element-block fixture requires one native CUDA rank.");
   CheckCase(2, false);
   CheckCase(5, true);
+  CheckCase(2, false, true);
+  CheckCase(5, true, true);
   CheckSelfNeighbor();
-  CheckLifecycle();
+  CheckLifecycle(false);
+  CheckLifecycle(true);
   std::cout << "element_block_jacobi_test passed current_coefficients=true "
-               "assembled_blocks=true full_A_columns=true fp64_lu=true "
+               "assembled_blocks=true full_A_columns=true fp64_lu=true fp64_explicit_inverse=true "
                "coarse=false skew=true curved=true dense_fallback=true self_neighbor=true\n";
   return 0;
 }

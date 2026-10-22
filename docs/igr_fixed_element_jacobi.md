@@ -38,6 +38,25 @@ Select the trial with these additions to the matched ordinary-DG case command:
 --igr-sigma-cadence every-stage
 ```
 
+The default `--igr-jacobi-blocks current` refreshes and factors the current
+element diagonal each update. The separately selected
+`--igr-jacobi-blocks reference` instead forms an explicit FP64 inverse of the
+initial production element blocks, then reuses it:
+
+```
+sigma = sigma + omega D_reference_inverse (b_current - A_current sigma)
+```
+
+This reference-block Richardson iteration is a different approximation from
+current-block Jacobi. It keeps the current FP64 equation and warm-start history;
+it does not refresh the local inverse as density evolves. An initial output-only
+solve or discarded prefetch cannot select the production reference matrix.
+The reference mode releases EA and LU construction storage after the checked
+inverse is complete. At 512² p5 it retains 2592 MiB of inverse matrices; its
+matrix-only setup peak is 7776 MiB, excluding common operator/state storage,
+maps, vectors and library workspaces. Reference-mode native and physical
+qualification are pending; the results below describe the current-block trial.
+
 Use CUDA, L2/BrokenL2, exact SIPG faces, and the direct identity layout. Disable
 global tensor, two-level, dense and patch preconditioners for this mode. Retain
 the optimized FP64 current-volume operator and the optimized Euler kernels.
