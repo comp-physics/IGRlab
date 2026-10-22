@@ -1,10 +1,13 @@
 #include "igrlab/compat.hpp"
+#include "igrlab/environment.hpp"
 #include "IGR_local_tensor_jacobi.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -22,6 +25,63 @@ constexpr int max_axis = 8;
 constexpr int max_dofs = max_axis * max_axis;
 constexpr int max_classes = 512;
 constexpr double admission_tolerance = 1.0e-11;
+
+enum class TensorExecution
+{
+  SimtFP64, SimtFP32, SimtDenseFP32, FactorTF32, DenseTF32, DenseFP64
+};
+
+TensorExecution ReadTensorExecution()
+{
+  // The requested canonical name contains IGR_ while its legacy spelling
+  // does not. Resolve it explicitly before GetEnv's usual prefix aliasing.
+  const char* value = ::igrlab::GetEnv("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION");
+  if (!value) { value = ::igrlab::GetEnv("DG_IGR_LOCAL_TENSOR_EXECUTION"); }
+  if (!value || !*value || std::strcmp(value, "simt-fp64") == 0)
+  { return TensorExecution::SimtFP64; }
+  if (std::strcmp(value, "simt-fp32") == 0) { return TensorExecution::SimtFP32; }
+  if (std::strcmp(value, "simt-dense-fp32") == 0) { return TensorExecution::SimtDenseFP32; }
+  if (std::strcmp(value, "wmma-factor-tf32") == 0) { return TensorExecution::FactorTF32; }
+  if (std::strcmp(value, "wmma-dense-tf32") == 0) { return TensorExecution::DenseTF32; }
+  if (std::strcmp(value, "wmma-dense-fp64") == 0) { return TensorExecution::DenseFP64; }
+  MFEM_ABORT("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION must be simt-fp64|simt-fp32|"
+             "simt-dense-fp32|wmma-factor-tf32|wmma-dense-tf32|wmma-dense-fp64; got " << value);
+  return TensorExecution::SimtFP64;
+}
+
+const char* ExecutionName(TensorExecution execution)
+{
+  switch (execution)
+  {
+    case TensorExecution::SimtFP64: return "simt-fp64";
+    case TensorExecution::SimtFP32: return "simt-fp32";
+    case TensorExecution::SimtDenseFP32: return "simt-dense-fp32";
+    case TensorExecution::FactorTF32: return "wmma-factor-tf32";
+    case TensorExecution::DenseTF32: return "wmma-dense-tf32";
+    case TensorExecution::DenseFP64: return "wmma-dense-fp64";
+  }
+  return "invalid";
+}
+
+bool UsesTensorCores(TensorExecution execution)
+{
+  return execution == TensorExecution::FactorTF32 ||
+         execution == TensorExecution::DenseTF32 || execution == TensorExecution::DenseFP64;
+}
+
+bool UsesDenseClasses(TensorExecution execution)
+{
+  return execution == TensorExecution::SimtDenseFP32 ||
+         execution == TensorExecution::DenseTF32 || execution == TensorExecution::DenseFP64;
+}
+
+const char* PrecisionName(TensorExecution execution)
+{
+  if (execution == TensorExecution::FactorTF32 || execution == TensorExecution::DenseTF32)
+  { return "tf32"; }
+  return execution == TensorExecution::SimtFP32 || execution == TensorExecution::SimtDenseFP32
+           ? "fp32" : "fp64";
+}
 
 __global__ void RefreshTensorMass(int entries, const double* geometry,
                                  const double* invrho, double* inverse_sqrt_mass)
@@ -72,6 +132,8 @@ __global__ void ApplyTensorInverse(int axis, const int* map, const int* classes,
     output[map[e * dof + t]] = scaling[e * dof + t] * value;
   }
 }
+
+#include "IGR_local_tensor_jacobi_kernels.cuh"
 
 const mfem::QuadratureSpace& CheckMassQF(const mfem::QuadratureFunction& qf,
                                        mfem::ParFiniteElementSpace& space)
@@ -238,6 +300,32 @@ TensorClass FactorAxes(int axis, std::vector<double> x, std::vector<double> y)
   return result;
 }
 
+// Form the inverse of one already-verified factor class, never an element's
+// current block. Mirrored entries are identical, and the positive eigensums
+// admitted by FactorAxes retain the reference operator's SPD qualification.
+void StoreDenseClassInverse(int axis, const std::vector<double>& packed, double* inverse)
+{
+  const int dof = axis * axis;
+  const double* qx = packed.data();
+  const double* qy = qx + dof;
+  const double* denominator = qy + dof;
+  for (int row = 0; row < dof; ++row)
+    for (int col = 0; col <= row; ++col)
+    {
+      double value = 0.0;
+      for (int ky = 0; ky < axis; ++ky)
+        for (int kx = 0; kx < axis; ++kx)
+        {
+          const double left = qx[row % axis + axis * kx] * qy[row / axis + axis * ky];
+          const double right = qx[col % axis + axis * kx] * qy[col / axis + axis * ky];
+          value += left * denominator[kx + axis * ky] * right;
+        }
+      MFEM_VERIFY(std::isfinite(value) && (row != col || value > 0.0),
+                  "Local tensor Jacobi cached class inverse is not finite/positive on its diagonal.");
+      inverse[row * dof + col] = inverse[col * dof + row] = value;
+    }
+}
+
 class LocalTensorJacobi final : public ElementBlockJacobi
 {
 public:
@@ -248,7 +336,8 @@ public:
       ne_(space.GetNE()), axis_(ne_ ? space.GetFE(0)->GetOrder() + 1 : 0),
       dof_(axis_ * axis_), space_sequence_(space.GetSequence()),
       mesh_sequence_(space.GetMesh() ? space.GetMesh()->GetSequence() : -1),
-      nodes_sequence_(space.GetMesh() ? space.GetMesh()->GetNodesSequence() : -1)
+      nodes_sequence_(space.GetMesh() ? space.GetMesh()->GetNodesSequence() : -1),
+      execution_(ReadTensorExecution())
   {
     static_assert(std::is_same<mfem::real_t, double>::value, "Local tensor Jacobi requires FP64 MFEM.");
     MFEM_VERIFY(dg_face::UsesOrdinaryCUDAForDGDiffusionFaces2D() && space.GetNRanks() == 1 &&
@@ -265,6 +354,22 @@ public:
     MFEM_VERIFY(std::size_t(ne_) * dof_ * dof_ <= std::size_t(std::numeric_limits<int>::max()) &&
                   invrho.Size() == height,
                 "Local tensor Jacobi dense setup/QF indexing bound exceeded.");
+    if (UsesTensorCores(execution_) || UsesDenseClasses(execution_))
+    {
+      MFEM_VERIFY(axis_ == tensor_axis,
+                  "Grouped local tensor Jacobi backends require p5/D1D=6; selected " <<
+                  ExecutionName(execution_) << ". No fallback is provided.");
+    }
+    if (UsesTensorCores(execution_))
+    {
+      int device = 0;
+      cudaDeviceProp properties;
+      MFEM_GPU_CHECK(cudaGetDevice(&device));
+      MFEM_GPU_CHECK(cudaGetDeviceProperties(&properties, device));
+      MFEM_VERIFY(properties.major >= 8,
+                  "Local tensor Jacobi WMMA requires native SM80+ tensor cores; selected " <<
+                  ExecutionName(execution_) << ". No fallback is provided.");
+    }
     BuildLayoutAndMass(invrho);
   }
 
@@ -360,6 +465,17 @@ public:
     double* packed = factors_.HostWrite();
     for (std::size_t c = 0; c < classes.size(); ++c)
     { std::copy(classes[c].packed.begin(), classes[c].packed.end(), packed + c * 3 * dof_); }
+    if (UsesDenseClasses(execution_))
+    {
+      class_inverses_.SetSize(int(classes.size()) * dof_ * dof_);
+      double* inverses = class_inverses_.HostWrite();
+      for (std::size_t c = 0; c < classes.size(); ++c)
+      { StoreDenseClassInverse(axis_, classes[c].packed, inverses + c * dof_ * dof_); }
+      class_inverses_.UseDevice(true);
+      (void)class_inverses_.Read();
+    }
+    if (UsesTensorCores(execution_) || UsesDenseClasses(execution_))
+    { BuildClassGroups(ids, int(classes.size())); }
     // The complete exact blocks, their host copy, EA buffers, and native-only
     // permutation are setup-only. Persistent storage is O(N) plus small classes.
     ea_.reset();
@@ -369,13 +485,29 @@ public:
     (void)element_classes_.Read(); (void)factors_.Read();
     ready_ = true; prepared_ = false;
     const std::size_t bytes = sizeof(double) * (std::size_t(geometry_mass_.Size()) +
-      inverse_sqrt_mass_.Size() + factors_.Size()) +
-      sizeof(int) * (std::size_t(element_dofs_.Size()) + element_classes_.Size());
-    std::cout << "[igr-local-tensor-jacobi] event=setup precision=fp64 execution=simt"
+      inverse_sqrt_mass_.Size() + factors_.Size() + class_inverses_.Size()) +
+      sizeof(int) * (std::size_t(element_dofs_.Size()) + element_classes_.Size() +
+                     grouped_elements_.Size() + grouped_classes_.Size());
+    const int dense_classes = UsesDenseClasses(execution_) ? int(classes.size()) : 0;
+    const bool grouped = grouped_classes_.Size() > 0;
+    std::cout << "[igr-local-tensor-jacobi] event=setup precision=" << PrecisionName(execution_)
+              << " execution=" << (UsesTensorCores(execution_) ? "wmma" : "simt")
+              << " backend=" << ExecutionName(execution_)
+              << " tensor_core=" << int(UsesTensorCores(execution_))
               << " d1d=" << axis_ << " elements=" << ne_ << " factor_classes=" << classes.size()
               << " coefficient_policy=current-collocated-mass initial_blocks=exact-sipg"
               << " geometry=affine-cartesian reconstruction_relative=" << maximum_reconstruction
-              << " owned_bytes=" << bytes << " dense_after_setup=0 fallback=none" << std::endl;
+              << " owned_bytes=" << bytes << " dense_after_setup=" << dense_classes
+              << " class_dense_matrices=" << dense_classes
+              << " class_dense_entries=" << class_inverses_.Size() << " dense_per_element=0"
+              << " grouping=" << (grouped ? "verified-class" : "element")
+              << " group_elements=" << (grouped ? tensor_group_elements : 1)
+              << " groups=" << (grouped ? grouped_classes_.Size() : ne_)
+              << " group_padding=" << (grouped ? grouped_elements_.Size() - ne_ : 0)
+              << " mass_precision=fp64 output_precision=fp64"
+              << " arithmetic_spd=" << (execution_ == TensorExecution::SimtFP64 ||
+                  execution_ == TensorExecution::DenseFP64 ? "fp64-roundoff" : "rounding-perturbed")
+              << " fallback=none" << std::endl;
   }
 
   void RefreshMassScaling(const mfem::QuadratureFunction& invrho) override
@@ -396,14 +528,79 @@ public:
     MFEM_VERIFY(ready_ && rhs.Size() == height && &rhs != &result,
                 "Local tensor Jacobi requires ready factors and distinct input/output vectors.");
     result.SetSize(height); result.UseDevice(true);
-    int threads = 32;
-    while (threads < dof_) { threads *= 2; }
-    ApplyTensorInverse<<<ne_, threads>>>(axis_, element_dofs_.Read(), element_classes_.Read(),
-      factors_.Read(), inverse_sqrt_mass_.Read(), rhs.Read(), result.Write());
+    const int* map = element_dofs_.Read();
+    const double* scaling = inverse_sqrt_mass_.Read();
+    const double* input = rhs.Read();
+    double* output = result.Write();
+    if (execution_ == TensorExecution::SimtFP64 || execution_ == TensorExecution::SimtFP32)
+    {
+      int threads = 32;
+      while (threads < dof_) { threads *= 2; }
+      if (execution_ == TensorExecution::SimtFP64)
+      {
+        ApplyTensorInverse<<<ne_, threads>>>(axis_, map, element_classes_.Read(),
+          factors_.Read(), scaling, input, output);
+      }
+      else
+      {
+        ApplyTensorInverseFP32<<<ne_, threads>>>(axis_, map, element_classes_.Read(),
+          factors_.Read(), scaling, input, output);
+      }
+    }
+    else
+    {
+      const int groups = grouped_classes_.Size();
+      const int* elements = grouped_elements_.Read();
+      const int* classes = grouped_classes_.Read();
+      if (execution_ == TensorExecution::FactorTF32)
+      {
+        ApplyTensorFactorTF32<<<groups, 6 * 32>>>(map, elements, classes, factors_.Read(),
+          scaling, input, output);
+      }
+      else if (execution_ == TensorExecution::DenseTF32)
+      {
+        ApplyTensorDenseTF32<<<groups, 3 * 32>>>(map, elements, classes, class_inverses_.Read(),
+          scaling, input, output);
+      }
+      else if (execution_ == TensorExecution::DenseFP64)
+      {
+        ApplyTensorDenseFP64<<<groups, 5 * 32>>>(map, elements, classes, class_inverses_.Read(),
+          scaling, input, output);
+      }
+      else
+      {
+        ApplyTensorDenseFP32<<<groups, 3 * 32>>>(map, elements, classes, class_inverses_.Read(),
+          scaling, input, output);
+      }
+    }
     MFEM_GPU_CHECK(cudaGetLastError());
   }
 
 private:
+  void BuildClassGroups(const int* ids, int class_count)
+  {
+    std::vector<std::vector<int>> members(class_count);
+    for (int e = 0; e < ne_; ++e) { members[ids[e]].push_back(e); }
+    int groups = 0;
+    for (const auto& elements : members)
+    { groups += (int(elements.size()) + tensor_group_elements - 1) / tensor_group_elements; }
+    grouped_classes_.SetSize(groups);
+    grouped_elements_.SetSize(groups * tensor_group_elements);
+    int* classes = grouped_classes_.HostWrite();
+    int* elements = grouped_elements_.HostWrite();
+    std::fill(elements, elements + grouped_elements_.Size(), -1);
+    int group = 0;
+    for (int c = 0; c < class_count; ++c)
+      for (std::size_t begin = 0; begin < members[c].size(); begin += tensor_group_elements)
+      {
+        classes[group] = c;
+        const int count = int(std::min<std::size_t>(tensor_group_elements, members[c].size() - begin));
+        std::copy_n(members[c].data() + begin, count, elements + group * tensor_group_elements);
+        ++group;
+      }
+    (void)grouped_elements_.Read(); (void)grouped_classes_.Read();
+  }
+
   void BuildLayoutAndMass(const mfem::QuadratureFunction& invrho)
   {
     const auto& fe = *space_.GetFE(0);
@@ -514,10 +711,12 @@ private:
   const mfem::QuadratureSpace* mass_space_;
   const int ne_, axis_, dof_;
   const long space_sequence_, mesh_sequence_, nodes_sequence_;
+  const TensorExecution execution_;
   std::unique_ptr<mfem::EABilinearFormExtension> ea_;
   mfem::DenseTensor blocks_;
   mfem::Array<int> lex_to_native_, element_dofs_, element_classes_;
-  mfem::Vector geometry_mass_, inverse_sqrt_mass_, factors_;
+  mfem::Array<int> grouped_elements_, grouped_classes_;
+  mfem::Vector geometry_mass_, inverse_sqrt_mass_, factors_, class_inverses_;
   bool prepared_ = false, ready_ = false;
 };
 }

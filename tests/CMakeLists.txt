@@ -1953,6 +1953,11 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   add_test(NAME dg_igr_local_tensor_jacobi_cuda COMMAND dg_igr_local_tensor_jacobi_test)
   set_tests_properties(dg_igr_local_tensor_jacobi_cuda PROPERTIES
     LABELS "cuda;igr;element-block;tensor" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_backends
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-backends)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_backends PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;precision" TIMEOUT 300 RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
   foreach(_igrlab_tensor_rejection skew curved nonseparable)
     add_test(NAME dg_igr_local_tensor_jacobi_cuda_reject_${_igrlab_tensor_rejection}
       COMMAND dg_igr_local_tensor_jacobi_test --reject-${_igrlab_tensor_rejection})
