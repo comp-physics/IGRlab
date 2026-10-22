@@ -54,7 +54,7 @@ output is explicitly approximate and uncertified; it is not replaced by a
 converged cleanup solve. Legacy defaults and the converged control's residual
 certification are unchanged.
 
-Validation and measurements are pending. The fixed physical comparison is
+The fixed physical comparison is
 512 by 512 elements, p5 ordinary DG/GL, SSPRK3, CFL 0.3, max-length
 `c_alpha=1/6`, final time 0.1, VTK every 0.02, with scans and limiters disabled.
 Compare complete conserved polynomial fields and derived flow quantities at
@@ -62,3 +62,43 @@ matching physical times; report sigma differences separately. A single fixed
 mesh does not establish error relative to the discretization error. Fresh
 Nsight attribution and unprofiled end-to-end timing determine the sigma/flow
 cost ratio and benefit.
+
+## Initial native validation and short comparison
+
+Native job `3431521` passed the current-block CUDA oracle, fixed-sweep lifecycle
+checks, mode/configuration checks and existing CUDA Krylov check. Tested source
+`829a988ec5e82ef543592f4000b067ec21d9e701`, application SHA256
+`a637586982a4e0fbb4e5b420fe6dff8c3eb4b7ce1d895d0675db4dcf4247c848`.
+Skewed/curved block and current-operator comparisons were within approximately
+`5.2e-16` relative error; FP64 block solves were within `5.5e-15`. The lifecycle
+check proves 50 initialization sweeps, two subsequent sweeps, output-only history
+invariance, and stage-zero prefetch consumption without a second solve.
+
+Job `3431542` ran both methods sequentially on one GH200 GPU through **t=0.0025
+only**, with 120 accepted steps each. Its reference is optimized source
+`97ba1681ac27e07145df790d4c23ed837a21caea`, binary SHA256
+`5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495`.
+Exact identities, configuration and field norms are in
+[the measurement record](benchmarks/dg_fixed_element_jacobi_short_measurements.json).
+
+| Short-run quantity | Optimized converged control | Two-sweep candidate |
+|---|---:|---:|
+| Native elapsed time, including output | 55.703 s | 143.831 s |
+| Entire application wall time | 133.726 s | 221.429 s |
+| Sigma updates | 361 | 361 |
+| Krylov iterations / Jacobi sweeps | 896 | 770 |
+| Host block/preconditioner setup counter | 3.252 s | 86.147 s |
+| Host linear solve counter | 4.637 s | 5.409 s |
+
+The candidate is slower in this short trial. Its block setup counter averages
+238.634 ms/update. These host counters are not a GPU cost partition: the LU
+status synchronization can wait for preceding asynchronous assembly. A bounded
+setup profile is the next step before a much longer full run.
+
+All saved conservative values are finite; density and pressure are positive at
+all 9,437,184 reconstructed native GL points. Full Q5 comparisons give maximum
+conserved relative L2 difference `3.647e-8`, pressure relative L2 `2.992e-9`, and
+sigma relative L2 **0.28847**. Sigma's reference L2 magnitude is only `1.185e-7`
+at this early time, so the small flow difference does not establish later-time
+accuracy or accuracy relative to discretization error. The t=0.1 comparison and
+fresh evolved-state sigma-to-flow profile remain pending.

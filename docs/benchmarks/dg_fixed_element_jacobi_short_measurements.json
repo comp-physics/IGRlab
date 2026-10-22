@@ -1,0 +1,212 @@
+{
+  "schema": "igr-fixed-element-jacobi-short-comparison-v1",
+  "status": "short-admission-only-full-comparison-pending",
+  "method": {
+    "regular_sweeps": 2,
+    "initial_sweeps_at_t0": 50,
+    "omega": 0.7,
+    "blocks": "current FP64 element diagonal, refreshed/factored each update",
+    "warm_start": "previous production sigma",
+    "global_coarse_or_krylov_fallback": false,
+    "candidate_convergence_claim": false
+  },
+  "case": {
+    "mesh_n": 512,
+    "elements": 262144,
+    "order": 5,
+    "euler_dofs": 37748736,
+    "sigma_dofs": 9437184,
+    "target_time": 0.1,
+    "cfl": 0.3,
+    "c_alpha": 0.16666666666666666,
+    "physical_alpha": 6.357828776041666e-07,
+    "linear_rtol": 1e-06,
+    "residual_scale": "rhs",
+    "nan_scan": false,
+    "admissibility_scan": false,
+    "positivity_limiter": "none",
+    "modal_damping_rate": 0
+  },
+  "actual_final_time": 0.0025,
+  "job": "3431542",
+  "node": "gh006",
+  "gpu_uuid": "GPU-8d1ac016-1267-753e-4674-204cd5dfdf83",
+  "source_and_binary": {
+    "reference": {
+      "source_commit": "97ba1681ac27e07145df790d4c23ed837a21caea",
+      "binary_sha256": "5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495",
+      "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-face-flux-20261021/tuning/run-3429955/t64-p73/native-3429955/frozen/sedov_taylor_blast"
+    },
+    "candidate": {
+      "source_commit": "829a988ec5e82ef543592f4000b067ec21d9e701",
+      "binary_sha256": "a637586982a4e0fbb4e5b420fe6dff8c3eb4b7ce1d895d0675db4dcf4247c848",
+      "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-fixed-block-jacobi-20261021/native-3431521/frozen/sedov_taylor_blast"
+    }
+  },
+  "native_validation": {
+    "job": "3431521",
+    "source_commit": "829a988ec5e82ef543592f4000b067ec21d9e701",
+    "binary_sha256": "a637586982a4e0fbb4e5b420fe6dff8c3eb4b7ce1d895d0675db4dcf4247c848",
+    "native_checks": [
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_time_defaults_tests",
+      "dg_igr_device_krylov_cuda"
+    ],
+    "native_check_status": "passed"
+  },
+  "application_speedup_reference_over_candidate": 0.6039220647095076,
+  "arms": {
+    "reference": {
+      "application_wall_seconds": 133.72565677203238,
+      "native_done_seconds": 55.703004349,
+      "accepted_steps": 120,
+      "calls": 361,
+      "iterations_or_sweeps": 896,
+      "host_seconds": {
+        "total_assemble_s": 3.0137322999999987,
+        "total_form_s": 13.048293049000003,
+        "total_pc_setup_s": 3.25210218200002,
+        "total_solve_s": 4.637031461000001,
+        "total_igr_s": 23.951158992000025,
+        "total_update_s": 24.12802502599998
+      },
+      "operator_apply_count": 1617,
+      "preconditioner_apply_count": 896
+    },
+    "candidate": {
+      "application_wall_seconds": 221.4286653632298,
+      "native_done_seconds": 143.831299429,
+      "accepted_steps": 120,
+      "calls": 361,
+      "iterations_or_sweeps": 770,
+      "host_seconds": {
+        "total_assemble_s": 2.952151841000001,
+        "total_form_s": 13.035820763000007,
+        "total_pc_setup_s": 86.14695216700001,
+        "total_solve_s": 5.409358512000002,
+        "total_igr_s": 107.54428328300001,
+        "total_update_s": 107.55587390000007
+      },
+      "operator_apply_count": 770,
+      "preconditioner_apply_count": 770
+    }
+  },
+  "fields": {
+    "density": {
+      "normalized_l2": 8.779593424445446e-10,
+      "normalized_linf_at_gl_points": 1.5737051099575655e-08,
+      "l2_difference": 8.779593625453523e-10,
+      "l2_reference": 1.0000000228949186
+    },
+    "momentum_x": {
+      "normalized_l2": 3.646612958646825e-08,
+      "normalized_linf_at_gl_points": 1.1472013262067679e-07,
+      "l2_difference": 4.136828639941935e-10,
+      "l2_reference": 0.01134430411687293
+    },
+    "momentum_y": {
+      "normalized_l2": 3.6469922020926985e-08,
+      "normalized_linf_at_gl_points": 1.1716750168453959e-07,
+      "l2_difference": 4.137258865240198e-10,
+      "l2_reference": 0.011344304116872466
+    },
+    "energy": {
+      "normalized_l2": 2.991536808696869e-09,
+      "normalized_linf_at_gl_points": 2.206151270721272e-08,
+      "l2_difference": 1.1881329045824305e-08,
+      "l2_reference": 3.9716472855301026
+    },
+    "pressure": {
+      "normalized_l2": 2.991732344507154e-09,
+      "normalized_linf_at_gl_points": 2.2061551435685318e-08,
+      "l2_difference": 4.7525893486413544e-09,
+      "l2_reference": 1.5885743781081048
+    },
+    "speed": {
+      "normalized_l2": 3.521509136818469e-08,
+      "normalized_linf_at_gl_points": 1.2655195909637238e-07,
+      "l2_difference": 5.650727866168137e-10,
+      "l2_reference": 0.01604632459160201
+    }
+  },
+  "sigma": {
+    "conservative_component": false,
+    "field_semantics": "IGR scalar sigma, compared as its complete saved Q5 polynomial; not an Euler conserved component.",
+    "l2_reference": 1.1848247515108536e-07,
+    "l2_candidate": 8.474826746633052e-08,
+    "l2_difference": 3.417853592366842e-08,
+    "normalized_l2": 0.28846912490716414,
+    "linf_reference_at_gl_points": 1.0059449871398206e-06,
+    "linf_candidate_at_gl_points": 7.701803230471052e-07,
+    "linf_difference_at_gl_points": 3.8722459792980156e-07,
+    "normalized_linf_at_gl_points": 0.38493615742426235,
+    "maximum_difference_location": {
+      "cell_ij": [
+        255,
+        256
+      ],
+      "gauss_ij": [
+        5,
+        0
+      ],
+      "xy": [
+        0.499934052259964,
+        0.500065947740036
+      ],
+      "reference": 1.0059449871398206e-06,
+      "candidate": 6.18720389210019e-07
+    },
+    "reference_range_at_gl_points": [
+      -3.4075412726853448e-15,
+      1.0059449871398206e-06
+    ],
+    "candidate_range_at_gl_points": [
+      1.4931166366830778e-16,
+      7.701803230471052e-07
+    ],
+    "integral_reference": 3.721933911165933e-08,
+    "integral_candidate": 2.657441672706311e-08,
+    "integral_candidate_minus_reference": -1.0644922384596215e-08,
+    "difference_of_separately_accumulated_integrals": -1.0644922384596218e-08,
+    "integral_abs_difference_over_reference_gl_l1": 0.2860051424391508,
+    "polynomial_l2_and_integrals_exact_up_to_roundoff": true,
+    "engineering_budget": null,
+    "engineering_budget_pass": null
+  },
+  "gl6_admissibility": {
+    "reference": {
+      "samples": 9437184,
+      "minimum_finite_density": 0.9987143713054072,
+      "minimum_finite_pressure": 1.0000028459324166,
+      "conservative_nonfinite_samples": 0,
+      "density_nonpositive_samples": 0,
+      "pressure_nonpositive_samples": 0,
+      "all_samples_finite_with_positive_density_and_pressure": true
+    },
+    "candidate": {
+      "samples": 9437184,
+      "minimum_finite_density": 0.9987143869703685,
+      "minimum_finite_pressure": 1.0000028459324115,
+      "conservative_nonfinite_samples": 0,
+      "density_nonpositive_samples": 0,
+      "pressure_nonpositive_samples": 0,
+      "all_samples_finite_with_positive_density_and_pressure": true
+    }
+  },
+  "limits": [
+    "Only120 accepted steps to t=.0025; no full-time accuracy or performance qualification.",
+    "Host timing counters are not a partition of GPU activity; factor synchronization can charge earlier asynchronous assembly.",
+    "Startup and VTK materially affect short-case wall times.",
+    "Early sigma is small, so tiny flow differences do not prove later-time accuracy.",
+    "Fixed mesh does not establish differences relative to discretization error.",
+    "Fresh setup profile and full-length comparison remain pending."
+  ],
+  "evidence_sha256": {
+    "comparison.json": "9d0fd389764e129c22272a689807a887e8889b707a21042d631db786dcdd2d66",
+    "final-fields.json": "bde124dc250ffcdac25ee5132813fb5b99e59e37080689d54187a687a24d3d1d",
+    "field-qualification.json": "ab9ea210d10f32be87a44966aa60ec72356fd125b7a538d29362fa0b0f5a493f",
+    "field-analysis/conserved.json": "f89dfc78130202cd9e2a16be7809f2bf182434632b5d366556e2b312972d946a",
+    "field-analysis/sigma.json": "654c7e45540ce28ac798ead05d2524bc20574393e7d1ffe2c466c55eacaa456b",
+    "field-analysis/gl6.json": "f36ae32e513af3730a46770ed2ee2cc8521fcc6cd7bd615a9e36361e4d66de11"
+  }
+}
