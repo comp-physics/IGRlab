@@ -199,7 +199,6 @@ void CheckCase(int order)
   FunctionCoefficient mass([&](const Vector& x) { return 1.0 / density(x); });
   FunctionCoefficient diffusion([&](const Vector& x) { return 0.017 / density(x); });
   FillMass(mesh, invrho, mass); FillMass(mesh, initial_invrho, mass);
-  auto backend = ::igrlab::igr_internal::MakeTensorElementBlockJacobi(space, invrho);
   BilinearForm volume(&space);
   AddDomain(volume, mass, diffusion, mass_rule, diffusion_rule);
   volume.SetAssemblyLevel(AssemblyLevel::PARTIAL); volume.Assemble();
@@ -215,6 +214,9 @@ void CheckCase(int order)
     &work.penalty_metric, &work.shape_dictionary, &work.normal_factorization);
   LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(info, work, side, kappa,
                                                 DGDiffusionFaceScaling::Arithmetic);
+  // PA/face preparation may install mesh Nodes lazily. Capture the fixed
+  // geometry sequence only after those initial caches have been established.
+  auto backend = ::igrlab::igr_internal::MakeTensorElementBlockJacobi(space, invrho);
   DenseTensor& built = backend->PrepareVolumeBlocks(volume);
   ::igrlab::igr_internal::AddExactFaceBlocks(info, work, -1.0, built);
   Vector initial_blocks = AssembledDiagonal(space, mass, diffusion, mass_rule,
@@ -315,7 +317,6 @@ void ExpectedRejection(const std::string& kind)
   QuadratureSpace qs(mesh, rule); QuadratureFunction invrho(qs);
   invrho = 1.0;
   std::cout << "local_tensor_jacobi_expected_rejection kind=" << kind << std::endl;
-  auto backend = ::igrlab::igr_internal::MakeTensorElementBlockJacobi(space, invrho);
   if (kind == "nonseparable")
   {
     mfem::ConstantCoefficient mass(1.0);
@@ -323,7 +324,12 @@ void ExpectedRejection(const std::string& kind)
     BilinearForm volume(&space);
     AddDomain(volume, mass, diffusion, rule, rule);
     volume.SetAssemblyLevel(AssemblyLevel::PARTIAL); volume.Assemble();
+    auto backend = ::igrlab::igr_internal::MakeTensorElementBlockJacobi(space, invrho);
     backend->PrepareVolumeBlocks(volume); backend->FactorBlocks();
+  }
+  else
+  {
+    auto backend = ::igrlab::igr_internal::MakeTensorElementBlockJacobi(space, invrho);
   }
   // Returning success makes a CTest WILL_FAIL rejection test fail.
   std::cout << "local_tensor_jacobi_unexpected_admission kind=" << kind << std::endl;

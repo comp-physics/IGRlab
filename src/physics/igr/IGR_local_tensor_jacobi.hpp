@@ -11,6 +11,8 @@ namespace igr_internal
  *
  * Assemble initial exact domain/face diagonal blocks through the usual
  * PrepareVolumeBlocks/AddExactFaceBlocks/FactorBlocks sequence exactly once.
+ * Establish initial PA/face geometry caches before constructing this backend:
+ * MFEM can create mesh Nodes lazily, which changes the geometry sequence.
  * For a collocated GL scalar space on fixed affine Cartesian quads, setup
  * admits only an SPD Kronecker sum after physical-mass normalization. It then
  * discards dense build storage and retains shared small tensor factors.
