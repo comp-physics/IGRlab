@@ -54,8 +54,9 @@ solve or discarded prefetch cannot select the production reference matrix.
 The reference mode releases EA and LU construction storage after the checked
 inverse is complete. At 512² p5 it retains 2592 MiB of inverse matrices; its
 matrix-only setup peak is 7776 MiB, excluding common operator/state storage,
-maps, vectors and library workspaces. Reference-mode native and physical
-qualification are pending; the results below describe the current-block trial.
+maps, vectors and library workspaces. Both policies passed native validation.
+The reference-block full physical trial failed, as recorded below; it must not
+be used for an accuracy or speedup claim.
 
 Use CUDA, L2/BrokenL2, exact SIPG faces, and the direct identity layout. Disable
 global tensor, two-level, dense and patch preconditioners for this mode. Retain
@@ -111,8 +112,8 @@ Exact identities, configuration and field norms are in
 
 The candidate is slower in this short trial. Its block setup counter averages
 238.634 ms/update. These host counters are not a GPU cost partition: the LU
-status synchronization can wait for preceding asynchronous assembly. A bounded
-setup profile is the next step before a much longer full run.
+status synchronization can wait for preceding asynchronous assembly. The bounded
+setup profile below identifies the recorded dominant kernels.
 
 All saved conservative values are finite; density and pressure are positive at
 all 9,437,184 reconstructed native GL points. Full Q5 comparisons give maximum
@@ -144,9 +145,39 @@ partition and sigma/flow ratio are withheld; the listed times describe recorded
 kernel occurrences, not an authoritative percentage of all GPU work. See the
 [profile record](benchmarks/dg_fixed_element_jacobi_setup_profile.json).
 
-An important method choice remains: the existing two-level path retains
-reference blocks, whereas this first trial deliberately refreshes exact current
-blocks. Reusing reference blocks would remove recurring assembly/factorization
-but changes the approximate iteration and needs a separate flow comparison.
-Optimizing current blocks preserves this method but must address LU and face
-assembly as well as volume EA. No full t=0.1 candidate result is claimed.
+The existing two-level path retains reference blocks, whereas the first trial
+refreshes exact current blocks. A separate reference-block physical comparison
+is reported below. Optimizing current blocks must address LU and face assembly
+as well as volume EA.
+
+## Reused-reference-block physical result
+
+Native job `3431758` passed all three focused suites on source
+`e3a32d91672c5d968d12493b24361a4e4cd0e303`, binary SHA256
+`8782cdc2d4d54191901040ee4e291e2fef80c03f2d087ea1affb5e80f7d1dafd`.
+Its 12 block oracles and two history-lifecycle cases cover both current and
+reference policies. Short job `3431802` reached t=0.0025 with finite positive
+GL6 fields and a maximum conserved relative L2 difference of `3.646e-8`.
+
+**The full cached-reference candidate failed physical validation.** Job
+`3431903` ran the optimized control and this candidate sequentially on one
+GH200. The control reached t=0.1 in 4,939 steps; its full saved Q5 field is
+finite, with minimum density 0.449420 and pressure 1.000319 at all 9,437,184
+native GL points. Its final VTU is byte-identical to the earlier optimized
+control. All 14,818 FP64 current-equation certificates passed the requested
+RHS-relative 1e-6 limit.
+
+The candidate's last finite reported extrema are at t=0.050602 and its first
+nonfinite reported extrema at t=0.069641. This brackets the printed diagnostics,
+not the exact onset or every intervening state. Its final conservative field is
+nonfinite at all 9,437,184 native GL points. Although the application continued
+to the target, its 3,571 steps and elapsed time cannot support a physical speedup
+claim. The saved raw execution records are retained and explicitly superseded
+by the failed field qualification. All checks here were offline; runtime scans
+remained disabled.
+
+The unchanged initial inverse with fixed omega=0.7 is therefore inadequate for
+this trial. This result does not establish the behavior of freshly updated
+current-block Jacobi. The faithful full current-block comparison and fresh
+optimized-control cost profile remain pending. Identities and measured evidence
+are in [the reference-block result record](benchmarks/dg_reference_element_jacobi_measurements.json).
