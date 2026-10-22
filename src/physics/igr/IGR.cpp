@@ -178,6 +178,8 @@ IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
 
 void IGRSolver::SetAlpha(double a)
 {
+  MFEM_VERIFY(!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_ || a == alpha_,
+              "Cannot change alpha with live tensor element-Jacobi factors.");
   alpha_ = a; // alpha_coef reads this by reference (see above)
   if (src_coef_)
   {
@@ -187,6 +189,9 @@ void IGRSolver::SetAlpha(double a)
 
 void IGRSolver::SetAlphaLengthScalePolicy(AlphaLengthScalePolicy policy)
 {
+  MFEM_VERIFY(!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_ ||
+                policy == alpha_length_scale_policy_,
+              "Cannot change alpha length-scale policy with live tensor element-Jacobi factors.");
   alpha_length_scale_policy_ = policy;
 }
 
@@ -353,10 +358,11 @@ bool IGRSolver::ReclassifyPendingStage0PrefetchAsOutputOnly(
   }
   AddOutputOnlyAccounting_(pending_stage0_prefetch_accounting_);
   if (solve_mode_ == SolveMode::FixedElementJacobi &&
-      element_jacobi_reference_blocks_ && !element_jacobi_history_valid_)
+      (element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) &&
+      !element_jacobi_history_valid_)
   {
-    // An abandoned initialization must not choose the reference operator for
-    // the first production solve from an output-only state.
+    // An abandoned initialization must not choose the frozen inverse or
+    // normalized tensor structure for the first production solve.
     element_jacobi_blocks_.reset();
   }
   pending_stage0_prefetch_accounting_ = {};
@@ -371,9 +377,11 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   MFEM_VERIFY(!pending_stage0_prefetch_accounting_.valid,
               "A stage-0 sigma prefetch must be consumed or reclassified "
               "before another IGR solve.");
-  MFEM_VERIFY(!element_jacobi_reference_blocks_ ||
+  MFEM_VERIFY(!(element_jacobi_reference_blocks_ && element_jacobi_tensor_blocks_),
+              "Reference and tensor element-Jacobi blocks are mutually exclusive.");
+  MFEM_VERIFY(!(element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) ||
                 solve_mode_ == SolveMode::FixedElementJacobi,
-              "Reference element blocks require fixed element-block Jacobi.");
+              "Reference/tensor element blocks require fixed element-block Jacobi.");
   if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)
   {
     pending_stage0_prefetch_sigma_checkpoint_ = sigma_;
@@ -475,7 +483,8 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   {
     AddOutputOnlyAccounting_(delta);
     if (solve_mode_ == SolveMode::FixedElementJacobi &&
-        element_jacobi_reference_blocks_ && !element_jacobi_history_valid_)
+        (element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) &&
+        !element_jacobi_history_valid_)
     {
       element_jacobi_blocks_.reset();
     }

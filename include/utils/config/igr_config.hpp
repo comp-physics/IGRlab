@@ -126,6 +126,7 @@ struct IGRConfig
   // Used only by FixedElementJacobi; the legacy smoother defaults are intact.
   double element_jacobi_omega = 0.7;
   bool element_jacobi_reference_blocks = false;
+  bool element_jacobi_tensor_blocks = false;
 
   IGRSolveMode solve_mode = IGRSolveMode::Krylov;
   IGRLinearSolverType lin_solver_type = IGRLinearSolverType::Auto;

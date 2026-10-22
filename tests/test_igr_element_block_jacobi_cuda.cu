@@ -413,7 +413,7 @@ private:
   std::vector<Entry> entries_;
 };
 
-void CheckLifecycle(bool reference_blocks)
+void CheckLifecycle(bool reference_blocks, bool tensor_blocks = false)
 {
   LifecycleEnvironment environment;
   Mesh serial = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL, true, 1.0, 1.0);
@@ -425,7 +425,13 @@ void CheckLifecycle(bool reference_blocks)
   int phase = 0;
   VectorFunctionCoefficient initial(4, [&](const Vector& x, Vector& value)
   {
-    const double rho = 1.0 + 0.1 * x[0] + 0.03 * phase * x[1];
+    // Tensor setup needs a separable initial operator. Elementwise constant
+    // phase 3 changes normalized face terms, so a leaked phase-0 cache cannot
+    // pass the initial output/discarded-prefetch comparison by mass scaling.
+    const double rho = tensor_blocks && phase == 0 ? 1.0 :
+      (tensor_blocks && phase == 3 ? (x[0] < 0.5 ? 0.75 : 1.25) :
+        (tensor_blocks && phase == 5 ? 0.45 :
+          1.0 + 0.1 * x[0] + 0.03 * phase * x[1]));
     const double u = 0.2 + 0.04 * x[0] + 0.07 * phase * x[1];
     const double v = -0.1 + 0.05 * x[1] + 0.03 * phase * x[0];
     const double pressure = 1.0 + 0.1 * x[0];
@@ -442,6 +448,7 @@ void CheckLifecycle(bool reference_blocks)
   config.regular_sweeps = 2; config.warm_start_sweeps = 50;
   config.element_jacobi_omega = 0.7;
   config.element_jacobi_reference_blocks = reference_blocks;
+  config.element_jacobi_tensor_blocks = tensor_blocks;
   config.exact_dg_face_operator = true;
   config.sigma_cadence = ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   config.lin_solver_type = ::igrlab::IGRLinearSolverType::FGMRES;
@@ -455,16 +462,46 @@ void CheckLifecycle(bool reference_blocks)
     solver->ApplyConfig(config);
     return solver;
   };
-  const auto check_solve = [reference_blocks](const ::igrlab::IGRSolver& solver, int sweeps, bool warm)
+  const auto check_solve = [reference_blocks, tensor_blocks](
+    const ::igrlab::IGRSolver& solver, int sweeps, bool warm)
   {
     MFEM_VERIFY(solver.GetLastLinearIters() == sweeps && !solver.GetLastLinearConverged() &&
                   solver.GetLastWarmStartEffective() == warm &&
                   solver.GetLastLinearSolverName() == "fixed-element-jacobi" &&
-                  solver.GetLastPrecondName() == (reference_blocks
-                    ? "reference-element-inverse-fp64" : "current-element-lu-fp64") &&
+                  solver.GetLastPrecondName() == (tensor_blocks
+                    ? "tensor-element-density-fp64" : (reference_blocks
+                        ? "reference-element-inverse-fp64" : "current-element-lu-fp64")) &&
                   std::isfinite(solver.GetLastLinearTrueResidualRelRHS()),
                 "Fixed-sweep lifecycle was relabeled, cold-started or changed its update budget.");
   };
+
+  if (tensor_blocks)
+  {
+    auto scaled = make_solver();
+    auto current_config = config;
+    current_config.element_jacobi_tensor_blocks = false;
+    auto current = std::make_unique<::igrlab::IGRSolver>(
+      scalar_space, vector_space, 2, 4, current_config.alpha);
+    current->ApplyConfig(current_config);
+    for (auto* solver : {scaled.get(), current.get()})
+    {
+      solver->UpdateFromState(state, true);
+    }
+    phase = 5;
+    state.ProjectCoefficient(initial);
+    for (auto* solver : {scaled.get(), current.get()})
+    {
+      solver->UpdateFromState(state, true);
+    }
+    check_solve(*scaled, 2, true);
+    Vector difference(scaled->GetSigma());
+    difference -= current->GetSigma();
+    MFEM_VERIFY(difference.Normlinf() <=
+                  5.0e-11 * std::max(1.0, current->GetSigma().Normlinf()),
+                "Tensor integration did not refresh mass scaling for a uniform density change.");
+    phase = 0;
+    state.ProjectCoefficient(initial);
+  }
 
   auto direct = make_solver(), interposed = make_solver();
   for (auto* solver : {direct.get(), interposed.get()})
@@ -495,7 +532,7 @@ void CheckLifecycle(bool reference_blocks)
                        std::size_t(scalar_space.GetVSize()) * sizeof(double)) == 0;
   };
   // Before production history exists, a different-state output/prefetch must
-  // seed neither sigma history nor the retained reference block inverse.
+  // seed neither sigma history nor the retained inverse/tensor structure.
   for (bool prefetch : {false, true})
   {
     auto fresh = make_solver(), temporary = make_solver();
@@ -534,6 +571,11 @@ void CheckLifecycle(bool reference_blocks)
 
   // Real ordinary-DG wrapper: initialization is prefetched once, then consumed
   // by stage zero without another solve; the next stage performs two sweeps.
+  if (tensor_blocks)
+  {
+    phase = 0;
+    state.ProjectCoefficient(initial);
+  }
   auto wrapped_solver = make_solver();
   EulerFlux euler(2, 1.4);
   FluxWithIGR physical(euler);
@@ -568,6 +610,8 @@ void CheckLifecycle(bool reference_blocks)
                 wrapped_solver->GetProductionLinearConvergedCalls() == 0,
               "Real wrapper changed fixed sweep counts or claimed convergence.");
   std::cout << "element_block_jacobi_lifecycle passed reference_blocks=" << int(reference_blocks)
+            << " tensor_blocks=" << int(tensor_blocks)
+            << " current_mass_refresh=" << int(tensor_blocks)
             << " initial_sweeps=50 regular_sweeps=2 "
                "omega=0.7 output_history=bitwise prefetch=consume-only "
                "discarded_prefetch=uncommitted different_state_initial_output=uncommitted "
@@ -589,6 +633,7 @@ int main(int argc, char** argv)
   CheckSelfNeighbor();
   CheckLifecycle(false);
   CheckLifecycle(true);
+  CheckLifecycle(false, true);
   std::cout << "element_block_jacobi_test passed current_coefficients=true "
                "assembled_blocks=true full_A_columns=true fp64_lu=true fp64_explicit_inverse=true "
                "coarse=false skew=true curved=true dense_fallback=true self_neighbor=true\n";

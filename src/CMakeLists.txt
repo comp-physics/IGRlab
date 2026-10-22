@@ -73,6 +73,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
                                   physics/igr/IGR_face_density_cuda.cu
                                   physics/igr/IGR_stationary_correction_cuda.cu
                                   physics/igr/IGR_element_block_jacobi.cu
+                                  physics/igr/IGR_local_tensor_jacobi.cu
                                   physics/igr/IGR_device_krylov_cuda.cu
                                   physics/igr/IGR_tensor_multigrid.cu
                                   physics/igr/IGR_tensor_volume.cu)

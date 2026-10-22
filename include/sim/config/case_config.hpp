@@ -418,10 +418,18 @@ inline ::igrlab::IGRSolveMode ParseIGRSolveMode(const std::string& value)
 inline bool ParseIGRElementJacobiReferenceBlocks(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
-  MFEM_VERIFY(lower == "current" || lower == "reference",
+  MFEM_VERIFY(lower == "current" || lower == "reference" || lower == "tensor",
               "Invalid IGR Jacobi block selection '" << value
-                << "'. Use 'current' or 'reference'.");
+                << "'. Use 'current', 'reference', or 'tensor'.");
   return lower == "reference";
+}
+
+inline bool ParseIGRElementJacobiTensorBlocks(const std::string& value)
+{
+  // Retain one validation surface for all block choices. Tensor is a distinct
+  // policy and must never be interpreted as a frozen reference inverse.
+  (void)ParseIGRElementJacobiReferenceBlocks(value);
+  return ToLowerCopy(value) == "tensor";
 }
 
 inline ::igrlab::IGRLinearSolverType
@@ -1783,8 +1791,9 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "(-1 keeps the case default).");
   args.AddOption(&igr_opts.element_jacobi_blocks,
                  "-ijb", "--igr-jacobi-blocks",
-                 "Fixed element-block Jacobi blocks: current | reference. "
-                 "Reference retains the initial FP64 element inverse.");
+                 "Fixed element-block Jacobi blocks: current | reference | tensor. "
+                 "Reference retains the initial FP64 inverse; tensor retains "
+                 "initial tensor factors with current density scaling.");
   args.AddOption(
     &igr_opts.linear_solver,
     "-ils",
@@ -2096,10 +2105,11 @@ inline std::string ValidateHdgIGRSigmaCadence(
   const IGROptions& igr_opts)
 {
   if (discretization == Discretization::HDG &&
-      ParseIGRElementJacobiReferenceBlocks(igr_opts.element_jacobi_blocks))
+      (ParseIGRElementJacobiReferenceBlocks(igr_opts.element_jacobi_blocks) ||
+       ParseIGRElementJacobiTensorBlocks(igr_opts.element_jacobi_blocks)))
   {
-    return "--igr-jacobi-blocks reference requires ordinary DG with "
-           "--igr-solve-mode element-block-jacobi.";
+    return "--igr-jacobi-blocks " + ToLowerCopy(igr_opts.element_jacobi_blocks) +
+           " requires ordinary DG with --igr-solve-mode element-block-jacobi.";
   }
   if (discretization == Discretization::HDG &&
       ParseIGRSolveMode(igr_opts.solve_mode) ==
@@ -2139,12 +2149,14 @@ inline std::string ValidateFixedElementJacobiIGRSelection(
 {
   const bool reference = ParseIGRElementJacobiReferenceBlocks(
     run_cfg.igr_opts.element_jacobi_blocks);
+  const bool tensor = ParseIGRElementJacobiTensorBlocks(
+    run_cfg.igr_opts.element_jacobi_blocks);
   const bool fixed = ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) ==
     ::igrlab::IGRSolveMode::FixedElementJacobi;
-  if (reference && !fixed)
+  if ((reference || tensor) && !fixed)
   {
-    return "--igr-jacobi-blocks reference requires "
-           "--igr-solve-mode element-block-jacobi.";
+    return "--igr-jacobi-blocks " + ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks) +
+           " requires --igr-solve-mode element-block-jacobi.";
   }
   if (!fixed)
   {

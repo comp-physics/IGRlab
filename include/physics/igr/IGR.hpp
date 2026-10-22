@@ -117,10 +117,24 @@ public:
   void SetElementJacobiDamping(double omega);
   void SetElementJacobiReferenceBlocks(bool reference)
   {
+    MFEM_VERIFY(!reference || !element_jacobi_tensor_blocks_,
+                "Reference and tensor element-Jacobi blocks are mutually exclusive.");
     MFEM_VERIFY(!element_jacobi_blocks_ ||
                   reference == element_jacobi_reference_blocks_,
                 "Cannot change element-Jacobi block policy on a live cache.");
     element_jacobi_reference_blocks_ = reference;
+  }
+  /// Retain initial tensor structure at fixed geometry/alpha and refresh
+  /// current physical-mass density scaling. Heterogeneous density is an SPD
+  /// surrogate; fixed sweeps do not certify the current elliptic solution.
+  void SetElementJacobiTensorBlocks(bool tensor)
+  {
+    MFEM_VERIFY(!tensor || !element_jacobi_reference_blocks_,
+                "Reference and tensor element-Jacobi blocks are mutually exclusive.");
+    MFEM_VERIFY(!element_jacobi_blocks_ ||
+                  tensor == element_jacobi_tensor_blocks_,
+                "Cannot change element-Jacobi block policy on a live cache.");
+    element_jacobi_tensor_blocks_ = tensor;
   }
 
   // ---- Recommended Krylov-solve knobs ----
@@ -198,7 +212,18 @@ public:
     SetSmoother(cfg.smoot);
     SetSweeps(cfg.regular_sweeps, cfg.warm_start_sweeps);
     SetElementJacobiDamping(cfg.element_jacobi_omega);
-    SetElementJacobiReferenceBlocks(cfg.element_jacobi_reference_blocks);
+    MFEM_VERIFY(!(cfg.element_jacobi_reference_blocks && cfg.element_jacobi_tensor_blocks),
+                "Reference and tensor element-Jacobi blocks are mutually exclusive.");
+    if (cfg.element_jacobi_tensor_blocks)
+    {
+      SetElementJacobiReferenceBlocks(false);
+      SetElementJacobiTensorBlocks(true);
+    }
+    else
+    {
+      SetElementJacobiTensorBlocks(false);
+      SetElementJacobiReferenceBlocks(cfg.element_jacobi_reference_blocks);
+    }
 
     SetSolveMode(cfg.solve_mode);
     SetLinearSolver(cfg.lin_solver_type);
@@ -738,9 +763,12 @@ private:
   bool first_call_ = true;
 
   // Fixed-sweep closure keeps production history separate from output-only
-  // evaluations. Blocks either refresh every state or retain a reference inverse.
+  // evaluations. Tensor factors retain the first production state's operator
+  // structure at fixed geometry/alpha and refresh only their physical-mass
+  // density scaling thereafter.
   double element_jacobi_omega_ = 0.7;
   bool element_jacobi_reference_blocks_ = false;
+  bool element_jacobi_tensor_blocks_ = false;
   std::unique_ptr<mfem::Solver> element_jacobi_blocks_;
   mfem::Vector element_jacobi_history_;
   mfem::Vector element_jacobi_residual_, element_jacobi_correction_;

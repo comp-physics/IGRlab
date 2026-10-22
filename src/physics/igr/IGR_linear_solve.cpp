@@ -15,6 +15,7 @@
 #include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
 #include "IGR_element_block_jacobi.hpp"
+#include "IGR_local_tensor_jacobi.hpp"
 #include "IGR_device_krylov.hpp"
 #include "IGR_chebyshev.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
@@ -2504,6 +2505,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "no essential constraints, every-stage updates and positive sweep "
               "counts. Disable global/patch preconditioners and do not request "
               "a converged residual certificate for this approximate mode.");
+  MFEM_VERIFY(!element_jacobi_tensor_blocks_ ||
+                (backend_ == GradBackend::BrokenDG && invrho_qf_),
+              "Tensor element-block Jacobi requires BrokenL2 gradients and "
+              "current collocated inverse-density quadrature data.");
   MFEM_VERIFY(!using_tensor_mg ||
                 !(using_dense_inverse || using_two_level_inverse || using_screened_patch),
               "Tensor multigrid cannot be combined with another experimental preconditioner.");
@@ -2753,23 +2758,29 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   {
 #ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
     // Current policy refreshes exact diagonal blocks every state. Reference
-    // policy freezes the initial element inverse; A and b still refresh above.
-    const bool refresh_blocks = !element_jacobi_reference_blocks_ ||
-                                !element_jacobi_blocks_;
+    // retains the initial inverse; tensor retains initial normalized factors
+    // and refreshes current mass scaling. A and b refresh for every policy.
+    const bool refresh_blocks =
+      !(element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) ||
+      !element_jacobi_blocks_;
     auto* exact_face = dynamic_cast<ExactL2DGFaceOperator*>(
       &exact_face_sum_op->FaceOperator());
     MFEM_VERIFY(exact_face, "Fixed element Jacobi requires exact L2 face data.");
     if (!element_jacobi_blocks_)
     {
-      element_jacobi_blocks_ = MakeElementBlockJacobi(
-        sfes_, element_jacobi_reference_blocks_);
+      element_jacobi_blocks_ = element_jacobi_tensor_blocks_
+        ? MakeTensorElementBlockJacobi(sfes_, *invrho_qf_)
+        : MakeElementBlockJacobi(sfes_, element_jacobi_reference_blocks_);
       if (mfem::Mpi::Root())
       {
         std::cout << "[igr-element-block-jacobi] event=setup"
                   << " blocks="
-                  << (element_jacobi_reference_blocks_ ? "reference-fp64" : "current-fp64")
+                  << (element_jacobi_tensor_blocks_ ? "tensor-density-fp64" :
+                      (element_jacobi_reference_blocks_ ? "reference-fp64" : "current-fp64"))
                   << " refresh="
-                  << (element_jacobi_reference_blocks_ ? "initial-only" : "every-state")
+                  << (element_jacobi_tensor_blocks_ ? "current-mass-scaling" :
+                      (element_jacobi_reference_blocks_ ? "initial-only" : "every-state"))
+                  << (element_jacobi_tensor_blocks_ ? " initial_reference=once certified=0" : "")
                   << " regular_sweeps=" << regular_sweeps_
                   << " initial_sweeps=" << warm_start_sweeps_
                   << " omega=" << element_jacobi_omega_
@@ -2789,6 +2800,11 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
         ::igrlab::NVTXRange factor_range("IGR/element-block-factor");
         blocks.FactorBlocks();
       }
+    }
+    if (element_jacobi_tensor_blocks_)
+    {
+      ::igrlab::NVTXRange scaling_range("IGR/element-tensor-mass-scaling");
+      blocks.RefreshMassScaling(*invrho_qf_);
     }
     last_pc_setup_seconds_ = ElapsedSeconds(pc_setup_start);
     total_pc_setup_seconds_ += last_pc_setup_seconds_;
@@ -2856,8 +2872,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     X_.SyncAliasMemory(sigma_);
     last_linear_iters_ = sweeps;
     last_linear_solver_name_ = "fixed-element-jacobi";
-    last_precond_name_ = element_jacobi_reference_blocks_
-      ? "reference-element-inverse-fp64" : "current-element-lu-fp64";
+    last_precond_name_ = element_jacobi_tensor_blocks_
+      ? "tensor-element-density-fp64" : (element_jacobi_reference_blocks_
+          ? "reference-element-inverse-fp64" : "current-element-lu-fp64");
     last_linear_solve_seconds_ = ElapsedSeconds(sweep_start);
     total_linear_solve_seconds_ += last_linear_solve_seconds_;
     ++linear_solve_calls_;

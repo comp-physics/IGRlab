@@ -1943,6 +1943,24 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   set_tests_properties(dg_igr_element_block_jacobi_cuda PROPERTIES
     LABELS "cuda;igr;element-block" TIMEOUT 180 RUN_SERIAL TRUE)
 
+  add_executable(dg_igr_local_tensor_jacobi_test test_igr_local_tensor_jacobi_cuda.cu)
+  target_link_libraries(dg_igr_local_tensor_jacobi_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_local_tensor_jacobi_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_local_tensor_jacobi_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda COMMAND dg_igr_local_tensor_jacobi_test)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda PROPERTIES
+    LABELS "cuda;igr;element-block;tensor" TIMEOUT 180 RUN_SERIAL TRUE)
+  foreach(_igrlab_tensor_rejection skew curved nonseparable)
+    add_test(NAME dg_igr_local_tensor_jacobi_cuda_reject_${_igrlab_tensor_rejection}
+      COMMAND dg_igr_local_tensor_jacobi_test --reject-${_igrlab_tensor_rejection})
+    set_tests_properties(dg_igr_local_tensor_jacobi_cuda_reject_${_igrlab_tensor_rejection}
+      PROPERTIES LABELS "cuda;igr;element-block;tensor;admission"
+      TIMEOUT 60 RUN_SERIAL TRUE WILL_FAIL TRUE)
+  endforeach()
+
   add_executable(dg_igr_device_krylov_test test_igr_device_krylov_cuda.cu)
   target_link_libraries(dg_igr_device_krylov_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
   target_compile_options(dg_igr_device_krylov_test PRIVATE
