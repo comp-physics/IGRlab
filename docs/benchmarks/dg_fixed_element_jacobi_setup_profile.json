@@ -1,0 +1,163 @@
+{
+  "schema": "igr-fixed-element-jacobi-setup-profile-v1",
+  "job": "3431621",
+  "node": "gh071",
+  "gpu": {
+    "index": 0,
+    "uuid": "GPU-1cb4f3c0-7c9a-ef06-5c56-e68dd7b16ad1",
+    "inherited_cuda_visible_devices": "0"
+  },
+  "source_commit": "829a988ec5e82ef543592f4000b067ec21d9e701",
+  "binary_sha256": "a637586982a4e0fbb4e5b420fe6dff8c3eb4b7ce1d895d0675db4dcf4247c848",
+  "status": "diagnostic-capture-completed",
+  "duration_seconds": 5,
+  "delay_seconds": 140,
+  "complete_regular_updates": 19,
+  "quantitative_gpu_timing_valid": false,
+  "cupti_possible_lost_records": true,
+  "invalid_correlation_or_interval_counts": {},
+  "host_phase_cost_per_update": {
+    "sigma_update": {
+      "count": 19,
+      "mean_ms": 257.5531317894737,
+      "median_ms": 257.618144,
+      "minimum_ms": 257.364064,
+      "maximum_ms": 257.702144,
+      "total_seconds": 4.893509504000001
+    },
+    "other_sigma_host": {
+      "count": 19,
+      "mean_ms": 14.717638736842105,
+      "median_ms": 14.717664,
+      "minimum_ms": 14.660447999999999,
+      "maximum_ms": 14.76304,
+      "total_seconds": 0.279635136
+    },
+    "system_assembly": {
+      "count": 19,
+      "mean_ms": 6.2203368421052625,
+      "median_ms": 6.290944,
+      "minimum_ms": 6.042911999999999,
+      "maximum_ms": 6.31232,
+      "total_seconds": 0.11818640000000001
+    },
+    "block_assembly": {
+      "count": 19,
+      "mean_ms": 0.03332210526315789,
+      "median_ms": 0.032704,
+      "minimum_ms": 0.031007999999999997,
+      "maximum_ms": 0.03904,
+      "total_seconds": 0.00063312
+    },
+    "block_factor": {
+      "count": 19,
+      "mean_ms": 236.41535157894737,
+      "median_ms": 236.41302399999998,
+      "minimum_ms": 236.357376,
+      "maximum_ms": 236.48627199999999,
+      "total_seconds": 4.49189168
+    },
+    "two_sweeps": {
+      "count": 19,
+      "mean_ms": 0.16648252631578947,
+      "median_ms": 0.16432,
+      "minimum_ms": 0.15545599999999998,
+      "maximum_ms": 0.184864,
+      "total_seconds": 0.003163168
+    },
+    "sweep_current_A": {
+      "count": 19,
+      "mean_ms": 0.07419621052631578,
+      "median_ms": 0.072416,
+      "minimum_ms": 0.065888,
+      "maximum_ms": 0.095936,
+      "total_seconds": 0.001409728
+    },
+    "sweep_block_solve": {
+      "count": 19,
+      "mean_ms": 0.07823326315789474,
+      "median_ms": 0.07699199999999999,
+      "minimum_ms": 0.07343999999999999,
+      "maximum_ms": 0.089152,
+      "total_seconds": 0.001486432
+    }
+  },
+  "observed_dominant_kernels": [
+    {
+      "phase": "block_factor",
+      "name": "void getrf_panel<double, double, (int)6, (int)6, (int)4, (int)4, (int)6, (bool)1>(int, T1 *const *, int, int *, int *, int)",
+      "calls": 19,
+      "summed_seconds": 2.60511208,
+      "mean_observed_ms": 137.11116210526316
+    },
+    {
+      "phase": "block_factor",
+      "name": "igrlab::igr_internal::<unnamed>::CheckFactorInfo(int, const int *, int *)",
+      "calls": 19,
+      "summed_seconds": 3.5520000000000006e-05,
+      "mean_observed_ms": 0.0018694736842105265
+    },
+    {
+      "phase": "block_factor",
+      "name": "igrlab::igr_internal::<unnamed>::PrepareFactorPointers(int, double *, double **, int)",
+      "calls": 19,
+      "summed_seconds": 2.9568000000000002e-05,
+      "mean_observed_ms": 0.0015562105263157895
+    },
+    {
+      "phase": "block_assembly",
+      "name": "void mfem::CuKernel1D<igrlab::igr_internal::<unnamed>::AddFaceBlocks<(bool)1>>(int, T1)",
+      "calls": 19,
+      "summed_seconds": 1.1945598640000001,
+      "mean_observed_ms": 62.871571789473684
+    },
+    {
+      "phase": "block_assembly",
+      "name": "void mfem::CuKernel2D<void mfem::EADiffusionAssemble2D<(int)6, (int)6>(int, const mfem::Array<double> &, const mfem::Array<double> &, const mfem::Vector &, mfem::Vector &, bool, int, int)::[lambda(int) (instance 1)]>(int, T1)",
+      "calls": 19,
+      "summed_seconds": 0.554123036,
+      "mean_observed_ms": 29.164370315789473
+    },
+    {
+      "phase": "block_assembly",
+      "name": "void mfem::CuKernel2D<void mfem::internal::EAMassAssemble2D<(int)6, (int)6>(int, const mfem::Array<double> &, const mfem::Vector &, mfem::Vector &, bool, int, int)::[lambda(int) (instance 1)]>(int, T1)",
+      "calls": 19,
+      "summed_seconds": 0.06423980700000001,
+      "mean_observed_ms": 3.3810424736842113
+    },
+    {
+      "phase": "sweep_block_solve",
+      "name": "void batch_trsm_left_kernel<double, (int)64, (int)4, (int)3, (bool)0, (bool)0, (bool)1>(cublasTrsmBatchParams2<T1>, T1, const T1 *, int)",
+      "calls": 188,
+      "summed_seconds": 0.12493520000000001,
+      "mean_observed_ms": 0.6645489361702128
+    },
+    {
+      "phase": "sweep_block_solve",
+      "name": "void batch_trsm_left_kernel<double, (int)64, (int)4, (int)3, (bool)0, (bool)0, (bool)0>(cublasTrsmBatchParams2<T1>, T1, const T1 *, int)",
+      "calls": 190,
+      "summed_seconds": 0.074470751,
+      "mean_observed_ms": 0.39195132105263164
+    },
+    {
+      "phase": "sweep_block_solve",
+      "name": "void laswp_kernel<double, (bool)0>(int, T1 *const *, int, int, int, const int *, int, int, int)",
+      "calls": 38,
+      "summed_seconds": 0.020110944000000002,
+      "mean_observed_ms": 0.5292353684210527
+    }
+  ],
+  "limits": [
+    "Candidate-only early diagnostic; not a completed physical run or matched performance comparison.",
+    "CUPTI reports possible missing records. Complete GPU phase percentages and sigma/flow ratio are withheld.",
+    "Listed kernel times describe actual recorded occurrences, not a complete GPU cost partition.",
+    "Factor host synchronization includes waiting for earlier asynchronous assembly.",
+    "The profile supports investigating LU and face assembly, rather than assuming only volume EA is expensive."
+  ],
+  "artifact_sha256": {
+    "run.json": "66d058f873a9272bc256025576871bb4c6829a1983c746f32c81d8ab2ca87ede",
+    "block-setup-analysis.json": "b777d35a8e5ec8f0cfefd00c529ca1c6624b34c8edc1a745d8b0732a5ff4d878",
+    "capture.nsys-rep": "9a445fe13b6f09a9b090736c9da0675ef930af7f55bf7ad83236541f6f42bb62",
+    "capture.sqlite": "1ab544a699b7a51652244ea295b424dc40eaac05d38b706f2ca197cc8e1f6888"
+  }
+}

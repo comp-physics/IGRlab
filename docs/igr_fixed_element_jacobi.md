@@ -102,3 +102,32 @@ sigma relative L2 **0.28847**. Sigma's reference L2 magnitude is only `1.185e-7`
 at this early time, so the small flow difference does not establish later-time
 accuracy or accuracy relative to discretization error. The t=0.1 comparison and
 fresh evolved-state sigma-to-flow profile remain pending.
+
+## Bounded setup diagnostic
+
+Job `3431621` captured five seconds of a separate continuous candidate process,
+after a nominal 140-second delay, then deliberately terminated that process.
+This is not a failed physical comparison. The trace contains 19 complete
+regular update scopes, each with one block assembly, one factorization and two
+sweeps. Actual absolute physical-time endpoints are not encoded by these NVTX
+ranges.
+
+The recorded dominant kernels averaged **137.111 ms** for cuBLAS `getrf_panel`,
+**62.872 ms** for exact face-block assembly, **29.164 ms** for MFEM diffusion EA,
+and **3.381 ms** for mass EA (19 recorded occurrences each). These observations
+show that optimizing only volume assembly would leave substantial LU and face
+assembly costs. The host factor scope averages 236.415 ms because its final
+scalar synchronization also waits for preceding assembly.
+
+**CUPTI warned of possible missing records.** The profiler also reported that
+driver 13.2 was unsupported by its bundled CUDA 12.9 tracing libraries. A complete GPU phase
+partition and sigma/flow ratio are withheld; the listed times describe recorded
+kernel occurrences, not an authoritative percentage of all GPU work. See the
+[profile record](benchmarks/dg_fixed_element_jacobi_setup_profile.json).
+
+An important method choice remains: the existing two-level path retains
+reference blocks, whereas this first trial deliberately refreshes exact current
+blocks. Reusing reference blocks would remove recurring assembly/factorization
+but changes the approximate iteration and needs a separate flow comparison.
+Optimizing current blocks preserves this method but must address LU and face
+assembly as well as volume EA. No full t=0.1 candidate result is claimed.
