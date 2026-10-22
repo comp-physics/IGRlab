@@ -6,6 +6,12 @@ spectral preconditioner inside FP64 FGMRES and certifies the current equation at
 the requested RHS-relative tolerance of `1e-6`. The historical original GPU
 solver is not the control for this experiment.
 
+The full current-block trial reached t=0.1 with finite positive native-node
+fields, maximum conserved relative L2 difference `1.077e-6`, and sigma relative
+L2 difference **2.035%**. It took **6.153 times** the control application time.
+The separate frozen-initial-block trial failed physical validation. The
+completed measurements below distinguish those two outcomes.
+
 For the current stage equation `A sigma = b`, let `D` contain the complete
 diagonal element blocks of `A`, including mass, volume diffusion and SIPG face
 self contributions. Each sweep computes
@@ -119,9 +125,9 @@ All saved conservative values are finite; density and pressure are positive at
 all 9,437,184 reconstructed native GL points. Full Q5 comparisons give maximum
 conserved relative L2 difference `3.647e-8`, pressure relative L2 `2.992e-9`, and
 sigma relative L2 **0.28847**. Sigma's reference L2 magnitude is only `1.185e-7`
-at this early time, so the small flow difference does not establish later-time
-accuracy or accuracy relative to discretization error. The t=0.1 comparison and
-fresh evolved-state sigma-to-flow profile remain pending.
+at this early time, so the small flow difference alone does not establish
+later-time accuracy or accuracy relative to discretization error. The completed
+t=0.1 current-block comparison is reported below.
 
 ## Bounded setup diagnostic
 
@@ -178,6 +184,137 @@ remained disabled.
 
 The unchanged initial inverse with fixed omega=0.7 is therefore inadequate for
 this trial. This result does not establish the behavior of freshly updated
-current-block Jacobi. The faithful full current-block comparison and fresh
-optimized-control cost profile remain pending. Identities and measured evidence
-are in [the reference-block result record](benchmarks/dg_reference_element_jacobi_measurements.json).
+current-block Jacobi. Identities and measured evidence are in
+[the reference-block result record](benchmarks/dg_reference_element_jacobi_measurements.json).
+
+
+## Completed current-block comparison
+
+Job `3432379` ran both arms sequentially on the same GH200 (`gh096`). Both took
+4,939 accepted SSPRK3 steps to t=0.1. The candidate used current FP64 element
+blocks, omega=0.7, 50 initial sweeps and two warm sweeps thereafter, with no
+converged cleanup. The physical settings matched the control; runtime scans and limiters remained
+disabled.
+Source/binary identities are control `97ba1681` / `5a8f1c3e` and candidate
+`e3a32d91` / `8782cdc2`; full identities and source/configuration receipts are in
+[the full measurement record](benchmarks/dg_current_element_jacobi_full_measurements.json).
+
+| Measured quantity | Optimized converged control | Current-block two-sweep trial |
+|---|---:|---:|
+| Entire application | 675.287 s / 11.255 min | 4,155.322 s / 69.255 min |
+| Native stopwatch, including output | 594.748 s | 4,076.908 s |
+| Sigma updates | 14,818 | 14,818 |
+| Iterations / sweeps | 51,742 | 29,684 |
+| Host block/preconditioner setup | 3.329 s | 3,504.213 s |
+| Host linear-solve timer | 231.539 s | 219.632 s |
+| Inclusive host sigma-update timer | 349.210 s | 3,830.630 s |
+
+The application is **6.153 times slower** in this one matched pair. The dominant
+cost is the current-block assembly/factorization timer: **58.404 minutes**. The
+linear-solve timer alone improves only 5.14%. These are host timers and may absorb
+preceding asynchronous work; they are not a GPU cost partition. In particular,
+subtracting sigma from the native stopwatch does not isolate Euler RHS cost.
+
+The final complete conservative fields are finite, with positive density and
+pressure at all 9,437,184 native GL points per arm. Candidate minima are density
+0.4494201809 and pressure 1.0003187645. Final-state comparisons are:
+
+| Field | Relative L2 difference from the converged control |
+|---|---:|
+| Density | 2.276e-7 |
+| Momentum x/y | 1.077e-6 |
+| Energy | 3.426e-7 |
+| Derived pressure | 3.045e-7 |
+| Sigma | 2.03476% |
+
+Sigma's sampled relative Linf difference is 2.65841%. Conservative integral
+differences are at accumulated-roundoff scale. Density, momentum, energy and
+sigma L2 norms integrate the full saved Q5 polynomials; derived pressure uses
+GL6 quadrature. Cell-average maps and radial profiles were rendered and
+inspected, with signed difference scales shown. This is comparison with a
+converged numerical control, not a fraction of the unknown discretization error.
+
+The two-sweep current-block approximation preserved the flow very closely in
+this test. That numerical result does not justify discarding block Jacobi as an
+algorithm. The present implementation is nevertheless not competitive with the
+optimized TF32-spectral control, and the frozen-initial-block shortcut is not a
+stable replacement at the tested damping. No further solver optimization is
+claimed by this experiment.
+
+### Operator work, including residuals
+
+A normal warm, nonrestarted N-iteration control solve performs N Arnoldi current-A
+actions, one initial-residual A action and one inner final-true-residual A action.
+This validated configuration also applies the independent public/original A
+once for its explicit certificate. That extra validation action is distinct from
+intrinsic FGMRES work. Over the full run, there were 81,377 inner A actions and
+14,818 independent public A actions: **96,195 total**, or **1.859 per iteration**
+amortized over 51,742 iterations. Every public FP64 certificate passed 1e-6
+RHS-relative tolerance; the maximum was 9.9954522e-7.
+
+The candidate performed 29,684 current-A actions and the same number of block
+solves, comprising the initial 50 sweeps and two per later update. Its acceptance
+is explicitly fixed-sweep and uncertified; it did not silently retry to the
+control tolerance. A lower operator-action count alone does not establish a
+speedup against a different, optimized preconditioner.
+
+
+## Fresh control profile: recorded activity with a metadata qualification
+
+The corrected capture `3432896` ran the frozen optimized control continuously
+from initialization to diagnostic t=0.035 and ended naturally. The predeclared
+2-second interior analysis window contains 27 complete RK steps, 81 sigma/Euler
+stages and 243 FGMRES iterations. No exact absolute physical-time endpoints are
+inferred from the trace-local ranges.
+
+The strict original analyzer remains **false/null** because the exporter says
+“No NVTX events collected” for the primary process. That literal absence
+statement conflicts with NVIDIA's own `nvtx_sum` report of 45,285 primary-thread
+ranges. Its kernel report independently summarizes the same SQLite as 97,299
+kernels; selected recorded launch/copy/memset APIs each have exactly one matching
+device record. Source-count and correlation checks pass, and no explicit
+primary/global incomplete-CUDA, missing-CUPTI, dropped-event or overflow warning
+remains. The cause of the contradictory metadata and acquisition completeness
+are not proven. Earlier captures with actual missing-CUPTI warnings remain
+rejected.
+
+A separate review therefore reports the following **observed activity estimates**
+for those selected scopes, without rewriting the strict gate. GPU events are
+assigned through launch-API/NVTX correlation; host submission/synchronization
+durations are not substituted for GPU work. See the
+[profile observation record](benchmarks/dg_optimized_sigma_profile_observations.json).
+
+| Recorded GPU activity | Mean in selected scopes |
+|---|---:|
+| Coefficient/source interpolation | 3.324 ms/stage |
+| Public form/RHS assembly | 0.595 ms/stage |
+| Exact-face coefficient setup | 1.461 ms/stage |
+| Arnoldi current-A action | 0.932 ms/iteration |
+| TF32 spectral preconditioner | 1.367 ms/iteration |
+| Krylov algebra/norms, amortized including fixed work | 0.496 ms/iteration |
+| Initial current-A residual | 1.095 ms/stage |
+| Inner final current-A residual | 1.103 ms/stage |
+| Extra configured original-A certificate | 1.433 ms/stage |
+| Certificate norms/postsolve remainder | 0.605 ms/stage |
+| Inclusive sigma activity | 17.999 ms/stage |
+| Euler RHS activity | 4.927 ms/stage |
+
+Coefficient/source/form/face preparation totals about **5.38 ms/stage**. The
+recorded Arnoldi-A, preconditioner and amortized Krylov algebra total about
+**2.80 ms/iteration**. A three-iteration solve in this window performs six A
+actions: initial + three Arnoldi + inner final + one extra configured original-A
+certificate. It also performs three spectral preconditioner applications, each
+containing four observed TF32 GEMMs. This is not three matrix inversions per
+step or per element.
+
+The observed sigma/Euler activity quotient is **3.653**, subject to the metadata
+qualification above. It is not a validated lossless ratio, utilization metric,
+whole-run partition or unprofiled speedup. Charging all preparation and residual
+work to each iteration would obscure why the full sigma update costs more than
+one Euler RHS: the iteration itself is about 2.8 ms in this window, while fixed
+stage work raises the complete sigma cost to about 18 ms.
+
+The current-block candidate's corresponding GPU sigma/Euler ratio was not
+measured in a qualified trace. Its full walltime and host block-setup counters
+already establish that this implementation is slower; no pure Euler cost is
+inferred from the unprofiled stopwatch remainder. The postprocessing review required no additional GPU run or solver optimization.

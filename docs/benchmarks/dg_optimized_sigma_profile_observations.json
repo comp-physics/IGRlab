@@ -1,0 +1,509 @@
+{
+  "schema": "igr-dg-optimized-sigma-profile-observations-v1",
+  "job": "3432896",
+  "node": "gh143",
+  "scope": "Qualified descriptive recorded-activity estimate, not a validated lossless GPU ratio or full-run partition",
+  "source_review_sha256": "59140ef5a244eb6162daf6574daeec6ed6d0b8c31bfee7e04169807f28cda5e6",
+  "durable_evidence_directory": "/home/jarias9/.cache/igrlab-experiments/igr-dg-current-block-jacobi-full-20261021",
+  "review": {
+    "schema": "igr-control-natural-3432896-independent-review-v1",
+    "scope": "Read-only/offline capture audit; requested CPU-only nsys stats executed on existing SQLite on login host. No build/application/GPU/scheduler action or production edit.",
+    "provenance": {
+      "directory": "/tmp/igr-dg-current-block-jacobi-full-20261021/control-nsys-natural-3432896",
+      "run_sha256": "44cae0472018d5079ad7e5b51d0b53d26a3dde9785c0eee32e40dd0964296281",
+      "all_18_remote_file_hashes_match": true,
+      "all_8_final_run_artifact_hashes_match": true,
+      "report_sha256": "8040e23ff769504800c9923a61114fd564007056d684cbf5a19c488dceacf6f3",
+      "sqlite_sha256": "5679d034f781ca3360e96874e7f0b9e4220400308cc19155521b9a41ecae1ffb",
+      "source_commit": "97ba1681ac27e07145df790d4c23ed837a21caea",
+      "binary_sha256": "5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495",
+      "reviewed_analyzer_sha256": "9b32e9b285fbf2de78c4b809009a5d847fcc11fc70258b62aa6cd5f213d10e2a",
+      "rerun_all_non_input_fields_identical": true,
+      "nsys_stats_stdout_sha256": "24748e98e28714987729bd4c158c630402ea8ab407887011eaac61e53763d577",
+      "nsys_stats_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "normal_diagnostic_completion": {
+      "job": "3432896",
+      "node": "gh143",
+      "status": "control-capture-completed",
+      "native_pid": 786687,
+      "native_exit_code_observed": null,
+      "profiler_returncode": 0,
+      "cleanup_signals": [],
+      "target_time": 0.035,
+      "steps": 1713,
+      "certificates": 5140,
+      "maximum_certificate_residual_rel_rhs": 9.9927217e-07,
+      "profile_command_wall_seconds": 292.89428474335,
+      "native_done_seconds": 209.067924909,
+      "capture_seconds": 64.680937664
+    },
+    "strict_original_analysis": {
+      "quantitative_timing_valid": false,
+      "possible_CUPTI_or_NVTX_loss": true,
+      "quantitative_phase_rates": null,
+      "quantitative_sigma_to_Euler_GPU_activity_ratio": null,
+      "unchanged": true
+    },
+    "diagnostic_classification": {
+      "primary_process": {
+        "globalPid": 294673394434048,
+        "pid": 786687,
+        "name": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-face-flux-20261021/tuning/run-3429955/t64-p73/native-3429955/frozen/sedov_taylor_blast"
+      },
+      "primary_all_diagnostics": [
+        {
+          "timestamp": -222149082720,
+          "timestampType": 1,
+          "source": 2,
+          "severity": 1,
+          "text": "Process was launched by the profiler, see /projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-current-block-jacobi-full-20261021/control-nsys-natural-tmp-3432896/nvidia/nsight_systems/quadd_session_10786678/streams/pid_786687_stdout.log and stderr.log for program output",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -221601539200,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Common injection library initialized successfully.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -221572109056,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "OS runtime libraries injection initialized successfully.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -220125663584,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -220066730016,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Loaded CUPTI library: /sw/user/cudatoolkits/installs/cuda-13.1.1/nsight-systems-2025.5.2/target-linux-sbsa-armv8/libcupti-sbsa.so.13.1",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -220066725920,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 13.1",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -220039171456,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Enabling trace for device graph launch",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -220039164768,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "CUDA injection initialized successfully.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": -219477459584,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "NVTX injection initialized successfully.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": 975453676,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": 975457996,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 1,
+          "text": "Number of CUDA events collected: \t370259.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": 975464684,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 1,
+          "text": "Number of OS runtime libraries events collected: \t116927.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": 975467532,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "cuBLAS profiling might have not been started correctly.",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": 975467916,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No cuBLAS events collected. Does the process use cuBLAS?",
+          "globalPid": 294673394434048
+        },
+        {
+          "timestamp": 64324929632,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Number of CUPTI events produced: \t391140, CUPTI buffers: 50.",
+          "globalPid": 294673394434048
+        }
+      ],
+      "global_diagnostics": [
+        {
+          "timestamp": 0,
+          "timestampType": 1,
+          "source": 3,
+          "severity": 1,
+          "text": "Profiling has started.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 975378702,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 64680937664,
+          "timestampType": 1,
+          "source": 3,
+          "severity": 1,
+          "text": "Profiling has stopped.",
+          "globalPid": -144115188075855872
+        }
+      ],
+      "verified_non_GPU_orted_globalPid": 294673495097344,
+      "primary_absence_warning": [
+        {
+          "timestamp": 975453676,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 294673394434048
+        }
+      ],
+      "explicit_primary_or_global_incomplete_drop_overflow_messages": [],
+      "primary_absence_statement_contradicted_by_recorded_NVTX": true,
+      "diagnostic_source": "Analysis",
+      "diagnostic_timestamp_source": "HostTimestamp; not a capture-relative target event and cannot localize a problem to the ROI",
+      "NVTX_range_records": 45285,
+      "NVTX_domain_creation_metadata_records": 2,
+      "primary_nvtx_tid": 294673395220735,
+      "nvtx_tid_minus_primary_globalPid": 786687,
+      "CUDA_collected_diagnostic_count": 370259,
+      "CUDA_counted_row_kinds": [
+        "RUNTIME",
+        "KERNEL",
+        "MEMSET",
+        "MEMCPY"
+      ],
+      "CUDA_counted_rows_sum": 370259,
+      "CUPTI_produced_diagnostic_count": 391140,
+      "CUPTI_buffer_diagnostic": "50; no X-of-Y or missing-event suffix",
+      "all_exported_CUPTI_kind_counts": {
+        "CUPTI_ACTIVITY_KIND_CUDA_EVENT": 17710,
+        "CUPTI_ACTIVITY_KIND_RUNTIME": 243388,
+        "CUPTI_ACTIVITY_KIND_KERNEL": 97299,
+        "CUPTI_ACTIVITY_KIND_MEMSET": 16990,
+        "CUPTI_ACTIVITY_KIND_MEMCPY": 12582,
+        "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION": 2998
+      },
+      "produced_and_CUDA_collected_are_different_activity_inventories": true,
+      "additional_warnings": [
+        "CUDA driver13.2 not supported by Nsight2025.5.2 build; fallback CUDA13.1 trace libraries.",
+        "No cuBLAS events collected/profiling might not have started; actual TF32 CUDA kernels exist, so do not claim cuBLAS API tracing."
+      ],
+      "cause": "Unresolved analysis/injection diagnostic inconsistency. Literal zero-NVTX statement is false for retained data; neither a boundary bug nor globally lossless acquisition is proven.",
+      "CUPTI_produced_minus_all_exported_CUPTI_kind_rows": 173,
+      "unreconciled_CUPTI_inventory_remainder": "173 records are not assigned a kind by this audit. The production and summary inventories are not defined identically; this difference is not a supported dropped-event counter and cannot establish losslessness or loss."
+    },
+    "qualified_recorded_activity_estimate": {
+      "evidence_class": "Qualified recorded activities within structurally validated selected scopes; separate from strict quantitative admission",
+      "can_report_as_descriptive_recorded_scope_estimate": true,
+      "lossless_capture_proven": false,
+      "validated_Euler_GPU_cost_ratio": false,
+      "selection": {
+        "schema": "igr-control-interior-roi-v1",
+        "coordinate": "capture-relative-nanoseconds",
+        "start_ns": 250000000,
+        "end_ns": 2250000000,
+        "duration_seconds": 2,
+        "selection": "Only fully enclosed RK ranges with exactly3 complete disjoint sigma and3 flow scopes.",
+        "predeclared_before_capture": true,
+        "adaptive_selection": false,
+        "exact_absolute_physical_state_claim": false,
+        "capture_seconds": 64.680937664,
+        "boundary_policy": "Discard RK ranges straddling either ROI edge; no device timestamp clipping.",
+        "recorded_complete_RK_count": 245,
+        "fully_enclosed_RK_candidate_count": 27,
+        "outside_or_straddling_RK_count": 218,
+        "output_analysis_overlaps": [],
+        "no_observed_output_analysis_overlap": true,
+        "output_instrumentation_complete": false,
+        "output_free_claim": false
+      },
+      "source_scope_counts": {
+        "sigma_updates": 81,
+        "inner_A": 405,
+        "iterations": 243,
+        "preconditioner": 243,
+        "initial_A": 81,
+        "inner_final_A": 81,
+        "observed_public_original_A": 81
+      },
+      "observed_witness_counts": {
+        "inner_initial_A_optimized_volume": 81,
+        "spectral_forward": 243,
+        "TF32_GEMM": 972,
+        "spectral_backward": 243,
+        "Arnoldi_A_optimized_volume": 243,
+        "inner_final_true_A_optimized_volume": 81,
+        "original_PA_mass": 81,
+        "original_PA_diffusion": 81
+      },
+      "correlation_or_count_failures": {},
+      "coverage_review": {
+        "schema": "igr-control-natural-independent-record-coverage-review-v1",
+        "selected_complete_RK_count": 27,
+        "duplicate_runtime_correlation_count": 0,
+        "selected_runtime_API_count": 26622,
+        "launch_activity_reciprocity": {
+          "KERNEL": {
+            "selected_recorded_launch_APIs": 10665,
+            "selected_correlated_device_records": 10665,
+            "every_recorded_launch_has_one_device_record": true,
+            "failures": [],
+            "first_device_start_ns": 318802567,
+            "last_device_end_ns": 2241434875
+          },
+          "MEMCPY": {
+            "selected_recorded_launch_APIs": 1377,
+            "selected_correlated_device_records": 1377,
+            "every_recorded_launch_has_one_device_record": true,
+            "failures": [],
+            "first_device_start_ns": 322451719,
+            "last_device_end_ns": 2240939035
+          },
+          "MEMSET": {
+            "selected_recorded_launch_APIs": 1863,
+            "selected_correlated_device_records": 1863,
+            "every_recorded_launch_has_one_device_record": true,
+            "failures": [],
+            "first_device_start_ns": 325384231,
+            "last_device_end_ns": 2230574043
+          }
+        },
+        "official_installed_nsys_stats": {
+          "nvtx": {
+            "range_name_count": 29,
+            "instance_count": 45285,
+            "all_styles": [
+              "PushPop"
+            ],
+            "matches_SQLite_push_pop_count": true
+          },
+          "kernel": {
+            "kernel_name_count": 55,
+            "instance_count": 97299,
+            "kernel_sum_ns": 16424669440,
+            "matches_SQLite_count_and_sum": true
+          }
+        },
+        "nvtx_event_type_counts": {
+          "75": 2,
+          "59": 45285
+        },
+        "nvtx_default_domain_pushpop_globalTids": [
+          294673395220735
+        ],
+        "limitations": [
+          "Reciprocity concerns recorded API and device rows; records missing in both streams cannot be ruled out by this check.",
+          "Official stats reread the same retained SQLite export and are independent summarization, not an independent acquisition or proof of losslessness.",
+          "Domain-create events with end=null are NVTX metadata, not unclosed push/pop ranges."
+        ]
+      },
+      "recorded_sigma_activity_union_seconds": 1.457944528,
+      "recorded_Euler_activity_union_seconds": 0.399100486,
+      "recorded_arithmetic_sigma_to_Euler_activity_quotient": 3.6530763031944793,
+      "recorded_sigma_ms_per_selected_stage": 17.999315160493826,
+      "recorded_Euler_ms_per_selected_stage": 4.92716649382716,
+      "phase_observations": {
+        "Arnoldi_A": {
+          "recorded_activity_union_seconds": 0.226582816,
+          "recorded_activity_union_ms_per_selected_stage": 2.7973187160493826,
+          "recorded_kernel_sum_seconds": 0.226582816,
+          "recorded_kernel_calls": 729
+        },
+        "Euler_spatial_RHS": {
+          "recorded_activity_union_seconds": 0.399100486,
+          "recorded_activity_union_ms_per_selected_stage": 4.92716649382716,
+          "recorded_kernel_sum_seconds": 0.37254679,
+          "recorded_kernel_calls": 891
+        },
+        "Krylov_algebra_norms_including_fixed_work": {
+          "recorded_activity_union_seconds": 0.12042109,
+          "recorded_activity_union_ms_per_selected_stage": 1.4866801234567901,
+          "recorded_kernel_sum_seconds": 0.119604546,
+          "recorded_kernel_calls": 3564
+        },
+        "RK_common_work": {
+          "recorded_activity_union_seconds": 0.033342399,
+          "recorded_activity_union_ms_per_selected_stage": 0.41163455555555556,
+          "recorded_kernel_sum_seconds": 0.033342399,
+          "recorded_kernel_calls": 135
+        },
+        "TF32_spectral_preconditioner": {
+          "recorded_activity_union_seconds": 0.332071045,
+          "recorded_activity_union_ms_per_selected_stage": 4.099642530864198,
+          "recorded_kernel_sum_seconds": 0.330572133,
+          "recorded_kernel_calls": 2187
+        },
+        "certificate_norms_postsolve_remainder": {
+          "recorded_activity_union_seconds": 0.048997281,
+          "recorded_activity_union_ms_per_selected_stage": 0.6049047037037036,
+          "recorded_kernel_sum_seconds": 0.009646144,
+          "recorded_kernel_calls": 243
+        },
+        "independent_original_A": {
+          "recorded_activity_union_seconds": 0.116087649,
+          "recorded_activity_union_ms_per_selected_stage": 1.4331808518518518,
+          "recorded_kernel_sum_seconds": 0.109381761,
+          "recorded_kernel_calls": 729
+        },
+        "inner_final_true_A": {
+          "recorded_activity_union_seconds": 0.089353505,
+          "recorded_activity_union_ms_per_selected_stage": 1.1031296913580246,
+          "recorded_kernel_sum_seconds": 0.082646113,
+          "recorded_kernel_calls": 405
+        },
+        "inner_initial_A": {
+          "recorded_activity_union_seconds": 0.088687425,
+          "recorded_activity_union_ms_per_selected_stage": 1.0949064814814815,
+          "recorded_kernel_sum_seconds": 0.082004002,
+          "recorded_kernel_calls": 405
+        },
+        "stage_coefficient_source_interpolation": {
+          "recorded_activity_union_seconds": 0.269228164,
+          "recorded_activity_union_ms_per_selected_stage": 3.3238044938271605,
+          "recorded_kernel_sum_seconds": 0.269228164,
+          "recorded_kernel_calls": 729
+        },
+        "stage_exact_face_coefficient_setup": {
+          "recorded_activity_union_seconds": 0.118313729,
+          "recorded_activity_union_ms_per_selected_stage": 1.4606633209876545,
+          "recorded_kernel_sum_seconds": 0.116306625,
+          "recorded_kernel_calls": 162
+        },
+        "stage_public_form_RHS_assembly": {
+          "recorded_activity_union_seconds": 0.048201824,
+          "recorded_activity_union_ms_per_selected_stage": 0.5950842469135802,
+          "recorded_kernel_sum_seconds": 0.047620928,
+          "recorded_kernel_calls": 486
+        }
+      },
+      "per_iteration_recorded_activity_ms": {
+        "Arnoldi_A": 0.9324395720164608,
+        "TF32_spectral_preconditioner": 1.366547510288066,
+        "Krylov_algebra_norms_including_fixed_work": 0.4955600411522633
+      },
+      "per_iteration_algebra_includes_fixed_initial_final_work": true,
+      "cached_preconditioner_setup": {
+        "recorded_host_scopes": 81,
+        "recorded_host_seconds": 3.0816e-05,
+        "correlated_device_activity_records": 0,
+        "global_initial_setup_outside_ROI": true
+      },
+      "mandatory_wording": "These are means/unions of the activities recorded and launch-correlated to27 complete RK scopes/81 stages in the predeclared0.25\u20132.25s ROI. They are an observational cost estimate with a contradictory primary NVTX-absence diagnostic, unsupported-driver fallback and unproven acquisition completeness; original strict timing gate remains false. They are not an unprofiled/full-run partition, speedup, SM-utilization metric, or claim that all records were acquired.",
+      "invalid_inferences": [
+        "Matching counts or official stats prove no events were lost.",
+        "The primary absence warning belongs to orted.",
+        "The HostTimestamp warning at0.975s identifies an ROI event loss location.",
+        "391140 minus370259 is the number of dropped CUDA records.",
+        "No explicit loss warning proves lossless acquisition.",
+        "Initial/global setup or final output costs are captured by this evolved-window stage ratio."
+      ],
+      "independent_public_certificate_policy": {
+        "environment": {
+          "IGRLAB_IGR_EXTENDED_CERTIFICATE": "1",
+          "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "DG_IGR_IGR_EXTENDED_CERTIFICATE": "1",
+          "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+          "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1"
+        },
+        "interpretation": "Independent public/original-A certificate is extra configured validation retained as mandatory for this control comparison. It is separate from the chosen FGMRES initial/Arnoldi/inner-final true residual actions. It does not establish that every FGMRES algorithm intrinsically needs N+3 A applications. The fixed-sweep candidate intentionally has no certificate."
+      }
+    },
+    "unprofiled_full_control": {
+      "job": "3432379",
+      "node": "gh096",
+      "source_commit": "97ba1681ac27e07145df790d4c23ed837a21caea",
+      "binary_sha256": "5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495",
+      "run_sha256": "1647f10adbb8af4c9f6d09f77799a5385281cb7ab2f6aebd8c7c099f6eeaa79e",
+      "stdout_sha256": "4d16dbcf5ce03a9893f9d9b4b30c04c97352855fcc1597f8250eea1d1779f669",
+      "source": "Unprofiled full t=.1 control, distinct from Nsight3432896",
+      "application_wall_seconds": 675.2871994750021,
+      "native_done_seconds": 594.747909506,
+      "steps": 4939,
+      "linear_calls": 14818,
+      "iterations": 51742,
+      "source_timer_seconds": {
+        "total_assemble_s": 93.26353658699978,
+        "total_form_s": 13.631720494000051,
+        "total_pc_setup_s": 3.329190035000476,
+        "total_solve_s": 231.53909116399973,
+        "total_igr_s": 341.76353828000003,
+        "total_update_s": 349.210340004999
+      },
+      "source_timers_are_nested": true,
+      "exact_Euler_GPU_seconds_available": false
+    },
+    "proposed_future_resolution_not_executed": [
+      "First reopen and CPU-export the unchanged report with a compatible/current Nsight host into a new output path, preserving original SHA and diagnostics; compare whether contradictory analysis diagnostics reproduce. This cannot recover genuinely unacquired records.",
+      "If acquisition must be repeated, use an Nsight version supporting the installed CUDA13.2 driver and first verify a bounded test-only NVTX/CUDA sample. Keep direct-native natural exit, periodic flushing, predeclared ROI, identity/certificate/lifecycle/count/correlation gates. No retry is performed or authorized by this review.",
+      "No production instrumentation, flight recorder, cudaDeviceReset hook or invented CUPTI buffer-setting environment variables are required for the proposed route."
+    ],
+    "official_sources": [
+      {
+        "title": "NVIDIA Post-Collection Analysis Guide: official report definitions",
+        "url": "https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html#statistical-reports-shipped-with-nsight-systems",
+        "use": "nvtx_sum counts/times NVTX ranges and cuda_gpu_kern_sum counts/times kernels; time percentages are over the listed records, not application wall time."
+      },
+      {
+        "title": "NVIDIA User Guide: NVTX trace",
+        "url": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html#nvtx-trace",
+        "use": "Default-domain NVTX push/pop annotations are a supported route. No documentation located explains this report-specific primary zero-NVTX contradiction."
+      }
+    ]
+  },
+  "candidate_gpu_sigma_to_Euler_ratio_measured": false,
+  "candidate_ratio_limit": "Current-block candidate has full matched walltime/field results and host scalar timers, but no qualified GPU sigma/Euler ratio. Do not derive Euler from native_done minus sigma."
+}
