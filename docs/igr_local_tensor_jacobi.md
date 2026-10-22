@@ -161,3 +161,8 @@ Full logs, compressed native fields and inspected density/pressure/sigma maps
 and radial plots are preserved with the external experiment artifacts named
 there. The tested application source remains `52d46caf`; subsequent result-only
 commits do not change that identity.
+
+A follow-on [tensor-core execution comparison](igr_local_jacobi_tensor_cores.md)
+measures opt-in grouped FP32, TF32 and FP64 tensor-core variants of this local
+surrogate. It leaves this validated FP64 SIMT path as the default; its kernel
+timings are separate from the full Sedov results above.
