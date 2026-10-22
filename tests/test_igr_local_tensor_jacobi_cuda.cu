@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -304,12 +305,12 @@ const std::vector<std::string>& ExecutionModes()
 {
   static const std::vector<std::string> modes{
     "simt-fp64", "simt-fp32", "simt-dense-fp32", "wmma-factor-tf32",
-    "wmma-dense-tf32", "wmma-dense-fp64"};
+    "wmma-factor-fp64", "wmma-dense-tf32", "wmma-dense-fp64"};
   return modes;
 }
 
 bool IsFP64(const std::string& mode)
-{ return mode == "simt-fp64" || mode == "wmma-dense-fp64"; }
+{ return mode == "simt-fp64" || mode == "wmma-factor-fp64" || mode == "wmma-dense-fp64"; }
 
 bool IsDense(const std::string& mode)
 { return mode.find("dense") != std::string::npos; }
@@ -330,6 +331,28 @@ public:
     if (had_previous_)
     { ::setenv("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION", previous_.c_str(), 1); }
     else { ::unsetenv("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION"); }
+  }
+private:
+  bool had_previous_ = false;
+  std::string previous_;
+};
+
+class ReferenceSelection
+{
+public:
+  explicit ReferenceSelection(const std::string& policy)
+  {
+    const char* previous = std::getenv("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE");
+    had_previous_ = previous != nullptr;
+    if (previous) { previous_ = previous; }
+    MFEM_VERIFY(::setenv("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", policy.c_str(), 1) == 0,
+                "Could not select local tensor reference policy.");
+  }
+  ~ReferenceSelection()
+  {
+    if (had_previous_)
+    { ::setenv("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", previous_.c_str(), 1); }
+    else { ::unsetenv("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE"); }
   }
 private:
   bool had_previous_ = false;
@@ -733,9 +756,9 @@ void QualifyBackends(const std::vector<std::string>& modes)
 
 struct Options
 {
-  bool benchmark = false, profile = false, qualify = false, help = false;
+  bool benchmark = false, profile = false, qualify = false, qualify_projected = false, help = false;
   int mesh_n = 512, repetitions = 64, warmup = 8, rounds = 3;
-  std::string backend = "all";
+  std::string backend = "all", reference = "exact", write_mapped_mesh;
 };
 
 Options ParseOptions(int argc, char** argv)
@@ -750,6 +773,9 @@ Options ParseOptions(int argc, char** argv)
     if (arg == "--benchmark") { options.benchmark = true; }
     else if (arg == "--profile") { options.benchmark = true; options.profile = true; }
     else if (arg == "--qualify-backends") { options.qualify = true; }
+    else if (arg == "--qualify-projected") { options.qualify_projected = true; options.reference = "projected"; }
+    else if (arg == "--reference") { options.reference = value(); }
+    else if (arg == "--write-mapped-mesh") { options.write_mapped_mesh = value(); }
     else if (arg == "--backend") { options.backend = value(); }
     else if (arg == "--mesh-n") { options.mesh_n = std::stoi(value()); }
     else if (arg == "--repetitions")
@@ -762,9 +788,14 @@ Options ParseOptions(int argc, char** argv)
   MFEM_VERIFY(options.backend == "all" ||
     std::find(ExecutionModes().begin(), ExecutionModes().end(), options.backend) != ExecutionModes().end(),
     "Unknown local tensor backend: " << options.backend);
-  MFEM_VERIFY(!(options.qualify && options.benchmark), "Select qualification or benchmark.");
-  MFEM_VERIFY(argc == 1 || options.help || options.qualify || options.benchmark,
-              "Select --qualify-backends, --benchmark or --profile before options.");
+  MFEM_VERIFY(options.reference == "exact" || options.reference == "projected", "Unknown tensor reference policy.");
+  const int actions = int(options.qualify) + int(options.qualify_projected) +
+                      int(options.benchmark) + int(!options.write_mapped_mesh.empty());
+  MFEM_VERIFY(actions <= 1, "Select one qualification, benchmark or mesh-generation action.");
+  MFEM_VERIFY(!options.qualify || options.reference == "exact", "--qualify-backends checks the exact reference.");
+  MFEM_VERIFY(!options.qualify_projected || options.reference == "projected", "--qualify-projected requires projected reference.");
+  MFEM_VERIFY(argc == 1 || options.help || actions == 1,
+              "Select --qualify-backends, --qualify-projected, --benchmark, --profile or --write-mapped-mesh.");
   if (options.profile)
   {
     MFEM_VERIFY(options.backend != "all", "--profile requires one explicit --backend.");
@@ -780,8 +811,18 @@ Options ParseOptions(int argc, char** argv)
   return options;
 }
 
-std::vector<std::string> SelectedModes(const std::string& selected)
-{ return selected == "all" ? ExecutionModes() : std::vector<std::string>{selected}; }
+std::vector<std::string> SelectedModes(const std::string& selected, const std::string& reference = "exact")
+{
+  if (selected != "all")
+  {
+    MFEM_VERIFY(reference != "projected" || !IsDense(selected), "Projected reference does not admit dense execution.");
+    return {selected};
+  }
+  // Mapped benchmark candidates keep both the reference and WMMA arithmetic
+  // bounded to shared axis factors plus one 36-entry diagonal per element.
+  if (reference == "projected") { return {"simt-fp64", "wmma-factor-fp64", "wmma-factor-tf32"}; }
+  return ExecutionModes();
+}
 
 class MultTimer
 {
@@ -819,6 +860,30 @@ public:
       float elapsed = 0.0f;
       MFEM_GPU_CHECK(cudaEventElapsedTime(&elapsed, starts_[i], stops_[i]));
       MFEM_VERIFY(std::isfinite(elapsed) && elapsed > 0.0f, "Invalid whole-Mult CUDA event timing.");
+      timings[i] = elapsed;
+    }
+    return timings;
+  }
+
+  std::vector<double> MeasureRefresh(::igrlab::igr_internal::ElementBlockJacobi& backend,
+                                     const QuadratureFunction& mass, int warmup)
+  {
+    for (int i = 0; i < warmup; ++i) { backend.RefreshMassScaling(mass); }
+    MFEM_GPU_CHECK(cudaDeviceSynchronize());
+    for (std::size_t i = 0; i < starts_.size(); ++i)
+    {
+      MFEM_GPU_CHECK(cudaEventRecord(starts_[i]));
+      backend.RefreshMassScaling(mass);
+      MFEM_GPU_CHECK(cudaEventRecord(stops_[i]));
+    }
+    MFEM_GPU_CHECK(cudaEventSynchronize(stops_.back()));
+    MFEM_GPU_CHECK(cudaGetLastError());
+    std::vector<double> timings(starts_.size());
+    for (std::size_t i = 0; i < starts_.size(); ++i)
+    {
+      float elapsed = 0.0f;
+      MFEM_GPU_CHECK(cudaEventElapsedTime(&elapsed, starts_[i], stops_[i]));
+      MFEM_VERIFY(std::isfinite(elapsed) && elapsed > 0.0f, "Invalid mass-refresh CUDA event timing.");
       timings[i] = elapsed;
     }
     return timings;
@@ -962,6 +1027,8 @@ void Benchmark(const Options& options, const std::vector<std::string>& modes)
             << " physical_accuracy_claim=false" << std::endl;
 }
 
+#include "igr_local_tensor_projected_fixture.hpp"
+
 // Separate expected-failure invocations avoid exception/build-option assumptions
 // and prove that unsupported inputs are rejected before any fallback can run.
 void ExpectedRejection(const std::string& kind)
@@ -1007,14 +1074,24 @@ void ExpectedRejection(const std::string& kind)
 int main(int argc, char** argv)
 {
   mfem::Mpi::Init(argc, argv);
-  mfem::Device device("cuda");
-  MFEM_VERIFY(mfem::Mpi::WorldSize() == 1 && UsesOrdinaryCUDAForDGDiffusionFaces2D(),
-              "Local tensor Jacobi fixture requires one native CUDA rank.");
   if (argc == 2 && std::strncmp(argv[1], "--reject-", 9) == 0)
   {
+    mfem::Device device("cuda");
+    ReferenceSelection exact_reference("exact");
+    ExecutionSelection baseline("simt-fp64");
+    MFEM_VERIFY(mfem::Mpi::WorldSize() == 1 && UsesOrdinaryCUDAForDGDiffusionFaces2D(),
+                "Local tensor rejection fixture requires one native CUDA rank.");
     const std::string kind(argv[1] + 9);
-    MFEM_VERIFY(kind == "skew" || kind == "curved" || kind == "nonseparable", "Unknown rejection fixture.");
     mfem::set_error_action(mfem::MFEM_ERROR_ABORT);
+    if (kind == "projected-dense")
+    {
+      ReferenceSelection projected("projected"); ExecutionSelection dense("simt-dense-fp32");
+      MappedTensorFixture fixture(3, 3, "curved-q2", 0.017, false);
+      auto backend = fixture.Prepare(); backend->FactorBlocks();
+      std::cout << "local_tensor_projected_unexpected_dense_admission\n";
+      return 0;
+    }
+    MFEM_VERIFY(kind == "skew" || kind == "curved" || kind == "nonseparable", "Unknown rejection fixture.");
     ExpectedRejection(kind);
     return 0;
   }
@@ -1022,14 +1099,21 @@ int main(int argc, char** argv)
   if (options.help)
   {
     std::cout << "Usage: dg_igr_local_tensor_jacobi_test [--qualify-backends [--backend MODE] | "
+                 "--qualify-projected [--backend all|MODE] | "
                  "--benchmark [--mesh-n 512] [--backend all|MODE] [--repetitions 64] "
-                 "[--warmup 8] [--rounds 3] | --profile --backend MODE "
-                 "[--mesh-n 512] [--repetitions 1] [--warmup 0]]\n";
+                 "[--warmup 8] [--rounds 3] [--reference exact|projected] | --profile --backend MODE "
+                 "[--reference exact|projected] [--mesh-n 512] [--repetitions 1] [--warmup 0] | "
+                 "--write-mapped-mesh PATH [--mesh-n 512]]\n";
     return 0;
   }
-  if (options.qualify || options.benchmark)
+  MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Local tensor fixture requires one rank.");
+  if (!options.write_mapped_mesh.empty()) { WriteMappedMesh(options); return 0; }
+  mfem::Device device("cuda");
+  MFEM_VERIFY(UsesOrdinaryCUDAForDGDiffusionFaces2D(), "Local tensor fixture requires native CUDA.");
+  ReferenceSelection reference(options.reference);
+  if (options.qualify || options.qualify_projected || options.benchmark)
   {
-    const auto modes = SelectedModes(options.backend);
+    const auto modes = SelectedModes(options.backend, options.reference);
     const bool needs_wmma = std::any_of(modes.begin(), modes.end(), [](const std::string& mode)
     { return mode.find("wmma") == 0; });
     int ordinal = 0; cudaDeviceProp properties{};
@@ -1041,6 +1125,8 @@ int main(int argc, char** argv)
       return 77;
     }
     if (options.qualify) { QualifyBackends(modes); }
+    else if (options.qualify_projected) { QualifyProjected(modes); }
+    else if (options.reference == "projected") { BenchmarkProjected(options, modes); }
     else { Benchmark(options, modes); }
     return 0;
   }

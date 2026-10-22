@@ -178,7 +178,8 @@ IGRSolver::IGRSolver(mfem::ParFiniteElementSpace& sigma_fes,
 
 void IGRSolver::SetAlpha(double a)
 {
-  MFEM_VERIFY(!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_ || a == alpha_,
+  MFEM_VERIFY(((!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_) &&
+                 !local_tensor_preconditioner_) || a == alpha_,
               "Cannot change alpha with live tensor element-Jacobi factors.");
   alpha_ = a; // alpha_coef reads this by reference (see above)
   if (src_coef_)
@@ -189,7 +190,8 @@ void IGRSolver::SetAlpha(double a)
 
 void IGRSolver::SetAlphaLengthScalePolicy(AlphaLengthScalePolicy policy)
 {
-  MFEM_VERIFY(!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_ ||
+  MFEM_VERIFY(((!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_) &&
+                 !local_tensor_preconditioner_) ||
                 policy == alpha_length_scale_policy_,
               "Cannot change alpha length-scale policy with live tensor element-Jacobi factors.");
   alpha_length_scale_policy_ = policy;
@@ -329,6 +331,10 @@ void IGRSolver::AddOutputOnlyAccounting_(const SolveAccountingDelta& delta)
 
 void IGRSolver::ConsumePendingStage0PrefetchAccounting()
 {
+  if (pending_stage0_prefetch_accounting_.valid && local_tensor_preconditioner_)
+  {
+    local_tensor_preconditioner_committed_ = true;
+  }
   if (pending_stage0_prefetch_accounting_.valid &&
       solve_mode_ == SolveMode::FixedElementJacobi)
   {
@@ -365,6 +371,11 @@ bool IGRSolver::ReclassifyPendingStage0PrefetchAsOutputOnly(
     // normalized tensor structure for the first production solve.
     element_jacobi_blocks_.reset();
   }
+  if (!local_tensor_preconditioner_committed_)
+  {
+    local_tensor_preconditioner_.reset();
+    local_tensor_preconditioner_key_.clear();
+  }
   pending_stage0_prefetch_accounting_ = {};
   return true;
 }
@@ -382,6 +393,12 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   MFEM_VERIFY(!(element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) ||
                 solve_mode_ == SolveMode::FixedElementJacobi,
               "Reference/tensor element blocks require fixed element-block Jacobi.");
+  const bool local_tensor_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER", false);
+  MFEM_VERIFY(!local_tensor_requested || solve_mode_ == SolveMode::Krylov,
+              "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER requires a Krylov solve.");
+  MFEM_VERIFY(!local_tensor_preconditioner_ || local_tensor_requested,
+              "Cannot disable the local tensor preconditioner on a live solver.");
   if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)
   {
     pending_stage0_prefetch_sigma_checkpoint_ = sigma_;
@@ -454,6 +471,10 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   }
 
   certify_current_solve_ = false;
+  if (purpose == IGRSolvePurpose::ProductionStage && local_tensor_preconditioner_)
+  {
+    local_tensor_preconditioner_committed_ = true;
+  }
   if (solve_mode_ == SolveMode::FixedElementJacobi &&
       purpose == IGRSolvePurpose::ProductionStage)
   {
@@ -487,6 +508,11 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
         !element_jacobi_history_valid_)
     {
       element_jacobi_blocks_.reset();
+    }
+    if (!local_tensor_preconditioner_committed_)
+    {
+      local_tensor_preconditioner_.reset();
+      local_tensor_preconditioner_key_.clear();
     }
   }
   else if (purpose == IGRSolvePurpose::ProductionStage0Prefetch)

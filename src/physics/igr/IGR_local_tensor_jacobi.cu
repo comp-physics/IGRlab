@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -28,8 +29,25 @@ constexpr double admission_tolerance = 1.0e-11;
 
 enum class TensorExecution
 {
-  SimtFP64, SimtFP32, SimtDenseFP32, FactorTF32, DenseTF32, DenseFP64
+  SimtFP64, SimtFP32, SimtDenseFP32, FactorTF32, FactorFP64, DenseTF32, DenseFP64
 };
+
+enum class TensorReference { Exact, Projected };
+
+TensorReference ReadTensorReference()
+{
+  const char* value = ::igrlab::GetEnv("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE");
+  if (!value) { value = ::igrlab::GetEnv("DG_IGR_IGR_LOCAL_TENSOR_REFERENCE"); }
+  if (!value) { value = ::igrlab::GetEnv("DG_IGR_LOCAL_TENSOR_REFERENCE"); }
+  if (!value || !*value || std::strcmp(value, "exact") == 0)
+  { return TensorReference::Exact; }
+  if (std::strcmp(value, "projected") == 0) { return TensorReference::Projected; }
+  MFEM_ABORT("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE must be exact|projected; got " << value);
+  return TensorReference::Exact;
+}
+
+const char* ReferenceName(TensorReference reference)
+{ return reference == TensorReference::Exact ? "exact" : "projected"; }
 
 TensorExecution ReadTensorExecution()
 {
@@ -42,10 +60,11 @@ TensorExecution ReadTensorExecution()
   if (std::strcmp(value, "simt-fp32") == 0) { return TensorExecution::SimtFP32; }
   if (std::strcmp(value, "simt-dense-fp32") == 0) { return TensorExecution::SimtDenseFP32; }
   if (std::strcmp(value, "wmma-factor-tf32") == 0) { return TensorExecution::FactorTF32; }
+  if (std::strcmp(value, "wmma-factor-fp64") == 0) { return TensorExecution::FactorFP64; }
   if (std::strcmp(value, "wmma-dense-tf32") == 0) { return TensorExecution::DenseTF32; }
   if (std::strcmp(value, "wmma-dense-fp64") == 0) { return TensorExecution::DenseFP64; }
   MFEM_ABORT("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION must be simt-fp64|simt-fp32|"
-             "simt-dense-fp32|wmma-factor-tf32|wmma-dense-tf32|wmma-dense-fp64; got " << value);
+             "simt-dense-fp32|wmma-factor-tf32|wmma-factor-fp64|wmma-dense-tf32|wmma-dense-fp64; got " << value);
   return TensorExecution::SimtFP64;
 }
 
@@ -57,6 +76,7 @@ const char* ExecutionName(TensorExecution execution)
     case TensorExecution::SimtFP32: return "simt-fp32";
     case TensorExecution::SimtDenseFP32: return "simt-dense-fp32";
     case TensorExecution::FactorTF32: return "wmma-factor-tf32";
+    case TensorExecution::FactorFP64: return "wmma-factor-fp64";
     case TensorExecution::DenseTF32: return "wmma-dense-tf32";
     case TensorExecution::DenseFP64: return "wmma-dense-fp64";
   }
@@ -66,6 +86,7 @@ const char* ExecutionName(TensorExecution execution)
 bool UsesTensorCores(TensorExecution execution)
 {
   return execution == TensorExecution::FactorTF32 ||
+         execution == TensorExecution::FactorFP64 ||
          execution == TensorExecution::DenseTF32 || execution == TensorExecution::DenseFP64;
 }
 
@@ -93,14 +114,15 @@ __global__ void RefreshTensorMass(int entries, const double* geometry,
 // One small CTA per element. All four contractions, diagonal division, native
 // gather/scatter and both current-mass factors stay in this single FP64 kernel.
 __global__ void ApplyTensorInverse(int axis, const int* map, const int* classes,
-                                   const double* factors, const double* scaling,
+                                   const double* factors, const double* element_diagonals,
+                                   const double* scaling,
                                    const double* input, double* output)
 {
   const int e = blockIdx.x, t = threadIdx.x, dof = axis * axis;
   const int x = t % axis, y = t / axis;
-  const double* qx = factors + std::size_t(classes[e]) * 3 * dof;
+  const double* qx = factors + std::size_t(classes[e]) * (element_diagonals ? 2 : 3) * dof;
   const double* qy = qx + dof;
-  const double* denominator = qy + dof;
+  const double* denominator = element_diagonals ? element_diagonals + std::size_t(e) * dof : qy + dof;
   __shared__ double u[max_dofs], v[max_dofs];
   if (t < dof) { u[t] = scaling[e * dof + t] * input[map[e * dof + t]]; }
   __syncthreads();
@@ -300,6 +322,20 @@ TensorClass FactorAxes(int axis, std::vector<double> x, std::vector<double> y)
   return result;
 }
 
+TensorClass FactorProjectedAxes(int axis, std::vector<double> x, std::vector<double> y)
+{
+  TensorClass result;
+  result.x = std::move(x); result.y = std::move(y);
+  std::vector<double> values, qx, qy;
+  SymmetricEigen(axis, result.x, values, qx);
+  SymmetricEigen(axis, result.y, values, qy);
+  // These partial-trace axes select a shared orthogonal basis only. Their
+  // gauge-dependent eigensums are not inverted or required to be positive.
+  result.packed = std::move(qx);
+  result.packed.insert(result.packed.end(), qy.begin(), qy.end());
+  return result;
+}
+
 // Form the inverse of one already-verified factor class, never an element's
 // current block. Mirrored entries are identical, and the positive eigensums
 // admitted by FactorAxes retain the reference operator's SPD qualification.
@@ -337,7 +373,7 @@ public:
       dof_(axis_ * axis_), space_sequence_(space.GetSequence()),
       mesh_sequence_(space.GetMesh() ? space.GetMesh()->GetSequence() : -1),
       nodes_sequence_(space.GetMesh() ? space.GetMesh()->GetNodesSequence() : -1),
-      execution_(ReadTensorExecution())
+      execution_(ReadTensorExecution()), reference_(ReadTensorReference())
   {
     static_assert(std::is_same<mfem::real_t, double>::value, "Local tensor Jacobi requires FP64 MFEM.");
     MFEM_VERIFY(dg_face::UsesOrdinaryCUDAForDGDiffusionFaces2D() && space.GetNRanks() == 1 &&
@@ -352,8 +388,17 @@ public:
                 "Local tensor Jacobi requires rank-one native CUDA, uniform scalar GL L2 quads, "
                 "D1D <= 8 and an identity true/local map.");
     MFEM_VERIFY(std::size_t(ne_) * dof_ * dof_ <= std::size_t(std::numeric_limits<int>::max()) &&
-                  invrho.Size() == height,
+                  (reference_ == TensorReference::Projected || invrho.Size() == height),
                 "Local tensor Jacobi dense setup/QF indexing bound exceeded.");
+    if (reference_ == TensorReference::Projected)
+    {
+      MFEM_VERIFY(axis_ == tensor_axis,
+                  "Projected local tensor Jacobi requires p5/D1D=6.");
+      MFEM_VERIFY(!UsesDenseClasses(execution_),
+                  "Projected local tensor Jacobi has an element-specific spectral diagonal; "
+                  "shared dense execution is unavailable for " << ExecutionName(execution_) <<
+                  ". Select simt-fp64|simt-fp32|wmma-factor-tf32|wmma-factor-fp64. No fallback is provided.");
+    }
     if (UsesTensorCores(execution_) || UsesDenseClasses(execution_))
     {
       MFEM_VERIFY(axis_ == tensor_axis,
@@ -378,6 +423,14 @@ public:
 
   mfem::MemoryClass GetMemoryClass() const override { return mfem::MemoryClass::DEVICE; }
 
+  const char* BackendName() const override
+  {
+    return reference_ == TensorReference::Exact && execution_ == TensorExecution::SimtFP64 ?
+      "tensor-element-density-fp64" : ExecutionName(execution_);
+  }
+
+  const char* ReferencePolicy() const override { return ReferenceName(reference_); }
+
   mfem::DenseTensor& PrepareVolumeBlocks(mfem::BilinearForm& form) override
   {
     CheckTopology();
@@ -398,6 +451,7 @@ public:
   {
     CheckTopology();
     MFEM_VERIFY(prepared_ && !ready_, "Prepare initial exact blocks before local tensor factorization.");
+    if (reference_ == TensorReference::Projected) { FactorProjectedBlocks(); return; }
     const double* blocks = blocks_.HostRead();
     const double* scale = inverse_sqrt_mass_.HostRead();
     const int* native = lex_to_native_.HostRead();
@@ -476,49 +530,27 @@ public:
     }
     if (UsesTensorCores(execution_) || UsesDenseClasses(execution_))
     { BuildClassGroups(ids, int(classes.size())); }
-    // The complete exact blocks, their host copy, EA buffers, and native-only
-    // permutation are setup-only. Persistent storage is O(N) plus small classes.
-    ea_.reset();
-    blocks_.Clear();
-    lex_to_native_.DeleteAll();
-    factors_.UseDevice(true);
-    (void)element_classes_.Read(); (void)factors_.Read();
-    ready_ = true; prepared_ = false;
-    const std::size_t bytes = sizeof(double) * (std::size_t(geometry_mass_.Size()) +
-      inverse_sqrt_mass_.Size() + factors_.Size() + class_inverses_.Size()) +
-      sizeof(int) * (std::size_t(element_dofs_.Size()) + element_classes_.Size() +
-                     grouped_elements_.Size() + grouped_classes_.Size());
-    const int dense_classes = UsesDenseClasses(execution_) ? int(classes.size()) : 0;
-    const bool grouped = grouped_classes_.Size() > 0;
-    std::cout << "[igr-local-tensor-jacobi] event=setup precision=" << PrecisionName(execution_)
-              << " execution=" << (UsesTensorCores(execution_) ? "wmma" : "simt")
-              << " backend=" << ExecutionName(execution_)
-              << " tensor_core=" << int(UsesTensorCores(execution_))
-              << " d1d=" << axis_ << " elements=" << ne_ << " factor_classes=" << classes.size()
-              << " coefficient_policy=current-collocated-mass initial_blocks=exact-sipg"
-              << " geometry=affine-cartesian reconstruction_relative=" << maximum_reconstruction
-              << " owned_bytes=" << bytes << " dense_after_setup=" << dense_classes
-              << " class_dense_matrices=" << dense_classes
-              << " class_dense_entries=" << class_inverses_.Size() << " dense_per_element=0"
-              << " grouping=" << (grouped ? "verified-class" : "element")
-              << " group_elements=" << (grouped ? tensor_group_elements : 1)
-              << " groups=" << (grouped ? grouped_classes_.Size() : ne_)
-              << " group_padding=" << (grouped ? grouped_elements_.Size() - ne_ : 0)
-              << " mass_precision=fp64 output_precision=fp64"
-              << " arithmetic_spd=" << (execution_ == TensorExecution::SimtFP64 ||
-                  execution_ == TensorExecution::DenseFP64 ? "fp64-roundoff" : "rounding-perturbed")
-              << " fallback=none" << std::endl;
+    CompleteSetup(int(classes.size()), maximum_reconstruction);
   }
 
   void RefreshMassScaling(const mfem::QuadratureFunction& invrho) override
   {
     CheckTopology();
-    MFEM_VERIFY(ready_ && &CheckMassQF(invrho, space_) == mass_space_ && invrho.Size() == height,
+    MFEM_VERIFY(ready_ && &CheckMassQF(invrho, space_) == mass_space_ &&
+                  invrho.Size() == geometry_mass_.Size(),
                 "Local tensor Jacobi mass layout changed; reconstruct the backend.");
     // invrho uses the established coefficient floor semantics. This update
     // intentionally adds no per-stage host copy, coefficient scan or reduction.
-    RefreshTensorMass<<<1 + (height - 1) / 256, 256>>>(
-      height, geometry_mass_.Read(), invrho.Read(), inverse_sqrt_mass_.Write());
+    if (reference_ == TensorReference::Projected)
+    {
+      RefreshProjectedTensorMass<<<ne_, 64>>>(mass_axis_, mass_basis_squared_.Read(),
+        geometry_mass_.Read(), invrho.Read(), inverse_sqrt_mass_.Write());
+    }
+    else
+    {
+      RefreshTensorMass<<<1 + (height - 1) / 256, 256>>>(
+        height, geometry_mass_.Read(), invrho.Read(), inverse_sqrt_mass_.Write());
+    }
     MFEM_GPU_CHECK(cudaGetLastError());
   }
 
@@ -531,6 +563,7 @@ public:
     const int* map = element_dofs_.Read();
     const double* scaling = inverse_sqrt_mass_.Read();
     const double* input = rhs.Read();
+    const double* diagonal = reference_ == TensorReference::Projected ? element_diagonals_.Read() : nullptr;
     double* output = result.Write();
     if (execution_ == TensorExecution::SimtFP64 || execution_ == TensorExecution::SimtFP32)
     {
@@ -539,12 +572,12 @@ public:
       if (execution_ == TensorExecution::SimtFP64)
       {
         ApplyTensorInverse<<<ne_, threads>>>(axis_, map, element_classes_.Read(),
-          factors_.Read(), scaling, input, output);
+          factors_.Read(), diagonal, scaling, input, output);
       }
       else
       {
         ApplyTensorInverseFP32<<<ne_, threads>>>(axis_, map, element_classes_.Read(),
-          factors_.Read(), scaling, input, output);
+          factors_.Read(), diagonal, scaling, input, output);
       }
     }
     else
@@ -555,7 +588,12 @@ public:
       if (execution_ == TensorExecution::FactorTF32)
       {
         ApplyTensorFactorTF32<<<groups, 6 * 32>>>(map, elements, classes, factors_.Read(),
-          scaling, input, output);
+          diagonal, scaling, input, output);
+      }
+      else if (execution_ == TensorExecution::FactorFP64)
+      {
+        ApplyTensorFactorFP64<<<groups, 6 * 32>>>(map, elements, classes, factors_.Read(),
+          diagonal, scaling, input, output);
       }
       else if (execution_ == TensorExecution::DenseTF32)
       {
@@ -577,6 +615,166 @@ public:
   }
 
 private:
+  void CompleteSetup(int class_count, double maximum_reconstruction,
+                     double maximum_offdiag = 0.0, double diagonal_minimum = 0.0,
+                     double diagonal_maximum = 0.0)
+  {
+    // Exact EA, its host copy, and the native-only permutation are setup-only.
+    // Runtime retains O(N) mass/maps/diagonals and at most 16 projected bases.
+    ea_.reset();
+    blocks_.Clear();
+    lex_to_native_.DeleteAll();
+    factors_.UseDevice(true);
+    (void)element_classes_.Read(); (void)factors_.Read();
+    ready_ = true; prepared_ = false;
+    const std::size_t bytes = sizeof(double) * (std::size_t(geometry_mass_.Size()) +
+      inverse_sqrt_mass_.Size() + factors_.Size() + class_inverses_.Size() +
+      mass_basis_squared_.Size() + element_diagonals_.Size()) +
+      sizeof(int) * (std::size_t(element_dofs_.Size()) + element_classes_.Size() +
+                     grouped_elements_.Size() + grouped_classes_.Size());
+    const int dense_classes = UsesDenseClasses(execution_) ? class_count : 0;
+    const bool projected = reference_ == TensorReference::Projected;
+    const bool grouped = grouped_classes_.Size() > 0;
+    std::cout << "[igr-local-tensor-jacobi] event=setup precision=" << PrecisionName(execution_)
+              << " execution=" << (UsesTensorCores(execution_) ? "wmma" : "simt")
+              << " backend=" << ExecutionName(execution_)
+              << " tensor_core=" << int(UsesTensorCores(execution_))
+              << " reference=" << ReferenceName(reference_)
+              << " d1d=" << axis_ << " elements=" << ne_ << " factor_classes=" << class_count
+              << " coefficient_policy=" << (projected ? "current-mass-diagonal" : "current-collocated-mass")
+              << " initial_blocks=exact-sipg"
+              << " geometry=" << (projected ? "fixed-q1q2-mapped" : "affine-cartesian")
+              << " geometry_order_max=" << maximum_geometry_order_
+              << " mass_rule=gl" << mass_axis_ << "x" << mass_axis_
+              << " mass_quadrature_entries=" << geometry_mass_.Size();
+    if (projected)
+    {
+      std::cout << " jacobian_validation=sampled"
+                << " geometry_approximation=projected-initial-block"
+                << " projected_offdiag_frobenius_relative_max=" << maximum_offdiag
+                << " projected_diagonal_min=" << diagonal_minimum
+                << " projected_diagonal_max=" << diagonal_maximum;
+    }
+    else { std::cout << " reconstruction_relative=" << maximum_reconstruction; }
+    std::cout << " density_approximation=heterogeneous-current-mass"
+              << " owned_bytes=" << bytes << " dense_after_setup=" << dense_classes
+              << " class_dense_matrices=" << dense_classes
+              << " class_dense_entries=" << class_inverses_.Size() << " dense_per_element=0"
+              << " class_cache_bytes=" << sizeof(double) * (std::size_t(factors_.Size()) + class_inverses_.Size())
+              << " element_diagonal_bytes=" << sizeof(double) * std::size_t(element_diagonals_.Size())
+              << " grouping=" << (grouped ? (projected ? "boundary-mask" : "verified-class") : "element")
+              << " group_elements=" << (grouped ? tensor_group_elements : 1)
+              << " groups=" << (grouped ? grouped_classes_.Size() : ne_)
+              << " group_padding=" << (grouped ? grouped_elements_.Size() - ne_ : 0)
+              << " mass_precision=fp64 output_precision=fp64"
+              << " arithmetic_spd=" << (execution_ == TensorExecution::SimtFP64 ||
+                  execution_ == TensorExecution::FactorFP64 || execution_ == TensorExecution::DenseFP64 ?
+                  "fp64-roundoff" : "rounding-perturbed")
+              << " fallback=none" << std::endl;
+  }
+
+  void FactorProjectedBlocks()
+  {
+    const double* blocks = blocks_.HostRead();
+    const double* scale = inverse_sqrt_mass_.HostRead();
+    const int* native = lex_to_native_.HostRead();
+    element_classes_.SetSize(ne_);
+    int* ids = element_classes_.HostWrite();
+    std::array<int, 16> counts{}, class_for_mask;
+    class_for_mask.fill(-1);
+    mfem::Array<int> edges, orientations;
+    for (int e = 0; e < ne_; ++e)
+    {
+      space_.GetMesh()->GetElementEdges(e, edges, orientations);
+      MFEM_VERIFY(edges.Size() == 4, "Projected local tensor Jacobi requires four local quad edges.");
+      int mask = 0;
+      for (int edge = 0; edge < 4; ++edge)
+      {
+        int first = -1, second = -1;
+        space_.GetMesh()->GetFaceElements(edges[edge], &first, &second);
+        MFEM_VERIFY(first == e || second == e, "Invalid projected local tensor edge adjacency.");
+        // Rank one and conforming: a single adjacent element is a physical
+        // boundary. Periodic faces have two sides, even when both are e.
+        if (first < 0 || second < 0) { mask |= 1 << edge; }
+      }
+      ids[e] = mask;
+      ++counts[mask];
+    }
+    int class_count = 0;
+    for (int mask = 0; mask < 16; ++mask)
+    { if (counts[mask]) { class_for_mask[mask] = class_count++; } }
+    std::vector<std::vector<double>> averages(class_count, std::vector<double>(dof_ * dof_, 0.0));
+    std::vector<double> h(dof_ * dof_), x, y;
+    for (int e = 0; e < ne_; ++e)
+    {
+      const int mask = ids[e], id = class_for_mask[mask];
+      ids[e] = id;
+      double norm = 0.0, asymmetry = 0.0;
+      for (int j = 0; j < dof_; ++j)
+        for (int i = 0; i < dof_; ++i)
+        {
+          const double a = blocks[std::size_t(e) * dof_ * dof_ + native[i] + dof_ * native[j]];
+          const double value = scale[e * dof_ + i] * a * scale[e * dof_ + j];
+          MFEM_VERIFY(std::isfinite(value) && (i != j || value > 0.0),
+                      "Projected local tensor Jacobi initial block is nonfinite/nonpositive on its diagonal; element " << e);
+          h[i + dof_ * j] = value;
+          norm = std::max(norm, std::abs(value));
+        }
+      MFEM_VERIFY(norm > 0.0, "Zero projected local tensor Jacobi initial block at element " << e);
+      for (int j = 0; j < dof_; ++j)
+        for (int i = 0; i < j; ++i)
+        {
+          asymmetry = std::max(asymmetry, std::abs(h[i + dof_ * j] - h[j + dof_ * i]));
+          const double average = 0.5 * (h[i + dof_ * j] + h[j + dof_ * i]);
+          h[i + dof_ * j] = h[j + dof_ * i] = average;
+        }
+      MFEM_VERIFY(asymmetry <= admission_tolerance * norm,
+                  "Projected local tensor Jacobi requires symmetric initial SIPG blocks; element " << e);
+      const double class_weight = 1.0 / counts[mask];
+      for (int i = 0; i < dof_ * dof_; ++i) { averages[id][i] += class_weight * h[i]; }
+    }
+    factors_.SetSize(class_count * 2 * dof_);
+    double* packed = factors_.HostWrite();
+    for (int c = 0; c < class_count; ++c)
+    {
+      for (double value : averages[c])
+      { MFEM_VERIFY(std::isfinite(value), "Nonfinite averaged projected local tensor reference class " << c); }
+      ExtractAxes(axis_, averages[c], x, y);
+      const auto basis = FactorProjectedAxes(axis_, x, y);
+      std::copy(basis.packed.begin(), basis.packed.end(), packed + c * 2 * dof_);
+    }
+    factors_.UseDevice(true);
+    element_diagonals_.SetSize(height); element_diagonals_.UseDevice(true);
+    mfem::Vector relative_offdiag(ne_); relative_offdiag.UseDevice(true);
+    ProjectTensorDiagonals<<<ne_, 128>>>(lex_to_native_.Read(), element_classes_.Read(),
+      blocks_.Read(), inverse_sqrt_mass_.Read(), factors_.Read(), element_diagonals_.Write(),
+      relative_offdiag.Write());
+    MFEM_GPU_CHECK(cudaGetLastError());
+    const double* reciprocals = element_diagonals_.HostRead();
+    const double* errors = relative_offdiag.HostRead();
+    double minimum = std::numeric_limits<double>::infinity(), maximum = 0.0, maximum_offdiag = 0.0;
+    for (int e = 0; e < ne_; ++e)
+    {
+      double element_minimum = std::numeric_limits<double>::infinity(), element_maximum = 0.0;
+      for (int i = 0; i < dof_; ++i)
+      {
+        const double reciprocal = reciprocals[e * dof_ + i];
+        const double value = 1.0 / reciprocal;
+        MFEM_VERIFY(std::isfinite(reciprocal) && reciprocal > 0.0 && std::isfinite(value) && value > 0.0,
+                    "Projected local tensor Jacobi requires finite positive projected diagonals; element " << e);
+        element_minimum = std::min(element_minimum, value);
+        element_maximum = std::max(element_maximum, value);
+      }
+      MFEM_VERIFY(element_minimum > 512.0 * std::numeric_limits<double>::epsilon() * element_maximum,
+                  "Projected local tensor Jacobi requires resolved positive projected diagonals; element " << e);
+      MFEM_VERIFY(std::isfinite(errors[e]), "Nonfinite projected local tensor off-diagonal metric; element " << e);
+      minimum = std::min(minimum, element_minimum); maximum = std::max(maximum, element_maximum);
+      maximum_offdiag = std::max(maximum_offdiag, errors[e]);
+    }
+    if (UsesTensorCores(execution_)) { BuildClassGroups(ids, class_count); }
+    CompleteSetup(class_count, 0.0, maximum_offdiag, minimum, maximum);
+  }
+
   void BuildClassGroups(const int* ids, int class_count)
   {
     std::vector<std::vector<int>> members(class_count);
@@ -601,8 +799,158 @@ private:
     (void)grouped_elements_.Read(); (void)grouped_classes_.Read();
   }
 
+  double CheckProjectedJacobian(mfem::ElementTransformation& transformation,
+                                const mfem::IntegrationPoint& ip, int element) const
+  {
+    transformation.SetIntPoint(&ip);
+    const auto& jacobian = transformation.Jacobian();
+    const double xx = jacobian(0, 0), xy = jacobian(0, 1);
+    const double yx = jacobian(1, 0), yy = jacobian(1, 1);
+    const double determinant = xx * yy - xy * yx;
+    MFEM_VERIFY(std::isfinite(xx) && std::isfinite(xy) && std::isfinite(yx) && std::isfinite(yy) &&
+                  std::isfinite(determinant) && determinant > 0.0,
+                "Projected local tensor Jacobi requires finite positive sampled signed Jacobians; element " << element);
+    const double weight = transformation.Weight();
+    MFEM_VERIFY(std::isfinite(weight) && weight > 0.0,
+                "Projected local tensor Jacobi requires positive sampled geometry weights; element " << element);
+    return weight;
+  }
+
+  void BuildProjectedLayoutAndMass(const mfem::QuadratureFunction& invrho)
+  {
+    const auto& fe = *space_.GetFE(0);
+    const auto* tensor = dynamic_cast<const mfem::NodalTensorFiniteElement*>(&fe);
+    MFEM_VERIFY(tensor && tensor->GetBasisType() == mfem::BasisType::GaussLegendre &&
+                  fe.GetGeomType() == mfem::Geometry::SQUARE && fe.GetDof() == dof_ &&
+                  fe.GetMapType() == mfem::FiniteElement::VALUE && fe.GetNodes().GetNPoints() == dof_,
+                "Projected local tensor Jacobi requires actual p5 Gauss-Legendre nodal tensor quads.");
+    const auto& lex = tensor->GetDofMap();
+    MFEM_VERIFY(lex.Size() == 0 || lex.Size() == dof_, "Invalid projected tensor native permutation.");
+    lex_to_native_.SetSize(dof_);
+    int* native = lex_to_native_.HostWrite();
+    std::vector<bool> local_seen(dof_, false), seen(height, false);
+    mfem::IntegrationRules gl_rules(0, mfem::Quadrature1D::GaussLegendre);
+    const auto& nodal_rule = gl_rules.Get(mfem::Geometry::SEGMENT, 2 * axis_ - 1);
+    for (int i = 0; i < dof_; ++i)
+    {
+      native[i] = lex.Size() ? lex[i] : i;
+      MFEM_VERIFY(native[i] >= 0 && native[i] < dof_ && !local_seen[native[i]],
+                  "Invalid unsigned projected tensor native permutation.");
+      local_seen[native[i]] = true;
+      const auto& node = fe.GetNodes().IntPoint(native[i]);
+      MFEM_VERIFY(std::isfinite(node.x) && std::isfinite(node.y) &&
+                    std::abs(node.x - nodal_rule.IntPoint(i % axis_).x) < 1.0e-13 &&
+                    std::abs(node.y - nodal_rule.IntPoint(i / axis_).x) < 1.0e-13,
+                  "Projected local tensor Jacobi requires lexicographic GL6 nodes.");
+    }
+    const auto& rule = mass_space_->GetIntRule(0);
+    mass_axis_ = int(std::sqrt(double(rule.GetNPoints())));
+    MFEM_VERIFY((mass_axis_ == 6 || mass_axis_ == 7) &&
+                  mass_axis_ * mass_axis_ == rule.GetNPoints() &&
+                  std::size_t(ne_) * rule.GetNPoints() == std::size_t(invrho.Size()),
+                "Projected local tensor Jacobi requires uniform actual GL6x6 or GL7x7 mass quadrature.");
+    const auto& mass_rule_1d = gl_rules.Get(mfem::Geometry::SEGMENT, 2 * mass_axis_ - 1);
+    MFEM_VERIFY(mass_rule_1d.GetNPoints() == mass_axis_, "Unexpected projected mass quadrature axis.");
+    mass_basis_squared_.SetSize(mass_axis_ * axis_);
+    double* squared_basis = mass_basis_squared_.HostWrite();
+    std::vector<double> basis(mass_axis_ * axis_);
+    mfem::Vector values(axis_), shape(dof_);
+    for (int q = 0; q < mass_axis_; ++q)
+    {
+      tensor->GetBasis1D().Eval(mass_rule_1d.IntPoint(q).x, values);
+      for (int i = 0; i < axis_; ++i)
+      {
+        const double value = values[i];
+        MFEM_VERIFY(std::isfinite(value), "Nonfinite projected mass basis value.");
+        basis[q + mass_axis_ * i] = value;
+        squared_basis[q + mass_axis_ * i] = value * value;
+      }
+    }
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      const int qx = q % mass_axis_, qy = q / mass_axis_;
+      const auto& ip = rule.IntPoint(q);
+      const auto& ix = mass_rule_1d.IntPoint(qx);
+      const auto& iy = mass_rule_1d.IntPoint(qy);
+      MFEM_VERIFY(std::isfinite(ip.x) && std::isfinite(ip.y) && std::isfinite(ip.weight) &&
+                    ip.weight > 0.0 && std::abs(ip.x - ix.x) < 1.0e-13 &&
+                    std::abs(ip.y - iy.x) < 1.0e-13 &&
+                    std::abs(ip.weight - ix.weight * iy.weight) < 1.0e-13 * ip.weight,
+                  "Projected local tensor Jacobi requires lexicographic Gauss-Legendre mass quadrature.");
+      fe.CalcShape(ip, shape);
+      for (int i = 0; i < dof_; ++i)
+      {
+        const double expected = basis[qx + mass_axis_ * (i % axis_)] *
+                                basis[qy + mass_axis_ * (i / axis_)];
+        MFEM_VERIFY(std::abs(shape[native[i]] - expected) < 1.0e-12,
+                    "Projected local tensor Jacobi mass shapes do not match the tensor basis.");
+      }
+    }
+    element_dofs_.SetSize(height); geometry_mass_.SetSize(invrho.Size());
+    inverse_sqrt_mass_.SetSize(height);
+    int* map = element_dofs_.HostWrite();
+    double* geometry = geometry_mass_.HostWrite();
+    const double* coefficient = invrho.HostRead();
+    mfem::Array<int> dofs;
+    const auto& vertices = *mfem::Geometries.GetVertices(mfem::Geometry::SQUARE);
+    for (int e = 0; e < ne_; ++e)
+    {
+      MFEM_VERIFY(space_.GetFE(e) == &fe && mass_space_->Offset(e) == e * rule.GetNPoints() &&
+                    &mass_space_->GetIntRule(e) == &rule &&
+                    space_.GetElementDofs(e, dofs) == nullptr && dofs.Size() == dof_,
+                  "Projected local tensor Jacobi requires uniform FE/QF layout without dof transformations.");
+      auto* transformation = space_.GetMesh()->GetElementTransformation(e);
+      const auto* isoparametric = dynamic_cast<const mfem::IsoparametricTransformation*>(transformation);
+      const int order = transformation->Order();
+      const auto* geometry_fe = isoparametric ? isoparametric->GetFE() : nullptr;
+      MFEM_VERIFY(geometry_fe && (order == 1 || order == 2) &&
+                    geometry_fe->GetGeomType() == mfem::Geometry::SQUARE &&
+                    geometry_fe->GetDof() == (order + 1) * (order + 1),
+                  "Projected local tensor Jacobi admits fixed Q1/Q2 quadrilateral mappings; element " << e);
+      MFEM_VERIFY(mass_axis_ >= axis_ + order - 1,
+                  "Projected Q2 local tensor Jacobi requires the actual GL7x7 mass rule, not collocated GL6; element " << e);
+      maximum_geometry_order_ = std::max(maximum_geometry_order_, order);
+      // These samples reject invalid metrics where observed; they do not
+      // certify positivity between the sampled points of a curved map.
+      for (int i = 0; i < vertices.GetNPoints(); ++i)
+      { CheckProjectedJacobian(*transformation, vertices.IntPoint(i), e); }
+      const auto& geometry_nodes = geometry_fe->GetNodes();
+      for (int i = 0; i < geometry_nodes.GetNPoints(); ++i)
+      { CheckProjectedJacobian(*transformation, geometry_nodes.IntPoint(i), e); }
+      for (int i = 0; i < dof_; ++i)
+      {
+        const int row = dofs[native[i]];
+        MFEM_VERIFY(row >= 0 && row < height && !seen[row],
+                    "Projected local tensor Jacobi requires disjoint unsigned scalar element dofs.");
+        seen[row] = true; map[e * dof_ + i] = row;
+        CheckProjectedJacobian(*transformation, fe.GetNodes().IntPoint(native[i]), e);
+      }
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const auto& ip = rule.IntPoint(q);
+        const double weight = ip.weight * CheckProjectedJacobian(*transformation, ip, e);
+        const int entry = e * rule.GetNPoints() + q;
+        const double mass = weight * coefficient[entry];
+        MFEM_VERIFY(std::isfinite(weight) && weight > 0.0 && std::isfinite(mass) && mass > 0.0,
+                    "Projected local tensor Jacobi requires positive finite initial quadrature mass; element " << e);
+        geometry[entry] = weight;
+      }
+    }
+    geometry_mass_.UseDevice(true); inverse_sqrt_mass_.UseDevice(true); mass_basis_squared_.UseDevice(true);
+    (void)element_dofs_.Read();
+    RefreshProjectedTensorMass<<<ne_, 64>>>(mass_axis_, mass_basis_squared_.Read(), geometry_mass_.Read(),
+      invrho.Read(), inverse_sqrt_mass_.Write());
+    MFEM_GPU_CHECK(cudaGetLastError());
+    const double* initial_scale = inverse_sqrt_mass_.HostRead();
+    for (int i = 0; i < height; ++i)
+    { MFEM_VERIFY(std::isfinite(initial_scale[i]) && initial_scale[i] > 0.0,
+                  "Projected local tensor Jacobi requires positive finite initial mass diagonals; entry " << i); }
+  }
+
   void BuildLayoutAndMass(const mfem::QuadratureFunction& invrho)
   {
+    if (reference_ == TensorReference::Projected) { BuildProjectedLayoutAndMass(invrho); return; }
+    mass_axis_ = axis_;
     const auto& fe = *space_.GetFE(0);
     const auto* tensor = dynamic_cast<const mfem::NodalTensorFiniteElement*>(&fe);
     MFEM_VERIFY(tensor && tensor->GetBasisType() == mfem::BasisType::GaussLegendre &&
@@ -712,11 +1060,14 @@ private:
   const int ne_, axis_, dof_;
   const long space_sequence_, mesh_sequence_, nodes_sequence_;
   const TensorExecution execution_;
+  const TensorReference reference_;
   std::unique_ptr<mfem::EABilinearFormExtension> ea_;
   mfem::DenseTensor blocks_;
   mfem::Array<int> lex_to_native_, element_dofs_, element_classes_;
   mfem::Array<int> grouped_elements_, grouped_classes_;
   mfem::Vector geometry_mass_, inverse_sqrt_mass_, factors_, class_inverses_;
+  mfem::Vector mass_basis_squared_, element_diagonals_;
+  int mass_axis_ = 0, maximum_geometry_order_ = 1;
   bool prepared_ = false, ready_ = false;
 };
 }

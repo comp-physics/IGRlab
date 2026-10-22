@@ -1958,6 +1958,19 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   set_tests_properties(dg_igr_local_tensor_jacobi_cuda_backends PROPERTIES
     LABELS "cuda;igr;element-block;tensor;precision" TIMEOUT 300 RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected --backend simt-fp64)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;projected;mapped" TIMEOUT 300 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_backends
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_backends PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;projected;mapped;precision" TIMEOUT 600 RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_reject_dense
+    COMMAND dg_igr_local_tensor_jacobi_test --reject-projected-dense)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_reject_dense PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;projected;admission" TIMEOUT 60 RUN_SERIAL TRUE WILL_FAIL TRUE)
   foreach(_igrlab_tensor_rejection skew curved nonseparable)
     add_test(NAME dg_igr_local_tensor_jacobi_cuda_reject_${_igrlab_tensor_rejection}
       COMMAND dg_igr_local_tensor_jacobi_test --reject-${_igrlab_tensor_rejection})

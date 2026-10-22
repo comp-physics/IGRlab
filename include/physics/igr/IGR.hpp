@@ -770,6 +770,7 @@ private:
   bool element_jacobi_reference_blocks_ = false;
   bool element_jacobi_tensor_blocks_ = false;
   std::unique_ptr<mfem::Solver> element_jacobi_blocks_;
+  std::string element_jacobi_tensor_key_;
   mfem::Vector element_jacobi_history_;
   mfem::Vector element_jacobi_residual_, element_jacobi_correction_;
   bool element_jacobi_history_valid_ = false;
@@ -782,6 +783,11 @@ private:
   // rebuild every stage. This cache owns only the first operator's inverse.
   std::unique_ptr<mfem::Solver> dense_inverse_preconditioner_;
   std::string dense_inverse_precision_;
+  // Local tensor factors are a preconditioner for the current FP64 operator.
+  // Output-only initialization does not commit the reference coefficient.
+  std::unique_ptr<mfem::Solver> local_tensor_preconditioner_;
+  std::string local_tensor_preconditioner_key_;
+  bool local_tensor_preconditioner_committed_ = false;
   std::unique_ptr<mfem::Solver> two_level_inverse_preconditioner_;
   std::string two_level_coarse_mode_;
   std::unique_ptr<mfem::Solver> screened_patch_preconditioner_;

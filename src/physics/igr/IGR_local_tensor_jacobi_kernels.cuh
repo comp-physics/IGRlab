@@ -5,17 +5,136 @@ constexpr int tensor_group_elements = 16;
 constexpr int tensor_axis = 6;
 constexpr int tensor_dofs = tensor_axis * tensor_axis;
 
+// The actual quadrature mass diagonal is not collocated on Q2 geometry.
+// Contract squared one-dimensional shapes with w det(J) invrho in x and y;
+// the coefficient is refreshed on the operator's mass rule, not at GL6 nodes.
+__global__ void RefreshProjectedTensorMass(int qaxis, const double* basis_squared,
+                                          const double* geometry, const double* invrho,
+                                          double* inverse_sqrt_mass)
+{
+  const int e = blockIdx.x, t = threadIdx.x;
+  const int offset = e * qaxis * qaxis;
+  __shared__ double intermediate[max_dofs];
+  if (t < tensor_axis * qaxis)
+  {
+    const int x = t % tensor_axis, qy = t / tensor_axis;
+    double value = 0.0;
+    for (int qx = 0; qx < qaxis; ++qx)
+    {
+      const int q = offset + qx + qaxis * qy;
+      value += basis_squared[qx + qaxis * x] * geometry[q] * invrho[q];
+    }
+    intermediate[t] = value;
+  }
+  __syncthreads();
+  if (t < tensor_dofs)
+  {
+    const int x = t % tensor_axis, y = t / tensor_axis;
+    double mass = 0.0;
+    for (int qy = 0; qy < qaxis; ++qy)
+    { mass += intermediate[x + tensor_axis * qy] * basis_squared[qy + qaxis * y]; }
+    inverse_sqrt_mass[e * tensor_dofs + t] = 1.0 / sqrt(mass);
+  }
+}
+
+// Setup only: form H_e Q with two directional contractions, then its Rayleigh
+// diagonals. There is one shared basis per physical-boundary mask, but each
+// element keeps its own positive reciprocal diagonal. Full dense blocks are
+// released after this kernel and the setup checks; none are used by Mult.
+__global__ void ProjectTensorDiagonals(const int* native, const int* classes,
+                                      const double* blocks, const double* scaling,
+                                      const double* factors, double* reciprocals,
+                                      double* relative_offdiag)
+{
+  const int e = blockIdx.x, t = threadIdx.x;
+  const double* qx = factors + std::size_t(classes[e]) * 2 * tensor_dofs;
+  const double* qy = qx + tensor_dofs;
+  const double* block = blocks + std::size_t(e) * tensor_dofs * tensor_dofs;
+  const double* scale = scaling + e * tensor_dofs;
+  __shared__ double u[tensor_dofs * tensor_dofs], v[tensor_dofs * tensor_dofs];
+  __shared__ double norms[128];
+  __shared__ double diagonal[tensor_dofs];
+  double maximum = 0.0;
+  for (int item = t; item < tensor_dofs * tensor_dofs; item += blockDim.x)
+  {
+    const int row = item % tensor_dofs, col = item / tensor_dofs;
+    const double a = scale[row] * block[native[row] + tensor_dofs * native[col]] * scale[col];
+    const double b = scale[col] * block[native[col] + tensor_dofs * native[row]] * scale[row];
+    const double value = row == col ? a : 0.5 * (a + b);
+    u[item] = value;
+    maximum = fmax(maximum, fabs(value));
+  }
+  norms[t] = maximum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
+  {
+    if (t < stride) { norms[t] = fmax(norms[t], norms[t + stride]); }
+    __syncthreads();
+  }
+  maximum = norms[0];
+  __syncthreads();
+  double norm_squared = 0.0;
+  for (int item = t; item < tensor_dofs * tensor_dofs; item += blockDim.x)
+  {
+    const double normalized = u[item] / maximum;
+    norm_squared += normalized * normalized;
+    const int row = item % tensor_dofs, col = item / tensor_dofs;
+    double value = 0.0;
+    for (int k = 0; k < tensor_axis; ++k)
+    { value += u[row + tensor_dofs * (k + tensor_axis * (col / tensor_axis))] *
+               qx[k + tensor_axis * (col % tensor_axis)]; }
+    v[item] = value;
+  }
+  norms[t] = norm_squared;
+  __syncthreads();
+  for (int item = t; item < tensor_dofs * tensor_dofs; item += blockDim.x)
+  {
+    const int row = item % tensor_dofs, col = item / tensor_dofs;
+    double value = 0.0;
+    for (int k = 0; k < tensor_axis; ++k)
+    { value += v[row + tensor_dofs * (col % tensor_axis + tensor_axis * k)] *
+               qy[k + tensor_axis * (col / tensor_axis)]; }
+    u[item] = value;
+  }
+  __syncthreads();
+  if (t < tensor_dofs)
+  {
+    double value = 0.0;
+    for (int row = 0; row < tensor_dofs; ++row)
+    { value += qx[row % tensor_axis + tensor_axis * (t % tensor_axis)] *
+               qy[row / tensor_axis + tensor_axis * (t / tensor_axis)] *
+               u[row + tensor_dofs * t]; }
+    reciprocals[e * tensor_dofs + t] = 1.0 / value;
+    diagonal[t] = value / maximum;
+  }
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
+  {
+    if (t < stride) { norms[t] += norms[t + stride]; }
+    __syncthreads();
+  }
+  if (t == 0)
+  {
+    double diagonal_squared = 0.0;
+    for (int i = 0; i < tensor_dofs; ++i) { diagonal_squared += diagonal[i] * diagonal[i]; }
+    // Orthogonal invariance gives ||offdiag(Q^T H Q)||_F^2 =
+    // ||H||_F^2 - ||diag(Q^T H Q)||_2^2. Clamp cancellation at roundoff.
+    relative_offdiag[e] = sqrt(fmax(0.0, norms[0] - diagonal_squared) / norms[0]);
+  }
+}
+
 // Precision control: retain FP64 current mass state, gather and final scaling,
 // while performing the same four directional contractions in FP32.
 __global__ void ApplyTensorInverseFP32(int axis, const int* map, const int* classes,
-                                     const double* factors, const double* scaling,
+                                     const double* factors, const double* element_diagonals,
+                                     const double* scaling,
                                      const double* input, double* output)
 {
   const int e = blockIdx.x, t = threadIdx.x, dof = axis * axis;
   const int x = t % axis, y = t / axis;
-  const double* qx = factors + std::size_t(classes[e]) * 3 * dof;
+  const double* qx = factors + std::size_t(classes[e]) * (element_diagonals ? 2 : 3) * dof;
   const double* qy = qx + dof;
-  const double* denominator = qy + dof;
+  const double* denominator = element_diagonals ? element_diagonals + std::size_t(e) * dof : qy + dof;
   __shared__ float u[max_dofs], v[max_dofs];
   if (t < dof)
   { u[t] = static_cast<float>(scaling[e * dof + t] * input[map[e * dof + t]]); }
@@ -100,6 +219,7 @@ __global__ void ApplyTensorDenseFP32(const int* map, const int* group_elements,
 // stays in shared memory, including the reciprocal eigensum multiplication.
 __global__ void ApplyTensorFactorTF32(const int* map, const int* group_elements,
                                      const int* group_classes, const double* factors,
+                                     const double* element_diagonals,
                                      const double* scaling, const double* input,
                                      double* output)
 {
@@ -107,7 +227,8 @@ __global__ void ApplyTensorFactorTF32(const int* map, const int* group_elements,
   using namespace nvcuda;
   constexpr int columns = tensor_group_elements * tensor_axis;
   const int warp = threadIdx.x / 32;
-  const double* qx = factors + std::size_t(group_classes[blockIdx.x]) * 3 * tensor_dofs;
+  const double* qx = factors + std::size_t(group_classes[blockIdx.x]) *
+                     (element_diagonals ? 2 : 3) * tensor_dofs;
   const double* qy = qx + tensor_dofs;
   const double* denominator = qy + tensor_dofs;
   const int* elements = group_elements + blockIdx.x * tensor_group_elements;
@@ -163,7 +284,12 @@ __global__ void ApplyTensorFactorTF32(const int* map, const int* group_elements,
         {
           value = v[line * columns + slot * tensor_axis + row];
           if (phase == 1)
-          { value *= static_cast<float>(denominator[row + tensor_axis * line]); }
+          {
+            const int e = elements[slot];
+            const double* diagonal = element_diagonals && e >= 0 ?
+              element_diagonals + std::size_t(e) * tensor_dofs : denominator;
+            value *= e >= 0 ? static_cast<float>(diagonal[row + tensor_axis * line]) : 0.0f;
+          }
         }
         u[i] = wmma::__float_to_tf32(value);
       }
@@ -178,6 +304,108 @@ __global__ void ApplyTensorFactorTF32(const int* map, const int* group_elements,
       const float value = v[(t / tensor_axis) * columns + slot * tensor_axis + t % tensor_axis];
       const int entry = e * tensor_dofs + t;
       output[map[entry]] = scaling[entry] * static_cast<double>(value);
+    }
+  }
+#else
+  asm("trap;");
+#endif
+}
+
+// Six warps each handle 16 of the group's 96 nodal-line columns. Native
+// FP64 8x8x4 WMMA performs each padded 6x6 transform as two K tiles and two
+// 8-column accumulators. Repacking and each element's reciprocal diagonal
+// remain in shared memory throughout the four transforms.
+__global__ void ApplyTensorFactorFP64(const int* map, const int* group_elements,
+                                     const int* group_classes, const double* factors,
+                                     const double* element_diagonals,
+                                     const double* scaling, const double* input,
+                                     double* output)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  using namespace nvcuda;
+  constexpr int columns = tensor_group_elements * tensor_axis;
+  const int warp = threadIdx.x / 32;
+  const double* qx = factors + std::size_t(group_classes[blockIdx.x]) *
+                     (element_diagonals ? 2 : 3) * tensor_dofs;
+  const double* qy = qx + tensor_dofs;
+  const double* denominator = qy + tensor_dofs;
+  const int* elements = group_elements + blockIdx.x * tensor_group_elements;
+  __shared__ __align__(32) double a[4][8 * 8];
+  __shared__ __align__(32) double u[8 * columns], v[8 * columns];
+  for (int i = threadIdx.x; i < 4 * 8 * 8; i += blockDim.x)
+  {
+    const int phase = i / (8 * 8), item = i % (8 * 8);
+    const int row = item / 8, k = item % 8;
+    double value = 0.0;
+    if (row < tensor_axis && k < tensor_axis)
+    {
+      const double* q = phase % 2 == 0 ? qx : qy;
+      value = phase < 2 ? q[k + tensor_axis * row] : q[row + tensor_axis * k];
+    }
+    a[phase][item] = value;
+  }
+  for (int i = threadIdx.x; i < 8 * columns; i += blockDim.x)
+  {
+    const int row = i / columns, column = i % columns;
+    const int e = elements[column / tensor_axis], y = column % tensor_axis;
+    double value = 0.0;
+    if (row < tensor_axis && e >= 0)
+    {
+      const int t = e * tensor_dofs + row + tensor_axis * y;
+      value = scaling[t] * input[map[t]];
+    }
+    u[i] = value;
+  }
+  __syncthreads();
+  for (int phase = 0; phase < 4; ++phase)
+  {
+    wmma::fragment<wmma::accumulator, 8, 8, 4, double> accumulator0, accumulator1;
+    wmma::fill_fragment(accumulator0, 0.0);
+    wmma::fill_fragment(accumulator1, 0.0);
+    for (int k0 = 0; k0 < 8; k0 += 4)
+    {
+      wmma::fragment<wmma::matrix_a, 8, 8, 4, double, wmma::row_major> left;
+      wmma::fragment<wmma::matrix_b, 8, 8, 4, double, wmma::row_major> right0, right1;
+      wmma::load_matrix_sync(left, a[phase] + k0, 8);
+      wmma::load_matrix_sync(right0, u + k0 * columns + 16 * warp, columns);
+      wmma::load_matrix_sync(right1, u + k0 * columns + 16 * warp + 8, columns);
+      wmma::mma_sync(accumulator0, left, right0, accumulator0);
+      wmma::mma_sync(accumulator1, left, right1, accumulator1);
+    }
+    wmma::store_matrix_sync(v + 16 * warp, accumulator0, columns, wmma::mem_row_major);
+    wmma::store_matrix_sync(v + 16 * warp + 8, accumulator1, columns, wmma::mem_row_major);
+    __syncthreads();
+    if (phase < 3)
+    {
+      for (int i = threadIdx.x; i < 8 * columns; i += blockDim.x)
+      {
+        const int row = i / columns, column = i % columns;
+        const int slot = column / tensor_axis, line = column % tensor_axis;
+        double value = 0.0;
+        if (row < tensor_axis)
+        {
+          value = v[line * columns + slot * tensor_axis + row];
+          if (phase == 1)
+          {
+            const int e = elements[slot];
+            const double* diagonal = element_diagonals && e >= 0 ?
+              element_diagonals + std::size_t(e) * tensor_dofs : denominator;
+            value *= e >= 0 ? diagonal[row + tensor_axis * line] : 0.0;
+          }
+        }
+        u[i] = value;
+      }
+      __syncthreads();
+    }
+  }
+  for (int i = threadIdx.x; i < tensor_group_elements * tensor_dofs; i += blockDim.x)
+  {
+    const int slot = i / tensor_dofs, t = i % tensor_dofs, e = elements[slot];
+    if (e >= 0)
+    {
+      const double value = v[(t / tensor_axis) * columns + slot * tensor_axis + t % tensor_axis];
+      const int entry = e * tensor_dofs + t;
+      output[map[entry]] = scaling[entry] * value;
     }
   }
 #else

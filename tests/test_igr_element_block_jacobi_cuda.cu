@@ -390,15 +390,27 @@ public:
       {"IGR_DIRECT_IDENTITY_SYSTEM", "1"}, {"IGR_FACE_DENSITY_CUDA", "1"},
       {"IGR_TENSOR_VOLUME", "simt"}, {"IGR_TENSOR_VOLUME_COLLOCATED", "0"},
       {"IGR_TENSOR_VOLUME_STORAGE", "cached"}, {"IGR_KRYLOV_BACKEND", "cuda-fp64"},
+      {"IGR_LOCAL_TENSOR_PRECONDITIONER", "0"},
+      {"IGR_LOCAL_TENSOR_REFERENCE", "exact"},
+      {"IGR_LOCAL_TENSOR_EXECUTION", "simt-fp64"},
       {"IGR_TRUE_RESIDUAL", "1"}};
     for (const char* prefix : {"IGRLAB_", "DG_IGR_"})
       for (const auto& setting : settings)
       {
         const std::string name = std::string(prefix) + setting.first;
-        const char* previous = std::getenv(name.c_str());
-        entries_.push_back({name, previous ? previous : "", previous != nullptr});
-        setenv(name.c_str(), setting.second, 1);
+        Set(name.c_str(), setting.second);
       }
+  }
+  void Set(const char* name, const char* value)
+  {
+    const auto found = std::find_if(entries_.begin(), entries_.end(),
+      [name](const Entry& entry) { return entry.name == name; });
+    if (found == entries_.end())
+    {
+      const char* previous = std::getenv(name);
+      entries_.push_back({name, previous ? previous : "", previous != nullptr});
+    }
+    setenv(name, value, 1);
   }
   ~LifecycleEnvironment()
   {
@@ -412,6 +424,115 @@ private:
   struct Entry { std::string name, value; bool had_value; };
   std::vector<Entry> entries_;
 };
+
+void CheckConvergedLocalTensor()
+{
+  LifecycleEnvironment environment;
+  environment.Set("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", "projected");
+  environment.Set("IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE", "rhs");
+  Mesh serial = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL, true, 1.0, 1.0);
+  serial.SetCurvature(2, false, 2, Ordering::byVDIM);
+  serial.Transform([](const Vector& x, Vector& y)
+  {
+    y.SetSize(2);
+    y[0] = x[0] + 0.08 * x[0] * x[1];
+    y[1] = x[1] + 0.04 * x[0] * (1.0 - x[0]);
+  });
+  ParMesh mesh(MPI_COMM_WORLD, serial);
+  DG_FECollection collection(5, 2, BasisType::GaussLegendre);
+  ParFiniteElementSpace scalar_space(&mesh, &collection);
+  ParFiniteElementSpace vector_space(&mesh, &collection, 4, Ordering::byNODES);
+  ParGridFunction state(&vector_space);
+  int phase = 0;
+  VectorFunctionCoefficient initial(4, [&](const Vector& x, Vector& value)
+  {
+    const double rho = 0.8 + 0.2 * x[0] + 0.1 * x[1] +
+      0.15 * phase * (1.0 + x[0] * x[1]);
+    const double u = 0.2 + 0.11 * x[0] + 0.06 * phase * x[1];
+    const double v = -0.1 + 0.08 * x[1] + 0.04 * phase * x[0];
+    value.SetSize(4);
+    value[0] = rho; value[1] = rho * u; value[2] = rho * v;
+    value[3] = 2.5 + 0.5 * rho * (u * u + v * v);
+  });
+  ::igrlab::IGRConfig config;
+  config.alpha = 0.005;
+  config.backend = ::igrlab::IGRGradBackend::BrokenDG;
+  config.ip_kind = ::igrlab::IGRIPKind::SIPG;
+  config.solve_mode = ::igrlab::IGRSolveMode::Krylov;
+  config.exact_dg_face_operator = true;
+  config.lin_solver_type = ::igrlab::IGRLinearSolverType::FGMRES;
+  config.prec_type = ::igrlab::IGRPrecondType::None;
+  config.lin_rtol = 1.0e-6; config.lin_atol = 0.0; config.lin_maxit = 1000;
+  config.nonconvergence_policy = ::igrlab::IGRNonconvergencePolicy::Error;
+  const auto make_solver = [&](bool control)
+  {
+    auto solver = std::make_unique<::igrlab::IGRSolver>(
+      scalar_space, vector_space, 2, 4, config.alpha);
+    auto selected = config;
+    if (control) { selected.lin_rtol = 1.0e-11; }
+    solver->ApplyConfig(selected);
+    return solver;
+  };
+  const auto solve_local = [&](::igrlab::IGRSolver& solver,
+                               ::igrlab::IGRSolvePurpose purpose)
+  {
+    environment.Set("IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER", "1");
+    solver.UpdateFromState(state, false, purpose);
+    MFEM_VERIFY(solver.GetLastLinearConverged() &&
+                  solver.GetLastLinearSolverName() == "fgmres-cuda-fp64" &&
+                  solver.GetLastPrecondName() == "tensor-element-projected-simt-fp64" &&
+                  solver.GetLastLinearTrueResidualRelRHS() <= config.lin_rtol &&
+                  solver.GetLastIndependentCertificateRelativeLimit() == config.lin_rtol,
+                "Local tensor FGMRES failed its original-current FP64 RHS residual certificate.");
+  };
+  auto local = make_solver(false), control = make_solver(true);
+  double maximum_difference = 0.0, maximum_residual = 0.0;
+  for (phase = 0; phase < 2; ++phase)
+  {
+    // Exercise the local-preconditioner certificate both without a volume
+    // override and with the existing current-coefficient SIMT optimization.
+    environment.Set("IGRLAB_IGR_TENSOR_VOLUME", phase == 0 ? "off" : "simt");
+    state.ProjectCoefficient(initial);
+    solve_local(*local, ::igrlab::IGRSolvePurpose::ProductionStage);
+    maximum_residual = std::max(maximum_residual, local->GetLastLinearTrueResidualRelRHS());
+    environment.Set("IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER", "0");
+    control->UpdateFromState(state, false);
+    const double difference = RelativeDifference(local->GetSigma(), control->GetSigma());
+    maximum_difference = std::max(maximum_difference, difference);
+    MFEM_VERIFY(control->GetLastLinearConverged() && difference <= 1.0e-4,
+                "Projected local preconditioning changed the converged current-operator solution: "
+                << difference);
+  }
+  // An output-only or abandoned initialization must not select the reference
+  // density for the first production preconditioner. Cold starts make equal
+  // production caches observable through identical solve work and sigma.
+  for (bool prefetch : {false, true})
+  {
+    auto fresh = make_solver(false), temporary = make_solver(false);
+    phase = 0; state.ProjectCoefficient(initial);
+    solve_local(*temporary, prefetch
+      ? ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch
+      : ::igrlab::IGRSolvePurpose::OutputOnly);
+    if (prefetch)
+    {
+      MFEM_VERIFY(temporary->ReclassifyPendingStage0PrefetchAsOutputOnly(true),
+                  "Local tensor fixture did not discard its initialization prefetch.");
+    }
+    phase = 1; state.ProjectCoefficient(initial);
+    solve_local(*fresh, ::igrlab::IGRSolvePurpose::ProductionStage);
+    solve_local(*temporary, ::igrlab::IGRSolvePurpose::ProductionStage);
+    MFEM_VERIFY(fresh->GetLastLinearIters() == temporary->GetLastLinearIters() &&
+                  std::memcmp(fresh->GetSigma().HostRead(), temporary->GetSigma().HostRead(),
+                              std::size_t(scalar_space.GetVSize()) * sizeof(double)) == 0,
+                "Uncommitted local tensor initialization changed the production reference.");
+  }
+  std::cout << "element_block_local_tensor_fgmres passed curved_q2=true order=5"
+            << " reference=projected execution=simt-fp64 coefficient_refresh=true"
+            << " original_current_fp64_certificate=true relative_limit=" << config.lin_rtol
+            << " maximum_true_residual_rel_rhs=" << maximum_residual
+            << " maximum_control_sigma_relative_difference=" << maximum_difference
+            << " uncommitted_initial_reference=discarded\n";
+}
 
 void CheckLifecycle(bool reference_blocks, bool tensor_blocks = false)
 {
@@ -634,6 +755,7 @@ int main(int argc, char** argv)
   CheckLifecycle(false);
   CheckLifecycle(true);
   CheckLifecycle(false, true);
+  CheckConvergedLocalTensor();
   std::cout << "element_block_jacobi_test passed current_coefficients=true "
                "assembled_blocks=true full_A_columns=true fp64_lu=true fp64_explicit_inverse=true "
                "coarse=false skew=true curved=true dense_fallback=true self_neighbor=true\n";

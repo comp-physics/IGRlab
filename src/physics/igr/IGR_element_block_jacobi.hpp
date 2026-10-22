@@ -33,9 +33,13 @@ public:
   explicit ElementBlockJacobi(int size) : mfem::Solver(size) { }
   virtual mfem::DenseTensor& PrepareVolumeBlocks(mfem::BilinearForm& form) = 0;
   virtual void FactorBlocks() = 0;
-  // The local tensor surrogate changes only its collocated physical mass.
+  // The local tensor surrogate changes only its physical mass diagonal.
   // Current-LU and frozen explicit-inverse modes retain their existing policy.
   virtual void RefreshMassScaling(const mfem::QuadratureFunction&) { }
+  // Optional immutable metadata for local tensor implementations. A null name
+  // preserves the existing current-LU/reference-inverse labels at the caller.
+  virtual const char* BackendName() const { return nullptr; }
+  virtual const char* ReferencePolicy() const { return "exact"; }
 };
 
 std::unique_ptr<ElementBlockJacobi> MakeElementBlockJacobi(
