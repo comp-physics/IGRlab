@@ -2509,22 +2509,6 @@ struct InteriorFaceDGDiffusionGather2D
   const mfem::real_t* contribution = nullptr;
   mfem::real_t* y = nullptr;
   bool add_to_base = false;
-  const mfem::real_t* residual_rhs = nullptr;
-
-  MFEM_HOST_DEVICE void StoreResidual(int output, mfem::real_t sum) const
-  {
-    // Preserve the original three separately rounded operations:
-    // scratch = +0 + sum; action = volume + scratch; residual = rhs - action.
-#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
-    const mfem::real_t face = __dadd_rn(0.0, sum);
-    const mfem::real_t action = __dadd_rn(y[output], face);
-    y[output] = __dsub_rn(residual_rhs[output], action);
-#else
-    const mfem::real_t face = mfem::real_t(0.0) + sum;
-    const mfem::real_t action = y[output] + face;
-    y[output] = residual_rhs[output] - action;
-#endif
-  }
 
   MFEM_HOST_DEVICE void operator()(int row) const
   {
@@ -2544,11 +2528,7 @@ struct InteriorFaceDGDiffusionGather2D
     // One CUDA row owns each discontinuous scalar dof.  Interior and shared
     // gathers execute in stream order, so the latter may safely add here.
     const int output = D(local_dof, 0, element);
-    if (residual_rhs)
-    {
-      StoreResidual(output, sum);
-    }
-    else if (add_to_base)
+    if (add_to_base)
     {
       // Original order: scratch = +0; scratch += sum; base += scratch.
       // Explicit CUDA adds retain both roundings, including signed zeros and
@@ -2612,11 +2592,7 @@ struct InteriorFaceDGDiffusionTensorLiftGather2D
 #endif
     }
     const int output = D(native, 0, element);
-    if (residual_rhs)
-    {
-      StoreResidual(output, sum);
-    }
-    else if (add_to_base)
+    if (add_to_base)
     {
 #if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
       y[output] = __dadd_rn(y[output], __dadd_rn(0.0, sum));
@@ -2633,6 +2609,60 @@ struct InteriorFaceDGDiffusionTensorLiftGather2D
       y[output] += sum;
 #endif
     }
+  }
+};
+
+// Keep residual data and arithmetic out of the legacy gather's functor and
+// kernel type. Even a disabled runtime branch changes register allocation and
+// can change which of two quiet-NaN operand payloads the legacy add preserves.
+struct InteriorFaceDGDiffusionTensorLiftResidual2D
+  : InteriorFaceDGDiffusionTensorLiftGather2D
+{
+  const mfem::real_t* rhs = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int element = row / 36;
+    const int native = row - element * 36;
+    const int lex = native_to_lex[native];
+    auto D = mfem::Reshape(element_vdof_map, 36, vdim, ne);
+    auto E = mfem::Reshape(endpoint, 2, 6, 2, slot_count);
+    auto Axis = mfem::Reshape(axes, 2, slot_count);
+    auto L = mfem::Reshape(contribution, 2, 6, 2, nf);
+    mfem::real_t sum = 0.0;
+    for (int incidence = element_face_offsets[element];
+         incidence < element_face_offsets[element + 1]; ++incidence)
+    {
+      const int side = element_face_sides[incidence];
+      const int face = element_face_ids[incidence];
+      const int slot = face_slots[face];
+      const int axis = Axis(side, slot);
+      const int i = axis == 0 ? lex % 6 : lex / 6;
+      const int t = axis == 0 ? lex / 6 : lex % 6;
+      const mfem::real_t a = L(0, t, side, face);
+      const mfem::real_t b = L(1, t, side, face);
+      const mfem::real_t face_value =
+        E(0, i, side, slot) * a + E(1, i, side, slot) * b;
+      // The separate old record rounds before the ordered incidence gather.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      sum = __dadd_rn(sum, face_value);
+#else
+      volatile mfem::real_t rounded_face_value = face_value;
+      sum += rounded_face_value;
+#endif
+    }
+    const int output = D(native, 0, element);
+    // Retain the old scratch/base/subtract sequence as three rounded FP64
+    // operations, with no store of the completed action between kernels.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+    const mfem::real_t face = __dadd_rn(0.0, sum);
+    const mfem::real_t action = __dadd_rn(y[output], face);
+    y[output] = __dsub_rn(rhs[output], action);
+#else
+    const mfem::real_t face = mfem::real_t(0.0) + sum;
+    const mfem::real_t action = y[output] + face;
+    y[output] = rhs[output] - action;
+#endif
   }
 };
 
@@ -2789,16 +2819,23 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
     gather.contribution = work.tensor_lift.Read();
     gather.y = y.ReadWrite();
     gather.add_to_base = add_to_base;
-    gather.residual_rhs = residual_rhs ? residual_rhs->Read() : nullptr;
     gather.endpoint = factor.tensor_endpoint.Read();
     gather.axes = factor.tensor_axes.Read();
     gather.face_slots = factor.tensor_face_slots.Read();
     gather.native_to_lex = factor.tensor_native_to_lex.Read();
     gather.slot_count = factor.tensor_slot_count;
-    mfem::forall(info.ne * info.dof, gather);
+    if (residual_rhs)
+    {
+      InteriorFaceDGDiffusionTensorLiftResidual2D residual;
+      static_cast<InteriorFaceDGDiffusionTensorLiftGather2D&>(residual) = gather;
+      residual.rhs = residual_rhs->Read();
+      mfem::forall(info.ne * info.dof, residual);
+    }
+    else { mfem::forall(info.ne * info.dof, gather); }
     return;
   }
 #endif
+  MFEM_VERIFY(!residual_rhs, "Fused face residual requires its preflighted compact lift layout.");
   if (work.tensor_lift.Size()) { work.tensor_lift.Destroy(); }
   work.face_contribution.SetSize(2 * info.dof * info.nf);
   work.face_contribution.UseDevice(true);
@@ -2866,7 +2903,6 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   gather.contribution = work.face_contribution.Read();
   gather.y = y.ReadWrite();
   gather.add_to_base = add_to_base;
-  gather.residual_rhs = residual_rhs ? residual_rhs->Read() : nullptr;
   mfem::forall(info.ne * info.dof, gather);
 }
 

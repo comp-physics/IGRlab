@@ -1595,8 +1595,14 @@ void CheckCompactFaceLiftGatherRounding()
       }
       else { forall(n, GatherForTest(info, work, full, expected)); }
       auto gather = LiftGatherForTest(info, work, lifts, padded, add_to_base);
-      gather.residual_rhs = residual ? rhs.Read() : nullptr;
-      forall(n, gather);
+      if (residual)
+      {
+        ::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftResidual2D residual_gather;
+        static_cast<::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftGather2D&>(residual_gather) = gather;
+        residual_gather.rhs = rhs.Read();
+        forall(n, residual_gather);
+      }
+      else { forall(n, gather); }
       Vector active;
       active.MakeRef(padded, 0, n);
       const bool same_bits = SameBits(active, expected);
