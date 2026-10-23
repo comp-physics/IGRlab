@@ -265,6 +265,30 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "dg;face;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_dg_mapped_dense_test test_dg_mapped_dense.cpp)
+target_link_libraries(dg_igr_dg_mapped_dense_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dg_mapped_dense_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(dg_igr_dg_mapped_dense_test PRIVATE cxx_std_17)
+# Retain the host MFEM assembly oracle in CUDA builds.
+set_source_files_properties(test_dg_mapped_dense.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_dg_mapped_dense_command dg_igr_dg_mapped_dense_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_dg_mapped_dense_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dg_mapped_dense_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dg_mapped_dense_cpu
+  COMMAND ${_igrlab_dg_mapped_dense_command} cpu)
+set_tests_properties(dg_igr_dg_mapped_dense_cpu PROPERTIES
+  LABELS "dg;mapped;dense;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dg_mapped_dense_cuda
+    COMMAND ${_igrlab_dg_mapped_dense_command} cuda)
+  set_tests_properties(dg_igr_dg_mapped_dense_cuda PROPERTIES
+    LABELS "dg;mapped;dense;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_face_density_host_cache_test
   test_igr_face_density_host_cache.cpp)
 target_link_libraries(dg_igr_face_density_host_cache_test PRIVATE igr_mfem mfem)

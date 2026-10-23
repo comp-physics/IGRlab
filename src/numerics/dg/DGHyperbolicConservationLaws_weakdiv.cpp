@@ -62,15 +62,16 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
     for (int e = 0; e < ne; ++e)
     {
       const int eoff = e * dof * dof * dim;
-      for (int i = 0; i < dof; ++i)
+      // Pack the original physical block by columns once. Output-row CUDA
+      // threads then read adjacent matrix entries without a second copy.
+      for (int j = 0; j < dof; ++j)
       {
-        const int ioff = eoff + i * dof * dim;
-        for (int j = 0; j < dof; ++j)
+        for (int d = 0; d < dim; ++d)
         {
-          const int joff = ioff + j * dim;
-          for (int d = 0; d < dim; ++d)
+          const int column_offset = eoff + (j * dim + d) * dof;
+          for (int i = 0; i < dof; ++i)
           {
-            weak_flat[joff + d] = weakdiv[e](i, j * dim + d);
+            weak_flat[column_offset + i] = weakdiv[e](i, j * dim + d);
           }
         }
       }
@@ -376,13 +377,15 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
   const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  const bool rows_admitted = UsePackedDenseRows_(vfes, dof, neq);
+  const bool dense_rows = !shared && rows_admitted;
   const bool fusion_requested = ::igrlab::EnvFlagEnabledDefault(
     "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION", false);
   const char* execution = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
   const bool requested_pointwise = execution && std::string(execution) == "pointwise";
   MFEM_VERIFY(!execution || std::string(execution) == "element" || requested_pointwise,
               "SHARED_EULER_FLUX_EXECUTION must be element or pointwise.");
-  const bool pointwise = shared && requested_pointwise;
+  const bool pointwise = (shared && requested_pointwise) || dense_rows;
   if (shared)
   {
     MFEM_VERIFY(weakdiv_shared_flux_execution_ < 0 ||
@@ -637,7 +640,16 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               "Volume-node speed tracking is restricted to exact "
               "invariant-domain Euler+IGR fluxes.");
 
+  Vector state_copy;
 #ifdef DG_IGR_HAS_ACCEL_FORALL
+  if (dense_rows)
+  {
+    const std::size_t flux_entries = std::size_t(ne) * dof * dim * neq;
+    MFEM_VERIFY(flux_entries <= std::size_t(std::numeric_limits<int>::max()),
+                "Packed dense Euler flux scratch exceeds native indexing.");
+    weakdiv_shared_flux_.SetSize(static_cast<int>(flux_entries));
+    weakdiv_shared_flux_.UseDevice(true);
+  }
   if (track_volume_speed && weakdiv_volume_speed_.Size() != ne)
   {
     weakdiv_volume_speed_.SetSize(ne);
@@ -659,7 +671,17 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.state_map = invmass_elem_vdof_map_.Read();
   kernel.weakdiv = shared ? nullptr : weakdiv_data_flat_.Read();
   kernel.x = x_in.Read();
-  kernel.z = shared ? nullptr : z_inout.ReadWrite();
+  kernel.z = (shared || dense_rows) ? nullptr : z_inout.ReadWrite();
+  // Two-pass row/shared execution reads all state before writing the residual.
+  // Only overlapping element execution needs a snapshot.
+  if (kernel.z && PackedPointersOverlap_(kernel.x, x_in.Size(),
+                                        kernel.z, z_inout.Size()))
+  {
+    state_copy.SetSize(x_in.Size());
+    state_copy.UseDevice(true);
+    state_copy = x_in;
+    kernel.x = state_copy.Read();
+  }
   kernel.volume_speed =
     track_volume_speed ? weakdiv_volume_speed_.Write() : nullptr;
   kernel.q_sigma_telemetry =
@@ -667,13 +689,13 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.sigma_map = sigma_map;
   kernel.sigma_interp = sigma_interp;
   kernel.sigma_vals = sigma_vals;
-  kernel.packed_flux = shared ? weakdiv_shared_flux_.Write() : nullptr;
+  kernel.packed_flux = (shared || dense_rows) ? weakdiv_shared_flux_.Write() : nullptr;
   if (pointwise)
   {
     // EvalNode_ may be called concurrently only for the independent packed
     // flux rows. The legacy fused residual scatter remains element-parallel.
     MFEM_VERIFY(kernel.packed_flux != nullptr,
-                "Pointwise DG flux preparation requires the shared packed output.");
+                "Pointwise DG flux preparation requires packed output scratch.");
     if (track_volume_speed && weakdiv_point_speed_.Size() != ne * dof)
     {
       weakdiv_point_speed_.SetSize(ne * dof);
@@ -691,7 +713,13 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   {
     mfem::forall(ne, kernel);
   }
-  if (conservative_fusion)
+  if (dense_rows)
+  {
+    mfem::forall(ne * dof * neq, PackedWeakDivRowsKernel{
+      dof, neq, dim, invmass_elem_vdof_map_.Read(), weakdiv_data_flat_.Read(),
+      weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+  }
+  else if (conservative_fusion)
   {
     weakdiv_shared_map_->ApplyDGConservativeFusion(
       weakdiv_shared_flux_, weakdiv_shared_column_sums_, weakdiv_shared_row_sums_,
@@ -723,6 +751,11 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   auto weak_flat = weakdiv_data_flat_.HostRead();
   auto xh = x_in.HostRead();
   auto zh = z_inout.HostReadWrite();
+  if (PackedPointersOverlap_(xh, x_in.Size(), zh, z_inout.Size()))
+  {
+    state_copy = x_in;
+    xh = state_copy.HostRead();
+  }
   auto sigma_map_h = weakdiv_sigma_elem_dof_map_.HostRead();
   auto sigma_interp_h = weakdiv_sigma_exact_nodes_ ? nullptr :
     weakdiv_sigma_interp_.HostRead();
@@ -815,12 +848,12 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
       for (int i = 0; i < dof; ++i)
       {
-        const int wbase = weak_off + i * dof * dim + j * dim;
+        const int wbase = weak_off + i + dof * j * dim;
 
         real_t sum_rho = 0.0;
         for (int d = 0; d < dim; ++d)
         {
-          sum_rho += weak_flat[wbase + d] * mom[d];
+          sum_rho += weak_flat[wbase + dof * d] * mom[d];
         }
         zh[state_map[state_off + i * neq + 0]] += sum_rho;
 
@@ -839,7 +872,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
                   TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
-            sum_m += weak_flat[wbase + d] * flux_md;
+            sum_m += weak_flat[wbase + dof * d] * flux_md;
           }
           zh[state_map[state_off + i * neq + (1 + m)]] += sum_m;
         }
@@ -854,7 +887,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               TensorSigmaEnergyTermFromInverseDensity(
                 sigma_j, mom[d], inv_rho_sigma);
           }
-          sum_e += weak_flat[wbase + d] * flux_ed;
+          sum_e += weak_flat[wbase + dof * d] * flux_ed;
         }
         zh[state_map[state_off + i * neq + energy_eq]] += sum_e;
       }
@@ -872,8 +905,12 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     std::cout << "[dg-device] event=weakdiv-volume-path"
               << " selected=" << (shared ? "shared-reference-" : "packed-mfem-forall-")
               << (use_sigma ? "euler-igr" : "euler")
-              << " flux_execution=" << (pointwise ? "pointwise" : "element")
-              << " backend=device\n";
+              << " flux_execution=" << (pointwise ? "pointwise" : "element");
+    if (!shared)
+    {
+      std::cout << " dense_execution=" << (dense_rows ? "rows" : "element");
+    }
+    std::cout << " backend=device\n";
     weakdiv_volume_path_logged_ = true;
   }
   return track_volume_speed

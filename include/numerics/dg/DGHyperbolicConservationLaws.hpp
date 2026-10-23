@@ -698,13 +698,14 @@ private:
 
   /// Per-element scalar dof count used by packed weak-divergence apply.
   int weakdiv_elem_dof_ = 0;
-  /// Flattened per-element weak-divergence blocks (row-major dof x (dof*dim)).
+  /// Column-major per-element weak-divergence blocks (dof x (dof*dim)).
   Vector weakdiv_data_flat_;
   mutable std::unique_ptr<::igrlab::shared_reference::Map> weakdiv_shared_map_;
   mutable DenseMatrix weakdiv_shared_row_sums_;
   mutable Vector weakdiv_shared_column_sums_;
   mutable Vector weakdiv_shared_mass_fractions_;
   mutable Vector weakdiv_shared_moment_correction_;
+  /// Pointwise FP64 flux scratch for shared maps or dense row applications.
   mutable Vector weakdiv_shared_flux_;
   /// Fixed shared flux launch policy for the lifetime of the packed setup.
   mutable int weakdiv_shared_flux_execution_ = -1;
@@ -712,7 +713,7 @@ private:
   mutable int weakdiv_shared_conservative_fusion_request_ = -1;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;
-  /// Optional pointwise speed scratch for the shared Euler flux preparation.
+  /// Optional pointwise speed scratch for the pointwise Euler flux preparation.
   mutable Vector weakdiv_point_speed_;
   /// Persistent per-volume-node q_sigma aggregates (five FP64 scalars/slot).
   mutable Array<double> weakdiv_q_sigma_telemetry_;

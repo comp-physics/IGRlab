@@ -141,6 +141,9 @@ void DGHyperbolicConservationLaws::ComputeInvMass()
 
 void DGHyperbolicConservationLaws::BuildInvMassApplyData_()
 {
+  // Reject malformed execution policy even when this backend keeps the
+  // original element algorithm or the mass turns out to be diagonal.
+  (void)UsePackedDenseRows_(vfes, 0, num_equations);
   invmass_apply_ready_ = false;
   face_data_dirty_ = true;
   invmass_elem_dof_ = 0;
@@ -351,7 +354,16 @@ void DGHyperbolicConservationLaws::ApplyInverseMassPacked_(
   auto minv = invmass_data_flat_.Read();
   auto zin = z_in.Read();
   auto yout = y_out.Write();
-
+  if (PackedPointersOverlap_(zin, z_in.Size(), yout, y_out.Size()))
+  {
+    // Dense row outputs must not overwrite inputs still needed by another
+    // output. Offset aliases also require a snapshot for diagonal masses.
+    Vector input_copy(z_in.Size());
+    input_copy.UseDevice(true);
+    input_copy = z_in;
+    ApplyInverseMassPacked_(input_copy, y_out);
+    return;
+  }
   if (invmass_data_flat_.Size() == ne * dof)
   {
     PackedDiagonalInverseMassKernel kernel;
@@ -374,15 +386,23 @@ void DGHyperbolicConservationLaws::ApplyInverseMassPacked_(
 #ifdef DG_IGR_HAS_ACCEL_FORALL
   // invmass_data_flat_ stores each local inverse mass in column-major order:
   // entry (row=i, col=j) is minv[moff + j*dof + i].
-  PackedInverseMassKernel kernel;
-  kernel.dof = dof;
-  kernel.neq = neq;
-  kernel.ldof = ldof;
-  kernel.map = map;
-  kernel.minv = minv;
-  kernel.zin = zin;
-  kernel.yout = yout;
-  mfem::forall(ne, kernel);
+  if (UsePackedDenseRows_(vfes, dof, neq))
+  {
+    mfem::forall(ne * ldof, PackedInverseMassRowsKernel{
+      dof, neq, map, minv, zin, yout});
+  }
+  else
+  {
+    PackedInverseMassKernel kernel;
+    kernel.dof = dof;
+    kernel.neq = neq;
+    kernel.ldof = ldof;
+    kernel.map = map;
+    kernel.minv = minv;
+    kernel.zin = zin;
+    kernel.yout = yout;
+    mfem::forall(ne, kernel);
+  }
 #else
   for (int e = 0; e < ne; ++e)
   {
@@ -410,6 +430,14 @@ void DGHyperbolicConservationLaws::ApplyInverseMassHost_(
   const Vector& z_in,
   Vector& y_out) const
 {
+  const real_t* input = z_in.HostRead();
+  real_t* output = y_out.HostWrite();
+  if (PackedPointersOverlap_(input, z_in.Size(), output, y_out.Size()))
+  {
+    Vector input_copy(z_in);
+    ApplyInverseMassHost_(input_copy, y_out);
+    return;
+  }
   if (invmass_apply_ready_)
   {
     const int ne = vfes.GetNE();
@@ -419,8 +447,8 @@ void DGHyperbolicConservationLaws::ApplyInverseMassHost_(
 
     auto map = invmass_elem_vdof_map_.HostRead();
     auto minv = invmass_data_flat_.HostRead();
-    auto zin = z_in.HostRead();
-    auto yout = y_out.HostWrite();
+    const real_t* zin = input;
+    real_t* yout = output;
 
     if (invmass_data_flat_.Size() == ne * dof)
     {
@@ -473,6 +501,8 @@ void DGHyperbolicConservationLaws::ApplyInverseMassHost_(
 void DGHyperbolicConservationLaws::ApplyInverseMass_(const Vector& z_in,
                                                      Vector& y_out) const
 {
+  const bool dense_rows =
+    UsePackedDenseRows_(vfes, invmass_elem_dof_, num_equations);
   if (Device::Allows(Backend::DEVICE_MASK))
   {
     MFEM_VERIFY(invmass_apply_ready_,
@@ -482,6 +512,9 @@ void DGHyperbolicConservationLaws::ApplyInverseMass_(const Vector& z_in,
     {
       std::cout << "[dg-device] event=invmass-path"
                 << " selected=packed-mfem-forall"
+                << " dense_execution="
+                << (invmass_data_flat_.Size() == vfes.GetNE() * invmass_elem_dof_
+                      ? "diagonal" : (dense_rows ? "rows" : "element"))
                 << " backend=device\n";
       invmass_path_logged_ = true;
     }

@@ -10,6 +10,43 @@ namespace
 
 using DeviceBoundaryType = detail::EulerBoundaryStateKind;
 
+// Keep the element algorithm available for matched execution checks. The
+// canonical IGRLAB_ spelling is resolved by GetEnv before its legacy alias.
+inline bool UsePackedDenseRows_(const FiniteElementSpace& fes, int dof, int neq)
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_DG_PACKED_DENSE_EXECUTION");
+  MFEM_VERIFY(!value || std::string(value) == "element" ||
+                std::string(value) == "rows",
+              "IGRLAB_DG_PACKED_DENSE_EXECUTION must be element or rows.");
+  const bool requested = !value || std::string(value) == "rows";
+#if defined(MFEM_USE_CUDA) && defined(DG_IGR_HAS_ACCEL_FORALL)
+  const unsigned long ordinary_backends =
+    static_cast<unsigned long>(Backend::CPU) |
+    static_cast<unsigned long>(Backend::CUDA);
+  return requested && Device::Allows(Backend::CUDA) &&
+    !Device::Allows(~ordinary_backends) &&
+    dynamic_cast<const L2_FECollection*>(fes.FEColl()) &&
+    dof > 0 && neq > 0 &&
+    static_cast<long long>(fes.GetNE()) * dof * neq == fes.GetVSize();
+#else
+  (void)fes; (void)dof; (void)neq; (void)requested;
+  return false;
+#endif
+}
+
+// Compare the pointers already required by the apply, including offset aliases.
+// Inspecting device pointers avoids host synchronization for this admission.
+inline bool PackedPointersOverlap_(const real_t* a, int a_size,
+                                   const real_t* b, int b_size)
+{
+  if (a_size == 0 || b_size == 0) { return false; }
+  const auto first = reinterpret_cast<std::uintptr_t>(a);
+  const auto second = reinterpret_cast<std::uintptr_t>(b);
+  return first <= second
+    ? second - first < std::size_t(a_size) * sizeof(real_t)
+    : first - second < std::size_t(b_size) * sizeof(real_t);
+}
+
 constexpr int kFrozenSigmaTelemetryWidth_ = 5;
 constexpr int kFrozenSigmaSampleCount_ = 0;
 constexpr int kFrozenSigmaNonpositiveCount_ = 1;
@@ -310,6 +347,31 @@ struct PackedInverseMassKernel
   }
 };
 
+// One output coefficient per thread. Adjacent rows read adjacent entries of
+// the original column-major physical inverse; each dot product keeps j order.
+struct PackedInverseMassRowsKernel
+{
+  int dof = 0;
+  int neq = 0;
+  const int* map = nullptr;
+  const real_t* minv = nullptr;
+  const real_t* zin = nullptr;
+  real_t* yout = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, column = entry / dof;
+    const int eq = column % neq, e = column / neq;
+    const int voff = e * dof * neq, moff = e * dof * dof;
+    real_t sum = 0.0;
+    for (int j = 0; j < dof; ++j)
+    {
+      sum += minv[moff + j * dof + i] * zin[map[voff + j * neq + eq]];
+    }
+    yout[map[voff + i * neq + eq]] = sum;
+  }
+};
+
 struct PackedWeakDivEulerKernel
 {
   int dof = 0;
@@ -436,13 +498,13 @@ struct PackedWeakDivEulerKernel
     const int weak_off = e * dof * dof * dim;
     for (int i = 0; i < dof; ++i)
     {
-      const int wbase = weak_off + i * (dof * dim) + j * dim;
+      const int wbase = weak_off + i + dof * j * dim;
 
       // Continuity equation.
       real_t sum_rho = 0.0;
       for (int d = 0; d < dim; ++d)
       {
-        sum_rho += weakdiv[wbase + d] * mom[d];
+        sum_rho += weakdiv[wbase + dof * d] * mom[d];
       }
       z[state_map[state_off + i * neq + 0]] += sum_rho;
 
@@ -462,7 +524,7 @@ struct PackedWeakDivEulerKernel
                 TensorSigmaMomentumDiagonalTerm(sigma_j);
             }
           }
-          sum_m += weakdiv[wbase + d] * flux_md;
+          sum_m += weakdiv[wbase + dof * d] * flux_md;
         }
         z[state_map[state_off + i * neq + (1 + m)]] += sum_m;
       }
@@ -478,7 +540,7 @@ struct PackedWeakDivEulerKernel
             TensorSigmaEnergyTermFromInverseDensity(
               sigma_j, mom[d], inv_rho_sigma);
         }
-        sum_e += weakdiv[wbase + d] * flux_ed;
+        sum_e += weakdiv[wbase + dof * d] * flux_ed;
       }
       z[state_map[state_off + i * neq + energy_eq]] += sum_e;
     }
@@ -536,6 +598,43 @@ struct PackedSharedWeakDivPointSpeedKernel
       speed = fmax(speed, point_speed[e * dof + j]);
     }
     element_speed[e] = speed;
+  }
+};
+
+// Use the same pointwise FP64 flux as the shared map, with each physical
+// per-element matrix retained. Rows are contiguous in the packed matrix.
+// Preserve the element kernel's directional subtotal and per-node addition
+// order, starting from the existing face residual.
+struct PackedWeakDivRowsKernel
+{
+  int dof = 0;
+  int neq = 0;
+  int dim = 0;
+  const int* map = nullptr;
+  const real_t* weakdiv = nullptr;
+  const real_t* flux = nullptr;
+  real_t* z = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, column = entry / dof;
+    const int eq = column % neq, e = column / neq;
+    const int output = map[e * dof * neq + i * neq + eq];
+    const int matrix_offset = e * dof * dof * dim;
+    const int flux_offset = (e * neq + eq) * dof * dim;
+    real_t value = z[output];
+    for (int j = 0; j < dof; ++j)
+    {
+      real_t subtotal = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        const int col = j * dim + d;
+        subtotal += weakdiv[matrix_offset + col * dof + i] *
+                    flux[flux_offset + col];
+      }
+      value += subtotal;
+    }
+    z[output] = value;
   }
 };
 
