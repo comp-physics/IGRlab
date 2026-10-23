@@ -192,7 +192,9 @@ add_executable(dg_igr_unit_tests
   test_diagnostics.cpp
 )
 
-add_executable(dg_igr_exact_face_test test_igr_exact_face.cpp)
+add_executable(dg_igr_exact_face_test
+  test_igr_exact_face.cpp
+  test_igr_exact_face_host_query.cpp)
 target_link_libraries(dg_igr_exact_face_test PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_exact_face_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 set(_igrlab_exact_face_command dg_igr_exact_face_test)

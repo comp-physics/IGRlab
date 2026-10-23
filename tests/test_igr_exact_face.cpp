@@ -21,6 +21,13 @@
 #include <string>
 #include <vector>
 
+namespace exact_face_test
+{
+bool CompactLiftHostQuery(
+  const ::igrlab::dg_face::InteriorFaceDGDiffusionApplyInfo& info,
+  const ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch& work);
+}
+
 namespace
 {
 // Keep namespace directives out of this CUDA translation unit: NVCC's
@@ -1797,6 +1804,10 @@ void CheckCompactFaceLifts()
     auto& factors = work.normal_factorization;
     MFEM_VERIFY(factors.TensorMatches(info) && factors.tensor_native_to_lex.Size() == 36,
                 "Focused compact-lift fixtures must have independently admitted p5/Q6 packs.");
+    work.compact_lift = true;
+    MFEM_VERIFY(!exact_face_test::CompactLiftHostQuery(info, work),
+                "Host query must reject geometry without refreshed current side coefficients.");
+    work.compact_lift = false;
     CheckTensorFacePack(info, work, fes, mesh, fqs);
     const int* initial_forward = factors.tensor_lex_to_native.HostRead();
     const int* initial_inverse = factors.tensor_native_to_lex.HostRead();
@@ -1820,13 +1831,16 @@ void CheckCompactFaceLifts()
         original.UseDevice(true); actual.UseDevice(true);
         original = 0.03125; actual = 0.03125;
         work.compact_lift = false;
+        MFEM_VERIFY(!exact_face_test::CompactLiftHostQuery(info, work),
+                    "Host query must respect the disabled compact-lift selector.");
         LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, original);
         Vector old_rows(work.face_contribution);
         old_diagonal = 0.125;
         ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(info, work, ip_sigma, old_diagonal);
         work.compact_lift = true;
-        MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == native_cuda,
-                    "Compact-lift selector must agree with actual backend admission.");
+        MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == native_cuda &&
+                      exact_face_test::CompactLiftHostQuery(info, work) == native_cuda,
+                    "Host C++ and CUDA compact-lift queries must agree with actual backend admission.");
         LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, actual);
         const Vector rows = RecordedFaceContributions(info, work);
         MFEM_VERIFY(SameBits(actual, original) && SameBits(rows, old_rows),
@@ -1879,8 +1893,9 @@ void CheckCompactFaceLifts()
     const Vector dense_expected = OriginalRecordAndGather(dense_info, dense, x, -1.0, dense_rows);
     auto fallback = [&]()
     {
-      MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work),
-                  "Invalid compact metadata must decline before any compact gather.");
+      MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) &&
+                    !exact_face_test::CompactLiftHostQuery(info, work),
+                  "Invalid compact metadata must decline in host C++ and CUDA before any compact gather.");
       Vector actual(x.Size()); actual.UseDevice(true); actual = 0.03125;
       const Vector unchanged(actual);
       MFEM_VERIFY(!::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
@@ -1904,15 +1919,17 @@ void CheckCompactFaceLifts()
     Vector recovered(x.Size()); recovered.UseDevice(true); recovered = 0.03125;
     LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, recovered);
     CheckFactorizationError(recovered, dense_expected, "Compact lift recovers after invalid metadata");
-    MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == native_cuda,
-                "Restored current inverse/geometry/coefficient metadata must recover compact admission.");
+    MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == native_cuda &&
+                  exact_face_test::CompactLiftHostQuery(info, work) == native_cuda,
+                "Restored current metadata must recover host C++ and CUDA compact admission.");
     LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
       info, work, side_q, 2.75, DGDiffusionFaceScaling::HarmonicWeighted);
     dense_info = build(dense, false, DGDiffusionFaceScaling::HarmonicWeighted);
     Vector harmonic(x.Size()), harmonic_rows;
     harmonic.UseDevice(true); harmonic = 0.03125;
-    MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work),
-                "Harmonic weighting must decline compact lifts with otherwise valid tensor/inverse metadata.");
+    MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) &&
+                  !exact_face_test::CompactLiftHostQuery(info, work),
+                "Harmonic weighting must decline host C++ and CUDA compact admission with valid tensor/inverse metadata.");
     LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, harmonic);
     const Vector harmonic_expected = OriginalRecordAndGather(dense_info, dense, x, -1.0, harmonic_rows);
     CheckFactorizationError(harmonic, harmonic_expected, "Compact-lift harmonic dense fallback");

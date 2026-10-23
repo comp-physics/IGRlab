@@ -289,11 +289,13 @@ inline bool UsesOrdinaryCUDAForDGDiffusionFaces2D()
 
 // This private witness is also the dispatch predicate. Its inverse-map proof
 // belongs to the geometry build; applies only compare revisions and sizes.
+// Host C++ selection logs query the same metadata as CUDA dispatch. Keep this
+// body independent of the translation-unit compiler; launches remain guarded.
 inline bool UsesInteriorFaceDGDiffusionCompactLift2D(
   const InteriorFaceDGDiffusionApplyInfo& info,
   const InteriorFaceDGDiffusionApplyScratch& work)
 {
-#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+#if defined(MFEM_USE_CUDA) && defined(MFEM_USE_DOUBLE)
   const auto& factor = work.normal_factorization;
   return work.compact_lift && UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
     HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work) &&
