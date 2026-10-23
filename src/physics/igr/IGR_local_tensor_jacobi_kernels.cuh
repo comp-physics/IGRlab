@@ -315,11 +315,12 @@ __global__ void ApplyTensorFactorTF32(const int* map, const int* group_elements,
 // FP64 8x8x4 WMMA performs each padded 6x6 transform as two K tiles and two
 // 8-column accumulators. Repacking and each element's reciprocal diagonal
 // remain in shared memory throughout the four transforms.
+template <bool add_to_solution>
 __global__ void ApplyTensorFactorFP64(const int* map, const int* group_elements,
                                      const int* group_classes, const double* factors,
                                      const double* element_diagonals,
                                      const double* scaling, const double* input,
-                                     double* output)
+                                     double* output, double omega = 0.0)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   using namespace nvcuda;
@@ -405,7 +406,16 @@ __global__ void ApplyTensorFactorFP64(const int* map, const int* group_elements,
     {
       const double value = v[(t / tensor_axis) * columns + slot * tensor_axis + t % tensor_axis];
       const int entry = e * tensor_dofs + t;
-      output[map[entry]] = scaling[entry] * value;
+      if constexpr (add_to_solution)
+      {
+        // Mult stores this product before Vector::Add sees it. Retain that
+        // rounding; otherwise contraction can change omega*(scaling*value).
+        const double correction = __dmul_rn(scaling[entry], value);
+        // Vector::Add deliberately does nothing for either sign of zero,
+        // including when the unused correction contains a NaN or infinity.
+        if (omega != 0.0) { output[map[entry]] += omega * correction; }
+      }
+      else { output[map[entry]] = scaling[entry] * value; }
     }
   }
 #else

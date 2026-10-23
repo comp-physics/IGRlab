@@ -592,7 +592,7 @@ public:
       }
       else if (execution_ == TensorExecution::FactorFP64)
       {
-        ApplyTensorFactorFP64<<<groups, 6 * 32>>>(map, elements, classes, factors_.Read(),
+        ApplyTensorFactorFP64<false><<<groups, 6 * 32>>>(map, elements, classes, factors_.Read(),
           diagonal, scaling, input, output);
       }
       else if (execution_ == TensorExecution::DenseTF32)
@@ -612,6 +612,35 @@ public:
       }
     }
     MFEM_GPU_CHECK(cudaGetLastError());
+  }
+
+  bool TryAddMult(const mfem::Vector& rhs, mfem::real_t omega,
+                  mfem::Vector& solution) const override
+  {
+    if (reference_ != TensorReference::Projected || execution_ != TensorExecution::FactorFP64 ||
+        !ready_ || rhs.Size() != height || solution.Size() != height)
+    { return false; }
+    CheckTopology();
+    const double* input = rhs.Read();
+    const double* current = solution.Read();
+    const auto a = reinterpret_cast<std::uintptr_t>(input);
+    const auto b = reinterpret_cast<std::uintptr_t>(current);
+    const auto bytes = std::size_t(height) * sizeof(double);
+    if ((a < b ? b - a : a - b) < bytes) { return false; }
+    // Setup proves that every native dof occurs in exactly one grouped real
+    // element. Padding owns no row; no other group can write this solution.
+    ApplyTensorFactorFP64<true><<<grouped_classes_.Size(), 6 * 32>>>(
+      element_dofs_.Read(), grouped_elements_.Read(), grouped_classes_.Read(), factors_.Read(),
+      element_diagonals_.Read(), inverse_sqrt_mass_.Read(), input, solution.ReadWrite(), omega);
+    MFEM_GPU_CHECK(cudaGetLastError());
+    if (!update_execution_reported_)
+    {
+      std::cout << "[igr-local-tensor-jacobi] event=execution path=fused-solution-update"
+                << " reference=projected backend=wmma-factor-fp64 correction_rounding=fp64"
+                << " elements=" << ne_ << " groups=" << grouped_classes_.Size() << std::endl;
+      update_execution_reported_ = true;
+    }
+    return true;
   }
 
 private:
@@ -1069,6 +1098,7 @@ private:
   mfem::Vector mass_basis_squared_, element_diagonals_;
   int mass_axis_ = 0, maximum_geometry_order_ = 1;
   bool prepared_ = false, ready_ = false;
+  mutable bool update_execution_reported_ = false;
 };
 }
 

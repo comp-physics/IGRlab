@@ -1137,6 +1137,43 @@ public:
     return added;
   }
 
+  bool CanCompleteResidual(const mfem::Vector& x,
+                           const mfem::Vector& rhs,
+                           const mfem::Vector& y) const
+  {
+    const auto* mesh = sfes_.GetMesh();
+    return HasDirectIdentityLayout() && !has_shared_ && mesh &&
+      mesh->GetSequence() == mesh_sequence_ &&
+      mesh->GetNodesSequence() == nodes_sequence_ &&
+      x.Size() == Width() && y.Size() == Height() &&
+      dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+        info_, scratch_, x, rhs, y);
+  }
+
+  void CompleteResidual(const mfem::Vector& x,
+                        const mfem::Vector& rhs,
+                        mfem::Vector& y) const
+  {
+    const auto start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    {
+      ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
+      dg_face::LaunchInteriorFaceDGDiffusionResidual2D(
+        info_, scratch_, x, ip_sigma_, rhs, y);
+    }
+    if (!residual_execution_reported_)
+    {
+      std::cout << "[igr-element-block-jacobi] event=execution path=fused-current-residual"
+                << " face=compact-lift fp64_order=volume-plus-completed-face-then-rhs-minus"
+                << " elements=" << info_.ne << " interior_faces=" << info_.nf << std::endl;
+      residual_execution_reported_ = true;
+    }
+    if (timing_enabled_)
+    {
+      timing_.local_apply_seconds += ElapsedSeconds(start);
+      ++timing_.mult_calls;
+    }
+  }
+
   mfem::MemoryClass GetMemoryClass() const override
   {
     return mfem::Device::GetDeviceMemoryClass();
@@ -1341,6 +1378,7 @@ private:
   mutable mfem::Vector local_y_;
   mutable mfem::ParGridFunction local_x_gf_;
   bool timing_enabled_ = false;
+  mutable bool residual_execution_reported_ = false;
   mutable ExactFaceTimingStats timing_;
 };
 
@@ -1403,6 +1441,37 @@ public:
   }
 
   long long LastMultCalls() const { return operator_mult_calls_; }
+
+  bool TryResidual(const mfem::Vector& x,
+                   const mfem::Vector& rhs,
+                   mfem::Vector& residual) const
+  {
+    // Finish every admission check before submitting the volume action. A
+    // declined attempt leaves the original Mult/subtract path untouched.
+    if (!direct_identity_system_ || !exact_face_ ||
+        !exact_face_->CanCompleteResidual(x, rhs, residual))
+    { return false; }
+    ::igrlab::NVTXRange range("IGR/exact-sum/residual");
+    ++operator_mult_calls_;
+    const auto base_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    {
+      ::igrlab::NVTXRange base_range("IGR/exact-sum/base");
+      base_->Mult(x, residual);
+    }
+    if (timing_enabled_)
+    { timing_.base_seconds += ElapsedSeconds(base_start); }
+    const auto face_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    {
+      ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
+      exact_face_->CompleteResidual(x, rhs, residual);
+    }
+    if (timing_enabled_)
+    {
+      timing_.face_seconds += ElapsedSeconds(face_start);
+      ++timing_.mult_calls;
+    }
+    return true;
+  }
 
   void LogTimingSummary(MPI_Comm comm,
                         int solve_call,
@@ -2897,20 +2966,39 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     correction.SetSize(X_.Size());
     residual.UseDevice(true);
     correction.UseDevice(true);
+    // Initialization retains the original application sequence and reference
+    // setup. Regular sweeps may finish b-Ax inside the exact face row gather.
+    const bool fused_residual_enabled = initialized && element_jacobi_tensor_blocks_ &&
+      using_tensor_volume && tensor_volume_mode == "simt" &&
+      ::igrlab::EnvFlagEnabledDefault(
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL", false);
+    const bool fused_update_enabled = initialized && element_jacobi_tensor_blocks_ &&
+      ::igrlab::EnvFlagEnabledDefault(
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_UPDATE", false);
+    int fused_residual_sweeps = 0;
+    int fused_update_sweeps = 0;
     const auto sweep_start = Clock::now();
     for (int sweep = 0; sweep < sweeps; ++sweep)
     {
       ::igrlab::NVTXRange sweep_range("IGR/element-jacobi-sweep");
+      bool fused_residual = false;
       {
         ::igrlab::NVTXRange apply_range("IGR/element-jacobi-current-A");
-        iteration_operator->Mult(X_, residual);
+        fused_residual = fused_residual_enabled &&
+          iteration_face_sum->TryResidual(X_, B_, residual);
+        if (!fused_residual) { iteration_operator->Mult(X_, residual); }
       }
-      subtract(B_, residual, residual);
+      if (!fused_residual) { subtract(B_, residual, residual); }
+      else { ++fused_residual_sweeps; }
+      bool fused_update = false;
       {
         ::igrlab::NVTXRange block_range("IGR/element-jacobi-block-solve");
-        blocks.Mult(residual, correction);
+        fused_update = fused_update_enabled &&
+          blocks.TryAddMult(residual, element_jacobi_omega_, X_);
+        if (!fused_update) { blocks.Mult(residual, correction); }
       }
-      X_.Add(element_jacobi_omega_, correction);
+      if (!fused_update) { X_.Add(element_jacobi_omega_, correction); }
+      else { ++fused_update_sweeps; }
     }
     last_krylov_operator_apply_count_ = sweeps;
     last_krylov_preconditioner_apply_count_ = sweeps;
@@ -2956,6 +3044,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       std::cout << "[igr-element-block-jacobi] event=solve"
                 << " solve_call=" << linear_solve_calls_
                 << " sweeps=" << sweeps
+                << " fused_residual_sweeps=" << fused_residual_sweeps
+                << " fused_update_sweeps=" << fused_update_sweeps
                 << " warm_effective=" << last_warm_start_effective_
                 << " converged=0 acceptance=fixed-sweeps"
                 << " true_residual_rel_rhs=" << last_linear_true_residual_rel_rhs_

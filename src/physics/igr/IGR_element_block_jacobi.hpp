@@ -36,6 +36,13 @@ public:
   // The local tensor surrogate changes only its physical mass diagonal.
   // Current-LU and frozen explicit-inverse modes retain their existing policy.
   virtual void RefreshMassScaling(const mfem::QuadratureFunction&) { }
+  // Optional fixed-sweep action x += omega * P rhs. A declined attempt makes
+  // no numerical updates or operator launches; callers retain Mult + Add.
+  // Acquiring current device pointers may allocate or transfer storage.
+  // Implementations must preserve the rounded FP64 correction before damping
+  // and prove disjoint input/output ranges even for MFEM aliases.
+  virtual bool TryAddMult(const mfem::Vector&, mfem::real_t,
+                          mfem::Vector&) const { return false; }
   // Optional immutable metadata for local tensor implementations. A null name
   // preserves the existing current-LU/reference-inverse labels at the caller.
   virtual const char* BackendName() const { return nullptr; }

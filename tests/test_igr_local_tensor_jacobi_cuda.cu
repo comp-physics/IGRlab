@@ -701,6 +701,75 @@ void FillSignedResidual(Vector& rhs, int exponent, bool second = false)
   }
 }
 
+void CheckFusedSolutionUpdate(::igrlab::igr_internal::ElementBlockJacobi& backend,
+                              const Vector& rhs, bool expected_admitted)
+{
+  const int n = rhs.Size(), padding = 7;
+  Vector live_rhs(rhs), input_view, correction(n), expected(n), padded(n + 2 * padding), output;
+  for (Vector* value : {&live_rhs, &correction, &expected, &padded}) { value->UseDevice(true); }
+  const auto same = [](const Vector& a, const Vector& b)
+  {
+    const double* av = a.HostRead(); const double* bv = b.HostRead();
+    for (int i = 0; i < a.Size(); ++i)
+    {
+      if (std::isnan(av[i]) && std::isnan(bv[i])) { continue; }
+      if (std::memcmp(av + i, bv + i, sizeof(double)) != 0) { return false; }
+    }
+    return true;
+  };
+  for (const bool nonfinite : {false, true, false})
+  {
+    const double* initial = rhs.Read();
+    double* current = live_rhs.Write();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    mfem::forall(n, [=] MFEM_HOST_DEVICE(int i)
+    {
+      current[i] = nonfinite && i == 0 ? nan :
+        (nonfinite && i == 1 ? inf : initial[i] + 0.003 * std::cos(0.13 * (i + 1)));
+    });
+    input_view.MakeRef(live_rhs, 0, n);
+    MFEM_VERIFY(!input_view.GetMemory().HostIsValid(),
+                "Fused update fixture must present a current device RHS and a stale host copy.");
+    backend.Mult(input_view, correction);
+    for (const double omega : {0.7, 1.0, -0.5, 0.0, -0.0})
+    {
+      double* values = padded.HostWrite();
+      for (int i = 0; i < padded.Size(); ++i) { values[i] = 12345.0; }
+      for (int i = 0; i < n; ++i)
+      { values[padding + i] = i == 0 ? -0.0 : 0.125 * std::sin(0.09 * (i + 1)); }
+      output.MakeRef(padded, padding, n);
+      const Vector before(output);
+      expected = output; expected.Add(omega, correction);
+      const bool admitted = backend.TryAddMult(input_view, omega, output);
+      MFEM_VERIFY(admitted == expected_admitted,
+                  "Only the projected FP64 WMMA backend may admit the fused solution update.");
+      if (!admitted)
+      {
+        MFEM_VERIFY(same(output, before), "A declined local update modified the solution.");
+        backend.Mult(input_view, correction); output.Add(omega, correction);
+      }
+      MFEM_VERIFY(same(output, expected),
+                  "Fused update changed rounded correction, damping, native ordering or nonfinite propagation.");
+      const double* result = padded.HostRead();
+      for (int i = 0; i < padding; ++i)
+      { MFEM_VERIFY(result[i] == 12345.0 && result[n + padding + i] == 12345.0,
+                    "Fused update modified a padded alias boundary."); }
+    }
+  }
+  Vector overlap(n + 1), left, right;
+  overlap.UseDevice(true); overlap = 0.25;
+  left.MakeRef(overlap, 0, n); right.MakeRef(overlap, 1, n);
+  const Vector before(overlap);
+  MFEM_VERIFY(!backend.TryAddMult(left, 0.7, right) &&
+                !backend.TryAddMult(left, 0.7, left) && same(overlap, before),
+              "Fused local update must decline complete and offset RHS/solution overlap without writes.");
+  std::cout << "local_tensor_fused_update admitted=" << expected_admitted
+            << " ordinary_Mult_Add_parity=bitwise finite=true nonfinite=true recovery=true"
+            << " damping=positive:negative:signed-zero alias_boundaries=true overlap_declined=true"
+            << " device_current_rhs=true native_order=true\n";
+}
+
 void QualifyBackends(const std::vector<std::string>& modes)
 {
   TensorFixture fixture(4, 3, 1.3, 0.7, 0.017, true);
@@ -714,6 +783,8 @@ void QualifyBackends(const std::vector<std::string>& modes)
     ExecutionSelection select(mode);
     fixture.SetPhase(0);
     auto backend = fixture.Prepare(); backend->FactorBlocks();
+    FillSignedResidual(rhs, 0);
+    CheckFusedSolutionUpdate(*backend, rhs, false);
     struct Case { int phase, exponent; };
     std::vector<Case> cases{{0, 0}, {1, 0}, {2, 0}, {3, 0}, {2, 80}, {2, -80}};
     if (IsFP64(mode)) { cases.push_back({2, 700}); cases.push_back({2, -700}); }

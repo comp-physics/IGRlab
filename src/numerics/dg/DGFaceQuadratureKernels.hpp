@@ -497,6 +497,28 @@ bool TryLaunchInteriorFaceDGDiffusionAddToBase2D(
   mfem::real_t ip_sigma,
   mfem::Vector& y);
 
+// Private fixed-sweep finalizer: after the caller writes the current volume
+// action into y, replace it with rhs - (volume + completed face action).
+// Preflight performs no numerical kernels or logical output writes. Acquiring
+// device pointers may allocate or transfer storage. Disjoint read-only aliases
+// are admitted. The caller must preflight before computing
+// volume and leave the same geometry, coefficients and buffers bound until
+// Launch. Unsupported layouts retain the original full-operator path.
+bool CanLaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  const mfem::Vector& rhs,
+  const mfem::Vector& y);
+
+void LaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  const mfem::Vector& rhs,
+  mfem::Vector& y);
+
 void LaunchSharedFaceDGDiffusionApply2D(
   const SharedFaceDGDiffusionApplyInfo& info,
   const SharedFaceDGDiffusionApplyScratch& work,
@@ -2487,6 +2509,22 @@ struct InteriorFaceDGDiffusionGather2D
   const mfem::real_t* contribution = nullptr;
   mfem::real_t* y = nullptr;
   bool add_to_base = false;
+  const mfem::real_t* residual_rhs = nullptr;
+
+  MFEM_HOST_DEVICE void StoreResidual(int output, mfem::real_t sum) const
+  {
+    // Preserve the original three separately rounded operations:
+    // scratch = +0 + sum; action = volume + scratch; residual = rhs - action.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+    const mfem::real_t face = __dadd_rn(0.0, sum);
+    const mfem::real_t action = __dadd_rn(y[output], face);
+    y[output] = __dsub_rn(residual_rhs[output], action);
+#else
+    const mfem::real_t face = mfem::real_t(0.0) + sum;
+    const mfem::real_t action = y[output] + face;
+    y[output] = residual_rhs[output] - action;
+#endif
+  }
 
   MFEM_HOST_DEVICE void operator()(int row) const
   {
@@ -2506,7 +2544,11 @@ struct InteriorFaceDGDiffusionGather2D
     // One CUDA row owns each discontinuous scalar dof.  Interior and shared
     // gathers execute in stream order, so the latter may safely add here.
     const int output = D(local_dof, 0, element);
-    if (add_to_base)
+    if (residual_rhs)
+    {
+      StoreResidual(output, sum);
+    }
+    else if (add_to_base)
     {
       // Original order: scratch = +0; scratch += sum; base += scratch.
       // Explicit CUDA adds retain both roundings, including signed zeros and
@@ -2570,7 +2612,11 @@ struct InteriorFaceDGDiffusionTensorLiftGather2D
 #endif
     }
     const int output = D(native, 0, element);
-    if (add_to_base)
+    if (residual_rhs)
+    {
+      StoreResidual(output, sum);
+    }
+    else if (add_to_base)
     {
 #if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
       y[output] = __dadd_rn(y[output], __dadd_rn(0.0, sum));
@@ -2693,7 +2739,8 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   const mfem::Vector& scalar,
   mfem::real_t ip_sigma,
   mfem::Vector& y,
-  bool add_to_base = false)
+  bool add_to_base = false,
+  const mfem::Vector* residual_rhs = nullptr)
 {
   MFEM_VERIFY(info.vdim == 1 &&
                 scalar.Size() == info.ne * info.dof &&
@@ -2742,6 +2789,7 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
     gather.contribution = work.tensor_lift.Read();
     gather.y = y.ReadWrite();
     gather.add_to_base = add_to_base;
+    gather.residual_rhs = residual_rhs ? residual_rhs->Read() : nullptr;
     gather.endpoint = factor.tensor_endpoint.Read();
     gather.axes = factor.tensor_axes.Read();
     gather.face_slots = factor.tensor_face_slots.Read();
@@ -2818,6 +2866,7 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   gather.contribution = work.face_contribution.Read();
   gather.y = y.ReadWrite();
   gather.add_to_base = add_to_base;
+  gather.residual_rhs = residual_rhs ? residual_rhs->Read() : nullptr;
   mfem::forall(info.ne * info.dof, gather);
 }
 

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -393,6 +394,8 @@ public:
       {"IGR_LOCAL_TENSOR_PRECONDITIONER", "0"},
       {"IGR_LOCAL_TENSOR_REFERENCE", "exact"},
       {"IGR_LOCAL_TENSOR_EXECUTION", "simt-fp64"},
+      {"IGR_ELEMENT_JACOBI_FUSED_RESIDUAL", "0"},
+      {"IGR_ELEMENT_JACOBI_FUSED_UPDATE", "0"},
       {"IGR_TRUE_RESIDUAL", "1"}};
     for (const char* prefix : {"IGRLAB_", "DG_IGR_"})
       for (const auto& setting : settings)
@@ -738,6 +741,127 @@ void CheckLifecycle(bool reference_blocks, bool tensor_blocks = false)
                "discarded_prefetch=uncommitted different_state_initial_output=uncommitted "
                "reference_cache_history=bitwise convergence_claim=false fallback=none\n";
 }
+
+void CheckFusedSweepLifecycle(bool compact_lift, int regular_sweeps,
+                              bool fuse_residual, bool fuse_update,
+                              const char* execution = "wmma-factor-fp64")
+{
+  LifecycleEnvironment environment;
+  environment.Set("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", "projected");
+  environment.Set("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION", execution);
+  environment.Set("IGRLAB_IGR_COMPACT_FACE_QDATA", "1");
+  environment.Set("IGRLAB_IGR_COMPACT_FACE_LIFT", compact_lift ? "1" : "0");
+  Mesh serial = Mesh::MakeCartesian2D(4, 3, Element::QUADRILATERAL, true, 1.0, 0.8);
+  serial.SetCurvature(2, false, 2, Ordering::byVDIM);
+  serial.Transform([](const Vector& x, Vector& y)
+  {
+    y.SetSize(2);
+    y[0] = x[0] + 0.08 * x[0] * x[1];
+    y[1] = x[1] + 0.04 * x[0] * (1.0 - x[0]);
+  });
+  ParMesh mesh(MPI_COMM_WORLD, serial);
+  DG_FECollection collection(5, 2, BasisType::GaussLegendre);
+  ParFiniteElementSpace scalar_space(&mesh, &collection);
+  ParFiniteElementSpace vector_space(&mesh, &collection, 4, Ordering::byNODES);
+  ParGridFunction state(&vector_space);
+  int phase = 0;
+  VectorFunctionCoefficient initial(4, [&](const Vector& x, Vector& value)
+  {
+    const double rho = 0.8 + 0.2 * x[0] + 0.1 * x[1] + 0.15 * phase * (1.0 + x[0] * x[1]);
+    const double u = 0.2 + 0.11 * x[0] + 0.06 * phase * x[1];
+    const double v = -0.1 + 0.08 * x[1] + 0.04 * phase * x[0];
+    value.SetSize(4);
+    value[0] = rho; value[1] = rho * u; value[2] = rho * v;
+    value[3] = 2.5 + 0.5 * rho * (u * u + v * v);
+  });
+  ::igrlab::IGRConfig config;
+  config.alpha = 0.002;
+  config.backend = ::igrlab::IGRGradBackend::BrokenDG;
+  config.ip_kind = ::igrlab::IGRIPKind::SIPG;
+  config.solve_mode = ::igrlab::IGRSolveMode::FixedElementJacobi;
+  config.regular_sweeps = regular_sweeps; config.warm_start_sweeps = 50;
+  config.element_jacobi_omega = 0.7;
+  config.element_jacobi_tensor_blocks = true;
+  config.exact_dg_face_operator = true;
+  config.sigma_cadence = ::igrlab::IGRSigmaUpdateCadence::EveryStage;
+  config.lin_print = 1;
+  config.nan_scan = false;
+  const auto make_solver = [&]()
+  {
+    auto result = std::make_unique<::igrlab::IGRSolver>(scalar_space, vector_space, 2, 4, config.alpha);
+    result->ApplyConfig(config);
+    return result;
+  };
+  auto original = make_solver(), fused = make_solver();
+  const auto update = [&](::igrlab::IGRSolver& solver, bool enabled,
+                          ::igrlab::IGRSolvePurpose purpose, bool initialized)
+  {
+    environment.Set("IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL", enabled && fuse_residual ? "1" : "0");
+    environment.Set("IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE", enabled && fuse_update ? "1" : "0");
+    std::ostringstream captured;
+    {
+      struct RestoreOutput
+      {
+        std::streambuf* previous;
+        ~RestoreOutput() { std::cout.rdbuf(previous); }
+      } restore{std::cout.rdbuf(captured.rdbuf())};
+      solver.UpdateFromState(state, true, purpose);
+    }
+    std::cout << captured.str();
+    const int sweeps = initialized ? regular_sweeps : 50;
+    const int fast_sweeps = enabled && fuse_residual && compact_lift && initialized ? sweeps : 0;
+    const int update_sweeps = enabled && fuse_update && initialized &&
+      std::strcmp(execution, "wmma-factor-fp64") == 0 ? sweeps : 0;
+    const auto expected = " fused_residual_sweeps=" + std::to_string(fast_sweeps) + " ";
+    const auto expected_update = " fused_update_sweeps=" + std::to_string(update_sweeps) + " ";
+    MFEM_VERIFY(captured.str().find(expected) != std::string::npos &&
+                  captured.str().find(expected_update) != std::string::npos &&
+                  solver.GetLastLinearIters() == sweeps &&
+                  solver.GetLastKrylovOperatorApplyCount() == sweeps + 1 &&
+                  solver.GetLastKrylovPreconditionerApplyCount() == sweeps &&
+                  solver.GetLastWarmStartEffective() == initialized &&
+                  !solver.GetLastLinearConverged() && std::isfinite(solver.GetLastLinearTrueResidualRelRHS()),
+                "Fused fixed-sweep path changed initialization, fallback, certificate or application accounting.");
+    if (!initialized)
+    { MFEM_VERIFY(captured.str().find("path=fused-") == std::string::npos,
+                  "Initialization must retain the original operator/inverse sequence."); }
+  };
+  const auto same = [&]()
+  {
+    MFEM_VERIFY(std::memcmp(original->GetSigma().HostRead(), fused->GetSigma().HostRead(),
+                            std::size_t(scalar_space.GetVSize()) * sizeof(double)) == 0 &&
+                  original->GetLastLinearTrueResidualRelRHS() == fused->GetLastLinearTrueResidualRelRHS(),
+                "Fused residual changed production sigma or the original current-FP64 residual.");
+  };
+  const auto production = ::igrlab::IGRSolvePurpose::ProductionStage;
+  state.ProjectCoefficient(initial);
+  update(*original, false, production, false);
+  update(*fused, true, production, false);
+  same();
+  phase = 1; state.ProjectCoefficient(initial);
+  update(*fused, true, ::igrlab::IGRSolvePurpose::OutputOnly, true);
+  update(*original, false, production, true);
+  update(*fused, true, production, true);
+  same();
+  phase = 2; state.ProjectCoefficient(initial);
+  update(*original, false, production, true);
+  update(*fused, true, ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch, true);
+  fused->ConsumePendingStage0PrefetchAccounting();
+  same();
+  phase = 3; state.ProjectCoefficient(initial);
+  update(*original, false, production, true);
+  update(*fused, true, production, true);
+  same();
+  MFEM_VERIFY(original->GetProductionLinearIterations() == 50 + 3 * regular_sweeps &&
+                fused->GetProductionLinearIterations() == 50 + 3 * regular_sweeps &&
+                fused->GetOutputOnlyLinearIterations() == regular_sweeps,
+              "Fused residual changed output-only or consumed-prefetch history.");
+  std::cout << "element_block_jacobi_fused_sweep passed p=5 geometry=q2 reference=projected"
+            << " execution=" << execution << " volume=simt compact_lift=" << compact_lift
+            << " fuse_residual=" << fuse_residual << " fuse_update=" << fuse_update
+            << " initial_sweeps=50 regular_sweeps=" << regular_sweeps
+            << " production_sigma=bitwise output_history=bitwise original_fp64_diagnostic=true\n";
+}
 }
 
 int main(int argc, char** argv)
@@ -756,6 +880,20 @@ int main(int argc, char** argv)
   CheckLifecycle(true);
   CheckLifecycle(false, true);
   CheckConvergedLocalTensor();
+  int current_device = 0;
+  cudaDeviceProp properties{};
+  MFEM_VERIFY(cudaGetDevice(&current_device) == cudaSuccess &&
+                cudaGetDeviceProperties(&properties, current_device) == cudaSuccess,
+              "Could not inspect the CUDA device for fused projected-WMMA qualification.");
+  if (properties.major >= 8)
+  {
+    CheckFusedSweepLifecycle(true, 2, true, false);
+    CheckFusedSweepLifecycle(true, 2, false, true);
+    CheckFusedSweepLifecycle(true, 2, true, true);
+    CheckFusedSweepLifecycle(true, 3, true, true);
+    CheckFusedSweepLifecycle(false, 2, true, true);
+    CheckFusedSweepLifecycle(true, 2, true, true, "simt-fp64");
+  }
   std::cout << "element_block_jacobi_test passed current_coefficients=true "
                "assembled_blocks=true full_A_columns=true fp64_lu=true fp64_explicit_inverse=true "
                "coarse=false skew=true curved=true dense_fallback=true self_neighbor=true\n";

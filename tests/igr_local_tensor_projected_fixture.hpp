@@ -514,6 +514,7 @@ void QualifyProjected(const std::vector<std::string>& modes)
         fixture.SetPhase(phase);
         backend->RefreshMassScaling(fixture.invrho);
         backend->Mult(rhs, actual); backend->Mult(second, action2);
+        if (phase == 2) { CheckFusedSolutionUpdate(*backend, rhs, mode == "wmma-factor-fp64"); }
         const auto budget = reference.Apply(rhs, expected, mode);
         const auto budget2 = reference.Apply(second, expected2, mode);
         const auto error = MeasureError(actual, expected), error2 = MeasureError(action2, expected2);

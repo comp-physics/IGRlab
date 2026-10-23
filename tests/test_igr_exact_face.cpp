@@ -1561,8 +1561,8 @@ void CheckCompactFaceLiftGatherRounding()
   const real_t terms[ne - 1][2] = {
     {-0.0, -0.0}, {-tiny, 0.0}, {1.0e16, -1.0e16},
     {nan2, 0.0}, {inf, -inf}, {2.0, 3.0}, {nan2, 0.0}};
-  Vector lifts(24 * nf), full(72 * nf), expected(n), scratch(n), padded(n + tail);
-  for (Vector* value : {&lifts, &full, &expected, &scratch, &padded}) { value->UseDevice(true); }
+  Vector lifts(24 * nf), full(72 * nf), expected(n), scratch(n), rhs(n), padded(n + tail);
+  for (Vector* value : {&lifts, &full, &expected, &scratch, &rhs, &padded}) { value->UseDevice(true); }
   for (bool recover : {false, true})
   {
     auto L = Reshape(lifts.HostWrite(), 2, 6, 2, nf);
@@ -1573,24 +1573,30 @@ void CheckCompactFaceLiftGatherRounding()
       nf, 2, factors.tensor_endpoint.Read(), factors.tensor_axes.Read(),
       factors.tensor_face_slots.Read(), factors.tensor_lex_to_native.Read(),
       lifts.Read(), full.Write()});
-    for (bool add_to_base : {false, true})
+    for (int mode = 0; mode < 3; ++mode)
     {
+      const bool add_to_base = mode == 1, residual = mode == 2;
       padded = 12345.0;
       real_t* actual = padded.HostReadWrite();
       real_t* original = expected.HostWrite();
+      real_t* source = rhs.HostWrite();
       for (int e = 0; e < ne; ++e) for (int d = 0; d < 36; ++d)
       {
         const int global = global_map[d + 36 * e];
         original[global] = actual[global] = recover ? 0.125 : bases[e];
+        source[global] = recover ? 1.25 : (e == 0 ? -0.0 : (e == 1 ? tiny : 2.0));
       }
-      if (add_to_base)
+      if (add_to_base || residual)
       {
         scratch = 0.0;
         forall(n, GatherForTest(info, work, full, scratch));
         expected += scratch;
+        if (residual) { subtract(rhs, expected, expected); }
       }
       else { forall(n, GatherForTest(info, work, full, expected)); }
-      forall(n, LiftGatherForTest(info, work, lifts, padded, add_to_base));
+      auto gather = LiftGatherForTest(info, work, lifts, padded, add_to_base);
+      gather.residual_rhs = residual ? rhs.Read() : nullptr;
+      forall(n, gather);
       Vector active;
       active.MakeRef(padded, 0, n);
       MFEM_VERIFY(SameBits(active, expected),
@@ -1604,8 +1610,67 @@ void CheckCompactFaceLiftGatherRounding()
     }
   }
   std::cout << "ExactFaceCompactLiftRounding parity=passed native_permutation=true"
-            << " global_permutation=true signed_zero=true nonfinite_recovery=true padded_tail=" << tail << '\n';
+            << " global_permutation=true signed_zero=true nonfinite_recovery=true fused_residual=true padded_tail=" << tail << '\n';
 #endif
+}
+
+void CheckCompactResidualFinalizer(const InteriorFaceDGDiffusionApplyInfo& info,
+                                   InteriorFaceDGDiffusionApplyScratch& work,
+                                   Vector& x, real_t ip_sigma)
+{
+  const int n = x.Size(), tail = 19;
+  Vector rhs(n), volume(n), face(n), expected(n), padded(n + tail), output;
+  for (Vector* value : {&rhs, &volume, &face, &expected, &padded}) { value->UseDevice(true); }
+  real_t* source = rhs.HostWrite();
+  real_t* base = volume.HostWrite();
+  for (int i = 0; i < n; ++i)
+  {
+    source[i] = 0.25 * std::cos(0.11 * (i + 1));
+    base[i] = 0.03125 + 0.125 * std::sin(0.07 * (i + 1));
+  }
+  face = 0.0;
+  LaunchInteriorFaceDGDiffusionApply2D(info, work, x, ip_sigma, face);
+  expected = volume;
+  expected += face;
+  subtract(rhs, expected, expected);
+  padded = 12345.0;
+  output.MakeRef(padded, 0, n);
+  output = volume;
+  Vector input_view, source_view;
+  input_view.MakeRef(x, 0, n);
+  source_view.MakeRef(rhs, 0, n);
+  const bool admitted = ::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+    info, work, input_view, source_view, output);
+  MFEM_VERIFY(admitted == ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA(),
+              "Fused residual must admit supported disjoint MFEM aliases on native FP64 CUDA.");
+  MFEM_VERIFY(SameBits(output, volume), "Residual preflight changed its volume input.");
+  if (admitted)
+  {
+    ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionResidual2D(
+      info, work, input_view, ip_sigma, source_view, output);
+    MFEM_VERIFY(SameBits(output, expected), "Fused residual changed completed volume + face or b-minus bits.");
+  }
+  const real_t* values = padded.HostRead();
+  for (int i = n; i < padded.Size(); ++i)
+  { MFEM_VERIFY(values[i] == 12345.0, "Fused residual changed its output tail."); }
+
+  Vector overlap(n + 1), left, right;
+  overlap.UseDevice(true); overlap = 0.125;
+  left.MakeRef(overlap, 0, n); right.MakeRef(overlap, 1, n);
+  const Vector unchanged(overlap);
+  MFEM_VERIFY(!::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+                info, work, left, rhs, right) &&
+              !::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+                info, work, x, left, right) &&
+              !::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+                info, work, x, rhs, x) &&
+              SameBits(overlap, unchanged),
+              "Residual preflight must reject full and offset overlap without modifying buffers.");
+  work.compact_lift = false;
+  MFEM_VERIFY(!::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+                info, work, x, rhs, output),
+              "Residual preflight must decline an unsupported face layout.");
+  work.compact_lift = true;
 }
 
 void CheckCompactFaceLifts()
@@ -1684,6 +1749,7 @@ void CheckCompactFaceLifts()
         const Vector rows = RecordedFaceContributions(info, work);
         MFEM_VERIFY(SameBits(actual, original) && SameBits(rows, old_rows),
                     "Compact lifts must preserve old tensor record and gather bits.");
+        CheckCompactResidualFinalizer(info, work, x, ip_sigma);
         if (native_cuda)
         {
           MFEM_VERIFY(work.face_contribution.Size() == 0 && work.tensor_lift.Size() == 24 * info.nf &&
@@ -1733,6 +1799,10 @@ void CheckCompactFaceLifts()
       MFEM_VERIFY(!::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work),
                   "Invalid compact metadata must decline before any compact gather.");
       Vector actual(x.Size()); actual.UseDevice(true); actual = 0.03125;
+      const Vector unchanged(actual);
+      MFEM_VERIFY(!::igrlab::dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+                    info, work, x, x, actual) && SameBits(actual, unchanged),
+                  "Stale residual metadata must decline without modifying the fallback output.");
       LaunchInteriorFaceDGDiffusionApply2D(info, work, x, -1.0, actual);
       CheckFactorizationError(actual, dense_expected, "Compact-lift invalid-metadata fallback");
       MFEM_VERIFY(work.tensor_lift.Size() == 0 && work.face_contribution.Size() == 72 * info.nf,
