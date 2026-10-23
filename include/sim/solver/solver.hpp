@@ -519,11 +519,69 @@ RunEulerCase(ExampleContext& ctx,
              const VTKRestartInfo* restart_info = nullptr,
              const mfem::ParGridFunction* static_source = nullptr)
 {
+  using WallClock = std::chrono::steady_clock;
+  // IGRLAB_SOLVER_WALL_TIMING (legacy DG_IGR_SOLVER_WALL_TIMING) opts in.
+  // Scope begins after the opt-in check, before communicator queries, and
+  // ends before the timing line and local destruction. Pre/post case setup,
+  // metadata, case postprocessing and process lifetime remain external work.
+  const bool wall_timing_enabled =
+    ::igrlab::EnvFlagEnabled("DG_IGR_SOLVER_WALL_TIMING");
+  const auto wall_case_start =
+    wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
+  WallClock::time_point wall_loop_start;
+  WallClock::time_point wall_loop_stop;
+  bool wall_loop_entered = false;
   int num_procs = 1;
   int my_rank = 0;
   MPI_Comm_size(ctx.Mesh().GetComm(), &num_procs);
   MPI_Comm_rank(ctx.Mesh().GetComm(), &my_rank);
   const bool communicator_root = my_rank == 0;
+  const auto emit_case_wall_timing = [&](const TimeLoopResult& timed_result)
+  {
+    if (!wall_timing_enabled || !communicator_root)
+    {
+      return;
+    }
+    const auto wall_case_stop = WallClock::now();
+    const double total_s =
+      std::chrono::duration<double>(wall_case_stop - wall_case_start).count();
+    const double setup_initial_output_s = wall_loop_entered
+      ? std::chrono::duration<double>(wall_loop_start - wall_case_start).count()
+      : total_s;
+    const double loop_s = wall_loop_entered
+      ? std::chrono::duration<double>(wall_loop_stop - wall_loop_start).count()
+      : 0.0;
+    const double postloop_s = wall_loop_entered
+      ? std::chrono::duration<double>(wall_case_stop - wall_loop_stop).count()
+      : 0.0;
+    // The loop complement includes stepping, CFL probes/reductions, control
+    // flow and their existing waits. Hook times include staging and waits;
+    // asynchronous device work can cross these host phase boundaries.
+    const double advancing_cfl_s = loop_s -
+      timed_result.scheduled_output_wall_seconds -
+      timed_result.final_output_wall_seconds -
+      timed_result.diagnostics_wall_seconds;
+    const double final_output_postloop_s =
+      timed_result.final_output_wall_seconds + postloop_s;
+    // Keep every field on this communicator root's timeline. Independent
+    // MPI_MAX reductions of individual bins would destroy additivity.
+    std::ostringstream timing;
+    timing << std::setprecision(17)
+           << "[solver-timing] event=run-summary scope=RunEulerCase"
+           << " clock=steady-host-wall rank=" << my_rank
+           << " origin=before-communicator-query end=before-return-and-destruction"
+           << " total_s=" << total_s
+           << " setup_initial_output_s=" << setup_initial_output_s
+           << " advancing_cfl_s=" << advancing_cfl_s
+           << " scheduled_output_s="
+           << timed_result.scheduled_output_wall_seconds
+           << " diagnostics_s=" << timed_result.diagnostics_wall_seconds
+           << " final_output_postloop_s=" << final_output_postloop_s
+           << " loop_s=" << loop_s
+           << " loop_entered=" << (wall_loop_entered ? 1 : 0)
+           << " success=" << (timed_result.success ? 1 : 0) << '\n';
+    std::cout << timing.str();
+  };
   const mfem::real_t initial_time = restart_info ? restart_info->time : 0.0;
   MFEM_VERIFY(!restart_info ||
                 restart_info->step <= std::numeric_limits<int>::max(),
@@ -645,6 +703,7 @@ RunEulerCase(ExampleContext& ctx,
                                        bundle.field_list.igr);
       }
     }
+    emit_case_wall_timing(failure);
     return false;
   }
 
@@ -711,6 +770,7 @@ RunEulerCase(ExampleContext& ctx,
                                      num_procs,
                                      bundle.field_list.igr);
     }
+    emit_case_wall_timing(failure);
     return false;
   }
   UpdateEulerOutputFields(bundle.field_list, &initial_field_timing);
@@ -972,8 +1032,17 @@ RunEulerCase(ExampleContext& ctx,
                            io,
                            callbacks,
                            initial_step);
+  if (wall_timing_enabled)
+  {
+    wall_loop_start = WallClock::now();
+    wall_loop_entered = true;
+  }
   TimeLoopResult result =
     RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
+  if (wall_timing_enabled)
+  {
+    wall_loop_stop = WallClock::now();
+  }
   std::optional<detail::EulerConservedIntegral> final_conservation;
   mfem::Vector accepted_boundary_flux;
   mfem::Vector accepted_boundary_flux_scale;
@@ -1379,6 +1448,7 @@ RunEulerCase(ExampleContext& ctx,
                                      num_procs,
                                      bundle.field_list.igr);
     }
+    emit_case_wall_timing(result);
     return false;
   }
 
@@ -1403,6 +1473,7 @@ RunEulerCase(ExampleContext& ctx,
         BuildRunSummary(ctx, result, elapsed, num_procs, bundle.field_list.igr);
     }
   }
+  emit_case_wall_timing(result);
   return true;
 }
 
