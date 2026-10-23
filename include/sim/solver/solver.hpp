@@ -836,7 +836,7 @@ RunEulerCase(ExampleContext& ctx,
   const std::string dc_name = detail::MakeEulerOutputDatasetName(
     case_cfg, run_cfg, c_alpha_value, restart_info, ctx, static_source);
   auto paraview_dc =
-    std::make_unique<mfem::ParaViewDataCollection>(dc_name, &ctx.Mesh());
+    mfem::io::MakeEulerVTKDataCollection(dc_name, &ctx.Mesh());
   const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
   const std::string dataset_dir =
     (std::filesystem::path(vtk_cfg.prefix_path) / dc_name).string();

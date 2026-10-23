@@ -289,6 +289,26 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "dg;mapped;dense;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_vtk_field_cache_test test_vtk_field_cache.cpp)
+target_link_libraries(dg_igr_vtk_field_cache_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_vtk_field_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(dg_igr_vtk_field_cache_test PRIVATE cxx_std_17)
+set_source_files_properties(test_vtk_field_cache.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_vtk_field_cache_command dg_igr_vtk_field_cache_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_vtk_field_cache_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_vtk_field_cache_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_vtk_field_cache_cpu COMMAND ${_igrlab_vtk_field_cache_command})
+set_tests_properties(dg_igr_vtk_field_cache_cpu PROPERTIES
+  LABELS "io;vtk;parity;cpu" TIMEOUT 120 RUN_SERIAL TRUE)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_vtk_field_cache_cuda COMMAND ${_igrlab_vtk_field_cache_command} cuda)
+  set_tests_properties(dg_igr_vtk_field_cache_cuda PROPERTIES
+    LABELS "io;vtk;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_dg_mapped_weakdiv_tensor_test
   test_dg_mapped_weakdiv_tensor.cpp)
 target_link_libraries(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE igr_mfem mfem)
