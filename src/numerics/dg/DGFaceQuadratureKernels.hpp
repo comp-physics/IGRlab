@@ -2,6 +2,8 @@
 // This file is intentionally included after MFEM backend headers.
 #pragma once
 
+#include "utils/config/env_flags.hpp"
+
 #include "igrlab/compat.hpp"
 
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
