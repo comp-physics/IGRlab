@@ -18,6 +18,10 @@ namespace igr_internal
 // storage requires admitted collocated SIMT; other combinations report cached
 // storage. Direct storage owns compact immutable geometry, sharing only bitwise
 // identical element tiles, and reads the current QFs during every application.
+// IGRLAB_IGR_TENSOR_VOLUME_COMPACT=1 opts into compact SIMT contractions for
+// D1D=6, mass Q1D=7 and diffusion Q1D=6. Other configurations retain their
+// selected generic/collocated path. Actual B/G entries and mapped metrics are
+// unchanged; this affects kernel execution, not quadrature or stored geometry.
 // Factory performs the first coefficient refresh. Later stages must refresh
 // after updating QFs. Direct storage retains QF object references until replaced
 // by Refresh; each bound QF must outlive that binding (and any submitted device

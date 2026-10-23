@@ -25,6 +25,9 @@ namespace
 using namespace mfem;
 using ::igrlab::igr_internal::MakeTensorVolumeOperator;
 using ::igrlab::igr_internal::RefreshTensorVolumeCoefficients;
+int compact_admitted_cases = 0;
+int compact_admitted_basis_mask = 0;
+
 
 class ScopedCollocatedSelection
 {
@@ -79,6 +82,34 @@ private:
   const char* names_[2] = {"IGRLAB_IGR_TENSOR_VOLUME_STORAGE",
                            "DG_IGR_IGR_TENSOR_VOLUME_STORAGE"};
   bool had_value_[2] = {false, false};
+  std::string old_value_[2];
+};
+
+class ScopedCompactSelection
+{
+public:
+  explicit ScopedCompactSelection(bool enabled)
+  {
+    for (int i=0; i<2; ++i)
+    {
+      if (const char* old=std::getenv(names_[i]))
+      { had_value_[i]=true; old_value_[i]=old; }
+      MFEM_VERIFY(setenv(names_[i],enabled?"1":"0",1)==0,
+                  "Could not select compact tensor volume test.");
+    }
+  }
+  ~ScopedCompactSelection()
+  {
+    for (int i=0; i<2; ++i)
+    {
+      if (had_value_[i]) { setenv(names_[i],old_value_[i].c_str(),1); }
+      else { unsetenv(names_[i]); }
+    }
+  }
+private:
+  const char* names_[2]={"IGRLAB_IGR_TENSOR_VOLUME_COMPACT",
+                         "DG_IGR_IGR_TENSOR_VOLUME_COMPACT"};
+  bool had_value_[2]={false,false};
   std::string old_value_[2];
 };
 
@@ -258,14 +289,40 @@ void CheckCase(int order, int basis, bool curved, bool unequal,
   FillCoefficients(mass,diffusion,0);
   auto simt=MakeTensorVolumeOperator(fes,mass,diffusion,"simt");
   auto wmma=MakeTensorVolumeOperator(fes,mass,diffusion,"wmma");
+  std::unique_ptr<Operator> compact;
+  std::ostringstream compact_log;
+  {
+    ScopedCompactSelection compact_selection(true);
+    struct RestoreOutput
+    {
+      std::streambuf* previous;
+      ~RestoreOutput() { std::cout.rdbuf(previous); }
+    } restore{std::cout.rdbuf(compact_log.rdbuf())};
+    compact=MakeTensorVolumeOperator(fes,mass,diffusion,"simt");
+  }
+  std::cout << compact_log.str();
+  const bool compact_expected=order==5 && mass_rule.GetNPoints()==49 &&
+                              diff_rule.GetNPoints()==36;
+  MFEM_VERIFY(compact_log.str().find(" compact_requested=1 ")!=std::string::npos &&
+      compact_log.str().find(compact_expected ? " compact_enabled=1 " : " compact_enabled=0 ")!=std::string::npos &&
+      compact_log.str().find(compact_expected ? " compact_reason=admitted " :
+        " compact_reason=requires-d6-qmass7-qdiff6 ")!=std::string::npos,
+      "Compact volume dispatch/fallback differs from actual dimensions.");
   Vector x(fes.GetVSize()), ys(fes.GetVSize()), yw(fes.GetVSize()), yp(fes.GetVSize()), yd;
+  Vector yc(fes.GetVSize()); yc.UseDevice(true);
+  const auto* compact_address=yc.Write();
   ys.UseDevice(true);yw.UseDevice(true);
   const auto* simt_address=ys.Write();const auto* wmma_address=yw.Write();
-  double worst_pa=0.0,worst_dense=0.0,worst_modes=0.0;
+  double worst_pa=0.0,worst_dense=0.0,worst_modes=0.0,worst_compact=0.0;
   for (int phase=0;phase<4;++phase)
   {
     FillCoefficients(mass,diffusion,phase);
-    if (phase) { RefreshTensorVolumeCoefficients(*simt,mass,diffusion); RefreshTensorVolumeCoefficients(*wmma,mass,diffusion); }
+    if (phase)
+    {
+      RefreshTensorVolumeCoefficients(*simt,mass,diffusion);
+      RefreshTensorVolumeCoefficients(*wmma,mass,diffusion);
+      RefreshTensorVolumeCoefficients(*compact,mass,diffusion);
+    }
     double* values=x.HostWrite();
     for(int i=0;i<x.Size();++i) { values[i]=phase==3?1.0:0.8+0.2*sin(0.37*i+phase); }
     QuadratureFunctionCoefficient mc(mass),dc(diffusion);
@@ -273,21 +330,23 @@ void CheckCase(int order, int basis, bool curved, bool unequal,
     auto* mi=new MassIntegrator(mc);mi->SetIntRule(&mass_rule);original.AddDomainIntegrator(mi);
     auto* di=new DiffusionIntegrator(dc);di->SetIntRule(&diff_rule);original.AddDomainIntegrator(di);
     original.Assemble(); original.Mult(x,yp);
-    simt->Mult(x,ys);wmma->Mult(x,yw);
+    simt->Mult(x,ys);wmma->Mult(x,yw);compact->Mult(x,yc);
     DenseOracle(fes,mass,diffusion,x,yd);
-    const double pa=std::max(Relative(ys,yp),Relative(yw,yp));
-    const double dense=std::max(Relative(ys,yd),Relative(yw,yd));
+    const double pa=std::max({Relative(ys,yp),Relative(yw,yp),Relative(yc,yp)});
+    const double dense=std::max({Relative(ys,yd),Relative(yw,yd),Relative(yc,yd)});
+    const double compact_error=Relative(yc,ys);
+    worst_compact=std::max(worst_compact,compact_error);
     const double modes=Relative(yw,ys);
     worst_pa=std::max(worst_pa,pa);worst_dense=std::max(worst_dense,dense);worst_modes=std::max(worst_modes,modes);
-    MFEM_VERIFY(pa<=2e-12 && dense<=2e-12 && modes<=2e-12,
+    MFEM_VERIFY(pa<=2e-12 && dense<=2e-12 && modes<=2e-12 && compact_error<=2e-12,
                 "IGR tensor volume parity failed: p="<<order<<" phase="<<phase
                 <<" curved="<<curved<<" unequal="<<unequal<<" pa="<<pa<<" dense="<<dense<<" modes="<<modes);
-    MFEM_VERIFY(simt_address==ys.Read() && wmma_address==yw.Read(), "IGR tensor Mult resized preallocated outputs.");
+    MFEM_VERIFY(simt_address==ys.Read() && wmma_address==yw.Read() && compact_address==yc.Read(), "IGR tensor Mult resized preallocated outputs.");
   }
   // Native current-A authority must see a bad coefficient; neither mode may
   // hide it by reusing a previously valid coefficient snapshot.
   diffusion.HostReadWrite()[0]=std::numeric_limits<double>::quiet_NaN();
-  for (Operator* op:{simt.get(),wmma.get()})
+  for (Operator* op:{simt.get(),wmma.get(),compact.get()})
   {
     RefreshTensorVolumeCoefficients(*op,mass,diffusion);op->Mult(x,yw);
     const double* values=yw.HostRead();bool nonfinite=false;
@@ -297,15 +356,21 @@ void CheckCase(int order, int basis, bool curved, bool unequal,
   FillCoefficients(mass,diffusion,2);
   RefreshTensorVolumeCoefficients(*simt,mass,diffusion);
   RefreshTensorVolumeCoefficients(*wmma,mass,diffusion);
-  simt->Mult(x,ys);wmma->Mult(x,yw);
+  RefreshTensorVolumeCoefficients(*compact,mass,diffusion);
+  simt->Mult(x,ys);wmma->Mult(x,yw);compact->Mult(x,yc);
   DenseOracle(fes,mass,diffusion,x,yd);
-  MFEM_VERIFY(Relative(ys,yd)<=2e-12 && Relative(yw,yd)<=2e-12,
+  MFEM_VERIFY(Relative(ys,yd)<=2e-12 && Relative(yw,yd)<=2e-12 && Relative(yc,yd)<=2e-12,
               "IGR tensor volume did not recover after a nonfinite coefficient.");
+  if (compact_expected)
+  {
+    ++compact_admitted_cases;
+    compact_admitted_basis_mask |= basis==mfem::BasisType::GaussLegendre ? 1 : 2;
+  }
   std::cout<<"igr_tensor_volume_case p="<<order<<" basis="<<basis<<" curved="<<curved
            <<" storage_requested="<<storage
            <<" mass_nq="<<mass_rule.GetNPoints()<<" diffusion_nq="<<diff_rule.GetNPoints()
            <<" max_pa_relative="<<worst_pa<<" max_dense_relative="<<worst_dense
-           <<" max_simt_wmma_relative="<<worst_modes<<" passed\n";
+           <<" max_simt_wmma_relative="<<worst_modes<<" max_compact_relative="<<worst_compact<<" compact_enabled="<<compact_expected<<" passed\n";
 }
 
 // These arrays belong to this fixture's FE collection. Restore the cached
@@ -1009,6 +1074,7 @@ int main(int argc,char** argv)
   const bool benchmark = argc == 3 && std::string(argv[1]) == "--benchmark512";
   MFEM_VERIFY(argc == 1 || benchmark, "Expected no arguments or --benchmark512 <Sedov mesh>.");
   mfem::Device device("cuda");
+  ScopedCompactSelection baseline_compact_selection(false);
   if (benchmark) { Benchmark512(argv[2]); return 0; }
   for (bool collocated : {false, true})
   {
@@ -1031,6 +1097,10 @@ int main(int argc,char** argv)
     }
     std::cout << "igr_tensor_volume_control_suite collocated_requested=1 storage_requested=direct passed\n";
   }
+  MFEM_VERIFY(compact_admitted_cases>=2 && compact_admitted_basis_mask==3,
+              "Compact volume must execute admitted GL and GLL cases, not only fallbacks.");
+  std::cout << "igr_tensor_volume_compact_test admitted_cases=" << compact_admitted_cases
+            << " gl_and_gll=true passed\n";
   CheckCollocatedSuite();
   CheckDirectGeometry(false);
   CheckDirectGeometry(true);

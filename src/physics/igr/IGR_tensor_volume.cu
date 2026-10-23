@@ -130,6 +130,135 @@ __global__ void IGRFusedTensorVolumeKernel(
   }
 }
 
+// Fixed D=6, Qmass=7, Qdiff=6 contractions keep only real rows/columns.
+// The actual (possibly nonidentity) maps and full mapped diffusion metric are
+// unchanged. Reference maps are shared by the four element warps in a CTA.
+__global__ void IGRCompactTensorVolumeKernel(
+  int ne, const int* dof_map, const double* maps, const double* mass,
+  const double* diffusion, const double* x, double* y)
+{
+  constexpr int d = 6, qm = 7, points = d*d;
+  const int warp = threadIdx.x/32, lane = threadIdx.x%32;
+  const int e = blockIdx.x*warps+warp;
+  __shared__ double bm[qm*d], b[points], g[points];
+  __shared__ double u[warps][points], result[warps][points];
+  __shared__ double t0[warps][qm*d], t1[warps][qm*d];
+  __shared__ double v0[warps][qm*qm], v1[warps][qm*qm];
+  if (threadIdx.x < qm*d)
+  {
+    const int i = threadIdx.x;
+    bm[i] = maps[i%qm+side*(i/qm)];
+  }
+  if (threadIdx.x < points)
+  {
+    const int i = threadIdx.x, padded = i%d+side*(i/d);
+    b[i] = maps[2*tile_size+padded];
+    g[i] = maps[4*tile_size+padded];
+  }
+  __syncthreads(); // partial final CTAs must participate before returning
+  if (e >= ne) { return; }
+  for (int i = lane; i < points; i += 32)
+  {
+    const int index = dof_map[e*points+i];
+    u[warp][i] = index >= 0 ? x[index] : -x[-1-index];
+  }
+  __syncwarp();
+  for (int i = lane; i < qm*d; i += 32)
+  {
+    const int qx = i%qm, dy = i/qm;
+    double value = 0.0;
+#pragma unroll
+    for (int k = 0; k < d; ++k) { value += bm[qx+qm*k]*u[warp][k+d*dy]; }
+    t0[warp][i] = value;
+  }
+  __syncwarp();
+  for (int i = lane; i < qm*qm; i += 32)
+  {
+    const int qx = i%qm, qy = i/qm;
+    double value = 0.0;
+#pragma unroll
+    for (int k = 0; k < d; ++k) { value += t0[warp][qx+qm*k]*bm[qy+qm*k]; }
+    v0[warp][i] = value*mass[e*tile_size+qx+side*qy];
+  }
+  __syncwarp();
+  for (int i = lane; i < d*qm; i += 32)
+  {
+    const int dx = i%d, qy = i/d;
+    double value = 0.0;
+#pragma unroll
+    for (int k = 0; k < qm; ++k) { value += bm[k+qm*dx]*v0[warp][k+qm*qy]; }
+    t0[warp][i] = value;
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int dx = i%d, dy = i/d;
+    double value = 0.0;
+#pragma unroll
+    for (int k = 0; k < qm; ++k) { value += t0[warp][dx+d*k]*bm[k+qm*dy]; }
+    result[warp][i] = value;
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int qx = i%d, dy = i/d;
+    double derivative = 0.0, value = 0.0;
+#pragma unroll
+    for (int k = 0; k < d; ++k)
+    {
+      derivative += g[qx+d*k]*u[warp][k+d*dy];
+      value += b[qx+d*k]*u[warp][k+d*dy];
+    }
+    t0[warp][i] = derivative;
+    t1[warp][i] = value;
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int qx = i%d, qy = i/d;
+    double gx = 0.0, gy = 0.0;
+#pragma unroll
+    for (int k = 0; k < d; ++k)
+    {
+      gx += t0[warp][qx+d*k]*b[qy+d*k];
+      gy += t1[warp][qx+d*k]*g[qy+d*k];
+    }
+    const double* metric = diffusion+e*3*tile_size+qx+side*qy;
+    v0[warp][i] = metric[0]*gx+metric[tile_size]*gy;
+    v1[warp][i] = metric[tile_size]*gx+metric[2*tile_size]*gy;
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int dx = i%d, qy = i/d;
+    double value0 = 0.0, value1 = 0.0;
+#pragma unroll
+    for (int k = 0; k < d; ++k)
+    {
+      value0 += g[k+d*dx]*v0[warp][k+d*qy];
+      value1 += b[k+d*dx]*v1[warp][k+d*qy];
+    }
+    t0[warp][i] = value0;
+    t1[warp][i] = value1;
+  }
+  __syncwarp();
+  for (int i = lane; i < points; i += 32)
+  {
+    const int dx = i%d, dy = i/d;
+    double value0 = 0.0, value1 = 0.0;
+#pragma unroll
+    for (int k = 0; k < d; ++k)
+    {
+      value0 += t0[warp][dx+d*k]*b[k+d*dy];
+      value1 += t1[warp][dx+d*k]*g[k+d*dy];
+    }
+    const double value = result[warp][i]+value0+value1;
+    const int index = dof_map[e*points+i];
+    if (index >= 0) { y[index] = value; }
+    else { y[-1-index] = -value; }
+  }
+}
+
 // Admission proves that both interpolation maps are diagonal, not that they
 // equal the identity. Retain each actual diagonal multiply at its original
 // forward/transpose stage. Only the four derivative contractions remain dense.
@@ -376,6 +505,13 @@ public:
     qd_ = CheckRule(diffusion_space_->GetIntRule(0));
     BuildMaps(fe);
     direct_storage_ = storage_requested_ == "direct" && collocated_enabled_;
+    compact_requested_ = ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_TENSOR_VOLUME_COMPACT", false);
+    compact_enabled_ = compact_requested_ && execution_ == "simt" &&
+      d_ == 6 && qm_ == 7 && qd_ == 6 && !direct_storage_;
+    compact_reason_ = !compact_requested_ ? "not-requested" :
+      execution_ != "simt" ? "execution-not-simt" :
+      (d_ != 6 || qm_ != 7 || qd_ != 6) ? "requires-d6-qmass7-qdiff6" :
+      direct_storage_ ? "requires-cached-storage" : "admitted";
     storage_reason_ = storage_requested_ == "cached" ? "cached-requested" :
       (direct_storage_ ? "admitted" : "requires-collocated-simt");
     dof_map_.SetSize(ne_*d_*d_);
@@ -435,6 +571,9 @@ public:
               << " diffusion_q1d=" << qd_ << " elements=" << ne_
               << " geometry=per-quadrature coefficient_policy=current-stage"
               << " quadrature=original-separate local_true=identity faces=external"
+              << " compact_requested=" << int(compact_requested_)
+              << " compact_enabled=" << int(compact_enabled_)
+              << " compact_reason=" << compact_reason_
               << " collocated_requested=" << int(collocated_requested_)
               << " collocated_enabled=" << int(collocated_enabled_)
               << " collocated_reason=" << collocated_reason_
@@ -447,8 +586,9 @@ public:
               << " owned_geometry_bytes=" << geometry_bytes
               << " owned_coefficient_bytes=" << coefficient_bytes
               << " owned_bytes=" << owned_bytes
-              << " kernel=" << (collocated_enabled_ ? "collocated-simt-one-warp-per-element" :
-                                                    "fused-one-warp-per-element")
+              << " kernel=" << (compact_enabled_ ? "compact-simt-d6-qmass7-qdiff6" :
+                  collocated_enabled_ ? "collocated-simt-one-warp-per-element" :
+                                       "fused-one-warp-per-element")
               << " fallback=none" << std::endl;
   }
 
@@ -487,6 +627,11 @@ public:
       IGRFusedTensorVolumeKernel<true><<<(ne_+warps-1)/warps,32*warps>>>(
         ne_,d_,qm_,qd_,dof_map_.Read(),maps_.Read(),mass_.Read(),diffusion_.Read(),input,output);
     }
+    else if (compact_enabled_)
+    {
+      IGRCompactTensorVolumeKernel<<<(ne_+warps-1)/warps,32*warps>>>(
+        ne_,dof_map_.Read(),maps_.Read(),mass_.Read(),diffusion_.Read(),input,output);
+    }
     else if (direct_storage_)
     {
       MFEM_VERIFY(invrho_ && ck_, "Direct IGR tensor coefficients are not bound.");
@@ -513,6 +658,9 @@ public:
   {
     std::cout << "[igr-tensor-volume] event=summary execution=" << execution_
               << " coefficient_refreshes=" << refreshes_ << " submitted_applications=" << applications_
+              << " compact_requested=" << int(compact_requested_)
+              << " compact_enabled=" << int(compact_enabled_)
+              << " compact_reason=" << compact_reason_
               << " collocated_requested=" << int(collocated_requested_)
               << " collocated_enabled=" << int(collocated_enabled_)
               << " collocated_reason=" << collocated_reason_
@@ -521,6 +669,8 @@ public:
   }
 
 private:
+  bool compact_requested_ = false, compact_enabled_ = false;
+  std::string compact_reason_ = "not-requested";
   void CheckUnchanged() const
   {
     MFEM_VERIFY(fes_.GetSequence() == space_sequence_ &&
