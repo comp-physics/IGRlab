@@ -379,6 +379,9 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
   const bool rows_admitted = UsePackedDenseRows_(vfes, dof, neq);
   const bool dense_rows = !shared && rows_admitted;
+  const bool row_reuse_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_DG_WEAKDIV_ROW_REUSE", false);
+  const bool row_reuse = row_reuse_requested && dense_rows && dim == 2 && neq == 4;
   const bool fusion_requested = ::igrlab::EnvFlagEnabledDefault(
     "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION", false);
   const char* execution = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
@@ -715,9 +718,18 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   }
   if (dense_rows)
   {
-    mfem::forall(ne * dof * neq, PackedWeakDivRowsKernel{
-      dof, neq, dim, invmass_elem_vdof_map_.Read(), weakdiv_data_flat_.Read(),
-      weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+    if (row_reuse)
+    {
+      mfem::forall(ne * dof, PackedWeakDivRowReuseEulerKernel{
+        dof, invmass_elem_vdof_map_.Read(), weakdiv_data_flat_.Read(),
+        weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+    }
+    else
+    {
+      mfem::forall(ne * dof * neq, PackedWeakDivRowsKernel{
+        dof, neq, dim, invmass_elem_vdof_map_.Read(), weakdiv_data_flat_.Read(),
+        weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+    }
   }
   else if (conservative_fusion)
   {
@@ -910,7 +922,10 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     {
       std::cout << " dense_execution=" << (dense_rows ? "rows" : "element");
     }
-    std::cout << " backend=device\n";
+    std::cout << " backend=device"
+              << " weakdiv_row_reuse_requested=" << int(row_reuse_requested)
+              << " weakdiv_row_reuse=" << int(row_reuse)
+              << '\n';
     weakdiv_volume_path_logged_ = true;
   }
   return track_volume_speed

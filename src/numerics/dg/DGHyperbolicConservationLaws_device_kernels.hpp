@@ -638,6 +638,55 @@ struct PackedWeakDivRowsKernel
   }
 };
 
+// One row owns the four 2D Euler equations. Reuse the original physical
+// matrix entries without changing any equation's directional subtotal or
+// ascending node accumulation, including its existing face residual.
+struct PackedWeakDivRowReuseEulerKernel
+{
+  int dof = 0;
+  const int* map = nullptr;
+  const real_t* weakdiv = nullptr;
+  const real_t* flux = nullptr;
+  real_t* z = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, e = entry / dof;
+    const int map_offset = (e * dof + i) * 4;
+    const int output0 = map[map_offset];
+    const int output1 = map[map_offset + 1];
+    const int output2 = map[map_offset + 2];
+    const int output3 = map[map_offset + 3];
+    const int matrix_offset = e * dof * dof * 2;
+    const int flux_stride = dof * 2;
+    const int flux_offset = e * 4 * flux_stride;
+    real_t value0 = z[output0], value1 = z[output1];
+    real_t value2 = z[output2], value3 = z[output3];
+    for (int j = 0; j < dof; ++j)
+    {
+      real_t subtotal0 = 0.0, subtotal1 = 0.0;
+      real_t subtotal2 = 0.0, subtotal3 = 0.0;
+      for (int d = 0; d < 2; ++d)
+      {
+        const int col = j * 2 + d;
+        const real_t weight = weakdiv[matrix_offset + col * dof + i];
+        subtotal0 += weight * flux[flux_offset + col];
+        subtotal1 += weight * flux[flux_offset + flux_stride + col];
+        subtotal2 += weight * flux[flux_offset + 2 * flux_stride + col];
+        subtotal3 += weight * flux[flux_offset + 3 * flux_stride + col];
+      }
+      value0 += subtotal0;
+      value1 += subtotal1;
+      value2 += subtotal2;
+      value3 += subtotal3;
+    }
+    z[output0] = value0;
+    z[output1] = value1;
+    z[output2] = value2;
+    z[output3] = value3;
+  }
+};
+
 // Named functors keep NVCC extended lambdas out of private member functions.
 struct PackedSharedWeakDivCenterKernel
 {

@@ -89,12 +89,15 @@ bool LogHas(const std::string& log, const char* event, const std::string& token)
 
 std::string Apply(mfem::DGHyperbolicConservationLaws& op,
                   const Vector& state, Vector& rhs, const char* execution,
-                  bool legacy_alias = false)
+                  bool legacy_alias = false, const char* row_reuse = nullptr,
+                  const char* legacy_row_reuse = nullptr)
 {
   ScopedEnvironment canonical("IGRLAB_DG_PACKED_DENSE_EXECUTION",
                               legacy_alias ? nullptr : execution);
   ScopedEnvironment legacy("DG_IGR_DG_PACKED_DENSE_EXECUTION",
                            legacy_alias ? execution : nullptr);
+  ScopedEnvironment reuse("IGRLAB_DG_WEAKDIV_ROW_REUSE", row_reuse);
+  ScopedEnvironment legacy_reuse("DG_IGR_DG_WEAKDIV_ROW_REUSE", legacy_row_reuse);
   // Every output must be owned and overwritten, including a final partial
   // block. This is test-only poisoning, not a production diagnostic scan.
   rhs = std::numeric_limits<double>::quiet_NaN();
@@ -557,11 +560,14 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   mfem::RusanovFluxWithSides flux(physical);
   auto rows = MakeOperator(fes, flux, "rows");
   auto element = MakeOperator(fes, flux, "element");
+  auto reuse = MakeOperator(fes, flux, "rows");
   HostDenseRHS oracle(ctx, fes, flux, fixture);
   Vector state(fes.GetVSize()), actual(fes.GetVSize()), legacy(fes.GetVSize());
   Vector expected(fes.GetVSize()), repeat(fes.GetVSize()), legacy_repeat(fes.GetVSize());
   Vector previous_sigma(fes.GetVSize());
+  Vector reused(fes.GetVSize()), reused_repeat(fes.GetVSize());
   actual.UseDevice(true); legacy.UseDevice(true); repeat.UseDevice(true); legacy_repeat.UseDevice(true);
+  reused.UseDevice(true); reused_repeat.UseDevice(true);
   const std::string cohort(fixture.name);
   ctx.Check(!rows->GetDGSEMDiagnosticStateScan() &&
               !element->GetDGSEMDiagnosticStateScan() &&
@@ -577,31 +583,48 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
     physical.SetSigmaField(phase == 1 ? nullptr : &sigma);
     const std::string label = cohort + " phase=" + std::to_string(phase);
     const std::string row_log = Apply(*rows, state, actual, "rows");
-    const std::string element_log = Apply(*element, state, legacy, "element");
+    const std::string element_log = Apply(*element, state, legacy, "element", false, "1");
+    const std::string reuse_log = Apply(*reuse, state, reused, "rows", false, "1");
     const double expected_speed = oracle.Apply(state, physical.GetSigmaField(), expected);
     Compare(ctx, actual, legacy, 3.e-12, label + " rows versus legacy element full RHS");
     Compare(ctx, actual, expected, 2.e-11, label + " full RHS versus independent host dense reference");
+    Compare(ctx, reused, actual, 3.e-12, label + " row reuse versus original rows full RHS");
+    Compare(ctx, reused, expected, 2.e-11, label + " row reuse versus independent host dense reference");
     const double speed = rows->GetMaxCharSpeed();
     ctx.Check(std::isfinite(speed) && std::isfinite(expected_speed) &&
                 std::abs(speed - expected_speed) <= 2.e-12 * std::max(1.0, expected_speed) &&
                 speed == element->GetMaxCharSpeed(),
               label + " preserves the face/CFL characteristic speed policy");
+    ctx.Check(reuse->GetMaxCharSpeed() == speed,
+              label + " row reuse preserves the characteristic speed");
     Apply(*rows, state, repeat, "rows");
     Apply(*element, state, legacy_repeat, "element");
+    Apply(*reuse, state, reused_repeat, "rows", false, "1");
     CompareRepeat(ctx, legacy_repeat, legacy, oracle.RepeatAllowance(),
                     label + " legacy repeat controls atomic face roundoff");
     CompareRepeat(ctx, repeat, actual, oracle.RepeatAllowance(),
                     label + " rows repeat with finite overwritten outputs");
+    CompareRepeat(ctx, reused_repeat, reused, oracle.RepeatAllowance(),
+                    label + " row reuse repeats with finite overwritten outputs");
     CheckConservation(ctx, fes, oracle.cell_mass, actual, phase != 0, label);
+    CheckConservation(ctx, fes, oracle.cell_mass, reused, phase != 0, label + " row reuse");
     if (phase == 0)
     {
       ctx.Check(actual.Normlinf() < 8.e-11, cohort + " preserves a constant state");
+      ctx.Check(reused.Normlinf() < 8.e-11, cohort + " row reuse preserves a constant state");
       if (mfem::Device::Allows(mfem::Backend::CUDA_MASK))
       {
-        const bool dense = fixture.geometry == Geometry::CurvedQ2;
+        const bool dense = fixture.geometry == Geometry::CurvedQ2 ||
+                           fixture.geometry == Geometry::CurvedQ3;
         ctx.Check(LogHas(row_log, "event=weakdiv-volume-path", "dense_execution=rows") &&
                     LogHas(element_log, "event=weakdiv-volume-path", "dense_execution=element"),
                   cohort + " selects both packed dense weak-divergence implementations");
+        ctx.Check(LogHas(row_log, "event=weakdiv-volume-path", "weakdiv_row_reuse=0") &&
+                    LogHas(reuse_log, "event=weakdiv-volume-path", "weakdiv_row_reuse=1") &&
+                    LogHas(reuse_log, "event=weakdiv-volume-path", "weakdiv_row_reuse_requested=1") &&
+                    LogHas(element_log, "event=weakdiv-volume-path", "weakdiv_row_reuse=0") &&
+                    LogHas(element_log, "event=weakdiv-volume-path", "weakdiv_row_reuse_requested=1"),
+                  cohort + " selects row reuse and retains requested element fallback");
         ctx.Check(LogHas(row_log, "event=invmass-path", dense ? "dense_execution=rows" : "dense_execution=diagonal") &&
                     LogHas(element_log, "event=invmass-path", dense ? "dense_execution=element" : "dense_execution=diagonal"),
                   cohort + " selects the expected physical inverse-mass representation");
@@ -623,6 +646,21 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   Apply(*rows, state, repeat, "rows", true);
   CompareRepeat(ctx, repeat, actual, oracle.RepeatAllowance(),
                   cohort + " legacy selector alias agrees with explicit rows");
+  auto legacy_reuse = MakeOperator(fes, flux, "rows");
+  const std::string alias_log = Apply(*legacy_reuse, state, reused_repeat,
+                                      "rows", false, nullptr, "1");
+  CompareRepeat(ctx, reused_repeat, reused, oracle.RepeatAllowance(),
+                  cohort + " legacy row-reuse alias agrees with canonical selection");
+  auto precedence = MakeOperator(fes, flux, "rows");
+  const std::string precedence_log = Apply(*precedence, state, reused_repeat,
+                                           "rows", false, "0", "1");
+  CompareRepeat(ctx, reused_repeat, actual, oracle.RepeatAllowance(),
+                  cohort + " canonical row-reuse off overrides the legacy request");
+  if (mfem::Device::Allows(mfem::Backend::CUDA_MASK))
+    ctx.Check(LogHas(alias_log, "event=weakdiv-volume-path", "weakdiv_row_reuse=1") &&
+                LogHas(precedence_log, "event=weakdiv-volume-path", "weakdiv_row_reuse=0") &&
+                LogHas(precedence_log, "event=weakdiv-volume-path", "weakdiv_row_reuse_requested=0"),
+              cohort + " verifies row-reuse alias selection and canonical precedence");
 
   // Perturb only one cell. Its neighbors must change through shared faces,
   // while independent full-RHS comparison still covers every output row.
@@ -632,8 +670,11 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   for (int j = 0; j < perturbed_dofs.Size(); ++j)
     modified[fes.DofToVDof(perturbed_dofs[j], 3)] += 0.004;
   Apply(*rows, state, repeat, "rows");
+  Apply(*reuse, state, reused_repeat, "rows", false, "1");
   oracle.Apply(state, &sigma, expected);
   Compare(ctx, repeat, expected, 2.e-11, cohort + " cell perturbation versus independent full RHS");
+  Compare(ctx, reused_repeat, expected, 2.e-11,
+            cohort + " row reuse reads changed state versus independent full RHS");
   double neighbor_change = 0.0;
   const auto* perturbed = repeat.HostRead(); const auto* before = actual.HostRead();
   for (int e = 1; e < fes.GetNE(); ++e)
@@ -655,17 +696,22 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   physical.SetInvariantDomainFlux(true);
   rows = MakeOperator(fes, flux, "rows");
   element = MakeOperator(fes, flux, "element");
+  reuse = MakeOperator(fes, flux, "rows");
   rows->SetInvariantDomainVolumeSpeedTracking(true);
   element->SetInvariantDomainVolumeSpeedTracking(true);
+  reuse->SetInvariantDomainVolumeSpeedTracking(true);
   Apply(*rows, state, actual, "rows");
   Apply(*element, state, legacy, "element");
+  Apply(*reuse, state, reused, "rows", false, "1");
   const double expected_speed = oracle.Apply(state, &sigma, expected, &physical);
   Compare(ctx, actual, legacy, 3.e-12, cohort + " invariant-speed rows versus element");
   Compare(ctx, actual, expected, 2.e-11, cohort + " invariant-speed independent full RHS");
+  Compare(ctx, reused, expected, 2.e-11,
+            cohort + " invariant-speed row reuse versus independent full RHS");
   const double speed = rows->GetMaxCharSpeed();
   ctx.Check(std::isfinite(speed) && std::isfinite(expected_speed) &&
               std::abs(speed - expected_speed) <= 2.e-12 * std::max(1.0, expected_speed) &&
-              speed == element->GetMaxCharSpeed(),
+              speed == element->GetMaxCharSpeed() && speed == reuse->GetMaxCharSpeed(),
             cohort + " invariant-speed node maximum agrees with host reference");
 }
 
@@ -751,9 +797,9 @@ void CheckCurvedTensorFaces(TestContext& ctx)
     HostDenseRHS oracle(ctx, fes, flux, fixture,
                          configuration.face_order_offset, true);
     mfem::Array<int> boundaries(mesh.bdr_attributes.Max()); boundaries = 1;
-    std::array<std::unique_ptr<mfem::DGHyperbolicConservationLaws>, 2> operators;
-    std::array<Vector, 2> residual, captured;
-    for (int variant = 0; variant < 2; ++variant)
+    std::array<std::unique_ptr<mfem::DGHyperbolicConservationLaws>, 3> operators;
+    std::array<Vector, 3> residual, captured;
+    for (int variant = 0; variant < 3; ++variant)
     {
       ScopedEnvironment face_mode("IGRLAB_DG_TENSOR_FACE", variant ? "fp64" : "off");
       operators[variant] = MakeOperator(fes, flux, "rows", configuration.face_order_offset);
@@ -780,13 +826,19 @@ void CheckCurvedTensorFaces(TestContext& ctx)
                   std::abs(boundary_reference[0]) < 2.e-12 &&
                   std::abs(boundary_reference[3]) < 2.e-12,
                 label + " has nontrivial wall force and zero mass/energy leakage");
-      for (int variant = 0; variant < 2; ++variant)
+      for (int variant = 0; variant < 3; ++variant)
       {
         const char* mode = variant ? "fp64" : "off";
+        const char* row_reuse = variant == 2 ? "1" : "0";
         ScopedEnvironment face_mode("IGRLAB_DG_TENSOR_FACE", mode);
         auto& op = *operators[variant];
         op.ArmPhysicalBoundaryFluxIntegral();
-        const std::string log = Apply(op, state, residual[variant], "rows");
+        const std::string log = Apply(op, state, residual[variant], "rows", false, row_reuse);
+        if (phase == 0 && mfem::Device::Allows(mfem::Backend::CUDA_MASK))
+          ctx.Check(LogHas(log, "event=weakdiv-volume-path",
+                            std::string("weakdiv_row_reuse=") + row_reuse),
+                    label + " selects the requested boundary row-reuse variant=" +
+                      std::to_string(variant));
         ctx.Check(op.HasLastPhysicalBoundaryFluxIntegral(),
                   label + " publishes the requested physical boundary integral mode=" + mode);
         if (op.HasLastPhysicalBoundaryFluxIntegral())
@@ -827,13 +879,17 @@ void CheckCurvedTensorFaces(TestContext& ctx)
         }
         if (variant && !configuration.fallback)
         {
-          Apply(op, state, repeat, "rows");
+          Apply(op, state, repeat, "rows", false, row_reuse);
           CompareRepeat(ctx, repeat, residual[variant], 0.0,
                           label + " tensor faces repeat with every output row owned");
         }
       }
       Compare(ctx, residual[1], residual[0], 3.e-12,
                 label + " tensor/requested fallback versus generic full RHS");
+      // Admitted tensor faces own each output, so these complete RHSs also
+      // provide an exact execution check without atomic face-order variation.
+      Compare(ctx, residual[2], residual[1], configuration.fallback ? 3.e-12 : 0.0,
+                label + " row reuse preserves the complete physical boundary RHS");
       if (phase == 0) { first_sigma = residual[1]; }
       else
         ctx.Check(Difference(residual[1], first_sigma) > 1.e-4,
@@ -855,7 +911,7 @@ int main(int argc, char** argv)
   ScopedEnvironment packed_mass("IGRLAB_DG_PACKED_INVMASS_DEVICE", "1");
   ScopedEnvironment sigma_storage("IGRLAB_WEAKDIV_SIGMA_STORAGE", "auto");
   TestContext ctx;
-  const std::array<Fixture, 4> fixtures{{
+  const std::array<Fixture, 6> fixtures{{
     {Geometry::CurvedQ2, 5, mfem::Ordering::byNODES, 5,
       mfem::BasisType::GaussLegendre, "Q2-p5-byNODES-exact-sigma"},
     {Geometry::CurvedQ2, 2, mfem::Ordering::byVDIM, 2,
@@ -863,7 +919,11 @@ int main(int argc, char** argv)
     {Geometry::Straight, 5, mfem::Ordering::byVDIM, 5,
       mfem::BasisType::GaussLegendre, "straight-p5-byVDIM-exact-sigma"},
     {Geometry::Shear, 2, mfem::Ordering::byNODES, 1,
-      mfem::BasisType::GaussLobatto, "shear-p2-byNODES-interpolated-sigma"}
+      mfem::BasisType::GaussLobatto, "shear-p2-byNODES-interpolated-sigma"},
+    {Geometry::CurvedQ2, 1, mfem::Ordering::byVDIM, 1,
+      mfem::BasisType::GaussLegendre, "Q2-p1-byVDIM-exact-sigma"},
+    {Geometry::CurvedQ3, 7, mfem::Ordering::byNODES, 7,
+      mfem::BasisType::GaussLegendre, "Q3-p7-byNODES-exact-sigma"}
   }};
   for (std::size_t i = 0; i < fixtures.size(); ++i)
     CheckFixture(ctx, fixtures[i], i == 0);
