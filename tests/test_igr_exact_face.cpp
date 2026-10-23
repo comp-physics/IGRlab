@@ -1599,8 +1599,35 @@ void CheckCompactFaceLiftGatherRounding()
       forall(n, gather);
       Vector active;
       active.MakeRef(padded, 0, n);
-      MFEM_VERIFY(SameBits(active, expected),
-                  "Compact gather changed rounded face/incidence/base order or nonfinite propagation.");
+      const bool same_bits = SameBits(active, expected);
+      if (!same_bits)
+      {
+        const real_t* observed = active.HostRead();
+        const real_t* reference = expected.HostRead();
+        bool reported = false;
+        for (int e = 0; e < ne && !reported; ++e) for (int native = 0; native < 36 && !reported; ++native)
+        {
+          const int global = global_map[native + 36 * e];
+          std::uint64_t actual_bits = 0, expected_bits = 0;
+          std::memcpy(&actual_bits, observed + global, sizeof(real_t));
+          std::memcpy(&expected_bits, reference + global, sizeof(real_t));
+          if (actual_bits == expected_bits) { continue; }
+          std::ostringstream detail;
+          detail << std::setprecision(17)
+                 << "ExactFaceCompactLiftRounding first_difference recover=" << recover << " mode=" << mode
+                 << " element=" << e << " native=" << native << " global=" << global
+                 << " actual=" << observed[global] << " expected=" << reference[global]
+                 << " actual_bits=0x" << std::hex << actual_bits << " expected_bits=0x" << expected_bits << std::dec
+                 << " actual_finite=" << std::isfinite(observed[global]) << " expected_finite=" << std::isfinite(reference[global])
+                 << " actual_nan=" << std::isnan(observed[global]) << " expected_nan=" << std::isnan(reference[global])
+                 << " actual_signbit=" << std::signbit(observed[global]) << " expected_signbit=" << std::signbit(reference[global]);
+          std::cerr << detail.str() << std::endl;
+          reported = true;
+        }
+      }
+      MFEM_VERIFY(same_bits,
+                  "Compact gather changed rounded face/incidence/base order or nonfinite propagation; recover="
+                  << recover << " mode=" << mode);
       const real_t* values = padded.HostRead();
       for (int i = n; i < n + tail; ++i)
       { MFEM_VERIFY(values[i] == 12345.0, "Compact gather wrote into its padded output tail."); }
