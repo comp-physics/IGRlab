@@ -67,6 +67,16 @@ void Compare(TestContext& ctx, const Vector& actual, const Vector& expected,
             label + " max error=" + dg_igr_tests::FormatSci(error));
 }
 
+void CompareRepeat(TestContext& ctx, const Vector& actual, const Vector& expected,
+                    double allowance, const std::string& label)
+{
+  const double error = Difference(actual, expected);
+  ctx.Check(std::isfinite(error) && std::isfinite(allowance) &&
+              allowance >= 0.0 && error <= allowance,
+            label + " max error=" + dg_igr_tests::FormatSci(error) +
+              " roundoff bound=" + dg_igr_tests::FormatSci(allowance));
+}
+
 bool LogHas(const std::string& log, const char* event, const std::string& token)
 {
   const auto begin = log.find(event);
@@ -199,14 +209,53 @@ void FillSigma(mfem::ParGridFunction& sigma, bool constant, double scale)
 class HostDenseRHS
 {
   mfem::ParFiniteElementSpace& fes_;
+  const mfem::NumericalFlux& flux_;
   mfem::HyperbolicFormIntegrator face_integrator_;
   mfem::ParNonlinearForm faces_;
   std::vector<DenseMatrix> weak_, inverse_;
+  double repeat_allowance_ = 0.0;
+
+  void AbsoluteFaceContributions(const Vector& state, Vector& absolute)
+  {
+    absolute.SetSize(fes_.GetVSize()); absolute = 0.0;
+    auto* sums = absolute.HostWrite();
+    const auto* input = state.HostRead();
+    mfem::HyperbolicFormIntegrator integrator(flux_, 2);
+    mfem::IntegrationRule single_point(1);
+    integrator.SetIntRule(&single_point);
+    auto& mesh = *fes_.GetMesh();
+    for (int f = 0; f < mesh.GetNumFaces(); ++f)
+    {
+      auto* tr = mesh.GetInteriorFaceTransformations(f);
+      if (!tr) { continue; }
+      const auto& left = *fes_.GetFE(tr->Elem1No);
+      const auto& right = *fes_.GetFE(tr->Elem2No);
+      mfem::Array<int> left_dofs, right_dofs;
+      fes_.GetElementVDofs(tr->Elem1No, left_dofs);
+      fes_.GetElementVDofs(tr->Elem2No, right_dofs);
+      Vector local(left_dofs.Size() + right_dofs.Size()), contribution;
+      for (int i = 0; i < left_dofs.Size(); ++i) { local[i] = input[left_dofs[i]]; }
+      for (int i = 0; i < right_dofs.Size(); ++i)
+        local[left_dofs.Size() + i] = input[right_dofs[i]];
+      const auto& rule = mfem::IntRules.Get(tr->GetGeometryType(),
+        2 * std::max(left.GetOrder(), right.GetOrder()) + 2);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        single_point.IntPoint(0) = rule.IntPoint(q);
+        integrator.AssembleFaceVector(left, right, *tr, local, contribution);
+        for (int i = 0; i < left_dofs.Size(); ++i)
+          sums[left_dofs[i]] += std::abs(contribution[i]);
+        for (int i = 0; i < right_dofs.Size(); ++i)
+          sums[right_dofs[i]] += std::abs(contribution[left_dofs.Size() + i]);
+      }
+    }
+  }
+
 public:
   std::vector<Vector> cell_mass;
   HostDenseRHS(TestContext& ctx, mfem::ParFiniteElementSpace& fes,
                const mfem::NumericalFlux& flux, const Fixture& fixture)
-    : fes_(fes), face_integrator_(flux, 2), faces_(&fes),
+    : fes_(fes), flux_(flux), face_integrator_(flux, 2), faces_(&fes),
       weak_(fes.GetNE()), inverse_(fes.GetNE()), cell_mass(fes.GetNE())
   {
     faces_.AddInteriorFaceIntegrator(&face_integrator_);
@@ -273,6 +322,8 @@ public:
     }
   }
 
+  double RepeatAllowance() const { return repeat_allowance_; }
+
   double Apply(const Vector& state, const mfem::ParGridFunction* sigma,
                 Vector& rhs, const mfem::FluxWithIGR* tracked_flux = nullptr)
   {
@@ -280,6 +331,11 @@ public:
     Vector face_rhs(fes_.GetVSize());
     faces_.Mult(state, face_rhs);
     double maximum_speed = face_integrator_.GetMaxCharSpeed();
+    Vector absolute_face;
+    const bool atomic_faces = mfem::Device::Allows(mfem::Backend::CUDA_MASK);
+    if (atomic_faces) { AbsoluteFaceContributions(state, absolute_face); }
+    const auto* face_bound = atomic_faces ? absolute_face.HostRead() : nullptr;
+    repeat_allowance_ = 0.0;
     const auto* input = state.HostRead();
     const auto* face = face_rhs.HostRead();
     auto* result = rhs.HostWrite();
@@ -291,6 +347,7 @@ public:
       mfem::Array<int> dofs;
       fes_.GetElementDofs(e, dofs);
       DenseMatrix nodal(dof * kDimension, kEquations), residual(dof, kEquations);
+      DenseMatrix absolute_residual(dof, kEquations);
       for (int j = 0; j < dof; ++j)
       {
         const auto& ip = fe.GetNodes().IntPoint(j);
@@ -324,17 +381,40 @@ public:
         for (int i = 0; i < dof; ++i)
         {
           long double sum = face[fes_.DofToVDof(dofs[i], c)];
+          long double absolute_sum = atomic_faces ?
+            face_bound[fes_.DofToVDof(dofs[i], c)] : 0.0L;
           for (int j = 0; j < dof * kDimension; ++j)
+          {
             sum += static_cast<long double>(weak_[e](i, j)) * nodal(j, c);
+            absolute_sum += std::abs(static_cast<long double>(weak_[e](i, j)) * nodal(j, c));
+          }
           residual(i, c) = static_cast<double>(sum);
+          absolute_residual(i, c) = static_cast<double>(absolute_sum);
         }
+      // The unchanged generic Rusanov kernels atomically add four faces times
+      // nq contributions into each element coefficient. Bound two evaluations
+      // with gamma_n = n*eps/(1-n*eps), propagated through the absolute dense
+      // weak-divergence and inverse-mass contractions. This uses physical
+      // matrix/flux magnitudes, including cancellation in a constant RHS.
+      const int nq = mfem::IntRules.Get(mfem::Geometry::SEGMENT,
+                                         2 * fe.GetOrder() + 2).GetNPoints();
+      const double operations = 4 * nq + 2 * kDimension * dof + 2 * dof + 8;
+      const double accumulated_epsilon = operations * std::numeric_limits<double>::epsilon();
+      const double gamma_n = accumulated_epsilon / (1.0 - accumulated_epsilon);
       for (int c = 0; c < kEquations; ++c)
         for (int i = 0; i < dof; ++i)
         {
-          long double sum = 0.0L;
+          long double sum = 0.0L, absolute_sum = 0.0L;
           for (int j = 0; j < dof; ++j)
+          {
             sum += static_cast<long double>(inverse_[e](i, j)) * residual(j, c);
+            absolute_sum += std::abs(static_cast<long double>(inverse_[e](i, j))) *
+                            absolute_residual(j, c);
+          }
           result[fes_.DofToVDof(dofs[i], c)] = static_cast<double>(sum);
+          if (atomic_faces)
+            repeat_allowance_ = std::max(repeat_allowance_,
+              static_cast<double>(2.0L * gamma_n * absolute_sum));
         }
     }
     return maximum_speed;
@@ -406,8 +486,9 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   auto element = MakeOperator(fes, flux, "element");
   HostDenseRHS oracle(ctx, fes, flux, fixture);
   Vector state(fes.GetVSize()), actual(fes.GetVSize()), legacy(fes.GetVSize());
-  Vector expected(fes.GetVSize()), repeat(fes.GetVSize()), previous_sigma(fes.GetVSize());
-  actual.UseDevice(true); legacy.UseDevice(true); repeat.UseDevice(true);
+  Vector expected(fes.GetVSize()), repeat(fes.GetVSize()), legacy_repeat(fes.GetVSize());
+  Vector previous_sigma(fes.GetVSize());
+  actual.UseDevice(true); legacy.UseDevice(true); repeat.UseDevice(true); legacy_repeat.UseDevice(true);
   const std::string cohort(fixture.name);
   ctx.Check(!rows->GetDGSEMDiagnosticStateScan() &&
               !element->GetDGSEMDiagnosticStateScan() &&
@@ -433,7 +514,11 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
                 speed == element->GetMaxCharSpeed(),
               label + " preserves the face/CFL characteristic speed policy");
     Apply(*rows, state, repeat, "rows");
-    Compare(ctx, repeat, actual, 0.0, label + " repeats with every output row owned");
+    Apply(*element, state, legacy_repeat, "element");
+    CompareRepeat(ctx, legacy_repeat, legacy, oracle.RepeatAllowance(),
+                    label + " legacy repeat controls atomic face roundoff");
+    CompareRepeat(ctx, repeat, actual, oracle.RepeatAllowance(),
+                    label + " rows repeat with finite overwritten outputs");
     CheckConservation(ctx, fes, oracle.cell_mass, actual, phase != 0, label);
     if (phase == 0)
     {
@@ -460,9 +545,11 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   }
   if (!supplementary) { return; }
   Apply(*rows, state, repeat, nullptr);
-  Compare(ctx, repeat, actual, 0.0, cohort + " default execution agrees with explicit rows");
+  CompareRepeat(ctx, repeat, actual, oracle.RepeatAllowance(),
+                  cohort + " default execution agrees with explicit rows");
   Apply(*rows, state, repeat, "rows", true);
-  Compare(ctx, repeat, actual, 0.0, cohort + " legacy selector alias agrees with explicit rows");
+  CompareRepeat(ctx, repeat, actual, oracle.RepeatAllowance(),
+                  cohort + " legacy selector alias agrees with explicit rows");
 
   // Perturb only one cell. Its neighbors must change through shared faces,
   // while independent full-RHS comparison still covers every output row.
@@ -490,9 +577,11 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
   ctx.Check(neighbor_change > 1.e-4, cohort + " transmits a cell perturbation through global face coupling");
   CheckConservation(ctx, fes, oracle.cell_mass, repeat, true, cohort + " perturbed cell");
 
-  // Reuse one curved fixture for the existing optional invariant-speed branch;
-  // primary campaign comparisons above retain its ordinary thermal policy.
+  // Reuse the curved mesh with fresh operators: face telemetry allocation is
+  // fixed when the invariant-speed policy first builds the face metadata.
   physical.SetInvariantDomainFlux(true);
+  rows = MakeOperator(fes, flux, "rows");
+  element = MakeOperator(fes, flux, "element");
   rows->SetInvariantDomainVolumeSpeedTracking(true);
   element->SetInvariantDomainVolumeSpeedTracking(true);
   Apply(*rows, state, actual, "rows");

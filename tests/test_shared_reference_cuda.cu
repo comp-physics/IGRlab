@@ -1034,6 +1034,21 @@ void DGVolumeMemoryOracle(int state_basis, int sigma_basis, int sigma_order,
                           bool periodic = false, bool with_sigma = true,
                           bool h1_sigma = false, bool permuted_sigma = false)
 {
+  // This historical fixture compares explicit shared-map flux modes with the
+  // original element control. Mapped dense row execution has its own RHS test.
+  const char* previous_dense_execution = std::getenv("IGRLAB_DG_PACKED_DENSE_EXECUTION");
+  struct RestoreDenseExecution
+  {
+    bool existed;
+    std::string value;
+    ~RestoreDenseExecution()
+    {
+      if (existed) { setenv("IGRLAB_DG_PACKED_DENSE_EXECUTION", value.c_str(), 1); }
+      else { unsetenv("IGRLAB_DG_PACKED_DENSE_EXECUTION"); }
+    }
+  } restore_dense_execution{previous_dense_execution != nullptr,
+      previous_dense_execution ? previous_dense_execution : ""};
+  setenv("IGRLAB_DG_PACKED_DENSE_EXECUTION", "element", 1);
   constexpr int order = 3;
   const int cells = periodic ? 4 : 1;
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
