@@ -1,0 +1,192 @@
+{
+  "schema": "igr-dg-mapped-pipeline-measurements-v1",
+  "status": "passed-short-execution-equivalence",
+  "campaign": "igr-dg-mapped-pipeline-20261022",
+  "evidence_remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-pipeline-20261022",
+  "evidence": {
+    "short_job": "3439969",
+    "short_run": {
+      "path": "short-3439969/run.json",
+      "sha256": "4ed842258a4e4c7efe4ee9229a18d2cf9cb200d465f9f65347dd7e1ce87041e4"
+    },
+    "native_job": "3439953",
+    "native_run": {
+      "path": "native-3439953/run.json",
+      "sha256": "bbe90d0df14286bc13443eb4b1b5c628420675aea3e39eb8bb8c6ad81cf9d069"
+    },
+    "fields": {
+      "path": "fields/comparison-t0025.json",
+      "sha256": "d4ff35c6688847135691818be4182564a5c5ccc49c4b90fca790d54f26511664"
+    },
+    "profile_job": "3439836",
+    "profile_review": {
+      "path": "prof-review.json",
+      "sha256": "9e7d8cc90c58137abfc352cb12e0f034f6b400380ea3ad8a0ff32e5d6c733462"
+    },
+    "source_manifest": {
+      "path": "source-freeze-r2/source-manifest.json",
+      "sha256": "be1e883f86aaed1b8f5aee0522c2aa8b2e45054fcffc9cd508c667abae86a9e0"
+    },
+    "source_graph_sha256": "e75dba096426effc9d37a740c65f4dc007b0575f0eb876d07307500ec76992a3",
+    "source_graph_files": 777,
+    "command_and_log_bindings": {
+      "baseline": {
+        "command_sha256": "fd9d23080c0d04b05e84a0dfba42054e3b1d0fe85a4d4dbeb142a97a990d01ad",
+        "stdout_sha256": "36cc5d486b3e7f6b4816cf2a6184a26bb49032157b13ee887538e38aa4650f9c",
+        "gpu_samples_sha256": "27064e307a6ddcd9a232b7556e5d8a1846b623b6eaecbf676c3b09c319da66ce"
+      },
+      "candidate": {
+        "command_sha256": "5dc9b0c43dd3066cca135ad7b030c1d95aaaf65727b116130aff0617a7b245d2",
+        "stdout_sha256": "c44758dd0e8a4b93db1ccfbb3c16da2b46d7a9c50464653119af2f91c616d2e1",
+        "gpu_samples_sha256": "48be4ca0d9b7589ad0f5780d729e37d4349d4b36fdde6bfd2ab6fdc211da87f1"
+      }
+    }
+  },
+  "source_commits": {
+    "baseline": "edba7971aacfa33b8886c94d67f38c6cbd9d6c23",
+    "candidate": "6ae6930f0d3c5b1c46fedb68b9a4bb626864631f"
+  },
+  "application_sha256": {
+    "baseline": "38e112c45baf6bfe1715b3710a3ecbc6109a11f4997a5f4c0a903be978f50a28",
+    "candidate": "fdd7b9e152598f7a9e561fe88510b97644e2cfbafd2b096d70c0d51a53bb6021"
+  },
+  "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+  "case": {
+    "mesh_n": 512,
+    "elements": 262144,
+    "geometry_order": 2,
+    "mapping_amplitude": 0.035,
+    "order": 5,
+    "conserved_dofs": 37748736,
+    "sigma_dofs": 9437184,
+    "target_time": 0.0025,
+    "integrator": "rk3ssp",
+    "cfl": 0.3,
+    "c_alpha": 0.16666666666666666,
+    "alpha_length": "max",
+    "mass_quadrature": "GL7x7",
+    "diffusion_quadrature": "GL6x6",
+    "sigma_cadence": "every-stage",
+    "initial_sweeps": 50,
+    "regular_sweeps": 2,
+    "omega": 0.7,
+    "local_inverse": "projected tensor-element WMMA FP64",
+    "current_residual": "global face-coupled FP64",
+    "euler_execution": {
+      "baseline": "element FP64 SIMT",
+      "candidate": "pointwise flux and dense rows FP64 SIMT"
+    },
+    "native_default_selector": "IGRLAB_DG_PACKED_DENSE_EXECUTION=rows",
+    "runtime_scans": false,
+    "restart": false
+  },
+  "native": {
+    "status": "passed",
+    "cuda_arch": 90,
+    "canonical_driver": "build.sh",
+    "tests": [
+      "dg_igr_dg_device_faces_cpu",
+      "dg_igr_dg_device_faces_cuda",
+      "dg_igr_dg_mapped_dense_cpu",
+      "dg_igr_dg_mapped_dense_cuda",
+      "dg_igr_dg_volume_memory_cuda",
+      "dg_igr_dg_tensor_face_cuda"
+    ]
+  },
+  "gpu": {
+    "index": 0,
+    "uuid": "GPU-b7de2193-6349-6d24-39b1-464c7bef6ca1",
+    "name": "NVIDIA GH200 120GB",
+    "memory_mib": 97871,
+    "cuda_visible_devices": "0",
+    "logical_cuda_device": 0
+  },
+  "node": "gh074",
+  "same_gpu": true,
+  "execution_order": [
+    "baseline",
+    "candidate"
+  ],
+  "accepted_steps_each": 162,
+  "rejected_steps_each": 0,
+  "sigma_calls_each": 487,
+  "production_sigma_calls_each": 486,
+  "output_only_sigma_calls_each": 1,
+  "total_sweeps_each": 1022,
+  "closure_certified": false,
+  "timings_seconds": {
+    "baseline": {
+      "pre_final_output_analysis_seconds": 125.339973,
+      "native_done_seconds": 168.817910605,
+      "application_wall_seconds": 284.6240030529443
+    },
+    "candidate": {
+      "pre_final_output_analysis_seconds": 22.709105,
+      "native_done_seconds": 65.360092309,
+      "application_wall_seconds": 177.80161486985162
+    }
+  },
+  "baseline_over_candidate": {
+    "pre_final_output_analysis_seconds": 5.519370886699409,
+    "native_done_seconds": 2.5828897212520308,
+    "application_wall_seconds": 1.6007953766971421
+  },
+  "timing_scopes": {
+    "pre_final_output_analysis_seconds": "Printed final Analysis elapsed before the final VTK save; not whole-process time.",
+    "native_done_seconds": "Native stopwatch starts after initial VTK output and includes final output and final reporting.",
+    "application_wall_seconds": "External monotonic process wall time, including setup, initial/final output and teardown."
+  },
+  "memory": {
+    "one_hz_sampled_total_gpu_peak_mib": {
+      "baseline": 29099.0,
+      "candidate": 29677.0
+    },
+    "sampled_increase_mib": 578,
+    "source_derived_flux_scratch_bytes": 603979776,
+    "source_derived_flux_scratch_mib": 576,
+    "note": "One-second total-device samples can miss the true peak and do not isolate scratch allocation."
+  },
+  "profile": {
+    "trace_seconds": 15.004799968,
+    "observed_weakdiv_ms": 145.78252055,
+    "observed_inverse_mass_ms": 72.67736525,
+    "observed_pair_clipped_seconds": 13.06949251,
+    "observed_pair_clipped_window_percent": 87.10207758765638,
+    "fully_interior_rk_steps_without_launch_holes": 18,
+    "driver_cupti": "Driver13.2 with Nsight2025.3.1/CUPTI12.9 fallback",
+    "coverage": "Primary CUPTI49/50 final-buffer warning; stop-boundary incompleteness retained. Recorded activity is not hardware utilization."
+  },
+  "fields": {
+    "complete_saved_polynomials": true,
+    "quadrature": "GL8x8 on verified fitted Q2 maps",
+    "cells": 262144,
+    "geometry_pair_max_abs_difference": 0,
+    "maximum_conserved_relative_l2": 3.24258540295972e-14,
+    "sigma_relative_l2": 1.0824401928625688e-12,
+    "per_component_relative_l2": {
+      "density": 1.3883525834830543e-15,
+      "momentum_x": 3.2410604851273184e-14,
+      "momentum_y": 3.24258540295972e-14,
+      "energy": 5.877434151765576e-16,
+      "sigma": 1.0824401928625688e-12,
+      "pressure": 5.922952810190954e-16,
+      "speed": 2.2909306728502825e-14,
+      "q_sigma": 5.95648716134037e-16
+    },
+    "vtu_sha256": {
+      "baseline": "37c53d02ee78063ffce7521e0f8091f5fc85d73af45c3b2c11740c995b8cbb72",
+      "candidate": "e74c9e902a5c92245af364e30aca964059baef382e5d2d4ddf43dccb12ab8e11"
+    },
+    "sampled_admissibility_all_positive": true,
+    "conserved_engineering_budgets_passed": true,
+    "sigma_accuracy_vs_converged_reference_qualified": false
+  },
+  "limitations": [
+    "One sequential short pair with unlocked clocks; no confidence interval or full-t=.1 timing result.",
+    "Execution equivalence compares the same approximate50/2 solver; it does not establish sigma or flow accuracy against a converged solution.",
+    "Earlier coarse control used a two-level element/Q1 cooperative-CG preconditioner and was not the same algorithm as this baseline.",
+    "Runtime/PVD receipts bind physical time; VTU does not independently encode that time.",
+    "Polynomial squared norms are exact on the fitted Q2 map up to FP64/geometry-fit roundoff; Linf/positivity remain GL8-sampled.",
+    "Validation binds frozen6ae6930, not later Q2 face changes."
+  ]
+}
