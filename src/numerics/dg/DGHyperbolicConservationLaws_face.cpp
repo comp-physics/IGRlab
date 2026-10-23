@@ -322,7 +322,10 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
   const auto fallback = [](const char* reason)
   {
     if (mfem::Mpi::Root())
-      std::cout << "[dg-tensor-face] event=fallback reason=" << reason << std::endl;
+      std::cout << "[dg-tensor-face] event=fallback reason=" << reason
+                << " row_reuse_requested="
+                << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+                << " row_reuse=0" << std::endl;
     return false;
   };
 #ifndef DG_IGR_HAS_ACCEL_FORALL
@@ -335,7 +338,7 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
       sizeof(real_t) != sizeof(double)) { return fallback("backend"); }
   if (!mesh || !mesh->Conforming() || mesh->Dimension() != 2 ||
       mesh->SpaceDimension() != 2 || dim != 2 || num_equations != 4 ||
-      vfes.GetVDim() != 4 || !invmass_apply_ready_ || weakdiv.empty() ||
+      vfes.GetVDim() != 4 || !invmass_apply_ready_ || !HasPreassembledWeakDivergence_() ||
       vol_mode_ != VolumeMode::WeakDivergence || vfes.GetNE() <= 0 ||
       !dynamic_cast<const L2_FECollection*>(vfes.FEColl()))
     { return fallback("state-layout"); }
@@ -781,6 +784,10 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
               << " dense_shape_entries=0 trace_bytes=" << std::size_t(data.traces.Size()) * sizeof(real_t)
               << " flux_bytes=" << std::size_t(data.flux.Size()) * sizeof(real_t)
               << " state=fp64 nonlinear_flux=fp64 lift=element-owned residual_atomics=0"
+              << " row_reuse_requested="
+              << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+              << " row_reuse="
+              << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
               << std::endl;
   return true;
 #endif
@@ -854,7 +861,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
     return;
   }
 
-  if (!invmass_apply_ready_ || weakdiv.empty() || !num_flux_)
+  if (!invmass_apply_ready_ || !HasPreassembledWeakDivergence_() || !num_flux_)
   {
     return;
   }
@@ -1760,7 +1767,7 @@ bool DGHyperbolicConservationLaws::SupportsPackedEntropyFacePolicy_() const
 bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
 {
   if (!Device::Allows(Backend::DEVICE_MASK) ||
-      vol_mode_ != VolumeMode::WeakDivergence || weakdiv.empty() ||
+      vol_mode_ != VolumeMode::WeakDivergence || !HasPreassembledWeakDivergence_() ||
       !invmass_apply_ready_) { return false; }
   const bool entropy = SupportsPackedEntropyFacePolicy_();
   const unsigned long native = static_cast<unsigned long>(Backend::CPU) |
@@ -1832,7 +1839,17 @@ bool DGHyperbolicConservationLaws::AddTensorFaceContributions_(
   trace.endpoints = data.endpoints.Read(); trace.state = x_in.Read();
   trace.sigma = use_sigma ? sigma->Read() : nullptr;
   trace.traces = data.traces.Write();
-  mfem::forall(data.elements * 4 * data.n, trace);
+  const bool row_reuse = dg_igr_detail::tensor_face::RowReuseRequested();
+  if (row_reuse)
+  {
+    dg_igr_detail::tensor_face::TraceRowReuseKernel reuse;
+    static_cast<dg_igr_detail::tensor_face::TraceKernel&>(reuse) = trace;
+    mfem::forall(data.elements * 4 * data.n, reuse);
+  }
+  else
+  {
+    mfem::forall(data.elements * 4 * data.n, trace);
+  }
 
   dg_igr_detail::tensor_face::FluxKernel flux;
   flux.n = data.n; flux.elements = data.elements;
@@ -1872,7 +1889,16 @@ bool DGHyperbolicConservationLaws::AddTensorFaceContributions_(
   lift.endpoints = data.endpoints.Read(); lift.tangents = data.tangents.Read();
   lift.interior_weights = face_int_weights_.Read(); lift.boundary_weights = face_bdr_weights_.Read();
   lift.flux = data.flux.Read(); lift.residual = z_out.Write();
-  mfem::forall(data.elements * data.n * data.n * 4, lift);
+  if (row_reuse)
+  {
+    dg_igr_detail::tensor_face::LiftRowReuseKernel reuse;
+    static_cast<dg_igr_detail::tensor_face::LiftKernel&>(reuse) = lift;
+    mfem::forall(data.elements * data.n * data.n, reuse);
+  }
+  else
+  {
+    mfem::forall(data.elements * data.n * data.n * 4, lift);
+  }
   if (capture_boundary_flux)
     mfem::forall(4, dg_igr_detail::tensor_face::BoundaryIntegralKernel{
       data.n, data.interior_faces, data.boundary_faces,

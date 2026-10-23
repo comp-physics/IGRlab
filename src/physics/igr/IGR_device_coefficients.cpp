@@ -961,8 +961,16 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 
   const mfem::Operator* R = ufes.GetElementRestriction(ordering);
   MFEM_VERIFY(R, "IGR device coefficients require element restriction.");
-  device_qinterp_evec_.SetSize(R->Height());
-  R->Mult(U, device_qinterp_evec_);
+  bool restricted_state_ready = false;
+  const auto restrict_state = [&]()
+  {
+    if (!restricted_state_ready)
+    {
+      device_qinterp_evec_.SetSize(R->Height());
+      R->Mult(U, device_qinterp_evec_);
+      restricted_state_ready = true;
+    }
+  };
 
   const int dim = dim_;
   const int num_eq = num_eq_;
@@ -977,6 +985,10 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
               "IGRLAB_IGR_COEFFICIENT_EXECUTION must be baseline|fused.");
   bool fused_coefficients = false;
   std::string fused_reason;
+  const bool direct_state_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_IGR_STAGE_STATE_DIRECT", false);
+  bool direct_state_selected = false;
+  std::string direct_state_reason;
   if (coefficient_execution == "fused")
   {
     // Diagnostic consumers need the materialized state/gradient QFs. The
@@ -989,19 +1001,39 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     {
 #ifdef DG_IGR_HAS_STAGE_COEFFICIENTS_CUDA
       if (mfem::Device::Allows(mfem::Backend::CUDA))
-        fused_coefficients = TryUpdateFusedStageCoefficientsCUDA(
-          *U.ParFESpace(), *mass_qs_, *sigma_qs_, *rhs_qs_, device_qinterp_evec_,
-          alpha, rho_floor, use_element_local_alpha ? &device_element_alpha_ : nullptr,
-          *invrho_qf_, *ck_qf_, *src_qf_, fused_stage_coefficients_, &fused_reason);
+      {
+        if (direct_state_requested)
+        {
+          fused_coefficients = TryUpdateFusedStageCoefficientsCUDA(
+            *U.ParFESpace(), *mass_qs_, *sigma_qs_, *rhs_qs_, U,
+            alpha, rho_floor, use_element_local_alpha ? &device_element_alpha_ : nullptr,
+            *invrho_qf_, *ck_qf_, *src_qf_, fused_stage_coefficients_, &fused_reason,
+            StageCoefficientStateLayout::Native);
+          direct_state_selected = fused_coefficients;
+          if (!fused_coefficients) { direct_state_reason = fused_reason; }
+        }
+        if (!fused_coefficients)
+        {
+          restrict_state();
+          fused_coefficients = TryUpdateFusedStageCoefficientsCUDA(
+            *U.ParFESpace(), *mass_qs_, *sigma_qs_, *rhs_qs_, device_qinterp_evec_,
+            alpha, rho_floor, use_element_local_alpha ? &device_element_alpha_ : nullptr,
+            *invrho_qf_, *ck_qf_, *src_qf_, fused_stage_coefficients_, &fused_reason);
+        }
+      }
       else fused_reason = "cuda-required";
 #else
       fused_reason = "cuda-build-required";
 #endif
     }
   }
+  if (direct_state_requested && !direct_state_selected && direct_state_reason.empty())
+  { direct_state_reason = fused_reason.empty() ? "fused-path-not-active" : fused_reason; }
   const std::string coefficient_selected = fused_coefficients ? "fused" : "baseline";
   const std::string coefficient_log_key = coefficient_execution + ":" +
-    coefficient_selected + ":" + fused_reason;
+    coefficient_selected + ":" + fused_reason + ":" +
+    (direct_state_requested ? "direct" : "restricted") + ":" +
+    (direct_state_selected ? "direct" : "restricted") + ":" + direct_state_reason;
   if (device_coeff_execution_logged_ != coefficient_log_key)
   {
     if (mfem::Mpi::Root())
@@ -1012,6 +1044,9 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
                 << " requested=" << coefficient_execution
                 << " selected=" << coefficient_selected << " precision=fp64";
       if (!fused_reason.empty()) { std::cout << " reason=" << fused_reason; }
+      std::cout << " state_requested=" << (direct_state_requested ? "direct" : "restricted")
+                << " state_selected=" << (direct_state_selected ? "direct" : "restricted");
+      if (!direct_state_reason.empty()) { std::cout << " state_reason=" << direct_state_reason; }
       std::cout << "\n";
     }
     device_coeff_execution_logged_ = coefficient_log_key;
@@ -1019,6 +1054,9 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 
   if (!fused_coefficients)
   {
+    // Diagnostic and unsupported paths still materialize the original current
+    // restriction, including transitions from a previously admitted direct stage.
+    restrict_state();
     auto project_state =
       [&](mfem::QuadratureSpace& qs,
           mfem::QuadratureFunction* values,

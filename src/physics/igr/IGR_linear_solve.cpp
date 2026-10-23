@@ -1129,6 +1129,7 @@ public:
       added = dg_face::TryLaunchInteriorFaceDGDiffusionAddToBase2D(
         info_, scratch_, x, ip_sigma_, y);
     }
+    if (added) { LogTraceSelection(); }
     if (added && timing_enabled_)
     {
       timing_.local_apply_seconds += ElapsedSeconds(start);
@@ -1160,6 +1161,7 @@ public:
       dg_face::LaunchInteriorFaceDGDiffusionResidual2D(
         info_, scratch_, x, ip_sigma_, rhs, y);
     }
+    LogTraceSelection();
     if (!residual_execution_reported_)
     {
       std::cout << "[igr-element-block-jacobi] event=execution path=fused-current-residual"
@@ -1199,6 +1201,7 @@ public:
         dg_face::LaunchInteriorFaceDGDiffusionApply2D(info_, scratch_, x,
                                                      ip_sigma_, y);
       }
+      LogTraceSelection();
       if (timing_enabled_)
       {
         timing_.local_apply_seconds += ElapsedSeconds(apply_start);
@@ -1229,6 +1232,7 @@ public:
                                                       ip_sigma_,
                                                       local_y_);
       }
+      LogTraceSelection();
       if (has_shared_)
       {
         {
@@ -1285,6 +1289,7 @@ public:
                                                     ip_sigma_,
                                                     local_y_);
     }
+    LogTraceSelection();
     timing_.local_apply_seconds += ElapsedSeconds(local_apply_start);
     if (has_shared_)
     {
@@ -1344,6 +1349,28 @@ public:
   }
 
 private:
+  void LogTraceSelection() const
+  {
+    const bool requested = ::igrlab::EnvFlagEnabledDefault(
+      "DG_IGR_IGR_FACE_COALESCED_TRACE", false);
+    if (!requested && trace_selection_log_.empty()) { return; }
+    const bool selected = requested && OwnedScratchChebyshev::UsesOrdinaryCUDA() &&
+      dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info_, scratch_);
+    const std::string key = std::string(requested ? "1:" : "0:") + (selected ? "1" : "0");
+    if (trace_selection_log_ == key) { return; }
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-exact-face-trace] event=execution"
+                << " requested=" << (requested ? "coalesced" : "legacy")
+                << " selected=" << (selected ? "coalesced" : "legacy")
+                << " reason=" << (selected ? "compact-native-cuda" :
+                    requested ? "requires-admitted-compact-native-cuda" : "not-requested")
+                << " scope=local-interior-faces elements=" << info_.ne
+                << " interior_faces=" << info_.nf << std::endl;
+    }
+    trace_selection_log_ = key;
+  }
+
   bool RuleMatches(const mfem::IntegrationRule& ir) const
   {
     if (ir.GetOrder() != rule_order_ ||
@@ -1379,6 +1406,7 @@ private:
   mutable mfem::ParGridFunction local_x_gf_;
   bool timing_enabled_ = false;
   mutable bool residual_execution_reported_ = false;
+  mutable std::string trace_selection_log_;
   mutable ExactFaceTimingStats timing_;
 };
 

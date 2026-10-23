@@ -6,9 +6,17 @@ namespace mfem
 {
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
+#include "DGHyperbolicConservationLaws_mass_reuse_kernels.hpp"
 
 namespace
 {
+
+bool UsePackedInverseMassRowReuse_(bool requested, bool dense_rows,
+                                  bool diagonal, int components)
+{
+  return requested && dense_rows && !diagonal && sizeof(real_t) == sizeof(double) &&
+         components >= 2 && components <= 5;
+}
 
 bool AssembleCollocatedInverseMass(const FiniteElement& fe,
                                   ElementTransformation& transformation,
@@ -386,7 +394,35 @@ void DGHyperbolicConservationLaws::ApplyInverseMassPacked_(
 #ifdef DG_IGR_HAS_ACCEL_FORALL
   // invmass_data_flat_ stores each local inverse mass in column-major order:
   // entry (row=i, col=j) is minv[moff + j*dof + i].
-  if (UsePackedDenseRows_(vfes, dof, neq))
+  const bool dense_rows = UsePackedDenseRows_(vfes, dof, neq);
+  const bool row_reuse = UsePackedInverseMassRowReuse_(
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DG_INVMASS_ROW_REUSE", false),
+    dense_rows, false, neq);
+  if (row_reuse)
+  {
+    switch (neq)
+    {
+      case 2:
+        mfem::forall(ne * dof, PackedInverseMassRowReuseKernel<2>{
+          dof, map, minv, zin, yout});
+        break;
+      case 3:
+        mfem::forall(ne * dof, PackedInverseMassRowReuseKernel<3>{
+          dof, map, minv, zin, yout});
+        break;
+      case 4:
+        mfem::forall(ne * dof, PackedInverseMassRowReuseKernel<4>{
+          dof, map, minv, zin, yout});
+        break;
+      case 5:
+        mfem::forall(ne * dof, PackedInverseMassRowReuseKernel<5>{
+          dof, map, minv, zin, yout});
+        break;
+      default:
+        MFEM_ABORT("Unsupported inverse-mass row-reuse component count.");
+    }
+  }
+  else if (dense_rows)
   {
     mfem::forall(ne * ldof, PackedInverseMassRowsKernel{
       dof, neq, map, minv, zin, yout});
@@ -503,6 +539,12 @@ void DGHyperbolicConservationLaws::ApplyInverseMass_(const Vector& z_in,
 {
   const bool dense_rows =
     UsePackedDenseRows_(vfes, invmass_elem_dof_, num_equations);
+  const bool row_reuse_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_DG_INVMASS_ROW_REUSE", false);
+  const bool diagonal =
+    invmass_data_flat_.Size() == vfes.GetNE() * invmass_elem_dof_;
+  const bool row_reuse = UsePackedInverseMassRowReuse_(
+    row_reuse_requested, dense_rows, diagonal, num_equations);
   if (Device::Allows(Backend::DEVICE_MASK))
   {
     MFEM_VERIFY(invmass_apply_ready_,
@@ -513,9 +555,11 @@ void DGHyperbolicConservationLaws::ApplyInverseMass_(const Vector& z_in,
       std::cout << "[dg-device] event=invmass-path"
                 << " selected=packed-mfem-forall"
                 << " dense_execution="
-                << (invmass_data_flat_.Size() == vfes.GetNE() * invmass_elem_dof_
-                      ? "diagonal" : (dense_rows ? "rows" : "element"))
-                << " backend=device\n";
+                << (diagonal ? "diagonal" : (dense_rows ? "rows" : "element"))
+                << " backend=device"
+                << " invmass_row_reuse_requested=" << int(row_reuse_requested)
+                << " invmass_row_reuse=" << int(row_reuse)
+                << '\n';
       invmass_path_logged_ = true;
     }
     return;

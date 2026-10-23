@@ -40,6 +40,7 @@ namespace mfem
 namespace dg_igr_detail
 {
 struct TensorFaceData;
+struct MappedWeakDivTensorData;
 }
 namespace dgsem
 {
@@ -449,6 +450,13 @@ private:
   /// Preassemble the weak-divergence operator on each element (optional).
   /// The layout is (test dof) × (trial node × dim), i.e. ByDim grouped per node.
   void ComputeWeakDivergence();
+  /// Exact-discrete mapped tensor storage, admitted before dense assembly.
+  /// Execution/storage changes require construction or Update, not a live toggle.
+  bool BuildMappedWeakDivTensorData_();
+  bool HasPreassembledWeakDivergence_() const
+  {
+    return !weakdiv.empty() || bool(weakdiv_mapped_tensor_data_);
+  }
   /// Admit every cell before replacing per-element weak-divergence storage.
   void ValidateSharedWeakDivTensorGeometry_() const;
 
@@ -700,6 +708,7 @@ private:
   int weakdiv_elem_dof_ = 0;
   /// Column-major per-element weak-divergence blocks (dof x (dof*dim)).
   Vector weakdiv_data_flat_;
+  std::shared_ptr<dg_igr_detail::MappedWeakDivTensorData> weakdiv_mapped_tensor_data_;
   mutable std::unique_ptr<::igrlab::shared_reference::Map> weakdiv_shared_map_;
   mutable DenseMatrix weakdiv_shared_row_sums_;
   mutable Vector weakdiv_shared_column_sums_;

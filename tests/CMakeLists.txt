@@ -289,6 +289,31 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "dg;mapped;dense;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_dg_mapped_weakdiv_tensor_test
+  test_dg_mapped_weakdiv_tensor.cpp)
+target_link_libraries(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE cxx_std_17)
+# The independent MFEM assembly oracle remains ordinary host C++.
+set_source_files_properties(test_dg_mapped_weakdiv_tensor.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_mapped_weakdiv_tensor_command dg_igr_dg_mapped_weakdiv_tensor_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_mapped_weakdiv_tensor_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dg_mapped_weakdiv_tensor_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dg_mapped_weakdiv_tensor_cpu
+  COMMAND ${_igrlab_mapped_weakdiv_tensor_command} cpu)
+set_tests_properties(dg_igr_dg_mapped_weakdiv_tensor_cpu PROPERTIES
+  LABELS "dg;mapped;tensor;parity;cpu" TIMEOUT 180)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dg_mapped_weakdiv_tensor_cuda
+    COMMAND ${_igrlab_mapped_weakdiv_tensor_command} cuda)
+  set_tests_properties(dg_igr_dg_mapped_weakdiv_tensor_cuda PROPERTIES
+    LABELS "dg;mapped;tensor;parity;cuda" TIMEOUT 240 RUN_SERIAL TRUE)
+endif()
+
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
   add_executable(dg_igr_stage_refresh_test test_igr_stage_refresh.cpp)
   target_link_libraries(dg_igr_stage_refresh_test PRIVATE igr_mfem mfem)

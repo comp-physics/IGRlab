@@ -472,7 +472,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   MFEM_VERIFY(!shared_reference_requested ||
                 (Device::Allows(Backend::CUDA_MASK) && dim == 2 &&
                  num_equations == 4 && vfes.GetNE() > 0 &&
-                 (vol_mode_ == VolumeMode::DGSEMFluxDiff || !weakdiv.empty())),
+                 (vol_mode_ == VolumeMode::DGSEMFluxDiff || HasPreassembledWeakDivergence_())),
               "Shared reference operators require CUDA 2D Euler and a "
               "preassembled DG or supported DGSEM volume path.");
   MFEM_VERIFY(!p0_face_reference_x_slopes_ ||
@@ -892,7 +892,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   }
 
   real_t volume_speed = 0.0;
-  if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
+  if (HasPreassembledWeakDivergence_())
   {
     ::igrlab::NVTXRange range("DG/weak-divergence");
     // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
@@ -985,8 +985,8 @@ void DGHyperbolicConservationLaws::Update()
   BuildInvMassApplyData_();
   BuildNativeMassInverseSolver_();
 
-  // If we already had weakdiv matrices, refresh them too
-  if (!weakdiv.empty())
+  // Refresh whichever preassembled weak-divergence representation is active.
+  if (HasPreassembledWeakDivergence_())
   {
     ComputeWeakDivergence();
     BuildWeakDivApplyData_();

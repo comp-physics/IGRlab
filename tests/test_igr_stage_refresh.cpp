@@ -279,12 +279,29 @@ VolumeValues RunVolume(Checks& checks, mfem::ParFiniteElementSpace& fes,
     invrho, ck, src, cache, &reason);
   checks.True(used && cache != nullptr, label + " selects fused volume: " + reason);
   if (!used) { return {}; }
+  // Consume the same device-current native state before the host oracle reads
+  // it. This also exercises switching the cache between restricted/native loads.
+  mfem::QuadratureFunction direct_invrho(mass_qs), direct_ck(diff_qs), direct_src(rhs_qs);
+  direct_invrho.UseDevice(true); direct_ck.UseDevice(true); direct_src.UseDevice(true);
+  direct_invrho = -19.0; direct_ck = -23.0; direct_src = -29.0;
+  const auto restricted_cache = cache;
+  const bool direct_used = internal::TryUpdateFusedStageCoefficientsCUDA(
+    fes, mass_qs, diff_qs, rhs_qs, state, alpha, .1, element_alpha,
+    direct_invrho, direct_ck, direct_src, cache, &reason,
+    internal::StageCoefficientStateLayout::Native);
+  checks.True(direct_used && cache == restricted_cache,
+              label + " selects direct native state with the same reference cache: " + reason);
+  checks.True(SameBits(direct_invrho, invrho) && SameBits(direct_ck, ck) && SameBits(direct_src, src),
+              label + " direct native loads retain restricted FP64 coefficient bits");
   real_t floor_gap = 0.0;
   const auto expected = HostVolume(state, mass_qs, diff_qs, rhs_qs, alpha,
                                     element_alpha, .1, &floor_gap);
   checks.Near(invrho, expected.invrho, 2e-12, label + " inverse density");
   checks.Near(ck, expected.ck, 2e-12, label + " diffusion coefficient");
   checks.Near(src, expected.src, 2e-11, label + " physical-gradient source");
+  checks.Near(direct_invrho, expected.invrho, 2e-12, label + " direct inverse density host oracle");
+  checks.Near(direct_ck, expected.ck, 2e-12, label + " direct diffusion host oracle");
+  checks.Near(direct_src, expected.src, 2e-11, label + " direct physical-gradient source host oracle");
   if (require_floor_gap)
   { checks.True(floor_gap > 1e-6, "under-floor fixture distinguishes quotient-density gradient semantics"); }
   VolumeValues actual;
@@ -316,13 +333,19 @@ void CheckVolumeRejections(Checks& checks, mfem::ParMesh& mesh,
     const mfem::Vector before_invrho(invrho), before_ck(ck), before_src(src);
     const auto cache_before = cache;
     std::string reason;
-    const bool used = internal::TryUpdateFusedStageCoefficientsCUDA(
-      active_fes, active_mass, active_diff, rhs_qs, restricted, .007, .1, nullptr,
-      invrho, ck, src, cache, &reason);
-    checks.True(!used && !reason.empty(), label + " declines with a reason");
-    checks.True(SameBits(invrho, before_invrho) && SameBits(ck, before_ck) &&
-                  SameBits(src, before_src) && cache == cache_before,
-                label + " leaves outputs and valid cache untouched");
+    for (const auto layout : {internal::StageCoefficientStateLayout::Restricted,
+                              internal::StageCoefficientStateLayout::Native})
+    {
+      const mfem::Vector& input = layout == internal::StageCoefficientStateLayout::Native
+        ? static_cast<const mfem::Vector&>(active_state) : restricted;
+      const bool used = internal::TryUpdateFusedStageCoefficientsCUDA(
+        active_fes, active_mass, active_diff, rhs_qs, input, .007, .1, nullptr,
+        invrho, ck, src, cache, &reason, layout);
+      checks.True(!used && !reason.empty(), label + " declines with a reason");
+      checks.True(SameBits(invrho, before_invrho) && SameBits(ck, before_ck) &&
+                    SameBits(src, before_src) && cache == cache_before,
+                  label + " leaves outputs and valid cache untouched for either state layout");
+    }
     ++checks.cases;
   };
   mfem::IntegrationRule changed_mass(mass_qs.GetIntRule(0));
@@ -728,11 +751,14 @@ void CheckSolver(Checks& checks)
     {
       ScopedEnv coefficients("IGRLAB_IGR_COEFFICIENT_EXECUTION", "fused");
       ScopedEnv faces("IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor");
+      ScopedEnv direct_state("IGRLAB_IGR_STAGE_STATE_DIRECT", "1");
       const auto log = UpdateSolver(fused, state, update != 0);
       if (!update && mfem::Mpi::WorldRank() == 0)
       {
         checks.True(log.find("requested=fused selected=fused") != std::string::npos,
                     "production integration pair actually selects fused coefficients");
+        checks.True(log.find("state_requested=direct state_selected=direct") != std::string::npos,
+                    "production integration pair actually skips the full state restriction");
         checks.True(log.find("requested=tensor selected=tensor") != std::string::npos,
                     "production integration pair actually selects tensor face density");
       }

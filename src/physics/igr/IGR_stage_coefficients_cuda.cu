@@ -146,11 +146,12 @@ bool CheckSampledGeometry(mfem::Mesh& mesh,
 // Four independent element warps per CTA. Only rho, mx and my enter shared
 // memory. The current conservative values/reference derivatives and physical
 // gradients remain on chip; the energy field is never loaded.
-template <bool identity_b6>
+template <bool identity_b6, bool native_state = false>
 __global__ void SourceAndDiffusionKernel(
   int ne, const double* basis, const double* jacobians,
   const double* state, double alpha, double rho_floor,
-  const double* element_alpha, double* ck, double* src)
+  const double* element_alpha, double* ck, double* src,
+  int state_node_stride, int state_component_stride)
 {
   const int warp = threadIdx.x/32, lane = threadIdx.x%32;
   const int e = blockIdx.x*warps+warp;
@@ -167,7 +168,11 @@ __global__ void SourceAndDiffusionKernel(
   for (int i = lane; i < 3*ndof; i += 32)
   {
     const int c = i/ndof, j = i%ndof;
-    u[warp][c][j] = state[j+ndof*(c+components*e)];
+    if constexpr (native_state)
+    {
+      u[warp][c][j] = state[(ndof*e+j)*state_node_stride+c*state_component_stride];
+    }
+    else { u[warp][c][j] = state[j+ndof*(c+components*e)]; }
   }
   __syncwarp();
   if constexpr (!identity_b6)
@@ -254,6 +259,46 @@ __global__ void InverseDensityKernel(
   if (e >= ne) { return; }
   for (int i = lane; i < ndof; i += 32)
   { rho[warp][i] = state[i+ndof*components*e]; }
+  __syncwarp();
+  for (int i = lane; i < mass_q1d*d1d; i += 32)
+  {
+    const int qx = i%mass_q1d, dy = i/mass_q1d;
+    double value = 0.0;
+#pragma unroll
+    for (int dx = 0; dx < d1d; ++dx)
+    { value += rho[warp][dx+d1d*dy]*b[qx+mass_q1d*dx]; }
+    bx[warp][i] = value;
+  }
+  __syncwarp();
+  for (int q = lane; q < mass_nq; q += 32)
+  {
+    const int qx = q%mass_q1d, qy = q/mass_q1d;
+    double density = 0.0;
+#pragma unroll
+    for (int dy = 0; dy < d1d; ++dy)
+    { density += bx[warp][qx+mass_q1d*dy]*b[qy+mass_q1d*dy]; }
+    invrho[q+mass_nq*e] =
+      frozen_scalar_igr_algebra::SafeInverseDensity(density, rho_floor);
+  }
+}
+
+// Keep the legacy restricted kernel intact. The native variant uses the same
+// ascending contractions and density-floor algebra, loading rho directly from
+// the current L-vector instead of a four-component restricted-state copy.
+__global__ void InverseDensityDirectStateKernel(
+  int ne, const double* basis, const double* state, int state_node_stride,
+  double rho_floor, double* invrho)
+{
+  const int warp = threadIdx.x/32, lane = threadIdx.x%32;
+  const int e = blockIdx.x*warps+warp;
+  __shared__ double b[mass_q1d*d1d];
+  __shared__ double rho[warps][ndof], bx[warps][mass_q1d*d1d];
+  if (threadIdx.x < mass_q1d*d1d)
+  { b[threadIdx.x] = basis[b7_offset+threadIdx.x]; }
+  __syncthreads();
+  if (e >= ne) { return; }
+  for (int i = lane; i < ndof; i += 32)
+  { rho[warp][i] = state[(ndof*e+i)*state_node_stride]; }
   __syncwarp();
   for (int i = lane; i < mass_q1d*d1d; i += 32)
   {
@@ -431,13 +476,17 @@ bool TryUpdateFusedStageCoefficientsCUDA(
   const mfem::QuadratureSpace& mass_qs,
   const mfem::QuadratureSpace& diff_qs,
   const mfem::QuadratureSpace& rhs_qs,
-  const mfem::Vector& restricted_state,
+  const mfem::Vector& state_values,
   double alpha, double rho_floor, const mfem::Vector* element_alpha,
   mfem::QuadratureFunction& invrho, mfem::QuadratureFunction& ck,
   mfem::QuadratureFunction& src,
-  std::shared_ptr<FusedStageCoefficientCache>& cache, std::string* reason)
+  std::shared_ptr<FusedStageCoefficientCache>& cache, std::string* reason,
+  StageCoefficientStateLayout state_layout)
 {
   if (reason) { reason->clear(); }
+  if (state_layout != StageCoefficientStateLayout::Restricted &&
+      state_layout != StageCoefficientStateLayout::Native)
+  { return Reject(reason, "unsupported-stage-state-layout"); }
   if (!mfem::Device::Allows(mfem::Backend::CUDA))
   { return Reject(reason, "requires-cuda"); }
   auto* mesh = ufes.GetMesh();
@@ -455,10 +504,18 @@ bool TryUpdateFusedStageCoefficientsCUDA(
   int ranks = 0; MPI_Comm_size(ufes.GetComm(), &ranks);
   if (ranks != 1) { return Reject(reason, "requires-one-mpi-rank"); }
   if (ufes.GetNDofs() != ndof*ne || ufes.GetVSize() != components*ndof*ne ||
-      restricted_state.Size() != components*ndof*ne ||
+      state_values.Size() != components*ndof*ne ||
       (ufes.GetOrdering() != mfem::Ordering::byNODES &&
        ufes.GetOrdering() != mfem::Ordering::byVDIM))
   { return Reject(reason, "unexpected-conservative-evec-layout"); }
+  const bool native_state = state_layout == StageCoefficientStateLayout::Native;
+  const int state_node_stride = native_state ? ufes.DofToVDof(1, 0) : 1;
+  const int state_component_stride = native_state ? ufes.DofToVDof(0, 1) : ndof;
+  if (native_state && (ufes.DofToVDof(0, 0) != 0 ||
+      !((state_node_stride == 1 && state_component_stride == ufes.GetNDofs()) ||
+        (state_node_stride == components && state_component_stride == 1)) ||
+      ufes.DofToVDof(ufes.GetNDofs()-1, components-1) != ufes.GetVSize()-1))
+  { return Reject(reason, "unsupported-native-state-strides"); }
   if (element_alpha && element_alpha->Size() != ne)
   { return Reject(reason, "element-alpha-size-mismatch"); }
   if (!std::isfinite(alpha) || !std::isfinite(rho_floor) || rho_floor <= 0.0)
@@ -503,24 +560,42 @@ bool TryUpdateFusedStageCoefficientsCUDA(
   }
   const double* basis = prepared->basis.Read();
   const double* jacobians = geometry->J.Read();
-  const double* state = restricted_state.Read();
+  const double* state = state_values.Read();
   const double* local_alpha = element_alpha ? element_alpha->Read() : nullptr;
   const int blocks = (ne+warps-1)/warps;
   double* diffusion = ck.Write();
   double* source = src.Write();
-  if (prepared->identity_b6)
+  if (native_state && prepared->identity_b6)
+  {
+    SourceAndDiffusionKernel<true, true><<<blocks,32*warps>>>(ne, basis, jacobians,
+      state, alpha, rho_floor, local_alpha, diffusion, source,
+      state_node_stride, state_component_stride);
+  }
+  else if (native_state)
+  {
+    SourceAndDiffusionKernel<false, true><<<blocks,32*warps>>>(ne, basis, jacobians,
+      state, alpha, rho_floor, local_alpha, diffusion, source,
+      state_node_stride, state_component_stride);
+  }
+  else if (prepared->identity_b6)
   {
     SourceAndDiffusionKernel<true><<<blocks,32*warps>>>(ne, basis, jacobians,
-      state, alpha, rho_floor, local_alpha, diffusion, source);
+      state, alpha, rho_floor, local_alpha, diffusion, source, 1, ndof);
   }
   else
   {
     SourceAndDiffusionKernel<false><<<blocks,32*warps>>>(ne, basis, jacobians,
-      state, alpha, rho_floor, local_alpha, diffusion, source);
+      state, alpha, rho_floor, local_alpha, diffusion, source, 1, ndof);
   }
   MFEM_VERIFY(cudaGetLastError() == cudaSuccess,
               "Fused stage source/diffusion coefficient launch failed.");
-  InverseDensityKernel<<<blocks,32*warps>>>(ne, basis, state, rho_floor, invrho.Write());
+  if (native_state)
+  {
+    InverseDensityDirectStateKernel<<<blocks,32*warps>>>(
+      ne, basis, state, state_node_stride, rho_floor, invrho.Write());
+  }
+  else
+  { InverseDensityKernel<<<blocks,32*warps>>>(ne, basis, state, rho_floor, invrho.Write()); }
   MFEM_VERIFY(cudaGetLastError() == cudaSuccess,
               "Fused stage mass coefficient launch failed.");
   return true;

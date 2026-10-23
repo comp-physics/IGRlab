@@ -2367,7 +2367,7 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
   const mfem::real_t* side_coefficient = nullptr;
   int slot_count = 0;
 
-  template <bool CompactLift>
+  template <bool CompactLift, bool CoalescedTrace = false>
   MFEM_HOST_DEVICE void Apply(int face) const
   {
 #if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
@@ -2387,7 +2387,42 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
     const int axis = Axis(side, slot);
 
     mfem::real_t trace = 0.0, normal_trace = 0.0;
-    if (active)
+    if constexpr (CoalescedTrace)
+    {
+      // Gather each side's complete lexicographic state with 32+4 cooperating
+      // lanes, instead of strided rows in twelve lanes. Broadcast values into
+      // the original ascending-i contractions; do not factor or reorder sums.
+      const int left = F(0, face), right = F(1, face);
+      const int native = lex_to_native[lane];
+      const mfem::real_t left_low = record.x[D(native, 0, left)];
+      const mfem::real_t right_low = record.x[D(native, 0, right)];
+      mfem::real_t left_high = 0.0, right_high = 0.0;
+      if (lane < 4)
+      {
+        const int tail_native = lex_to_native[lane+32];
+        left_high = record.x[D(tail_native, 0, left)];
+        right_high = record.x[D(tail_native, 0, right)];
+      }
+#pragma unroll 1
+      for (int i = 0; i < 6; ++i)
+      {
+        const int lex = axis == 0 ? i+6*index : index+6*i;
+        const int source_lane = lex%32;
+        // Select the side after each full-warp shuffle: selecting before it
+        // would mix the source lanes' own side assignments.
+        const mfem::real_t a = __shfl_sync(0xffffffffu, left_low, source_lane);
+        const mfem::real_t b = __shfl_sync(0xffffffffu, right_low, source_lane);
+        const mfem::real_t c = __shfl_sync(0xffffffffu, left_high, source_lane);
+        const mfem::real_t d = __shfl_sync(0xffffffffu, right_high, source_lane);
+        if (active)
+        {
+          const mfem::real_t x = side == 0 ? (lex < 32 ? a : c) : (lex < 32 ? b : d);
+          trace += E(0, i, side, slot) * x;
+          normal_trace += E(1, i, side, slot) * x;
+        }
+      }
+    }
+    else if (active)
     {
       const int element = F(side, face);
 #pragma unroll 1
@@ -2494,6 +2529,14 @@ struct InteriorFaceDGDiffusionTensorLiftRecord2DWarp
   : InteriorFaceDGDiffusionTensorRecord2DWarp
 {
   MFEM_HOST_DEVICE void operator()(int face) const { Apply<true>(face); }
+};
+
+// IGRLAB_IGR_FACE_COALESCED_TRACE opts into this load schedule only after the
+// existing compact p5/Q6/native-CUDA layout and coefficient admission succeeds.
+struct InteriorFaceDGDiffusionTensorLiftCoalescedRecord2DWarp
+  : InteriorFaceDGDiffusionTensorRecord2DWarp
+{
+  MFEM_HOST_DEVICE void operator()(int face) const { Apply<true, true>(face); }
 };
 
 struct InteriorFaceDGDiffusionGather2D
@@ -2804,8 +2847,16 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       factor.tensor_axes.Read(), factor.tensor_face_slots.Read(),
       factor.tensor_lex_to_native.Read(), factor.normal_geometry.Read(),
       work.side_coefficient.Read(), factor.tensor_slot_count};
-    mfem::forall_2D_batch(info.nf, 32, 1, 4,
-      InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record});
+    if (::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_COALESCED_TRACE", false))
+    {
+      mfem::forall_2D_batch(info.nf, 32, 1, 4,
+        InteriorFaceDGDiffusionTensorLiftCoalescedRecord2DWarp{tensor_record});
+    }
+    else
+    {
+      mfem::forall_2D_batch(info.nf, 32, 1, 4,
+        InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record});
+    }
 
     InteriorFaceDGDiffusionTensorLiftGather2D gather;
     gather.dof = info.dof;

@@ -1706,6 +1706,55 @@ void CheckCompactResidualFinalizer(const InteriorFaceDGDiffusionApplyInfo& info,
   work.compact_lift = true;
 }
 
+void CheckCoalescedTraceRecordBits(const InteriorFaceDGDiffusionApplyInfo& info,
+                                   InteriorFaceDGDiffusionApplyScratch& work,
+                                   const Vector& x, real_t ip_sigma)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  if (!::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA()) { return; }
+  constexpr int tail = 19;
+  Vector legacy(24*info.nf+tail), coalesced(legacy.Size()), state(x);
+  legacy.UseDevice(true); coalesced.UseDevice(true); state.UseDevice(true);
+  real_t nan1, nan2;
+  const std::uint64_t payload1 = UINT64_C(0x7ff8000000000042);
+  const std::uint64_t payload2 = UINT64_C(0x7ff8000000000017);
+  std::memcpy(&nan1, &payload1, sizeof(real_t));
+  std::memcpy(&nan2, &payload2, sizeof(real_t));
+  for (int cohort = 0; cohort < 4; ++cohort)
+  {
+    state = x;
+    if (cohort == 1)
+    {
+      real_t* input = state.HostReadWrite();
+      for (int i = 0; i < state.Size(); ++i)
+      { input[i] = i%3 == 0 ? -0.0 : i%3 == 1 ? 0.0 : std::numeric_limits<real_t>::denorm_min(); }
+    }
+    if (cohort == 2)
+    {
+      real_t* input = state.HostReadWrite();
+      input[0] = nan1; input[35] = nan2;
+      input[state.Size()-1] = std::numeric_limits<real_t>::infinity();
+    }
+    // Cohort three returns to finite data after nonfinite input. Neither path
+    // may retain a stage value or depend on inactive projection-lane contents.
+    legacy = 12345.0; coalesced = 12345.0;
+    mfem::forall_2D_batch(info.nf, 32, 1, 4,
+      ::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp{
+        TensorRecordForTest(info, work, state, ip_sigma, legacy)});
+    mfem::forall_2D_batch(info.nf, 32, 1, 4,
+      ::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftCoalescedRecord2DWarp{
+        TensorRecordForTest(info, work, state, ip_sigma, coalesced)});
+    MFEM_VERIFY(SameBits(legacy, coalesced),
+                "Coalesced trace loads changed legacy compact packet bits, including signed zero/NaN payloads.");
+    const real_t* output = coalesced.HostRead();
+    for (int i = 24*info.nf; i < coalesced.Size(); ++i)
+    { MFEM_VERIFY(output[i] == 12345.0, "Coalesced partial face batch overwrote its padded tail."); }
+  }
+#else
+  (void)info; (void)work; (void)x; (void)ip_sigma;
+#endif
+}
+
 void CheckCompactFaceLifts()
 {
   const bool native_cuda = ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA();
@@ -1782,6 +1831,7 @@ void CheckCompactFaceLifts()
         const Vector rows = RecordedFaceContributions(info, work);
         MFEM_VERIFY(SameBits(actual, original) && SameBits(rows, old_rows),
                     "Compact lifts must preserve old tensor record and gather bits.");
+        CheckCoalescedTraceRecordBits(info, work, x, ip_sigma);
         CheckCompactResidualFinalizer(info, work, x, ip_sigma);
         if (native_cuda)
         {
@@ -2399,6 +2449,8 @@ void BenchmarkCompactFaceLifts512(const InteriorFaceDGDiffusionApplyInfo& info,
   for (bool compact : {false, true})
   {
     const char* variant = compact ? "compact_lift" : "full_rows";
+    const bool coalesced_trace = compact && ::igrlab::EnvFlagEnabledDefault(
+      "DG_IGR_IGR_FACE_COALESCED_TRACE", false);
     if (!profile_variant.empty() && profile_variant != variant) { continue; }
     work.compact_lift = compact;
     MFEM_VERIFY(::igrlab::dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info, work) == compact,
@@ -2425,6 +2477,7 @@ void BenchmarkCompactFaceLifts512(const InteriorFaceDGDiffusionApplyInfo& info,
                   << " mesh_path=" << std::quoted(mesh_path)
                   << " serial_refinements=0 parallel_refinements=4"
                   << " tensor_admitted=1 compact_lift_admitted=" << compact
+                  << " trace_selected=" << (coalesced_trace ? "coalesced" : "legacy")
                   << " record_launches=1 gather_launches=1 natural_exit=true"
                   << " logical_record_scratch_bytes=" << std::size_t(packet.Size()) * sizeof(real_t)
                   << " oracle_downloads=false timing_events=false" << std::endl;
@@ -2491,6 +2544,7 @@ void BenchmarkCompactFaceLifts512(const InteriorFaceDGDiffusionApplyInfo& info,
                 << " mean_record_gather_ms=" << combined_ms
                 << " record_gather_speedup=" << baseline_combined_ms / combined_ms
                 << " tensor_admitted=1 compact_lift_admitted=" << compact
+                << " trace_selected=" << (coalesced_trace ? "coalesced" : "legacy")
                 << " logical_record_scratch_bytes=" << std::size_t(packet.Size()) * sizeof(real_t)
                 << " record_scratch_device_resident_bytes=" << packet_bytes
                 << " scratch_device_resident_bytes=" << scratch_bytes
@@ -2501,8 +2555,16 @@ void BenchmarkCompactFaceLifts512(const InteriorFaceDGDiffusionApplyInfo& info,
     const auto tensor_record = TensorRecordForTest(info, work, x, -1.0, packet);
     if (compact)
     {
-      run(::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record},
-          LiftGatherForTest(info, work, packet, output));
+      if (coalesced_trace)
+      {
+        run(::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftCoalescedRecord2DWarp{tensor_record},
+            LiftGatherForTest(info, work, packet, output));
+      }
+      else
+      {
+        run(::igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record},
+            LiftGatherForTest(info, work, packet, output));
+      }
     }
     else { run(tensor_record, GatherForTest(info, work, packet, output)); }
   }
@@ -2834,7 +2896,11 @@ int main(int argc, char** argv)
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
   CheckCompactFaceQdata();
-  CheckCompactFaceLifts();
+  for (const char* coalesced : {"0", "1"})
+  {
+    ScopedEnvironment trace("IGRLAB_IGR_FACE_COALESCED_TRACE", coalesced);
+    CheckCompactFaceLifts();
+  }
   CheckCompactFaceLiftGatherRounding();
   CheckProductionFactorizedDispatch();
   CheckProductionIdentityCopies();
