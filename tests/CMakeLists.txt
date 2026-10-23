@@ -289,6 +289,23 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "dg;mapped;dense;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_executable(dg_igr_stage_refresh_test test_igr_stage_refresh.cpp)
+  target_link_libraries(dg_igr_stage_refresh_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_stage_refresh_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_features(dg_igr_stage_refresh_test PRIVATE cxx_std_17)
+  set_source_files_properties(test_igr_stage_refresh.cpp PROPERTIES LANGUAGE CXX)
+  set(_igrlab_stage_refresh_command dg_igr_stage_refresh_test)
+  if(MPIEXEC_EXECUTABLE)
+    set(_igrlab_stage_refresh_command
+      ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_stage_refresh_test> ${MPIEXEC_POSTFLAGS})
+  endif()
+  add_test(NAME dg_igr_stage_refresh_cuda COMMAND ${_igrlab_stage_refresh_command} cuda)
+  set_tests_properties(dg_igr_stage_refresh_cuda PROPERTIES
+    LABELS "igr;mapped;coefficients;face;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_face_density_host_cache_test
   test_igr_face_density_host_cache.cpp)
 target_link_libraries(dg_igr_face_density_host_cache_test PRIVATE igr_mfem mfem)

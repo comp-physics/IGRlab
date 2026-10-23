@@ -30,7 +30,7 @@
  */
 namespace igrlab
 {
-namespace igr_internal { struct FaceDensityCUDAProjectionCache; class HostFaceDensityPreparationCache; struct NodalVelocitySourceCache; }
+namespace igr_internal { struct FaceDensityCUDAProjectionCache; class HostFaceDensityPreparationCache; struct NodalVelocitySourceCache; struct FusedStageCoefficientCache; }
 
 enum class IGRSolvePurpose
 {
@@ -626,7 +626,7 @@ private:
     double rho_floor_;
   };
 
-  /// f(x) = α ( ||∇u||_F^2 + (∇·u)^2 ), with u = m / ρ (componentwise).
+  /// f(x) = α ( tr((∇u)^2) + (∇·u)^2 ), with u = m / ρ (componentwise).
   class SigmaSourceCoefficient : public mfem::Coefficient
   {
   public:
@@ -694,6 +694,8 @@ private:
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> src_qf_coef_;
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_face_qf_coef_;
   mfem::Vector device_qinterp_evec_;
+  std::shared_ptr<igr_internal::FusedStageCoefficientCache> fused_stage_coefficients_;
+  std::string device_coeff_execution_logged_;
   std::shared_ptr<igr_internal::NodalVelocitySourceCache> nodal_velocity_source_cache_;
   mfem::Vector device_face_restr_evec_;
   // Per-solver reference/geometry metadata only; current face coefficients

@@ -71,6 +71,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
                                   physics/igr/IGR_two_level_inverse_cuda.cu
                                   physics/igr/IGR_screened_patch_inverse_cuda.cu
                                   physics/igr/IGR_face_density_cuda.cu
+                                  physics/igr/IGR_stage_coefficients_cuda.cu
                                   physics/igr/IGR_stationary_correction_cuda.cu
                                   physics/igr/IGR_element_block_jacobi.cu
                                   physics/igr/IGR_local_tensor_jacobi.cu
@@ -81,6 +82,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
                                               DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA=1
                                               DG_IGR_HAS_SCREENED_PATCH_CUDA=1
                                               DG_IGR_HAS_FACE_DENSITY_CUDA=1
+                                              DG_IGR_HAS_STAGE_COEFFICIENTS_CUDA=1
                                               DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1
                                               DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA=1
                                               DG_IGR_HAS_DEVICE_KRYLOV_CUDA=1
