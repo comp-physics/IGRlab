@@ -1,6 +1,6 @@
 {
   "schema": "igr-dg-mapped-pipeline-measurements-v1",
-  "status": "passed-short-execution-equivalence",
+  "status": "passed-short-execution-and-full-mapped-case-comparisons",
   "campaign": "igr-dg-mapped-pipeline-20261022",
   "evidence_remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-pipeline-20261022",
   "evidence": {
@@ -182,12 +182,12 @@
     "sigma_accuracy_vs_converged_reference_qualified": false
   },
   "limitations": [
-    "One sequential short pair with unlocked clocks; no confidence interval or full-t=.1 timing result.",
-    "Execution equivalence compares the same approximate50/2 solver; it does not establish sigma or flow accuracy against a converged solution.",
-    "Earlier coarse control used a two-level element/Q1 cooperative-CG preconditioner and was not the same algorithm as this baseline.",
+    "Short pairs and the full physical comparison are single sequential observations with unlocked clocks and no confidence interval.",
+    "Full comparison changes both preconditioner and stopping policy; its speedup is not isolated stopping-rule performance.",
+    "Earlier coarse control and the fixed hybrid use different algorithms; the short execution speedups are not multiplied across their different GPUs.",
     "Runtime/PVD receipts bind physical time; VTU does not independently encode that time.",
-    "Polynomial squared norms are exact on the fitted Q2 map up to FP64/geometry-fit roundoff; Linf/positivity remain GL8-sampled.",
-    "Row execution binds frozen6ae6930; the separate Q2 face result binds b53b40a. Neither qualifies full-t=.1 physical accuracy."
+    "GL8 polynomial squared norms are exact on the fitted Q2 map up to roundoff; Linf and positivity are sampled at the final saved frame.",
+    "Tested source is 6ae6930 for the row pair and b53b40a for face/full runs; results are limited to the recorded mapped Sedov configuration, without a discretization-error or between-time positivity proof."
   ],
   "q2_tensor_faces": {
     "status": "passed-short-execution-equivalence",
@@ -320,13 +320,12 @@
     ]
   },
   "full_comparison": {
-    "status": "submitted-full-results-pending",
+    "status": "completed-final-saved-flow-engineering-budgets-passed",
     "runner": "full_pair.py",
     "candidate_first": true,
     "target_time": 0.1,
     "reference": "Converged current-FP64 two-level element/Q1 cooperative-CG",
     "different_reference_preconditioner": true,
-    "converged_reference_flow_accuracy_qualified": false,
     "full_job_submitted_by_this_audit": false,
     "job": "3440138",
     "runner_sha256": "e387944bd69455ae944ec46712878462e57dbb5143b49b5fcfbc752fb40ab106",
@@ -339,7 +338,203 @@
     "allocation_wall_seconds": 16200,
     "bounds_are_eta": false,
     "native_and_face_qualification_gates_passed": true,
-    "full_results_available": false,
-    "automation_created": false
+    "full_results_available": true,
+    "automation_created": false,
+    "final_saved_flow_engineering_budgets_passed": true,
+    "discretization_accuracy_qualified": false,
+    "run_receipt": {
+      "path": "full-3440138/run.json",
+      "sha256": "5c45e27a30c714bb67abd242e8f7c3221643903d7283f6182555fe056e5b97a2"
+    },
+    "field_comparison": {
+      "path": "full-fields/comparison-t01.json",
+      "sha256": "b2108492a98d0ad8751b9a721dfac096544d45579d375acc4fcc2f1e8116ecb7",
+      "helper_sha256": "f3cb6b0baaf8c0e54c1fa99e1fe63868b93f0064e013002edbfc0fa5ca2da615"
+    },
+    "native_run": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-pipeline-20261022/native-3440081/run.json",
+      "sha256": "bdbf0c47f02edcf39374d6a13d274b507c1a7648aaf6064ecb345dc470959170",
+      "bytes": 97837
+    },
+    "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "node": "gh010",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-68c936db-7ee6-cb65-ab25-aecc4c8fde9d",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "same_gpu": true,
+    "same_binary": true,
+    "execution_order": [
+      "candidate",
+      "control"
+    ],
+    "accepted_steps_each": 6663,
+    "rejected_steps_each": 0,
+    "sigma_calls_each": 19990,
+    "production_sigma_calls_each": 19989,
+    "output_only_sigma_calls_each": 1,
+    "candidate": {
+      "method": "50 initial/two subsequent projected element-block corrections, omega=.7",
+      "local_inverse": "FP64 WMMA",
+      "total_corrections": 40028,
+      "convergence_certificate": false
+    },
+    "reference_method": {
+      "method": "FP64 FGMRES",
+      "residual_scale": "rhs",
+      "relative_tolerance": 1e-06,
+      "preconditioner": "retained first-operator element blocks + Q1 FP64 cooperative-CG two-level",
+      "total_iterations": 330526,
+      "certificate_calls": 19990,
+      "every_solve_call_certified": true,
+      "maximum_rhs_relative_residual": 9.9999306e-07,
+      "final_rhs_relative_residual": 9.466338761107555e-07,
+      "residual_replacement_retries": 0
+    },
+    "common_euler": "FP64 SIMT dense rows/pointwise flux and FP64 Q2 tensor faces",
+    "different_preconditioners_and_stopping_policies": true,
+    "isolated_stopping_rule_speedup_claim": false,
+    "timings_seconds": {
+      "candidate": {
+        "pre_final_output_analysis": 603.587655,
+        "native_loop": 646.740361036,
+        "application_wall": 760.1200736798346,
+        "analysis_scope": "Time-loop hook start through final accepted endpoint Analysis before final save; includes intermediate VTK/sigma output and prior analysis work; excludes initial setup/initial VTK and final output processing; not pure evolution"
+      },
+      "control": {
+        "pre_final_output_analysis": 2056.821112,
+        "native_loop": 2101.535439389,
+        "application_wall": 2224.2722475850023,
+        "analysis_scope": "Time-loop hook start through final accepted endpoint Analysis before final save; includes intermediate VTK/sigma output and prior analysis work; excludes initial setup/initial VTK and final output processing; not pure evolution"
+      }
+    },
+    "reference_over_candidate": {
+      "pre_final_output_analysis": 3.4076593431984623,
+      "native_loop": 3.2494267653600497,
+      "application_wall": 2.9262116928671906
+    },
+    "pre_final_elapsed_is_pure_evolution": false,
+    "output_times": [
+      0,
+      0.02,
+      0.04,
+      0.06,
+      0.08,
+      0.1
+    ],
+    "sampled_peak_total_gpu_memory_mib": {
+      "candidate": 27649.0,
+      "control": 34839.0
+    },
+    "command_and_log_bindings": {
+      "candidate": {
+        "command_sha256": "1a4201f02aa5365e28592e390da2ed31e959722a9c0cb06bdd2dffa046abc9f1",
+        "stdout_sha256": "4719627ea653eace76036d0a917fb695cdb520dfeaa56f049a316bf80df21e36",
+        "gpu_samples_sha256": "90f8bfe042853d3a3c5ec10945c4cf86691db3286833ef44d5f544e0c8301c56",
+        "final_native_vtu_sha256": "84571e6b0e09bad3556ec49ed0c7eed09e9cb3ccab1f3fccc5eedab990b99cba"
+      },
+      "control": {
+        "command_sha256": "099a8a870aeabbc739597e2bee8e43c390bf5e3eb254bfeba00fc2586a0612a5",
+        "stdout_sha256": "41b6891893a8f37a6212aec9508aa8f4eacd7bc4096e9164934eaa87f719f966",
+        "gpu_samples_sha256": "0e80fb4bb02d1490c934e9292687f15f617e1681c160c91abef55c941d2598e4",
+        "final_native_vtu_sha256": "e0b291007b58d44558dd39860bb3cb340a429e488b65782891ac5937b9d99bd7"
+      }
+    },
+    "fields": {
+      "time": 0.1,
+      "complete_native_vtu_sha256": {
+        "candidate": "84571e6b0e09bad3556ec49ed0c7eed09e9cb3ccab1f3fccc5eedab990b99cba",
+        "control": "e0b291007b58d44558dd39860bb3cb340a429e488b65782891ac5937b9d99bd7"
+      },
+      "source_geometry": "matching verified Q2",
+      "saved_field_degree": 5,
+      "cells": 262144,
+      "quadrature": "GL8x8",
+      "maximum_conserved_relative_l2": 8.206696152442044e-07,
+      "maximum_conserved_sampled_relative_linf": 1.9605446561069827e-06,
+      "per_component": {
+        "density": {
+          "normalized_l2": 1.7330307355598425e-07,
+          "normalized_linf_at_gl_points": 7.338790511468055e-07,
+          "engineering_budget_pass": true
+        },
+        "momentum_x": {
+          "normalized_l2": 8.206696152442044e-07,
+          "normalized_linf_at_gl_points": 1.9605446561069827e-06,
+          "engineering_budget_pass": true
+        },
+        "momentum_y": {
+          "normalized_l2": 8.206696152384462e-07,
+          "normalized_linf_at_gl_points": 1.9605446519962967e-06,
+          "engineering_budget_pass": true
+        },
+        "energy": {
+          "normalized_l2": 2.6156257072075614e-07,
+          "normalized_linf_at_gl_points": 8.996940946707064e-07,
+          "engineering_budget_pass": true
+        },
+        "sigma": {
+          "normalized_l2": 0.015288468095397634,
+          "normalized_linf_at_gl_points": 0.02534375470071539,
+          "engineering_budget_pass": null
+        },
+        "pressure": {
+          "normalized_l2": 2.3239014152634446e-07,
+          "normalized_linf_at_gl_points": 8.358906326671092e-07,
+          "engineering_budget_pass": null
+        },
+        "speed": {
+          "normalized_l2": 5.327518271830393e-07,
+          "normalized_linf_at_gl_points": 1.3387009094861887e-06,
+          "engineering_budget_pass": null
+        },
+        "q_sigma": {
+          "normalized_l2": 2.2367316199793536e-07,
+          "normalized_linf_at_gl_points": 7.879250245870056e-07,
+          "engineering_budget_pass": null
+        }
+      },
+      "sigma_relative_l2": 0.015288468095397634,
+      "sigma_sampled_relative_linf": 0.02534375470071539,
+      "sigma_budget": null,
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.44942021429786166,
+          "pressure_min": 1.0003187640061193,
+          "q_sigma_min": 1.4004462696404312
+        },
+        "candidate": {
+          "density_min": 0.44942017258888334,
+          "pressure_min": 1.0003187640018865,
+          "q_sigma_min": 1.4004462696343145
+        }
+      },
+      "sampled_admissibility_all_positive": true,
+      "continuous_positivity_claim": false,
+      "between_time_positivity_claim": false
+    },
+    "qualification_scope": "One complete 512-square Q2 p5 mapped Sedov case at final saved t=.1 against the converged current-FP64 reference; engineering flow agreement, not a discretization-error bound or arbitrary-geometry validation."
+  },
+  "measurement_scopes": {
+    "row_execution_pair": "t=.0025; same approximate solver, old/new Euler execution, gh074",
+    "q2_tensor_faces": "t=.0025; same new binary/fixed solver, face-off/on, gh093",
+    "full_comparison": "t=.1; optimized fixed-sweep hybrid versus converged reference with different preconditioner, gh010"
   }
 }

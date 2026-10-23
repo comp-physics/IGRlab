@@ -1,6 +1,10 @@
-**Mapped DG dense Euler row execution — measured short result**
+**Mapped DG spectral-block hybrid — measured mapped Sedov results**
 
-On the 512² Q2-mapped p5 DG case, whole-application wall time fell from 284.624 to 177.802 s (1.601×). Pre-final-output Analysis elapsed fell from 125.340 to 22.709 s (5.519×). Complete saved conserved fields differ by at most 3.2426e-14 in relative L2 at t=.0025. This qualifies the short execution change; full-time physical accuracy remains to be compared with a converged reference.
+On this 512² Q2-mapped p5 DG Sedov case to t=.1, the fixed 50/2 hybrid completed in **760.120 s** versus **2,224.272 s** for the converged FP64 reference (**2.926×**). Maximum final conserved relative L2 difference is **8.2067e-7**, within the 1e-3 engineering comparison budget; sigma relative L2 differs by **1.529%**. The reference uses a different preconditioner, so this is an end-to-end method comparison. The earlier execution-only pairs are retained separately below.
+
+**Row execution — matched short pair**
+
+On the 512² Q2-mapped p5 DG case, whole-application wall time fell from 284.624 to 177.802 s (1.601×). Pre-final-output Analysis elapsed fell from 125.340 to 22.709 s (5.519×). Complete saved conserved fields differ by at most 3.2426e-14 in relative L2 at t=.0025. This qualifies the short execution change; the separate complete t=.1 comparison is reported below.
 
 Both fresh runs retain SSPRK3/CFL=.3, C_alpha=1/6/max-h, exact face-coupled FP64 residuals, actual GL7 mass/GL6 diffusion, and the same warm-started element-block iteration: 50 initial corrections, then two at omega=.7. Euler pointwise-flux/dense-row kernels use FP64 SIMT. The unchanged per-element spectral local inverse uses FP64 WMMA tensor cores. Scans, limiters and modal damping remain off.
 
@@ -38,6 +42,24 @@ Job 3440099 ran face-off then FP64-face-on using this same binary on gh093, UUID
 
 One-Hz total-device sampled peaks fell from 29,677 to 27,649 MiB, a 2,028 MiB reduction; this is not an exact peak allocation measurement. The same VTK policy and the timing definitions above apply. This is one paired observation with unlocked clocks. The earlier row pair used a different GPU: its 5.519× and this pair's 1.333× ratios must not be composed into a directly measured cumulative speedup.
 
-Both complete final VTU hashes were independently rechecked against the run/transfer/comparison receipts. The GL8×8 comparison on all matching Q2/Q5 cells gives maximum conserved relative L2 **4.063260876695138e-14** and sigma relative L2 **1.1116402531354572e-12**; sampled density, pressure and q_sigma are positive. This passes the 1e-10 conserved execution-equivalence gate. Sigma is reported separately and does not qualify the approximate closure against a converged reference. No full-time accuracy claim follows.
+Both complete final VTU hashes were independently rechecked against the run/transfer/comparison receipts. The GL8×8 comparison on all matching Q2/Q5 cells gives maximum conserved relative L2 **4.063260876695138e-14** and sigma relative L2 **1.1116402531354572e-12**; sampled density, pressure and q_sigma are positive. This passes the 1e-10 conserved execution-equivalence gate. This short face test reports execution equivalence; the separate complete comparison below measures final flow agreement with the converged reference.
 
-Full comparison job **3440138** was submitted after native and face-qualification gates passed. It runs the fixed 50/2 candidate to t=.1 first, then the converged FP64 two-level element/Q1 cooperative-CG reference on the same tested b53b40a binary and Euler policy. The frozen runner SHA256 is `e387944bd69455ae944ec46712878462e57dbb5143b49b5fcfbc752fb40ab106`. Runtime caps are 3,600 s candidate and 12,000 s reference within a 4h30 allocation: these are upper bounds, not an ETA. The reference preconditioner differs, so this is an end-to-end physical comparison. Full results and physical-accuracy qualification remain pending; no automation was created. Earlier short coarse/local-P reference fields agreed to 1.2254e-13 in relative L2; this does not establish late-time agreement. The full run keeps scans off and outputs every .02. Its final Analysis elapsed includes intermediate VTK saves.
+**Complete mapped Sedov comparison to t=.1**
+
+Job **3440138** completed candidate first, then reference, on gh010, GPU UUID `GPU-68c936db-7ee6-cb65-ab25-aecc4c8fde9d`. Both use the same tested b53b40a source/app SHA above, mapped mesh, FP64 row Euler/Q2 faces and output schedule at 0,.02,.04,.06,.08,.1. Both accepted 6,663 steps without rejection and made 19,990 sigma calls.
+
+The hybrid uses warm-started projected element blocks with FP64 WMMA, 50 initial/two subsequent corrections at omega=.7: **40,028 corrections**, with no convergence certificate. The reference uses **FP64 FGMRES**, RHS-relative tolerance 1e-6, and retained initial element blocks plus a Q1 cooperative FP64-CG two-level preconditioner. All **19,990** current-A certificates pass; maximum relative residual is 9.9999306e-7 and the final residual is 9.4663387611e-7. Its 330,526 iterations and different preconditioner make the measured speedup an end-to-end comparison, not an isolated stopping-rule result.
+
+| Timing scope, seconds | Hybrid | Converged reference | Reference / hybrid |
+| --- | ---: | ---: | ---: |
+| Pre-final-output Analysis elapsed | 603.587655 | 2,056.821112 | 3.408× |
+| Native `done` stopwatch | 646.740361 | 2,101.535439 | 3.249× |
+| Whole application process wall | 760.120074 | 2,224.272248 | 2.926× |
+
+Pre-final elapsed **includes intermediate VTK saves** and analysis work; it is not pure evolution. The native stopwatch additionally includes final output/reporting, while process wall also includes setup and initial output. This is one sequential observation with unlocked clocks. One-Hz sampled total-device peaks were 27,649 MiB for the hybrid and 34,839 MiB for the reference; these samples can miss true peaks.
+
+Complete final Q5 polynomials on all 262,144 matching Q2 cells were compared with GL8×8. Relative L2 differences are 1.7330307356e-7 for density, 8.2066961524e-7 maximum over momentum components, and 2.6156257072e-7 for energy; derived pressure is 2.3239014153e-7. Maximum conserved sampled relative Linf is 1.9605446561e-6. Every conserved component passes the **1e-3 relative L2 / 1e-2 sampled relative Linf engineering budgets**. These thresholds are not discretization-error bounds.
+
+Sigma differs by **0.0152884680954 relative L2 (1.52885%)** and **0.0253437547007 sampled relative Linf (2.53438%)**. It is reported separately from the conserved-flow gate; the hybrid remains an uncertified approximate closure. At final GL8 samples the hybrid minima are density 0.4494201726, pressure 1.0003187640 and q_sigma 1.4004462696, all positive. This establishes neither positivity between samples/times nor accuracy on untested geometries. Scope is this recorded mapped Sedov configuration at the final saved t=.1 frame.
+
+The benchmark JSON binds the unchanged run receipt (`5c45e27a30c714bb67abd242e8f7c3221643903d7283f6182555fe056e5b97a2`), full-field comparison (`b2108492a98d0ad8751b9a721dfac096544d45579d375acc4fcc2f1e8116ecb7`), native/source identities, commands/logs and both raw final VTU hashes. The complete VTU hashes were independently rechecked after transfer. Full results are complete for this comparison.
