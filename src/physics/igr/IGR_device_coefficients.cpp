@@ -1282,15 +1282,21 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
     device_coeff_diagnostics_logged_ = true;
   }
 
-  // Exact faces consume their independently projected side coefficients. The
-  // single-valued MFEM projection below is unused by that operator and has a
-  // separate Q1D<=10 limit. Skip it only for this explicit quadrature study.
-  const bool skip_unused_face_projection = OperatorQuadratureMinimumOrder() > 0;
+  // The exact side-aware operator consumes its own two-sided coefficients;
+  // BuildBilinearForm_ does not attach the stock single-valued face integrator
+  // on that route. Retain its projection only for an explicit diagnostic.
+  // Oversampled exact-face studies always skip it because of its Q1D<=10 limit.
+  const bool exact_side_faces = IsDGSpace(sfes_) && UseExactDGFaceOperator_();
+  const bool face_projection_diagnostic = ingestion_audit || debug_qf;
+  const bool skip_unused_face_projection = OperatorQuadratureMinimumOrder() > 0 ||
+    (exact_side_faces && !face_projection_diagnostic);
   if (skip_unused_face_projection && !device_coeff_logged_ && mfem::Mpi::Root())
   {
     std::cout << "[igr-linear] event=face-qf-projector"
               << " mode=skipped-unused-single-valued"
-              << " reason=oversampled-exact-side-operator\n";
+              << " reason=" << (OperatorQuadratureMinimumOrder() > 0
+                   ? "oversampled-exact-side-operator" : "exact-side-coefficients-active")
+              << "\n";
   }
   if (sigma_fqs_ && ck_face_qf_ && !skip_unused_face_projection)
   {
