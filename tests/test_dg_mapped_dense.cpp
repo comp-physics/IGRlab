@@ -1,7 +1,9 @@
 #include "igrlab/environment.hpp"
+#include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/igr/igr_flux.hpp"
+#include "physics/bc/boundary_state.hpp"
 #include "test_utils.hpp"
 
 #include <algorithm>
@@ -108,7 +110,7 @@ std::string Apply(mfem::DGHyperbolicConservationLaws& op,
   return output.str();
 }
 
-enum class Geometry { Straight, Shear, CurvedQ2 };
+enum class Geometry { Straight, Shear, CurvedQ2, CurvedQ3 };
 
 struct Fixture
 {
@@ -129,12 +131,13 @@ mfem::Mesh MakeMesh(Geometry geometry)
     Vector({1.0, 0.0}), Vector({0.0, 1.0})};
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
     box, box.CreatePeriodicVertexMapping(translations));
-  if (geometry == Geometry::CurvedQ2)
+  if (geometry == Geometry::CurvedQ2 || geometry == Geometry::CurvedQ3)
   {
     // Keep the discontinuous coordinate space used by MFEM periodic meshes.
     // The warp agrees on opposite boundaries, so the periodic face pairing
     // remains geometric and constant-state/global conservation checks apply.
-    periodic.SetCurvature(2, true, kDimension, mfem::Ordering::byVDIM);
+    periodic.SetCurvature(geometry == Geometry::CurvedQ2 ? 2 : 3,
+                          true, kDimension, mfem::Ordering::byVDIM);
     periodic.Transform([](const Vector& point, Vector& mapped)
     {
       const double pi = std::acos(-1.0);
@@ -210,7 +213,10 @@ class HostDenseRHS
 {
   mfem::ParFiniteElementSpace& fes_;
   const mfem::NumericalFlux& flux_;
+  int face_order_offset_;
   mfem::HyperbolicFormIntegrator face_integrator_;
+  mfem::Array<int> boundary_marker_;
+  std::unique_ptr<mfem::BdrHyperbolicFluxIntegrator> boundary_integrator_;
   mfem::ParNonlinearForm faces_;
   std::vector<DenseMatrix> weak_, inverse_;
   double repeat_allowance_ = 0.0;
@@ -220,7 +226,7 @@ class HostDenseRHS
     absolute.SetSize(fes_.GetVSize()); absolute = 0.0;
     auto* sums = absolute.HostWrite();
     const auto* input = state.HostRead();
-    mfem::HyperbolicFormIntegrator integrator(flux_, 2);
+    mfem::HyperbolicFormIntegrator integrator(flux_, face_order_offset_);
     mfem::IntegrationRule single_point(1);
     integrator.SetIntRule(&single_point);
     auto& mesh = *fes_.GetMesh();
@@ -238,7 +244,7 @@ class HostDenseRHS
       for (int i = 0; i < right_dofs.Size(); ++i)
         local[left_dofs.Size() + i] = input[right_dofs[i]];
       const auto& rule = mfem::IntRules.Get(tr->GetGeometryType(),
-        2 * std::max(left.GetOrder(), right.GetOrder()) + 2);
+        2 * std::max(left.GetOrder(), right.GetOrder()) + face_order_offset_);
       for (int q = 0; q < rule.GetNPoints(); ++q)
       {
         single_point.IntPoint(0) = rule.IntPoint(q);
@@ -254,11 +260,22 @@ class HostDenseRHS
 public:
   std::vector<Vector> cell_mass;
   HostDenseRHS(TestContext& ctx, mfem::ParFiniteElementSpace& fes,
-               const mfem::NumericalFlux& flux, const Fixture& fixture)
-    : fes_(fes), flux_(flux), face_integrator_(flux, 2), faces_(&fes),
+               const mfem::NumericalFlux& flux, const Fixture& fixture,
+               int face_order_offset = 2, bool slip_walls = false)
+    : fes_(fes), flux_(flux), face_order_offset_(face_order_offset),
+      face_integrator_(flux, face_order_offset), faces_(&fes),
       weak_(fes.GetNE()), inverse_(fes.GetNE()), cell_mass(fes.GetNE())
   {
     faces_.AddInteriorFaceIntegrator(&face_integrator_);
+    if (slip_walls)
+    {
+      boundary_marker_.SetSize(fes.GetMesh()->bdr_attributes.Max());
+      boundary_marker_ = 1;
+      boundary_integrator_ = std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        flux, std::make_unique<mfem::SlipWallState>(kDimension, 1.e-12, 1.e-12),
+        face_order_offset);
+      faces_.AddBdrFaceIntegrator(boundary_integrator_.get(), boundary_marker_);
+    }
     faces_.UseExternalIntegrators();
     mfem::TransposeIntegrator weak(new mfem::GradientIntegrator());
     mfem::InverseIntegrator inverse(new mfem::MassIntegrator());
@@ -324,15 +341,69 @@ public:
 
   double RepeatAllowance() const { return repeat_allowance_; }
 
+  Vector SlipBoundaryFlux(const Vector& state, double& normal_variation) const
+  {
+    Vector integral(kEquations); integral = 0.0;
+    normal_variation = 0.0;
+    const auto* input = state.HostRead();
+    auto& mesh = *fes_.GetMesh();
+    for (int b = 0; b < mesh.GetNBE(); ++b)
+    {
+      auto* tr = mesh.GetBdrFaceTransformations(b);
+      if (!tr) { continue; }
+      const auto& fe = *fes_.GetFE(tr->Elem1No);
+      mfem::Array<int> dofs;
+      fes_.GetElementDofs(tr->Elem1No, dofs);
+      Vector shape(fe.GetDof()), minus(kEquations), plus(kEquations);
+      Vector normal(kDimension), first_normal(kDimension), flux(kEquations);
+      const auto& rule = mfem::IntRules.Get(tr->GetGeometryType(),
+        2 * fe.GetOrder() + face_order_offset_);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        const auto& point = rule.IntPoint(q);
+        tr->SetAllIntPoints(&point);
+        fe.CalcShape(tr->GetElement1IntPoint(), shape);
+        minus = 0.0;
+        for (int j = 0; j < dofs.Size(); ++j)
+          for (int c = 0; c < kEquations; ++c)
+            minus[c] += shape[j] * input[fes_.DofToVDof(dofs[j], c)];
+        mfem::CalcOrtho(tr->Jacobian(), normal);
+        const double length = normal.Norml2();
+        MFEM_VERIFY(std::isfinite(length) && length > 0.0,
+                    "Curved boundary oracle requires finite physical normals.");
+        if (q == 0) { first_normal = normal; first_normal /= length; }
+        normal_variation = std::max(normal_variation,
+          std::hypot(normal[0] / length - first_normal[0],
+                     normal[1] / length - first_normal[1]));
+        // Reflect momentum analytically, independently of SlipWallState and
+        // the packed exterior-state helper. Density and energy stay fixed.
+        plus = minus;
+        const double reflected = 2.0 *
+          (minus[1] * normal[0] + minus[2] * normal[1]) / (length * length);
+        plus[1] -= reflected * normal[0];
+        plus[2] -= reflected * normal[1];
+        flux_.Eval(minus, plus, normal, *tr, flux);
+        integral.Add(point.weight, flux);
+      }
+    }
+    return integral;
+  }
+
   double Apply(const Vector& state, const mfem::ParGridFunction* sigma,
                 Vector& rhs, const mfem::FluxWithIGR* tracked_flux = nullptr)
   {
     face_integrator_.ResetMaxCharSpeed();
+    if (boundary_integrator_) { boundary_integrator_->ResetMaxCharSpeed(); }
     Vector face_rhs(fes_.GetVSize());
     faces_.Mult(state, face_rhs);
     double maximum_speed = face_integrator_.GetMaxCharSpeed();
+    if (boundary_integrator_)
+      maximum_speed = std::max(maximum_speed,
+        static_cast<double>(boundary_integrator_->GetMaxCharSpeed()));
     Vector absolute_face;
-    const bool atomic_faces = mfem::Device::Allows(mfem::Backend::CUDA_MASK);
+    // Exact repeats are only checked for the original periodic cohorts.
+    const bool atomic_faces = !boundary_integrator_ &&
+      mfem::Device::Allows(mfem::Backend::CUDA_MASK);
     if (atomic_faces) { AbsoluteFaceContributions(state, absolute_face); }
     const auto* face_bound = atomic_faces ? absolute_face.HostRead() : nullptr;
     repeat_allowance_ = 0.0;
@@ -397,7 +468,7 @@ public:
       // weak-divergence and inverse-mass contractions. This uses physical
       // matrix/flux magnitudes, including cancellation in a constant RHS.
       const int nq = mfem::IntRules.Get(mfem::Geometry::SEGMENT,
-                                         2 * fe.GetOrder() + 2).GetNPoints();
+        2 * fe.GetOrder() + face_order_offset_).GetNPoints();
       const double operations = 4 * nq + 2 * kDimension * dof + 2 * dof + 8;
       const double accumulated_epsilon = operations * std::numeric_limits<double>::epsilon();
       const double gamma_n = accumulated_epsilon / (1.0 - accumulated_epsilon);
@@ -457,10 +528,12 @@ void CheckConservation(TestContext& ctx, mfem::ParFiniteElementSpace& fes,
 }
 
 std::unique_ptr<mfem::DGHyperbolicConservationLaws> MakeOperator(
-  mfem::ParFiniteElementSpace& fes, const mfem::NumericalFlux& flux, const char* execution)
+  mfem::ParFiniteElementSpace& fes, const mfem::NumericalFlux& flux,
+  const char* execution, int face_order_offset = 2)
 {
   ScopedEnvironment selected("IGRLAB_DG_PACKED_DENSE_EXECUTION", execution);
-  auto op = std::make_unique<mfem::DGHyperbolicConservationLaws>(fes, flux, 2, true);
+  auto op = std::make_unique<mfem::DGHyperbolicConservationLaws>(
+    fes, flux, face_order_offset, true);
   op->SetDGSEMGamma(kGamma);
   op->SetDGSEMDiagnosticStateScan(false);
   return op;
@@ -595,6 +668,179 @@ void CheckFixture(TestContext& ctx, const Fixture& fixture, bool supplementary)
               speed == element->GetMaxCharSpeed(),
             cohort + " invariant-speed node maximum agrees with host reference");
 }
+
+void CheckWallBalance(TestContext& ctx, mfem::ParFiniteElementSpace& fes,
+                       const std::vector<Vector>& cell_mass, const Vector& rhs,
+                       const Vector& outward, const std::string& label)
+{
+  const auto* values = rhs.HostRead();
+  const auto* flux = outward.HostRead();
+  std::array<long double, kEquations> total{}, bound{};
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    mfem::Array<int> dofs;
+    fes.GetElementDofs(e, dofs);
+    for (int c = 0; c < kEquations; ++c)
+      for (int i = 0; i < dofs.Size(); ++i)
+      {
+        const long double term = static_cast<long double>(cell_mass[e][i]) *
+          values[fes.DofToVDof(dofs[i], c)];
+        total[c] += term; bound[c] += std::abs(term);
+      }
+  }
+  bool balanced = true;
+  for (int c = 0; c < kEquations; ++c)
+    balanced = balanced && std::isfinite(total[c]) && std::isfinite(flux[c]) &&
+      std::abs(total[c] + flux[c]) <=
+        5.e-11L * std::max(1.0L, bound[c] + std::abs(flux[c]));
+  ctx.Check(balanced, label + " closes the independently integrated physical wall flux balance");
+}
+
+void CheckCurvedTensorFaces(TestContext& ctx)
+{
+  struct Configuration
+  {
+    int geometry_order;
+    int face_order_offset;
+    bool mismatched_sigma;
+    const char* name;
+    const char* fallback;
+  };
+  const std::array<Configuration, 4> configurations{{
+    {2, 1, false, "Q2-p5-curved-slip-wall", nullptr},
+    {2, 2, false, "Q2-p5-curved-slip-wall-higher-quadrature", "quadrature"},
+    {2, 1, true, "Q2-p5-curved-slip-wall-interpolated-sigma", "sigma-layout"},
+    {3, 1, false, "Q3-p5-curved-slip-wall", "geometry"}
+  }};
+  for (const auto& configuration : configurations)
+  {
+    mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
+      2, 2, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+    serial.SetCurvature(configuration.geometry_order, false,
+                        kDimension, mfem::Ordering::byVDIM);
+    serial.Transform([&configuration](const Vector& point, Vector& mapped)
+    {
+      const double x = point[0], y = point[1];
+      mapped.SetSize(kDimension);
+      mapped[0] = x + 0.06 * y * (1.0 - y) + 0.04 * x * y;
+      mapped[1] = y + 0.07 * x * (1.0 - x) + 0.03 * x * y;
+      if (configuration.geometry_order == 3) { mapped[0] += 0.02 * x * x * x * y; }
+    });
+    mfem::ParMesh mesh(MPI_COMM_SELF, serial);
+    mfem::L2_FECollection fec(5, kDimension, mfem::BasisType::GaussLegendre);
+    mfem::L2_FECollection sfec(5, kDimension, configuration.mismatched_sigma
+      ? mfem::BasisType::GaussLobatto : mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace fes(&mesh, &fec, kEquations, mfem::Ordering::byNODES);
+    mfem::ParFiniteElementSpace sfes(&mesh, &sfec);
+    mfem::ParGridFunction sigma(&sfes);
+    Vector state(fes.GetVSize());
+    FillState(fes, state, false);
+    FillSigma(sigma, false, 1.0);
+    mfem::EulerFlux euler(kDimension, kGamma);
+    mfem::FluxWithIGR physical(euler, kGamma);
+    physical.SetSigmaField(&sigma);
+    physical.SetInvariantDomainFlux(false);
+    physical.SetSigmaAwareCFL(false);
+    physical.SetSigmaAwareRusanov(false);
+    mfem::RusanovFluxWithSides flux(physical);
+    const Fixture fixture{configuration.geometry_order == 2
+      ? Geometry::CurvedQ2 : Geometry::CurvedQ3, 5, mfem::Ordering::byNODES, 5,
+      configuration.mismatched_sigma ? mfem::BasisType::GaussLobatto
+                                    : mfem::BasisType::GaussLegendre,
+      configuration.name};
+    HostDenseRHS oracle(ctx, fes, flux, fixture,
+                         configuration.face_order_offset, true);
+    mfem::Array<int> boundaries(mesh.bdr_attributes.Max()); boundaries = 1;
+    std::array<std::unique_ptr<mfem::DGHyperbolicConservationLaws>, 2> operators;
+    std::array<Vector, 2> residual, captured;
+    for (int variant = 0; variant < 2; ++variant)
+    {
+      ScopedEnvironment face_mode("IGRLAB_DG_TENSOR_FACE", variant ? "fp64" : "off");
+      operators[variant] = MakeOperator(fes, flux, "rows", configuration.face_order_offset);
+      operators[variant]->AddBdrFaceIntegrator(new mfem::BdrHyperbolicFluxIntegrator(
+        flux, std::make_unique<mfem::SlipWallState>(kDimension, 1.e-12, 1.e-12),
+        configuration.face_order_offset), boundaries);
+      residual[variant].SetSize(fes.GetVSize()); residual[variant].UseDevice(true);
+    }
+    // Only the admitted fixture repeats with changed current sigma. Each
+    // fallback configuration needs one complete RHS and boundary comparison.
+    const int phases = configuration.fallback ? 1 : 2;
+    Vector expected(fes.GetVSize()), first_sigma(fes.GetVSize()), repeat(fes.GetVSize());
+    repeat.UseDevice(true);
+    for (int phase = 0; phase < phases; ++phase)
+    {
+      FillSigma(sigma, false, phase ? 1.8 : 1.0);
+      const std::string label = std::string(configuration.name) + " phase=" + std::to_string(phase);
+      const double expected_speed = oracle.Apply(state, &sigma, expected);
+      double normal_variation = 0.0;
+      const Vector boundary_reference = oracle.SlipBoundaryFlux(state, normal_variation);
+      ctx.Check(normal_variation > 1.e-3,
+                label + " has varying physical normal directions along boundary edges");
+      ctx.Check(boundary_reference.Normlinf() > 1.e-4 &&
+                  std::abs(boundary_reference[0]) < 2.e-12 &&
+                  std::abs(boundary_reference[3]) < 2.e-12,
+                label + " has nontrivial wall force and zero mass/energy leakage");
+      for (int variant = 0; variant < 2; ++variant)
+      {
+        const char* mode = variant ? "fp64" : "off";
+        ScopedEnvironment face_mode("IGRLAB_DG_TENSOR_FACE", mode);
+        auto& op = *operators[variant];
+        op.ArmPhysicalBoundaryFluxIntegral();
+        const std::string log = Apply(op, state, residual[variant], "rows");
+        ctx.Check(op.HasLastPhysicalBoundaryFluxIntegral(),
+                  label + " publishes the requested physical boundary integral mode=" + mode);
+        if (op.HasLastPhysicalBoundaryFluxIntegral())
+        {
+          captured[variant] = op.GetLastPhysicalBoundaryFluxIntegral();
+          Compare(ctx, captured[variant], boundary_reference, 2.e-12,
+                    label + " boundary flux versus independent reflection/quadrature mode=" + mode);
+        }
+        Compare(ctx, residual[variant], expected, 2.e-11,
+                  label + " full RHS versus independent host reference mode=" + mode);
+        CheckWallBalance(ctx, fes, oracle.cell_mass, residual[variant], boundary_reference,
+                           label + " mode=" + mode);
+        const double speed = op.GetMaxCharSpeed();
+        ctx.Check(std::isfinite(speed) && std::isfinite(expected_speed) &&
+                    std::abs(speed - expected_speed) <= 2.e-12 * std::max(1.0, expected_speed),
+                  label + " preserves physical boundary/interior characteristic speeds mode=" + mode);
+        if (!variant && phase == 0 && mfem::Device::Allows(mfem::Backend::CUDA_MASK))
+          ctx.Check(log.find("[dg-tensor-face]") == std::string::npos &&
+                      LogHas(log, "event=face-domain-path", "selected=packed-mfem-forall-euler-rusanov"),
+                    label + " keeps the off control on original generic faces");
+        if (variant && phase == 0 && mfem::Device::Allows(mfem::Backend::CUDA_MASK))
+        {
+          if (configuration.fallback)
+          {
+            ctx.Check(LogHas(log, "[dg-tensor-face] event=fallback",
+                              std::string("reason=") + configuration.fallback) &&
+                        log.find("[dg-tensor-face] event=setup selected=fp64") == std::string::npos &&
+                        LogHas(log, "event=face-domain-path", "selected=packed-mfem-forall-euler-rusanov"),
+                      label + " retains original generic faces for the incompatible configuration");
+          }
+          else
+          {
+            ctx.Check(LogHas(log, "[dg-tensor-face] event=setup", "selected=fp64") &&
+                        LogHas(log, "[dg-tensor-face] event=setup", "geometry_order_max=2") &&
+                        LogHas(log, "[dg-tensor-face] event=setup", "jacobian_validation=sampled-q2"),
+                      label + " admits sampled Q2 geometry to the exact tensor face path");
+          }
+        }
+        if (variant && !configuration.fallback)
+        {
+          Apply(op, state, repeat, "rows");
+          CompareRepeat(ctx, repeat, residual[variant], 0.0,
+                          label + " tensor faces repeat with every output row owned");
+        }
+      }
+      Compare(ctx, residual[1], residual[0], 3.e-12,
+                label + " tensor/requested fallback versus generic full RHS");
+      if (phase == 0) { first_sigma = residual[1]; }
+      else
+        ctx.Check(Difference(residual[1], first_sigma) > 1.e-4,
+                  label + " reads changed sigma on curved physical boundaries");
+    }
+  }
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -621,5 +867,6 @@ int main(int argc, char** argv)
   }};
   for (std::size_t i = 0; i < fixtures.size(); ++i)
     CheckFixture(ctx, fixtures[i], i == 0);
+  CheckCurvedTensorFaces(ctx);
   return ctx.failures == 0 ? 0 : 1;
 }
