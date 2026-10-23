@@ -60,8 +60,18 @@ paths in qualification gates. They are retired for new jobs and must not be
 reused unchanged with this wrapper. Existing code, golden finals, and pinned
 inputs are not automatically moved or rewritten. Preserve original receipts;
 any archive relocation needs an explicit path/hash mapping and compatible
-readers. A fresh canonical `build.sh --output-root '{scratch}/builds'` requires
-initial configuration before `--iterate` can be used there.
+readers. Reruns reuse the existing qualified application binary. Keep installed Spack
+dependencies and the stamped MFEM cache persistent; they are not disposable
+job output. If an application source change requires a build, use the canonical
+driver with the matching persistent `--reuse-mfem-root` (or shared
+`--mfem-output-root`) and `--no-deps` when the dependencies are already
+installed. The driver still checks the dependency profile and compatibility.
+A fresh application `--output-root '{scratch}/builds'` requires initial
+configuration before `--iterate`; it does not require rebuilding compatible
+installed dependencies.
 
-This wrapper has host-only filesystem validation. Its node capacity,
-performance, and cluster runtime have not been tested by a GPU job.
+The wrapper was exercised by DeltaAI full-comparison job `3445369` and
+Nsight Compute job `3445658`. Both completed with successful selected-file
+retention and cleanup. Retained copies passed size/SHA256 checks; final
+physical fields also passed separate native-VTK validation. Capacity remains
+a per-job preflight because node-local storage is shared.
