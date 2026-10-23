@@ -51,7 +51,7 @@ perturb symmetry/SPD; FP64 admission does not certify its rounded arithmetic.
 NCU job **3439260** independently confirms **1,573,344 DMMA instructions**,
 zero HMMA, 12.11% tensor-pipe activity and 90.44% active-warps occupancy.
 Its diagnostic duration is 216.992 microseconds with 333,429,248 DRAM bytes
-(1.54 TB/s); benchmark comparisons use the separate unprofiled timings above.
+(1.54 TB/s); benchmark comparisons use the separate unprofiled timings in the benchmark table.
 
 All **11 native suites passed**, covering retained exact-mode guards/regressions,
 projected Cartesian/rotated-orthogonal/sheared/curved Q2 cases, reordered elements,
@@ -129,7 +129,7 @@ These are engineering comparisons with the converged run, not discretization-err
 estimates or positivity proofs between samples.
 
 **Sigma differs by 23.0209% in L2** (31.3431% sampled normalized Linf). The reference
-sigma amplitude is only 1.006e-6, while pressure is at least1.0000028. This early
+sigma amplitude is only 1.006e-6, while pressure is at least 1.0000028. This early
 agreement does not establish the two-sweep method's later accuracy or stability.
 No full t=.1 comparison has run, and no TF32 physical comparison is claimed.
 
@@ -138,8 +138,8 @@ weights work on this mapped mesh, with actual FP64 tensor-core execution and no
 retained dense inverse per element. It does not establish a universally stable
 fixed-sweep solver. Further validation should use an efficient converged reference
 with a coarse correction before paying for a late-time mapped comparison: the
-local-only control averaged 67.1 FGMRES iterations. Existing generic element/Q1
-two-level preconditioning is source-compatible but not yet measured on this mesh.
+local-only control averaged 67.1 FGMRES iterations. The subsequent short qualification of generic element/Q1 two-level preconditioning
+is recorded below; the full late-time comparison is still pending.
 
 The original metadata writer emits bare `nan` for two unavailable fixed-sweep
 residual norms. Raw output is preserved; a separate postprocessor treats only
@@ -159,3 +159,27 @@ in the measurements. The fixture can generate the exact map with
 `--write-mapped-mesh PATH --mesh-n 512`; benchmark with
 `--benchmark --reference projected --mesh-n 512 --backend all --warmup 8 --repetitions 64 --rounds 3`.
 Do not substitute a differently warped/refined mesh or a historical Cartesian VTK.
+
+**Coarse-reference qualification (2026-10-23 UTC).** Job **3439487** used the same
+frozen application and curved mesh, with exact FP64 element inverses plus internal
+Q1 Galerkin coarse correction. Cooperative coarse CG executed throughout, without
+fallback; the physical sigma space remains L2/BrokenL2. All **487** original-current-A
+certificates passed RHS-relative `1e-6` (maximum `9.9848182e-7`), without replacement
+retries. The block and coarse reconstruction probes were `3.8130e-16` and `1.7486e-16`.
+
+At t=.0025, its conserved fields agree with the retained local-only converged
+reference to at most **1.2254e-13 relative L2**; sigma differs **1.6349e-7**. Both
+fields pass sampled positivity. This qualifies the cheaper reference without
+changing the physical equation or requested residual tolerance.
+
+Setup took **11.130765 s**; mean outer iterations fell from **67.07 to 25.84**.
+Observed pre-final-output evolution time was **187.275804 s**, the native loop
+with final output **228.888441 s**, and the complete process **350.501437 s**.
+These separate-allocation short costs do not constitute a matched speedup
+measurement. Exact settings and receipts are in
+[coarse-reference measurements](benchmarks/dg_mapped_coarse_reference_measurements.json).
+
+Full job **3439538** is submitted to run the coarse-corrected converged control
+and the projected FP64 WMMA fixed-sweep candidate sequentially on the same GPU,
+both freshly evolved to **t=.1**. Its results are pending. The application source
+remains `edba797`; no rebuild or new application changes were needed for this phase.
