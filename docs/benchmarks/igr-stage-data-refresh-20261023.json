@@ -1,0 +1,1770 @@
+{
+  "schema": "igr-stage-refresh-results-v1",
+  "status": "completed",
+  "source_commit": "b6f20b909034e13614791b4b15031b02c0405f41",
+  "binary_sha256": "cc27f58382d492b728f9e839130d5334fb0da32c1a5db94ee0bdc85427f783c9",
+  "branch": "igr-stage-data-refresh",
+  "native": {
+    "receipt": {
+      "path": "/tmp/igr-stage-data-refresh-20261023/native-3443660/run.json",
+      "sha256": "a3b170fa9df2cf397aaa96553658810ba1d29c594328ccc2cc604af191d5cc8c"
+    },
+    "job": "3443660",
+    "tests": [
+      "dg_igr_exact_face_cpu",
+      "dg_igr_exact_face_cuda",
+      "dg_igr_stage_refresh_cuda",
+      "dg_igr_local_tensor_jacobi_cuda_projected"
+    ]
+  },
+  "comparison_baseline": {
+    "source_commit": "b53b40a56facbd4a47b198239158764da82b6295",
+    "binary_sha256": "007acaade17c5ec6e9adfc7e3ebe796da8406a28ad606041da77888e4f0986c2",
+    "scope": "previous optimized mapped spectral-block hybrid, not original GPU solver or Cartesian global spectral inverse"
+  },
+  "mesh": {
+    "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+    "sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "record": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+      "mesh_n": "512",
+      "elements": "262144",
+      "geometry_order": "2",
+      "final_mesh_before_mapping": "true",
+      "amplitude": "0.035000000000000003",
+      "analytic_detj_lower": "0.78008851424871439",
+      "sampled_detj_min": "2.9757909459230195e-06",
+      "sampled_detj_max": "4.6536035853265469e-06",
+      "sampled_detj_scaled_min": "0.78008574172804401",
+      "jacobian_samples": "16252928",
+      "sample_sets": "vertices,GL7,geometry-nodes",
+      "boundary_fixed": "true",
+      "center_fixed": "true",
+      "application_refinements": "0"
+    }
+  },
+  "configuration": {
+    "argv": {
+      "original": [
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-pipeline-20261022/native-3440081/frozen/sedov_taylor_blast",
+        "-m",
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+        "--device",
+        "cuda",
+        "--discretization",
+        "dg",
+        "--regularization",
+        "igr",
+        "--time-integrator",
+        "rk3ssp",
+        "-o",
+        "5",
+        "-rs",
+        "0",
+        "-rp",
+        "0",
+        "-tf",
+        "0.1",
+        "-c",
+        "0.3",
+        "--element-assembly-divergence",
+        "--igr-space",
+        "L2",
+        "--igr-grad",
+        "BrokenL2",
+        "--c-alpha",
+        "0.16666666666666666",
+        "--igr-alpha-length",
+        "max",
+        "--igr-ip-kind",
+        "sipg",
+        "--igr-exact-dg-face",
+        "--igr-sigma-cadence",
+        "every-stage",
+        "--igr-stage-rtol-scale",
+        "1",
+        "--igr-linear-solver",
+        "fgmres",
+        "--igr-preconditioner",
+        "none",
+        "--igr-lin-rtol",
+        "1e-6",
+        "--igr-lin-atol",
+        "0",
+        "--igr-lin-maxit",
+        "1000",
+        "--igr-nonconvergence-policy",
+        "error",
+        "--igr-lin-print",
+        "0",
+        "--positivity-limiter",
+        "none",
+        "--modal-damping-rate",
+        "0",
+        "--dgsem-surface-flux",
+        "rusanov",
+        "--no-igr-sigma-cfl",
+        "--no-igr-sigma-rusanov",
+        "--no-igr-invariant-domain-flux",
+        "--no-admissibility-scan",
+        "--no-conservation-balance",
+        "--no-nan-scan",
+        "-no-glvis",
+        "-vtk",
+        "--time-step-save",
+        "0.02",
+        "--no-vtk-h1-diagnostics",
+        "--no-vtk-l2-diagnostics",
+        "--no-save-state",
+        "-vs",
+        "100",
+        "-as",
+        "500",
+        "--igr-solve-mode",
+        "element-block-jacobi",
+        "--igr-jacobi-blocks",
+        "tensor",
+        "--igr-sweeps",
+        "2",
+        "--igr-initial-sweeps",
+        "50",
+        "--igr-jacobi-omega",
+        "0.7"
+      ],
+      "fused": [
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023/native-3443660/frozen/sedov_taylor_blast",
+        "-m",
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+        "--device",
+        "cuda",
+        "--discretization",
+        "dg",
+        "--regularization",
+        "igr",
+        "--time-integrator",
+        "rk3ssp",
+        "-o",
+        "5",
+        "-rs",
+        "0",
+        "-rp",
+        "0",
+        "-tf",
+        "0.1",
+        "-c",
+        "0.3",
+        "--element-assembly-divergence",
+        "--igr-space",
+        "L2",
+        "--igr-grad",
+        "BrokenL2",
+        "--c-alpha",
+        "0.16666666666666666",
+        "--igr-alpha-length",
+        "max",
+        "--igr-ip-kind",
+        "sipg",
+        "--igr-exact-dg-face",
+        "--igr-sigma-cadence",
+        "every-stage",
+        "--igr-stage-rtol-scale",
+        "1",
+        "--igr-linear-solver",
+        "fgmres",
+        "--igr-preconditioner",
+        "none",
+        "--igr-lin-rtol",
+        "1e-6",
+        "--igr-lin-atol",
+        "0",
+        "--igr-lin-maxit",
+        "1000",
+        "--igr-nonconvergence-policy",
+        "error",
+        "--igr-lin-print",
+        "0",
+        "--positivity-limiter",
+        "none",
+        "--modal-damping-rate",
+        "0",
+        "--dgsem-surface-flux",
+        "rusanov",
+        "--no-igr-sigma-cfl",
+        "--no-igr-sigma-rusanov",
+        "--no-igr-invariant-domain-flux",
+        "--no-admissibility-scan",
+        "--no-conservation-balance",
+        "--no-nan-scan",
+        "-no-glvis",
+        "-vtk",
+        "--time-step-save",
+        "0.02",
+        "--no-vtk-h1-diagnostics",
+        "--no-vtk-l2-diagnostics",
+        "--no-save-state",
+        "-vs",
+        "100",
+        "-as",
+        "500",
+        "--igr-solve-mode",
+        "element-block-jacobi",
+        "--igr-jacobi-blocks",
+        "tensor",
+        "--igr-sweeps",
+        "2",
+        "--igr-initial-sweeps",
+        "50",
+        "--igr-jacobi-omega",
+        "0.7"
+      ]
+    },
+    "environments": {
+      "original": {
+        "OMP_NUM_THREADS": "1",
+        "IGRLAB_PROFILE_NVTX": "0",
+        "IGRLAB_IGR_PARTIAL_ASSEMBLY": "1",
+        "IGRLAB_IGR_DEVICE_QF": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CUDA": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CACHE": "1",
+        "IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "IGRLAB_IGR_IPDG_PENALTY_SCALE": "1",
+        "IGRLAB_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "IGRLAB_IGR_TENSOR_VOLUME": "simt",
+        "IGRLAB_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "IGRLAB_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "IGRLAB_IGR_TENSOR_MG": "off",
+        "IGRLAB_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "IGRLAB_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_TRUE_RESIDUAL": "0",
+        "IGRLAB_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "IGRLAB_IGR_OPERATOR_PROBE_EVERY": "0",
+        "IGRLAB_IGR_PRECONDITIONER_PROBE": "0",
+        "IGRLAB_SHARED_OPERATOR_PRECISION": "off",
+        "IGRLAB_SHARED_EULER_LAYOUT": "dense",
+        "IGRLAB_SHARED_EULER_FLUX_EXECUTION": "element",
+        "IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "IGRLAB_DG_FORCE_MATRIX_FREE": "0",
+        "IGRLAB_DG_FORCE_NLFORM_FACE": "0",
+        "IGRLAB_DG_NATIVE_MASS_INV": "0",
+        "IGRLAB_DG_PACKED_INVMASS_DEVICE": "1",
+        "IGRLAB_DG_TENSOR_FACE": "fp64",
+        "IGRLAB_WEAKDIV_SIGMA_STORAGE": "auto",
+        "IGRLAB_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "IGRLAB_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "IGRLAB_IGR_COMPACT_FACE_QDATA": "1",
+        "IGRLAB_IGR_COMPACT_FACE_LIFT": "1",
+        "IGRLAB_VTK_PRESSURE_COEFFICIENT": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "IGRLAB_DG_PACKED_DENSE_EXECUTION": "rows",
+        "IGRLAB_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023/full-3443733/original/vtk",
+        "DG_IGR_PROFILE_NVTX": "0",
+        "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CUDA": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CACHE": "1",
+        "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "DG_IGR_IGR_IPDG_PENALTY_SCALE": "1",
+        "DG_IGR_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "DG_IGR_IGR_TENSOR_VOLUME": "simt",
+        "DG_IGR_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "DG_IGR_IGR_TENSOR_MG": "off",
+        "DG_IGR_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "DG_IGR_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "DG_IGR_IGR_TRUE_RESIDUAL": "0",
+        "DG_IGR_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "DG_IGR_IGR_OPERATOR_PROBE_EVERY": "0",
+        "DG_IGR_IGR_PRECONDITIONER_PROBE": "0",
+        "DG_IGR_SHARED_OPERATOR_PRECISION": "off",
+        "DG_IGR_SHARED_EULER_LAYOUT": "dense",
+        "DG_IGR_SHARED_EULER_FLUX_EXECUTION": "element",
+        "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "DG_IGR_DG_FORCE_MATRIX_FREE": "0",
+        "DG_IGR_DG_FORCE_NLFORM_FACE": "0",
+        "DG_IGR_DG_NATIVE_MASS_INV": "0",
+        "DG_IGR_DG_PACKED_INVMASS_DEVICE": "1",
+        "DG_IGR_DG_TENSOR_FACE": "fp64",
+        "DG_IGR_WEAKDIV_SIGMA_STORAGE": "auto",
+        "DG_IGR_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "DG_IGR_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "DG_IGR_IGR_COMPACT_FACE_QDATA": "1",
+        "DG_IGR_IGR_COMPACT_FACE_LIFT": "1",
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_DG_PACKED_DENSE_EXECUTION": "rows",
+        "DG_IGR_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023/full-3443733/original/vtk",
+        "DG_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_LOCAL_TENSOR_REFERENCE": "projected"
+      },
+      "fused": {
+        "OMP_NUM_THREADS": "1",
+        "IGRLAB_PROFILE_NVTX": "0",
+        "IGRLAB_IGR_PARTIAL_ASSEMBLY": "1",
+        "IGRLAB_IGR_DEVICE_QF": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CUDA": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CACHE": "1",
+        "IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "IGRLAB_IGR_IPDG_PENALTY_SCALE": "1",
+        "IGRLAB_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "IGRLAB_IGR_TENSOR_VOLUME": "simt",
+        "IGRLAB_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "IGRLAB_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "IGRLAB_IGR_TENSOR_MG": "off",
+        "IGRLAB_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "IGRLAB_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_TRUE_RESIDUAL": "0",
+        "IGRLAB_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "IGRLAB_IGR_OPERATOR_PROBE_EVERY": "0",
+        "IGRLAB_IGR_PRECONDITIONER_PROBE": "0",
+        "IGRLAB_SHARED_OPERATOR_PRECISION": "off",
+        "IGRLAB_SHARED_EULER_LAYOUT": "dense",
+        "IGRLAB_SHARED_EULER_FLUX_EXECUTION": "element",
+        "IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "IGRLAB_DG_FORCE_MATRIX_FREE": "0",
+        "IGRLAB_DG_FORCE_NLFORM_FACE": "0",
+        "IGRLAB_DG_NATIVE_MASS_INV": "0",
+        "IGRLAB_DG_PACKED_INVMASS_DEVICE": "1",
+        "IGRLAB_DG_TENSOR_FACE": "fp64",
+        "IGRLAB_WEAKDIV_SIGMA_STORAGE": "auto",
+        "IGRLAB_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "IGRLAB_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "IGRLAB_IGR_COMPACT_FACE_QDATA": "1",
+        "IGRLAB_IGR_COMPACT_FACE_LIFT": "1",
+        "IGRLAB_VTK_PRESSURE_COEFFICIENT": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "IGRLAB_DG_PACKED_DENSE_EXECUTION": "rows",
+        "IGRLAB_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023/full-3443733/fused/vtk",
+        "DG_IGR_PROFILE_NVTX": "0",
+        "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CUDA": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CACHE": "1",
+        "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "DG_IGR_IGR_IPDG_PENALTY_SCALE": "1",
+        "DG_IGR_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "DG_IGR_IGR_TENSOR_VOLUME": "simt",
+        "DG_IGR_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "DG_IGR_IGR_TENSOR_MG": "off",
+        "DG_IGR_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "DG_IGR_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "DG_IGR_IGR_TRUE_RESIDUAL": "0",
+        "DG_IGR_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "DG_IGR_IGR_OPERATOR_PROBE_EVERY": "0",
+        "DG_IGR_IGR_PRECONDITIONER_PROBE": "0",
+        "DG_IGR_SHARED_OPERATOR_PRECISION": "off",
+        "DG_IGR_SHARED_EULER_LAYOUT": "dense",
+        "DG_IGR_SHARED_EULER_FLUX_EXECUTION": "element",
+        "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "DG_IGR_DG_FORCE_MATRIX_FREE": "0",
+        "DG_IGR_DG_FORCE_NLFORM_FACE": "0",
+        "DG_IGR_DG_NATIVE_MASS_INV": "0",
+        "DG_IGR_DG_PACKED_INVMASS_DEVICE": "1",
+        "DG_IGR_DG_TENSOR_FACE": "fp64",
+        "DG_IGR_WEAKDIV_SIGMA_STORAGE": "auto",
+        "DG_IGR_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "DG_IGR_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "DG_IGR_IGR_COMPACT_FACE_QDATA": "1",
+        "DG_IGR_IGR_COMPACT_FACE_LIFT": "1",
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_DG_PACKED_DENSE_EXECUTION": "rows",
+        "DG_IGR_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023/full-3443733/fused/vtk",
+        "DG_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_COEFFICIENT_EXECUTION": "fused",
+        "IGRLAB_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "DG_IGR_IGR_COEFFICIENT_EXECUTION": "fused",
+        "DG_IGR_IGR_FACE_DENSITY_EXECUTION": "tensor"
+      }
+    },
+    "scan_policy": "all optional scans off",
+    "precision": "FP64 stage preparation and current operator; existing local FP64 WMMA inverse retained"
+  },
+  "short": {
+    "receipt": {
+      "path": "/tmp/igr-stage-data-refresh-20261023/short-3443676/run.json",
+      "sha256": "e294c734ef20ab425c72053126134d8b3b710836c37be74affed2f509eda5c0c"
+    },
+    "job": "3443676",
+    "target_time": 0.0025,
+    "node": "gh017",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-4f4c45f0-3728-02ec-42c5-8f0dbc9e95e2",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "arms": {
+      "original": {
+        "timings": {
+          "application_wall_seconds": 172.4330839989707,
+          "native_done_seconds": 60.612772892,
+          "pre_final_output_analysis_seconds": 17.09332
+        },
+        "accepted_steps": 162,
+        "sigma_calls": 487,
+        "total_sweeps": "1022",
+        "sampled_gpu_memory_used_mib_max": 27649.0,
+        "actual_modes": {
+          "requested": {
+            "coefficient": "legacy-baseline",
+            "face_density": "legacy-dense"
+          },
+          "face_qf_projector": {
+            "event": "face-qf-projector",
+            "mode": "single-valued-mfem-face-restriction",
+            "diagnostic_only": "1",
+            "reason": "side-dependent-coefficient-not-represented"
+          },
+          "coefficient_setup": [],
+          "face_density_execution": [],
+          "evidence": {
+            "coefficient_selection": "legacy baseline implementation, no selector tag",
+            "face_density_selection": "legacy dense implementation, no tensor selector tag"
+          }
+        }
+      },
+      "skip": {
+        "timings": {
+          "application_wall_seconds": 170.22219065576792,
+          "native_done_seconds": 60.19056457,
+          "pre_final_output_analysis_seconds": 17.623443
+        },
+        "accepted_steps": 162,
+        "sigma_calls": 487,
+        "total_sweeps": "1022",
+        "sampled_gpu_memory_used_mib_max": 27395.0,
+        "actual_modes": {
+          "requested": {
+            "coefficient": "baseline",
+            "face_density": "dense"
+          },
+          "face_qf_projector": {
+            "event": "face-qf-projector",
+            "mode": "skipped-unused-single-valued",
+            "reason": "exact-side-coefficients-active"
+          },
+          "coefficient_setup": [
+            {
+              "event": "setup",
+              "requested": "baseline",
+              "selected": "baseline",
+              "precision": "fp64"
+            }
+          ],
+          "face_density_execution": [],
+          "evidence": {
+            "coefficient_selection": "explicit requested/selected baseline setup log",
+            "face_density_selection": "explicit dense selector in command receipt; no tensor enablement claim"
+          }
+        }
+      },
+      "faces": {
+        "timings": {
+          "application_wall_seconds": 175.0266330661252,
+          "native_done_seconds": 62.894952183,
+          "pre_final_output_analysis_seconds": 16.246799
+        },
+        "accepted_steps": 162,
+        "sigma_calls": 487,
+        "total_sweeps": "1022",
+        "sampled_gpu_memory_used_mib_max": 25617.0,
+        "actual_modes": {
+          "requested": {
+            "coefficient": "baseline",
+            "face_density": "tensor"
+          },
+          "face_qf_projector": {
+            "event": "face-qf-projector",
+            "mode": "skipped-unused-single-valued",
+            "reason": "exact-side-coefficients-active"
+          },
+          "coefficient_setup": [
+            {
+              "event": "setup",
+              "requested": "baseline",
+              "selected": "baseline",
+              "precision": "fp64"
+            }
+          ],
+          "face_density_execution": [
+            {
+              "event": "execution",
+              "requested": "tensor",
+              "selected": "tensor",
+              "reason": "supported"
+            }
+          ],
+          "evidence": {
+            "coefficient_selection": "explicit requested/selected setup log",
+            "face_density_selection": "explicit requested/selected tensor execution log"
+          }
+        }
+      },
+      "fused": {
+        "timings": {
+          "application_wall_seconds": 168.77452495787293,
+          "native_done_seconds": 58.266074231,
+          "pre_final_output_analysis_seconds": 15.190616
+        },
+        "accepted_steps": 162,
+        "sigma_calls": 487,
+        "total_sweeps": "1022",
+        "sampled_gpu_memory_used_mib_max": 24355.0,
+        "actual_modes": {
+          "requested": {
+            "coefficient": "fused",
+            "face_density": "tensor"
+          },
+          "face_qf_projector": {
+            "event": "face-qf-projector",
+            "mode": "skipped-unused-single-valued",
+            "reason": "exact-side-coefficients-active"
+          },
+          "coefficient_setup": [
+            {
+              "event": "setup",
+              "requested": "fused",
+              "selected": "fused",
+              "precision": "fp64"
+            }
+          ],
+          "face_density_execution": [
+            {
+              "event": "execution",
+              "requested": "tensor",
+              "selected": "tensor",
+              "reason": "supported"
+            }
+          ],
+          "evidence": {
+            "coefficient_selection": "explicit requested/selected setup log",
+            "face_density_selection": "explicit requested/selected tensor execution log"
+          }
+        }
+      }
+    }
+  },
+  "short_fields": {
+    "skip": {
+      "report": {
+        "path": "/tmp/igr-stage-data-refresh-20261023/short-fields/skip-comparison.json",
+        "sha256": "327437259243a7a0bd4a4b574b19f7461c99284a758e6f11ad302034fa767412"
+      },
+      "time": 0.0025,
+      "reference_vtu_sha256": "333ba99bd203a0c3948332dd6c05416e1ac259ff2b842ca84b65d335a176110f",
+      "candidate_vtu_sha256": "333ba99bd203a0c3948332dd6c05416e1ac259ff2b842ca84b65d335a176110f",
+      "conserved_relative_l2_max": 0.0,
+      "sigma_relative_l2": 0.0,
+      "primary_sampled_normalized_linf_max": 0.0,
+      "components": {
+        "density": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "energy": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "pressure": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "speed": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        },
+        "q_sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_candidate_minus_reference": 0.0
+        }
+      },
+      "quadrature": {
+        "rule": "tensor Gauss-Legendre 8x8 on [0,1]^2",
+        "points_1d": [
+          0.019855071751231912,
+          0.10166676129318664,
+          0.2372337950418355,
+          0.4082826787521751,
+          0.5917173212478248,
+          0.7627662049581645,
+          0.8983332387068134,
+          0.9801449282487681
+        ],
+        "weights_1d": [
+          0.050614268145188344,
+          0.11119051722668717,
+          0.15685332293894352,
+          0.18134189168918088,
+          0.18134189168918088,
+          0.15685332293894352,
+          0.11119051722668717,
+          0.050614268145188344
+        ],
+        "points_per_cell": 64,
+        "points_total": 16777216,
+        "node_order": "VTK parametric coordinates; canonical x reference index fastest",
+        "saved_field_degree_per_axis": 5,
+        "squared_difference_degree_per_axis": 10,
+        "q2_detj_degree_per_axis_upper_bound": 3,
+        "weighted_squared_degree_upper_bound": 13,
+        "gl8_exact_degree_per_axis": 15,
+        "derived_pressure_speed_q_sigma_metrics": "quadrature estimates"
+      },
+      "grid": {
+        "cells": 262144,
+        "points": 9437184,
+        "matching_ordered_connectivity": true,
+        "cell_rematching": false,
+        "coordinate_pair_absolute_difference_max": 0.0,
+        "coordinate_pair_absolute_tolerance": 1e-12,
+        "q2_fit_absolute_residual_max_reference": 2.7755575615628914e-15,
+        "q2_fit_absolute_residual_max_candidate": 2.7755575615628914e-15,
+        "sampled_signed_detj_range_reference": [
+          2.975792223659254e-06,
+          4.653602307607573e-06
+        ],
+        "sampled_signed_detj_range_candidate": [
+          2.975792223659254e-06,
+          4.653602307607573e-06
+        ],
+        "sampled_signed_detj_pair_absolute_difference_max": 0.0,
+        "area_reference": 1.0000000000002616,
+        "area_candidate": 1.0000000000002616,
+        "integration_measure": "GL8 weights times fitted reference Q2 signed detJ at each point",
+        "source_geometry_requirement": "caller binds Q2 source mesh; saved coordinates independently verified Q2"
+      },
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.9987143834157151,
+          "pressure_min": 1.000002845935433,
+          "q_sigma_min": 1.4000039843096124
+        },
+        "candidate": {
+          "density_min": 0.9987143834157151,
+          "pressure_min": 1.000002845935433,
+          "q_sigma_min": 1.4000039843096124
+        }
+      }
+    },
+    "faces": {
+      "report": {
+        "path": "/tmp/igr-stage-data-refresh-20261023/short-fields/faces-comparison.json",
+        "sha256": "c75820df809fd310af32f3a66c178dd3cfc79aeccafc47b3b93f3a3160a77d0b"
+      },
+      "time": 0.0025,
+      "reference_vtu_sha256": "333ba99bd203a0c3948332dd6c05416e1ac259ff2b842ca84b65d335a176110f",
+      "candidate_vtu_sha256": "375250ef2b14143e3b73c73b580f008b7184b76d2085b9df1d3be790b254e746",
+      "conserved_relative_l2_max": 6.210818707125411e-15,
+      "sigma_relative_l2": 3.2926377133817686e-13,
+      "primary_sampled_normalized_linf_max": 1.3658882827365031e-12,
+      "components": {
+        "density": {
+          "normalized_l2": 1.7548162149280096e-16,
+          "normalized_linf_at_gl_points": 4.6620897553271746e-15,
+          "integral_candidate_minus_reference": 2.069102490632429e-20
+        },
+        "momentum_x": {
+          "normalized_l2": 6.141636594070875e-15,
+          "normalized_linf_at_gl_points": 6.137028652475414e-14,
+          "integral_candidate_minus_reference": 8.388676204938907e-21
+        },
+        "momentum_y": {
+          "normalized_l2": 6.210818707125411e-15,
+          "normalized_linf_at_gl_points": 4.9632800026925956e-14,
+          "integral_candidate_minus_reference": 8.884106902521015e-21
+        },
+        "energy": {
+          "normalized_l2": 2.099978589280655e-16,
+          "normalized_linf_at_gl_points": 2.001755666575161e-15,
+          "integral_candidate_minus_reference": -2.0157312784288053e-19
+        },
+        "sigma": {
+          "normalized_l2": 3.2926377133817686e-13,
+          "normalized_linf_at_gl_points": 1.3658882827365031e-12,
+          "integral_candidate_minus_reference": 2.351483357269468e-24
+        },
+        "pressure": {
+          "normalized_l2": 2.1463134863110634e-16,
+          "normalized_linf_at_gl_points": 2.117241570488833e-15,
+          "integral_candidate_minus_reference": -9.039160338246179e-20
+        },
+        "speed": {
+          "normalized_l2": 4.373143549821017e-15,
+          "normalized_linf_at_gl_points": 5.899980067388031e-14,
+          "integral_candidate_minus_reference": 1.001443020730861e-20
+        },
+        "q_sigma": {
+          "normalized_l2": 2.185474902802051e-16,
+          "normalized_linf_at_gl_points": 2.1997314076050077e-15,
+          "integral_candidate_minus_reference": -1.4215787601410978e-19
+        }
+      },
+      "quadrature": {
+        "rule": "tensor Gauss-Legendre 8x8 on [0,1]^2",
+        "points_1d": [
+          0.019855071751231912,
+          0.10166676129318664,
+          0.2372337950418355,
+          0.4082826787521751,
+          0.5917173212478248,
+          0.7627662049581645,
+          0.8983332387068134,
+          0.9801449282487681
+        ],
+        "weights_1d": [
+          0.050614268145188344,
+          0.11119051722668717,
+          0.15685332293894352,
+          0.18134189168918088,
+          0.18134189168918088,
+          0.15685332293894352,
+          0.11119051722668717,
+          0.050614268145188344
+        ],
+        "points_per_cell": 64,
+        "points_total": 16777216,
+        "node_order": "VTK parametric coordinates; canonical x reference index fastest",
+        "saved_field_degree_per_axis": 5,
+        "squared_difference_degree_per_axis": 10,
+        "q2_detj_degree_per_axis_upper_bound": 3,
+        "weighted_squared_degree_upper_bound": 13,
+        "gl8_exact_degree_per_axis": 15,
+        "derived_pressure_speed_q_sigma_metrics": "quadrature estimates"
+      },
+      "grid": {
+        "cells": 262144,
+        "points": 9437184,
+        "matching_ordered_connectivity": true,
+        "cell_rematching": false,
+        "coordinate_pair_absolute_difference_max": 0.0,
+        "coordinate_pair_absolute_tolerance": 1e-12,
+        "q2_fit_absolute_residual_max_reference": 2.7755575615628914e-15,
+        "q2_fit_absolute_residual_max_candidate": 2.7755575615628914e-15,
+        "sampled_signed_detj_range_reference": [
+          2.975792223659254e-06,
+          4.653602307607573e-06
+        ],
+        "sampled_signed_detj_range_candidate": [
+          2.975792223659254e-06,
+          4.653602307607573e-06
+        ],
+        "sampled_signed_detj_pair_absolute_difference_max": 0.0,
+        "area_reference": 1.0000000000002616,
+        "area_candidate": 1.0000000000002616,
+        "integration_measure": "GL8 weights times fitted reference Q2 signed detJ at each point",
+        "source_geometry_requirement": "caller binds Q2 source mesh; saved coordinates independently verified Q2"
+      },
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.9987143834157151,
+          "pressure_min": 1.000002845935433,
+          "q_sigma_min": 1.4000039843096124
+        },
+        "candidate": {
+          "density_min": 0.9987143834157146,
+          "pressure_min": 1.000002845935433,
+          "q_sigma_min": 1.4000039843096124
+        }
+      }
+    },
+    "fused": {
+      "report": {
+        "path": "/tmp/igr-stage-data-refresh-20261023/short-fields/fused-comparison.json",
+        "sha256": "dfeb264d79a1db8e39e6387da7c61f6d5a5d0f1a1b9b6e63fdd671aa1dd9419f"
+      },
+      "time": 0.0025,
+      "reference_vtu_sha256": "333ba99bd203a0c3948332dd6c05416e1ac259ff2b842ca84b65d335a176110f",
+      "candidate_vtu_sha256": "375250ef2b14143e3b73c73b580f008b7184b76d2085b9df1d3be790b254e746",
+      "conserved_relative_l2_max": 6.210818707125411e-15,
+      "sigma_relative_l2": 3.2926377133817686e-13,
+      "primary_sampled_normalized_linf_max": 1.3658882827365031e-12,
+      "components": {
+        "density": {
+          "normalized_l2": 1.7548162149280096e-16,
+          "normalized_linf_at_gl_points": 4.6620897553271746e-15,
+          "integral_candidate_minus_reference": 2.069102490632429e-20
+        },
+        "momentum_x": {
+          "normalized_l2": 6.141636594070875e-15,
+          "normalized_linf_at_gl_points": 6.137028652475414e-14,
+          "integral_candidate_minus_reference": 8.388676204938907e-21
+        },
+        "momentum_y": {
+          "normalized_l2": 6.210818707125411e-15,
+          "normalized_linf_at_gl_points": 4.9632800026925956e-14,
+          "integral_candidate_minus_reference": 8.884106902521015e-21
+        },
+        "energy": {
+          "normalized_l2": 2.099978589280655e-16,
+          "normalized_linf_at_gl_points": 2.001755666575161e-15,
+          "integral_candidate_minus_reference": -2.0157312784288053e-19
+        },
+        "sigma": {
+          "normalized_l2": 3.2926377133817686e-13,
+          "normalized_linf_at_gl_points": 1.3658882827365031e-12,
+          "integral_candidate_minus_reference": 2.351483357269468e-24
+        },
+        "pressure": {
+          "normalized_l2": 2.1463134863110634e-16,
+          "normalized_linf_at_gl_points": 2.117241570488833e-15,
+          "integral_candidate_minus_reference": -9.039160338246179e-20
+        },
+        "speed": {
+          "normalized_l2": 4.373143549821017e-15,
+          "normalized_linf_at_gl_points": 5.899980067388031e-14,
+          "integral_candidate_minus_reference": 1.001443020730861e-20
+        },
+        "q_sigma": {
+          "normalized_l2": 2.185474902802051e-16,
+          "normalized_linf_at_gl_points": 2.1997314076050077e-15,
+          "integral_candidate_minus_reference": -1.4215787601410978e-19
+        }
+      },
+      "quadrature": {
+        "rule": "tensor Gauss-Legendre 8x8 on [0,1]^2",
+        "points_1d": [
+          0.019855071751231912,
+          0.10166676129318664,
+          0.2372337950418355,
+          0.4082826787521751,
+          0.5917173212478248,
+          0.7627662049581645,
+          0.8983332387068134,
+          0.9801449282487681
+        ],
+        "weights_1d": [
+          0.050614268145188344,
+          0.11119051722668717,
+          0.15685332293894352,
+          0.18134189168918088,
+          0.18134189168918088,
+          0.15685332293894352,
+          0.11119051722668717,
+          0.050614268145188344
+        ],
+        "points_per_cell": 64,
+        "points_total": 16777216,
+        "node_order": "VTK parametric coordinates; canonical x reference index fastest",
+        "saved_field_degree_per_axis": 5,
+        "squared_difference_degree_per_axis": 10,
+        "q2_detj_degree_per_axis_upper_bound": 3,
+        "weighted_squared_degree_upper_bound": 13,
+        "gl8_exact_degree_per_axis": 15,
+        "derived_pressure_speed_q_sigma_metrics": "quadrature estimates"
+      },
+      "grid": {
+        "cells": 262144,
+        "points": 9437184,
+        "matching_ordered_connectivity": true,
+        "cell_rematching": false,
+        "coordinate_pair_absolute_difference_max": 0.0,
+        "coordinate_pair_absolute_tolerance": 1e-12,
+        "q2_fit_absolute_residual_max_reference": 2.7755575615628914e-15,
+        "q2_fit_absolute_residual_max_candidate": 2.7755575615628914e-15,
+        "sampled_signed_detj_range_reference": [
+          2.975792223659254e-06,
+          4.653602307607573e-06
+        ],
+        "sampled_signed_detj_range_candidate": [
+          2.975792223659254e-06,
+          4.653602307607573e-06
+        ],
+        "sampled_signed_detj_pair_absolute_difference_max": 0.0,
+        "area_reference": 1.0000000000002616,
+        "area_candidate": 1.0000000000002616,
+        "integration_measure": "GL8 weights times fitted reference Q2 signed detJ at each point",
+        "source_geometry_requirement": "caller binds Q2 source mesh; saved coordinates independently verified Q2"
+      },
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.9987143834157151,
+          "pressure_min": 1.000002845935433,
+          "q_sigma_min": 1.4000039843096124
+        },
+        "candidate": {
+          "density_min": 0.9987143834157146,
+          "pressure_min": 1.000002845935433,
+          "q_sigma_min": 1.4000039843096124
+        }
+      }
+    }
+  },
+  "full": {
+    "receipt": {
+      "path": "/tmp/igr-stage-data-refresh-20261023/full-3443733/run.json",
+      "sha256": "f28ab3de1b44abf8f454ec4726b014c7d72c244ce9a433d9d8a3c4fc9f9e4eb3"
+    },
+    "job": "3443733",
+    "target_time": 0.1,
+    "node": "gh113",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-26b289b6-14ac-c162-8198-dda306da454a",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "arms": {
+      "original": {
+        "timings": {
+          "application_wall_seconds": 768.0571046769619,
+          "native_done_seconds": 655.549379668,
+          "pre_final_output_analysis_seconds": 608.620905
+        },
+        "accepted_steps": 6663,
+        "sigma_calls": 19990,
+        "total_sweeps": "40028",
+        "sampled_gpu_memory_used_mib_max": 27649.0,
+        "actual_modes": {
+          "requested": {
+            "coefficient": "legacy-baseline",
+            "face_density": "legacy-dense"
+          },
+          "face_qf_projector": {
+            "event": "face-qf-projector",
+            "mode": "single-valued-mfem-face-restriction",
+            "diagnostic_only": "1",
+            "reason": "side-dependent-coefficient-not-represented"
+          },
+          "coefficient_setup": [],
+          "face_density_execution": [],
+          "evidence": {
+            "coefficient_selection": "legacy baseline implementation, no selector tag",
+            "face_density_selection": "legacy dense implementation, no tensor selector tag"
+          }
+        }
+      },
+      "fused": {
+        "timings": {
+          "application_wall_seconds": 711.2129426049069,
+          "native_done_seconds": 598.169273753,
+          "pre_final_output_analysis_seconds": 547.77099
+        },
+        "accepted_steps": 6663,
+        "sigma_calls": 19990,
+        "total_sweeps": "40028",
+        "sampled_gpu_memory_used_mib_max": 24355.0,
+        "actual_modes": {
+          "requested": {
+            "coefficient": "fused",
+            "face_density": "tensor"
+          },
+          "face_qf_projector": {
+            "event": "face-qf-projector",
+            "mode": "skipped-unused-single-valued",
+            "reason": "exact-side-coefficients-active"
+          },
+          "coefficient_setup": [
+            {
+              "event": "setup",
+              "requested": "fused",
+              "selected": "fused",
+              "precision": "fp64"
+            }
+          ],
+          "face_density_execution": [
+            {
+              "event": "execution",
+              "requested": "tensor",
+              "selected": "tensor",
+              "reason": "supported"
+            }
+          ],
+          "evidence": {
+            "coefficient_selection": "explicit requested/selected setup log",
+            "face_density_selection": "explicit requested/selected tensor execution log"
+          }
+        }
+      }
+    },
+    "sampled_clocks": {
+      "original": {
+        "active_samples_ge90pct": 391,
+        "sm_clock_mhz": {
+          "min": 1965.0,
+          "median": 1980.0,
+          "max": 1980.0
+        },
+        "memory_clock_mhz": {
+          "min": 2619.0,
+          "median": 2619.0,
+          "max": 2619.0
+        }
+      },
+      "fused": {
+        "active_samples_ge90pct": 299,
+        "sm_clock_mhz": {
+          "min": 1950.0,
+          "median": 1980.0,
+          "max": 1980.0
+        },
+        "memory_clock_mhz": {
+          "min": 2619.0,
+          "median": 2619.0,
+          "max": 2619.0
+        }
+      }
+    }
+  },
+  "full_original_over_fused_timing_ratios": {
+    "application_wall_seconds": 1.079925657516659,
+    "native_done_seconds": 1.0959262008812138,
+    "pre_final_output_analysis_seconds": 1.1110864140505141
+  },
+  "full_fields": {
+    "report": {
+      "path": "/tmp/igr-stage-data-refresh-20261023/full-fields/fused-comparison.json",
+      "sha256": "6ea68becc1c83dd1e630f898bf45f8e00f0fce48e452c755a08925323b4c42c2"
+    },
+    "time": 0.1,
+    "reference_vtu_sha256": "84571e6b0e09bad3556ec49ed0c7eed09e9cb3ccab1f3fccc5eedab990b99cba",
+    "candidate_vtu_sha256": "db4d0b272baa028a1469006dc3a76a72b6fd055a069a0593aff947b01dc4d94b",
+    "conserved_relative_l2_max": 8.848645567510479e-15,
+    "sigma_relative_l2": 3.9182947631496424e-13,
+    "primary_sampled_normalized_linf_max": 1.202250887813249e-12,
+    "components": {
+      "density": {
+        "normalized_l2": 8.395042991804327e-15,
+        "normalized_linf_at_gl_points": 6.656821623603354e-14,
+        "integral_candidate_minus_reference": 1.5375242542438286e-18
+      },
+      "momentum_x": {
+        "normalized_l2": 8.848645567510479e-15,
+        "normalized_linf_at_gl_points": 3.882927400246393e-14,
+        "integral_candidate_minus_reference": 1.1176630441384821e-18
+      },
+      "momentum_y": {
+        "normalized_l2": 8.845023550491122e-15,
+        "normalized_linf_at_gl_points": 3.62131172434405e-14,
+        "integral_candidate_minus_reference": 3.724780989311356e-20
+      },
+      "energy": {
+        "normalized_l2": 2.8039571072038037e-15,
+        "normalized_linf_at_gl_points": 1.3714200855113243e-14,
+        "integral_candidate_minus_reference": 8.619537404964987e-18
+      },
+      "sigma": {
+        "normalized_l2": 3.9182947631496424e-13,
+        "normalized_linf_at_gl_points": 1.202250887813249e-12,
+        "integral_candidate_minus_reference": -2.3120029137725674e-21
+      },
+      "pressure": {
+        "normalized_l2": 2.7646821786076264e-15,
+        "normalized_linf_at_gl_points": 1.3936555453602829e-14,
+        "integral_candidate_minus_reference": -1.2949320814089144e-17
+      },
+      "speed": {
+        "normalized_l2": 6.6017393946971216e-15,
+        "normalized_linf_at_gl_points": 3.049848258071789e-14,
+        "integral_candidate_minus_reference": 1.4122314029193315e-16
+      },
+      "q_sigma": {
+        "normalized_l2": 2.765456593033151e-15,
+        "normalized_linf_at_gl_points": 1.3936542670088948e-14,
+        "integral_candidate_minus_reference": -1.8121682439260325e-17
+      }
+    },
+    "quadrature": {
+      "rule": "tensor Gauss-Legendre 8x8 on [0,1]^2",
+      "points_1d": [
+        0.019855071751231912,
+        0.10166676129318664,
+        0.2372337950418355,
+        0.4082826787521751,
+        0.5917173212478248,
+        0.7627662049581645,
+        0.8983332387068134,
+        0.9801449282487681
+      ],
+      "weights_1d": [
+        0.050614268145188344,
+        0.11119051722668717,
+        0.15685332293894352,
+        0.18134189168918088,
+        0.18134189168918088,
+        0.15685332293894352,
+        0.11119051722668717,
+        0.050614268145188344
+      ],
+      "points_per_cell": 64,
+      "points_total": 16777216,
+      "node_order": "VTK parametric coordinates; canonical x reference index fastest",
+      "saved_field_degree_per_axis": 5,
+      "squared_difference_degree_per_axis": 10,
+      "q2_detj_degree_per_axis_upper_bound": 3,
+      "weighted_squared_degree_upper_bound": 13,
+      "gl8_exact_degree_per_axis": 15,
+      "derived_pressure_speed_q_sigma_metrics": "quadrature estimates"
+    },
+    "grid": {
+      "cells": 262144,
+      "points": 9437184,
+      "matching_ordered_connectivity": true,
+      "cell_rematching": false,
+      "coordinate_pair_absolute_difference_max": 0.0,
+      "coordinate_pair_absolute_tolerance": 1e-12,
+      "q2_fit_absolute_residual_max_reference": 2.7755575615628914e-15,
+      "q2_fit_absolute_residual_max_candidate": 2.7755575615628914e-15,
+      "sampled_signed_detj_range_reference": [
+        2.975792223659254e-06,
+        4.653602307607573e-06
+      ],
+      "sampled_signed_detj_range_candidate": [
+        2.975792223659254e-06,
+        4.653602307607573e-06
+      ],
+      "sampled_signed_detj_pair_absolute_difference_max": 0.0,
+      "area_reference": 1.0000000000002616,
+      "area_candidate": 1.0000000000002616,
+      "integration_measure": "GL8 weights times fitted reference Q2 signed detJ at each point",
+      "source_geometry_requirement": "caller binds Q2 source mesh; saved coordinates independently verified Q2"
+    },
+    "sampled_admissibility": {
+      "reference": {
+        "density_min": 0.44942017258888334,
+        "pressure_min": 1.0003187640018865,
+        "q_sigma_min": 1.4004462696343145
+      },
+      "candidate": {
+        "density_min": 0.4494201725888792,
+        "pressure_min": 1.000318764001886,
+        "q_sigma_min": 1.4004462696343138
+      }
+    }
+  },
+  "profile": {
+    "receipt": {
+      "path": "/tmp/igr-stage-data-refresh-20261023/nsys-3443736/run.json",
+      "sha256": "28b231c1a18275f28e535d97218a9aea0a62e36ff642e0f3a995e695badcf48a"
+    },
+    "audit": {
+      "path": "/tmp/igr-stage-data-refresh-20261023/nsys-3443736/gpu-audit-refresh.json",
+      "sha256": "96038ca347bf591f3d156304c204d01642f5a7ead99ef3c62c52387b28087d5b"
+    },
+    "job": "3443736",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-1c73cb48-3af0-9de1-cb22-524081d11b3a",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "selected_counts": {
+      "selected_rk_steps": 290,
+      "selected_stages": 870,
+      "current_A_scopes": 1740,
+      "local_inverse_P_scopes": 1740,
+      "sweep_scopes": 1740,
+      "current_A_scopes_per_stage": 2.0,
+      "local_inverse_P_scopes_per_stage": 2.0,
+      "sweep_scopes_per_stage": 2.0
+    },
+    "baseline_comparison": {
+      "baseline": {
+        "path": "/tmp/igr-spencer-deck-20261023/revision-setup-labels/current-hybrid-gpu-audit-v2.json",
+        "sha256": "6287827d1a35391d494e8e6d76872fd4a2a03648859f07f0159a826573d74d54",
+        "source_commit": "b53b40a56facbd4a47b198239158764da82b6295",
+        "binary_sha256": "007acaade17c5ec6e9adfc7e3ebe796da8406a28ad606041da77888e4f0986c2",
+        "selected_counts": {
+          "selected_rk_steps": 229,
+          "selected_stages": 687,
+          "current_A_scopes": 1374,
+          "local_inverse_P_scopes": 1374,
+          "sweep_scopes": 1374,
+          "current_A_scopes_per_stage": 2.0,
+          "local_inverse_P_scopes_per_stage": 2.0,
+          "sweep_scopes_per_stage": 2.0
+        }
+      },
+      "current": {
+        "source_commit": "b6f20b909034e13614791b4b15031b02c0405f41",
+        "binary_sha256": "cc27f58382d492b728f9e839130d5334fb0da32c1a5db94ee0bdc85427f783c9",
+        "selected_counts": {
+          "selected_rk_steps": 290,
+          "selected_stages": 870,
+          "current_A_scopes": 1740,
+          "local_inverse_P_scopes": 1740,
+          "sweep_scopes": 1740,
+          "current_A_scopes_per_stage": 2.0,
+          "local_inverse_P_scopes_per_stage": 2.0,
+          "sweep_scopes_per_stage": 2.0
+        }
+      },
+      "metrics": {
+        "preparation_gpu_union_ms_per_stage": {
+          "baseline": 6.684083749636098,
+          "current": 2.113435034482759,
+          "current_minus_baseline": -4.5706487151533395,
+          "current_over_baseline": 0.31618919116592764
+        },
+        "sigma_gpu_union_ms_per_stage": {
+          "baseline": 11.262837053857352,
+          "current": 6.707877698850575,
+          "current_minus_baseline": -4.554959355006777,
+          "current_over_baseline": 0.5955762004523742
+        },
+        "Euler_gpu_union_ms_per_stage": {
+          "baseline": 9.88332282823872,
+          "current": 9.857298464367815,
+          "current_minus_baseline": -0.026024363870904565,
+          "current_over_baseline": 0.9973668406543852
+        },
+        "sigma_to_Euler_gpu_union_ratio": {
+          "baseline": 1.1395800025551197,
+          "current": 0.6804985892532549,
+          "current_minus_baseline": -0.4590814133018648,
+          "current_over_baseline": 0.5971485878371582
+        },
+        "sigma_current_A_union_ms": {
+          "baseline": 1.6943941055312957,
+          "current": 1.7009320080459769,
+          "current_minus_baseline": 0.006537902514681226,
+          "current_over_baseline": 1.0038585489015446
+        },
+        "sigma_local_inverse_P_union_ms": {
+          "baseline": 0.2080875691411936,
+          "current": 0.2097083034482759,
+          "current_minus_baseline": 0.0016207343070822888,
+          "current_over_baseline": 1.0077887127701635
+        },
+        "full_sweep_union_ms": {
+          "baseline": 2.024865093158661,
+          "current": 2.0332049827586207,
+          "current_minus_baseline": 0.008339889599959793,
+          "current_over_baseline": 1.00411873839306
+        }
+      },
+      "interpretation": "Descriptive comparison of separate recorded profile windows; these are not unprofiled timings, paired speedup evidence or a full-trajectory result."
+    },
+    "preparation_components": [
+      {
+        "label": "Current-state quadrature, coefficients and source",
+        "phase": "sigma_coefficient_source_interpolation",
+        "ms_per_update": 0.7420964413793104,
+        "meaning": "Current rho/momentum values and physical gradients, 1/rho, alpha/rho, and alpha*(tr((grad u)^2)+(div u)^2). Named fused kernels replace the baseline interpolation and intermediate-QF kernels."
+      },
+      {
+        "label": "Exact face coefficient refresh",
+        "phase": "sigma_exact_face_coefficient_setup",
+        "ms_per_update": 0.204620983908046,
+        "meaning": "Current two-sided density-dependent SIPG coefficients and qdata, including endpoint traces and canonical GL6 packing on tensor mode."
+      },
+      {
+        "label": "Partial-form data and RHS integration",
+        "phase": "sigma_public_form_RHS_assembly",
+        "ms_per_update": 0.6196850758620689,
+        "meaning": "Refresh partial-assembly mass/diffusion data and integrate source into b."
+      },
+      {
+        "label": "Current local-P mass scaling",
+        "phase": "sigma_preconditioner_refresh",
+        "ms_per_update": 0.2027336827586207,
+        "meaning": "Refresh density-weighted inverse-square-root mass diagonal scaling."
+      },
+      {
+        "label": "Cached current-volume coefficient packing",
+        "phase": "sigma_volume_operator_coefficient_refresh",
+        "ms_per_update": 0.34429885057471266,
+        "meaning": "Combine cached quadrature geometry with current 1/rho and alpha/rho for subsequent current-A applications; keep this in preparation."
+      }
+    ],
+    "phase_rows": [
+      {
+        "label": "Euler spatial RHS",
+        "phase_keys": [
+          "Euler_spatial_RHS"
+        ],
+        "gpu_activity_union_ms_per_update": 9.857298464367815,
+        "gpu_activity_union_share_percent": 58.06437190995906,
+        "recorded_kernel_share_percent": 59.839200248846545,
+        "activity_records": 11310,
+        "kernel_records": 9570
+      },
+      {
+        "label": "Per-stage coefficients/RHS + operator/P refresh",
+        "phase_keys": [
+          "sigma_coefficient_source_interpolation",
+          "sigma_exact_face_coefficient_setup",
+          "sigma_public_form_RHS_assembly",
+          "sigma_preconditioner_refresh",
+          "sigma_volume_operator_coefficient_refresh",
+          "sigma_assembly_other"
+        ],
+        "gpu_activity_union_ms_per_update": 2.113435034482759,
+        "gpu_activity_union_share_percent": 12.449179488004294,
+        "recorded_kernel_share_percent": 13.06481265516228,
+        "activity_records": 13920,
+        "kernel_records": 12180
+      },
+      {
+        "label": "IGR operator A (volume + faces)",
+        "phase_keys": [
+          "sigma_current_A"
+        ],
+        "gpu_activity_union_ms_per_update": 3.4018640160919538,
+        "gpu_activity_union_share_percent": 20.03866456225218,
+        "recorded_kernel_share_percent": 20.336509851688376,
+        "activity_records": 12180,
+        "kernel_records": 8700
+      },
+      {
+        "label": "IGR local inverse P",
+        "phase_keys": [
+          "sigma_local_inverse_P"
+        ],
+        "gpu_activity_union_ms_per_update": 0.4194166068965518,
+        "gpu_activity_union_share_percent": 2.47057162122932,
+        "recorded_kernel_share_percent": 2.635110104096307,
+        "activity_records": 1740,
+        "kernel_records": 1740
+      },
+      {
+        "label": "IGR vector updates/copies",
+        "phase_keys": [
+          "sigma_solve_updates_copies_reductions",
+          "sigma_update_other"
+        ],
+        "gpu_activity_union_ms_per_update": 0.7731620413793103,
+        "gpu_activity_union_share_percent": 4.5543074991176695,
+        "recorded_kernel_share_percent": 1.5400983096200491,
+        "activity_records": 6090,
+        "kernel_records": 3480
+      },
+      {
+        "label": "Other RK work",
+        "phase_keys": [
+          "RK_common_other"
+        ],
+        "gpu_activity_union_ms_per_update": 0.4113244689655173,
+        "gpu_activity_union_share_percent": 2.4229049194374706,
+        "recorded_kernel_share_percent": 2.5842688305864354,
+        "activity_records": 1450,
+        "kernel_records": 1450
+      }
+    ],
+    "named_refresh_kernel_census": {
+      "SourceAndDiffusionKernel": {
+        "calls": 870,
+        "calls_per_stage": 1.0,
+        "kernel_sum_ms_per_stage": 0.42369541149425294,
+        "activity_union_ms_per_stage": 0.42369541149425294,
+        "expected_phase": "sigma_coefficient_source_interpolation",
+        "original_host_owners": {
+          "IGR/device-coefficients": 870
+        },
+        "resolved_demangled_names": [
+          "void igrlab::igr_internal::<unnamed>::SourceAndDiffusionKernel<(bool)0>(int, const double *, const double *, const double *, double, double, const double *, double *, double *)"
+        ],
+        "present_in_every_selected_stage": true,
+        "exactly_once_in_every_selected_stage": true,
+        "phase_assignment_matches": true
+      },
+      "InverseDensityKernel": {
+        "calls": 870,
+        "calls_per_stage": 1.0,
+        "kernel_sum_ms_per_stage": 0.14182311724137933,
+        "activity_union_ms_per_stage": 0.14182311724137933,
+        "expected_phase": "sigma_coefficient_source_interpolation",
+        "original_host_owners": {
+          "IGR/device-coefficients": 870
+        },
+        "resolved_demangled_names": [
+          "igrlab::igr_internal::<unnamed>::InverseDensityKernel(int, const double *, const double *, double, double *)"
+        ],
+        "present_in_every_selected_stage": true,
+        "exactly_once_in_every_selected_stage": true,
+        "phase_assignment_matches": true
+      },
+      "TensorDensityTraces": {
+        "calls": 870,
+        "calls_per_stage": 1.0,
+        "kernel_sum_ms_per_stage": 0.07155225747126438,
+        "activity_union_ms_per_stage": 0.07155225747126438,
+        "expected_phase": "sigma_exact_face_coefficient_setup",
+        "original_host_owners": {
+          "IGR/exact-face-setup": 870
+        },
+        "resolved_demangled_names": [
+          "igrlab::igr_internal::<unnamed>::TensorDensityTraces(int, const int *, const double *, const double *, double *)"
+        ],
+        "present_in_every_selected_stage": true,
+        "exactly_once_in_every_selected_stage": true,
+        "phase_assignment_matches": true
+      },
+      "PackTensorDensity": {
+        "calls": 870,
+        "calls_per_stage": 1.0,
+        "kernel_sum_ms_per_stage": 0.06713725057471265,
+        "activity_union_ms_per_stage": 0.06713725057471265,
+        "expected_phase": "sigma_exact_face_coefficient_setup",
+        "original_host_owners": {
+          "IGR/exact-face-setup": 870
+        },
+        "resolved_demangled_names": [
+          "igrlab::igr_internal::<unnamed>::PackTensorDensity(int, const int *, const int *, const int *, const int *, const double *, const double *, double, const double *, double, double *, double *)"
+        ],
+        "present_in_every_selected_stage": true,
+        "exactly_once_in_every_selected_stage": true,
+        "phase_assignment_matches": true
+      }
+    },
+    "validation": {
+      "trace_seconds": 15.004992704000001,
+      "activity_counts": {
+        "CUPTI_ACTIVITY_KIND_KERNEL": 37323,
+        "CUPTI_ACTIVITY_KIND_RUNTIME": 48769,
+        "CUPTI_ACTIVITY_KIND_MEMCPY": 9627,
+        "CUPTI_ACTIVITY_KIND_MEMSET": 0,
+        "OSRT_API": 337
+      },
+      "nvtx_complete_ranges": {
+        "IGR/form-linear-system": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.0014295039999999955,
+          "mean_host_seconds": 1.6355881006864936e-06
+        },
+        "IGR/exact-face-setup": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.02220438400000003,
+          "mean_host_seconds": 2.540547368421056e-05
+        },
+        "IGR/solve-elliptic-system": {
+          "complete_count": 874,
+          "summed_host_seconds": 4.901084735999993,
+          "mean_host_seconds": 0.005607648439359261
+        },
+        "IGR/element-tensor-mass-scaling": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.003249215999999998,
+          "mean_host_seconds": 3.7176384439359244e-06
+        },
+        "IGR/element-jacobi-sweep": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.06426454399999998,
+          "mean_host_seconds": 3.67646132723112e-05
+        },
+        "IGR/element-jacobi-current-A": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.04775737600000002,
+          "mean_host_seconds": 2.7321153318077812e-05
+        },
+        "IGR/exact-sum/Mult": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.04702800000000008,
+          "mean_host_seconds": 2.690389016018311e-05
+        },
+        "IGR/exact-sum/base": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.006119232,
+          "mean_host_seconds": 3.500704805491991e-06
+        },
+        "IGR/exact-sum/face": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.03416447999999997,
+          "mean_host_seconds": 1.954489702517161e-05
+        },
+        "IGR/exact-face/Mult": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.03345760000000007,
+          "mean_host_seconds": 1.914050343249432e-05
+        },
+        "IGR/exact-face/prolong": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.006624096000000005,
+          "mean_host_seconds": 3.7895286041189957e-06
+        },
+        "IGR/exact-face/local-apply": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.011793471999999973,
+          "mean_host_seconds": 6.746837528604104e-06
+        },
+        "IGR/exact-face/restrict": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.00687971199999999,
+          "mean_host_seconds": 3.935762013729971e-06
+        },
+        "IGR/exact-sum/axpy": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.005423871999999977,
+          "mean_host_seconds": 3.1029016018306507e-06
+        },
+        "IGR/element-jacobi-block-solve": {
+          "complete_count": 1748,
+          "summed_host_seconds": 0.005924639999999988,
+          "mean_host_seconds": 3.3893821510297413e-06
+        },
+        "DG/Mult": {
+          "complete_count": 874,
+          "summed_host_seconds": 2.284420576000001,
+          "mean_host_seconds": 0.002613753519450802
+        },
+        "DG/prolong-true-to-local": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.0035609919999999976,
+          "mean_host_seconds": 4.074361556064071e-06
+        },
+        "DG/face-packed-euler-rusanov": {
+          "complete_count": 874,
+          "summed_host_seconds": 2.2601473920000017,
+          "mean_host_seconds": 0.0025859809977116723
+        },
+        "DG/weak-divergence": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.008740832,
+          "mean_host_seconds": 1.0000951945080091e-05
+        },
+        "DG/inverse-mass-local-and-restrict": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.009634560000000004,
+          "mean_host_seconds": 1.1023524027459959e-05
+        },
+        "IGR/update-from-state": {
+          "complete_count": 873,
+          "summed_host_seconds": 12.625905152000001,
+          "mean_host_seconds": 0.014462663404352809
+        },
+        "IGR/assemble-system": {
+          "complete_count": 873,
+          "summed_host_seconds": 7.725442432000005,
+          "mean_host_seconds": 0.008849304045819021
+        },
+        "IGR/device-coefficients": {
+          "complete_count": 874,
+          "summed_host_seconds": 0.026223872000000006,
+          "mean_host_seconds": 3.0004430205949663e-05
+        },
+        "IGR/mfem-form-assemble": {
+          "complete_count": 873,
+          "summed_host_seconds": 7.6621147519999955,
+          "mean_host_seconds": 0.008776763747995412
+        },
+        "RK/Step": {
+          "complete_count": 290,
+          "summed_host_seconds": 14.864796639999998,
+          "mean_host_seconds": 0.05125791944827585
+        },
+        "Solver/pressure-projection": {
+          "complete_count": 1,
+          "summed_host_seconds": 0.00016310400000000002,
+          "mean_host_seconds": 0.00016310400000000002
+        }
+      },
+      "profiler_diagnostics": [
+        {
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9"
+        },
+        {
+          "severity": 2,
+          "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults."
+        },
+        {
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected."
+        },
+        {
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?"
+        },
+        {
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected."
+        },
+        {
+          "severity": 2,
+          "text": "CUDA profiling might have not been started correctly."
+        },
+        {
+          "severity": 2,
+          "text": "No CUDA events collected. Does the process use CUDA?"
+        },
+        {
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected."
+        },
+        {
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected."
+        },
+        {
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected."
+        }
+      ],
+      "diagnostic_review_required": true,
+      "complete_ranges_exclude_capture_endpoints": true,
+      "interpretation": "NVTX ranges are nested; host elapsed time includes device/API waits and must not be added to GPU time",
+      "selected_complete_rk_steps": 290,
+      "selected_complete_stages": 870,
+      "minimum_complete_rk_steps": 100,
+      "current_stage_kernel_counts": {
+        "SourceAndDiffusionKernel<": 870,
+        "InverseDensityKernel(": 870,
+        "TensorDensityTraces(": 870,
+        "PackTensorDensity(": 870
+      },
+      "output_nvtx_names": [],
+      "complete_rk_audit": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023/nsys-3443736/gpu-audit.json",
+        "sha256": "396199edff018b9e6515d1f17dc5ea2ac1b9cdd57d9ed8f4ba04b1f88d94b7ae",
+        "bytes": 13512
+      },
+      "application_log_validation": {
+        "coefficient_setup": [
+          {
+            "event": "setup",
+            "requested": "fused",
+            "selected": "fused",
+            "precision": "fp64"
+          }
+        ],
+        "face_density_execution": [
+          {
+            "event": "execution",
+            "requested": "tensor",
+            "selected": "tensor",
+            "reason": "supported"
+          }
+        ],
+        "initial_preparation": [
+          {
+            "event": "initial-preparation",
+            "time": "0",
+            "solved": "1",
+            "reusable_stage0": "1",
+            "vtk_enabled": "1",
+            "jacobi_blocks": "tensor",
+            "certification_supported": "0",
+            "certified": "0",
+            "approximate": "1"
+          }
+        ],
+        "vtk_records": [
+          {
+            "elapsed_seconds": 112.55911992501933,
+            "line": "[vtk] cycle      0 | step      0 | t     0.000000 | initial"
+          }
+        ],
+        "no_noninitial_vtk_observed": true,
+        "progress_before_collection": [
+          {
+            "elapsed_seconds": 175.41870379500324,
+            "step": 1100,
+            "physical_time": 0.016932,
+            "dt": 1.518e-05
+          }
+        ],
+        "progress_during_collection": [
+          {
+            "elapsed_seconds": 180.5143740249914,
+            "step": 1200,
+            "physical_time": 0.018448,
+            "dt": 1.514e-05
+          },
+          {
+            "elapsed_seconds": 185.63213956099935,
+            "step": 1300,
+            "physical_time": 0.019959,
+            "dt": 1.509e-05
+          },
+          {
+            "elapsed_seconds": 190.76313441502862,
+            "step": 1400,
+            "physical_time": 0.021466,
+            "dt": 1.505e-05
+          }
+        ],
+        "progress_after_collection": [
+          {
+            "elapsed_seconds": 195.8906296250061,
+            "step": 1500,
+            "physical_time": 0.022969,
+            "dt": 1.501e-05
+          }
+        ],
+        "time_window_limit": "Progress times are exact logged values rounded by the application, associated with stdout arrival times; they do not establish exact physical endpoints of the profiler window."
+      }
+    },
+    "scope": "separate evolved recorded-activity windows; not full wall timings; diagnostic output cadence0.1 vs0.02 timing arms",
+    "recorded_launch_device_reciprocity": {
+      "KERNEL": {
+        "recorded_selected_launch_APIs": 37120,
+        "exactly_one_device_activity_per_recorded_launch": true,
+        "failures": []
+      },
+      "MEMCPY": {
+        "recorded_selected_launch_APIs": 9570,
+        "exactly_one_device_activity_per_recorded_launch": true,
+        "failures": []
+      },
+      "MEMSET": {
+        "recorded_selected_launch_APIs": 0,
+        "exactly_one_device_activity_per_recorded_launch": true,
+        "failures": []
+      }
+    }
+  },
+  "limitations": [
+    "One sequential same-GPU full timing pair with unlocked clocks; no confidence interval.",
+    "Pre-final-output elapsed includes intermediate VTK; native done includes final output; process wall additionally includes setup/initial output/teardown.",
+    "Short four-arm standalone contributions are noisy; use the direct full pair for cumulative wall claims.",
+    "GPU memory maxima are one-second samples, not exact peaks.",
+    "Fixed50/2 approximate sigma closure is unchanged; FP64 execution equivalence does not confer convergence.",
+    "Fast paths are selectable and retain unsupported fallback; admitted p5 Q1/Q2 ordinaryDG geometry only; both new fast paths currently require one MPI rank and fused volume requires exact GL7/GL6 rules."
+  ],
+  "retained_converged_reference_comparison": {
+    "report": "/tmp/igr-stage-data-refresh-20261023/full-fields/converged-comparison.json",
+    "report_sha256": "c9fec0a73a641f5d85312b27230fc7b4ab9efccb18ca0743b7b6daed4038ff78",
+    "reference_vtu_sha256": "e0b291007b58d44558dd39860bb3cb340a429e488b65782891ac5937b9d99bd7",
+    "candidate_vtu_sha256": "db4d0b272baa028a1469006dc3a76a72b6fd055a069a0593aff947b01dc4d94b",
+    "maximum_conserved_relative_l2": 8.206696155040836e-07,
+    "sigma_relative_l2": 0.015288468095394612,
+    "timing_claim": null
+  }
+}
