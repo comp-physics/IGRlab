@@ -187,6 +187,159 @@
     "Earlier coarse control used a two-level element/Q1 cooperative-CG preconditioner and was not the same algorithm as this baseline.",
     "Runtime/PVD receipts bind physical time; VTU does not independently encode that time.",
     "Polynomial squared norms are exact on the fitted Q2 map up to FP64/geometry-fit roundoff; Linf/positivity remain GL8-sampled.",
-    "Validation binds frozen6ae6930, not later Q2 face changes."
-  ]
+    "Row execution binds frozen6ae6930; the separate Q2 face result binds b53b40a. Neither qualifies full-t=.1 physical accuracy."
+  ],
+  "q2_tensor_faces": {
+    "status": "passed-short-execution-equivalence",
+    "source_commit": "b53b40a56facbd4a47b198239158764da82b6295",
+    "binary_sha256": "007acaade17c5ec6e9adfc7e3ebe796da8406a28ad606041da77888e4f0986c2",
+    "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "native": {
+      "job": "3440081",
+      "receipt_sha256": "bdbf0c47f02edcf39374d6a13d274b507c1a7648aaf6064ecb345dc470959170",
+      "source_manifest_sha256": "23609922fdd51bb9fce568f60b5af714fd3ced3dfc7389ba8304ec0bda4c137e",
+      "source_graph_files": 777,
+      "tests": [
+        "dg_igr_dg_device_faces_cpu",
+        "dg_igr_dg_device_faces_cuda",
+        "dg_igr_dg_mapped_dense_cpu",
+        "dg_igr_dg_mapped_dense_cuda",
+        "dg_igr_dg_volume_memory_cuda",
+        "dg_igr_dg_tensor_face_cuda"
+      ],
+      "canonical_sm90_nvtx_build": true
+    },
+    "paired_job": "3440099",
+    "run_receipt": {
+      "path": "faces-3440099/run.json",
+      "sha256": "0027d7d4563dd590a60389877d7a98715f50e4c9f25f6fa679001ce96dab7207"
+    },
+    "comparison": {
+      "path": "faces-fields/comparison-t0025.json",
+      "sha256": "e200b1b8bcc87904a2ee4f262addedd0e1a6ee8e46a0ec580602615483610168"
+    },
+    "source_manifest": {
+      "path": "source-freeze-q2/source-manifest.json",
+      "sha256": "23609922fdd51bb9fce568f60b5af714fd3ced3dfc7389ba8304ec0bda4c137e"
+    },
+    "same_binary": true,
+    "same_gpu": true,
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-2a5f1b42-1214-cc5c-6e6e-132df93018af",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "node": "gh093",
+    "execution_order": [
+      "faces-off",
+      "faces-fp64"
+    ],
+    "rows_euler_both": true,
+    "local_inverse": "unchanged FP64 WMMA projected element blocks",
+    "initial_sweeps": 50,
+    "regular_sweeps": 2,
+    "omega": 0.7,
+    "target_time": 0.0025,
+    "accepted_steps_each": 162,
+    "sigma_calls_each": 487,
+    "total_sweeps_each": 1022,
+    "actual_candidate_tensor_face": {
+      "event": "setup",
+      "selected": "fp64",
+      "n1d": "6",
+      "elements": "262144",
+      "interior_faces": "523264",
+      "boundary_faces": "2048",
+      "geometry_order_max": "2",
+      "jacobian_validation": "sampled-q2",
+      "reference_maps": "6",
+      "sparse_tangent_maps": "3",
+      "dense_shape_entries": "0",
+      "trace_bytes": "251658240",
+      "flux_bytes": "100859904",
+      "state": "fp64",
+      "nonlinear_flux": "fp64",
+      "lift": "element-owned",
+      "residual_atomics": "0"
+    },
+    "timings_seconds": {
+      "baseline": {
+        "pre_final_output_analysis_seconds": 22.632057,
+        "native_done_seconds": 65.435308115,
+        "application_wall_seconds": 177.5849435730197
+      },
+      "candidate": {
+        "pre_final_output_analysis_seconds": 16.976771,
+        "native_done_seconds": 59.442663791,
+        "application_wall_seconds": 169.7685912649904
+      }
+    },
+    "baseline_over_candidate": {
+      "pre_final_output_analysis_seconds": 1.3331190601557859,
+      "native_done_seconds": 1.1008138589661811,
+      "application_wall_seconds": 1.0460412155734322
+    },
+    "sampled_peak_total_gpu_memory_mib": {
+      "baseline": 29677.0,
+      "candidate": 27649.0
+    },
+    "sampled_reduction_mib": 2028.0,
+    "command_and_log_bindings": {
+      "baseline": {
+        "command_sha256": "67692bf2ff268473394ad787f3e5fa3c76a2801832c5b8094a5c7a168502f741",
+        "stdout_sha256": "89bef45522cafc3dbd2a05e392ba3f9eb981e23f0b11a51c83a4a6bb75635563",
+        "gpu_samples_sha256": "9382915e407a87c19527392ec9a51d6532d6354e340eb845cb77411e2c6c3904"
+      },
+      "candidate": {
+        "command_sha256": "94aa07bb9cc08c24af175c74aa06da887db0e895078c480a2fad366d9bb2d915",
+        "stdout_sha256": "9c9bbaf68b1c274c8452a44b508cc9921e1cf37a8cb78a8735a6bc64e9388497",
+        "gpu_samples_sha256": "dbe04f689845f8daaa82e698995811f8ee62bccc87cb2563767b90c3ddcbbeae"
+      }
+    },
+    "fields": {
+      "complete_saved_q5_polynomials": true,
+      "verified_matching_q2_geometry": true,
+      "quadrature": "GL8x8",
+      "maximum_conserved_relative_l2": 4.063260876695138e-14,
+      "sigma_relative_l2": 1.1116402531354572e-12,
+      "sampled_admissibility_all_positive": true,
+      "vtu_sha256": {
+        "baseline": "7a2d81c792330b6e3d053cef18f34eb1f10aeac24416c14f0515f078e991daa7",
+        "candidate": "333ba99bd203a0c3948332dd6c05416e1ac259ff2b842ca84b65d335a176110f"
+      }
+    },
+    "limits": [
+      "One sequential short pair, unlocked clocks and identical VTK policy; the three timing scopes remain distinct.",
+      "This face pair used gh093; the earlier row pair used gh074. Their speedup ratios are not multiplied into a directly measured cumulative result.",
+      "Sigma difference compares two executions of the same approximate closure, not accuracy against a converged solution.",
+      "Q2 Jacobian validation, Linf and positivity are sampled; full-time physical accuracy remains unqualified.",
+      "One-Hz total-device memory samples can miss true peaks."
+    ]
+  },
+  "full_comparison": {
+    "status": "submitted-full-results-pending",
+    "runner": "full_pair.py",
+    "candidate_first": true,
+    "target_time": 0.1,
+    "reference": "Converged current-FP64 two-level element/Q1 cooperative-CG",
+    "different_reference_preconditioner": true,
+    "converged_reference_flow_accuracy_qualified": false,
+    "full_job_submitted_by_this_audit": false,
+    "job": "3440138",
+    "runner_sha256": "e387944bd69455ae944ec46712878462e57dbb5143b49b5fcfbc752fb40ab106",
+    "source_commit": "b53b40a56facbd4a47b198239158764da82b6295",
+    "binary_sha256": "007acaade17c5ec6e9adfc7e3ebe796da8406a28ad606041da77888e4f0986c2",
+    "runtime_caps_seconds": {
+      "candidate": 3600,
+      "reference": 12000
+    },
+    "allocation_wall_seconds": 16200,
+    "bounds_are_eta": false,
+    "native_and_face_qualification_gates_passed": true,
+    "full_results_available": false,
+    "automation_created": false
+  }
 }
