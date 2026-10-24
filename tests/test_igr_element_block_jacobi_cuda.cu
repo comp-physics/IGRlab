@@ -1016,6 +1016,16 @@ int main(int argc, char** argv)
   MFEM_VERIFY(argc==1 || gll_only, "Expected no arguments or --qualify-dgsem-mapped.");
   if (gll_only)
   {
+    int current_device = 0;
+    cudaDeviceProp properties{};
+    MFEM_VERIFY(cudaGetDevice(&current_device) == cudaSuccess &&
+                  cudaGetDeviceProperties(&properties, current_device) == cudaSuccess,
+                "Could not inspect the CUDA device for mapped DGSEM qualification.");
+    if (properties.major < 8)
+    {
+      std::cout << "SKIP: mapped DGSEM WMMA qualification requires SM80 or newer.\n";
+      return 77;
+    }
     CheckDGSEMMappedFixedLifecycle();
     CheckFusedSweepLifecycle(true, 2, true, true, "wmma-factor-fp64", BasisType::GaussLobatto);
     CheckFusedSweepLifecycle(true, 2, true, true, "simt-fp64", BasisType::GaussLobatto);
