@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
+#include <typeinfo>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -96,6 +99,54 @@ struct LimiterAdmissionCounts
   int active;
 };
 
+struct ReferencePointKey
+{
+  const mfem::FiniteElement* fe;
+  std::uint64_t x;
+  std::uint64_t y;
+
+  bool operator==(const ReferencePointKey& other) const
+  {
+    return fe == other.fe && x == other.x && y == other.y;
+  }
+};
+
+struct ReferencePointKeyHash
+{
+  std::size_t operator()(const ReferencePointKey& key) const
+  {
+    std::size_t value = std::hash<const mfem::FiniteElement*>{}(key.fe);
+    for (const auto bits : {key.x, key.y})
+    {
+      value ^= std::hash<std::uint64_t>{}(bits) + 0x9e3779b97f4a7c15ULL +
+               (value << 6) + (value >> 2);
+    }
+    return value;
+  }
+};
+
+ReferencePointKey MakeReferencePointKey(const mfem::FiniteElement& fe,
+                                        const mfem::IntegrationPoint& point)
+{
+  ReferencePointKey key{&fe, 0, 0};
+  static_assert(sizeof(point.x) <= sizeof(key.x), "Unsupported coordinate size.");
+  // The built-in 2D element reads only x/y. Set2 and face transformations need
+  // not initialize z. Preserve every active-coordinate bit, including -0.0;
+  // hash collisions still compare the full FE identity and coordinate bits.
+  std::memcpy(&key.x, &point.x, sizeof(point.x));
+  std::memcpy(&key.y, &point.y, sizeof(point.y));
+  return key;
+}
+
+bool SupportsReferencePointDedup(const mfem::FiniteElement& fe)
+{
+  const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
+  return typeid(fe) == typeid(mfem::L2_QuadrilateralElement) &&
+         fe.GetOrder() == 5 && fe.GetDof() == 36 &&
+         fe.GetMapType() == mfem::FiniteElement::VALUE && tensor != nullptr &&
+         tensor->GetBasisType() == mfem::BasisType::GaussLegendre;
+}
+
 struct DeviceLimiterCache
 {
   const mfem::Mesh* mesh = nullptr;
@@ -111,6 +162,8 @@ struct DeviceLimiterCache
   bool tensor_points = false;
   bool compact_reference_requested = false;
   bool shared_reference_points = false;
+  bool reference_point_dedup_requested = false;
+  bool indexed_reference_points = false;
   bool mfem_volume_points = false;
   bool mfem_face_points = false;
   bool fused_face_points = false;
@@ -125,6 +178,7 @@ struct DeviceLimiterCache
   int boundary_faces = 0;
   mfem::Vector average_weights;
   mfem::Array<int> point_offsets;
+  mfem::Array<int> point_indices;
   mfem::Array<int> face_point_offsets;
   mfem::Vector point_shapes;
   mfem::Vector point_factors;
@@ -878,6 +932,7 @@ struct CooperativeZhangShuQuadKernel
   const double* weights = nullptr;
   const int* offsets = nullptr;
   const int* face_offsets = nullptr;
+  const int* point_indices = nullptr;
   const double* factors = nullptr;
   const double* volume_values = nullptr;
   const double* face_values = nullptr;
@@ -927,6 +982,7 @@ struct CooperativeZhangShuQuadKernel
       return;
     }
     point += (shared_reference_points ? 0 : offsets[e]) - face_count;
+    if (point_indices != nullptr) { point = point_indices[point]; }
     for (int c = 0; c < kNumEq; ++c) { value[c] = 0.0; }
     for (int d = 0; d < kDof; ++d)
     {
@@ -1283,6 +1339,12 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   const bool requested_enforce_vtk_points = enforce_vtk_points;
   const bool cooperative_enabled =
     ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_COOPERATIVE", true);
+  const bool requested_reference_point_dedup =
+    ne > 0 && mesh.Dimension() == 2 &&
+    num_eq == CooperativeZhangShuQuadKernel::kNumEq &&
+    !requested_mfem_face_points && SupportsReferencePointDedup(*vfes.GetFE(0)) &&
+    cooperative_enabled &&
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_REFERENCE_DEDUP", true);
   const bool requested_compact_reference_points =
     requested_mfem_volume_points && requested_mfem_face_points &&
     mesh.Dimension() == 2 && dof == CooperativeZhangShuQuadKernel::kDof &&
@@ -1337,6 +1399,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     cache_ptr->mfem_volume_points != requested_mfem_volume_points ||
     cache_ptr->mfem_face_points != requested_mfem_face_points ||
     cache_ptr->fused_face_points != requested_fused_face_points ||
+    cache_ptr->reference_point_dedup_requested !=
+      requested_reference_point_dedup ||
     cache_ptr->enforce_nodes != requested_enforce_nodes ||
     cache_ptr->enforce_vtk_points != requested_enforce_vtk_points ||
     cache_ptr->compact_reference_requested != requested_compact_reference_points;
@@ -1375,6 +1439,19 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.enforce_vtk_points = requested_enforce_vtk_points;
   cache.compact_reference_requested = requested_compact_reference_points;
   cache.shared_reference_points = requested_compact_reference_points;
+  cache.reference_point_dedup_requested = requested_reference_point_dedup;
+  cache.indexed_reference_points = requested_reference_point_dedup;
+  if (cache.indexed_reference_points)
+  {
+    for (int e = 0; e < ne; ++e)
+    {
+      if (!SupportsReferencePointDedup(*vfes.GetFE(e)))
+      {
+        cache.indexed_reference_points = false;
+        break;
+      }
+    }
+  }
   if (cache.shared_reference_points)
   {
     // With MFEM volume/face QI, the remaining points are reference FE nodes
@@ -1486,7 +1563,35 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     cache.face_point_offsets.SetSize(ne + 1);
   }
   std::vector<double> point_shapes;
+  std::vector<int> point_indices;
+  std::unordered_map<ReferencePointKey, int, ReferencePointKeyHash> reference_rows;
   mfem::Vector shape;
+  auto append_point = [&](const mfem::FiniteElement& fe,
+                          const mfem::IntegrationPoint& point)
+  {
+    ReferencePointKey key{};
+    if (cache.indexed_reference_points)
+    {
+      key = MakeReferencePointKey(fe, point);
+      const auto existing = reference_rows.find(key);
+      if (existing != reference_rows.end())
+      {
+        point_indices.push_back(existing->second);
+        return;
+      }
+    }
+    const int row = static_cast<int>(point_shapes.size()) / dof;
+    fe.CalcShape(point, shape);
+    for (int d = 0; d < dof; ++d)
+    {
+      point_shapes.push_back(shape(NativeDof(fe, d)));
+    }
+    if (cache.indexed_reference_points)
+    {
+      reference_rows.emplace(key, row);
+      point_indices.push_back(row);
+    }
+  };
   cache.point_offsets[0] = 0;
   if (cache.mfem_face_points)
   {
@@ -1534,11 +1639,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
       for (int q = 0; q < volume_rule.GetNPoints(); ++q)
       {
         const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
-        fe.CalcShape(ip, shape);
-        for (int d = 0; d < dof; ++d)
-        {
-          point_shapes.push_back(shape(NativeDof(fe, d)));
-        }
+        append_point(fe, ip);
       }
     }
     MFEM_VERIFY(volume > 0.0, "Element has non-positive volume.");
@@ -1630,11 +1731,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
             const mfem::IntegrationPoint& element_ip =
               first ? face_transformation->GetElement1IntPoint()
                     : face_transformation->GetElement2IntPoint();
-            fe.CalcShape(element_ip, shape);
-            for (int d = 0; d < dof; ++d)
-            {
-              point_shapes.push_back(shape(NativeDof(fe, d)));
-            }
+            append_point(fe, element_ip);
           }
         }
       }
@@ -1647,11 +1744,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
         const mfem::IntegrationRule& nodes = fe.GetNodes();
         for (int q = 0; q < nodes.GetNPoints(); ++q)
         {
-          fe.CalcShape(nodes.IntPoint(q), shape);
-          for (int d = 0; d < dof; ++d)
-          {
-            point_shapes.push_back(shape(NativeDof(fe, d)));
-          }
+          append_point(fe, nodes.IntPoint(q));
         }
       }
       if (cache.enforce_vtk_points)
@@ -1660,17 +1753,14 @@ DeviceLimiterCache& GetDeviceLimiterCache(
           mfem::GlobGeometryRefiner.Refine(fe.GetGeomType(), fe.GetOrder(), 1);
         for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
         {
-          fe.CalcShape(refined->RefPts.IntPoint(q), shape);
-          for (int d = 0; d < dof; ++d)
-          {
-            point_shapes.push_back(shape(NativeDof(fe, d)));
-          }
+          append_point(fe, refined->RefPts.IntPoint(q));
         }
       }
     }
     const int stored_points = static_cast<int>(point_shapes.size()) / dof;
-    cache.point_offsets[e + 1] = cache.shared_reference_points
-                                 ? (e + 1) * stored_points : stored_points;
+    cache.point_offsets[e + 1] = cache.indexed_reference_points
+      ? static_cast<int>(point_indices.size())
+      : (cache.shared_reference_points ? (e + 1) * stored_points : stored_points);
     if (cache.mfem_face_points)
     {
       cache.face_point_offsets[e + 1] = mfem_face_point_count;
@@ -1682,6 +1772,19 @@ DeviceLimiterCache& GetDeviceLimiterCache(
                         dynamic_cast<const mfem::TensorBasisElement*>(
                           vfes.GetFE(0)) != nullptr &&
                         BuildTensorPointFactors(cache, point_shapes);
+  if (cache.indexed_reference_points && !cache.tensor_points)
+  {
+    // Restore every original logical row exactly before using the serial
+    // fallback. Never substitute an approximate factorization or point set.
+    std::vector<double> expanded_shapes(point_indices.size() * dof);
+    for (std::size_t point = 0; point < point_indices.size(); ++point)
+    {
+      std::copy_n(point_shapes.data() + point_indices[point] * dof, dof,
+                  expanded_shapes.data() + point * dof);
+    }
+    point_shapes.swap(expanded_shapes);
+    cache.indexed_reference_points = false;
+  }
   if (cache.shared_reference_points && !cache.tensor_points)
   {
     // A failed tensor factorization must retain the complete serial fallback
@@ -1701,6 +1804,12 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   for (int i = 0; i < cache.point_shapes.Size(); ++i)
   {
     cache.point_shapes[i] = point_shapes[i];
+  }
+  cache.point_indices.SetSize(cache.indexed_reference_points
+                               ? static_cast<int>(point_indices.size()) : 0);
+  for (int i = 0; i < cache.point_indices.Size(); ++i)
+  {
+    cache.point_indices[i] = point_indices[i];
   }
   if (cache.mfem_face_points)
   {
@@ -1767,6 +1876,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   }
   cache.average_weights.UseDevice(true);
   cache.point_offsets.UseDevice();
+  cache.point_indices.UseDevice();
   cache.face_point_offsets.UseDevice();
   cache.point_shapes.UseDevice(true);
   cache.point_factors.UseDevice(true);
@@ -1999,6 +2109,8 @@ void ApplyDeviceZhangShuPositivityLimiter(
     kernel.weights = weights;
     kernel.offsets = offsets;
     kernel.face_offsets = face_offsets;
+    kernel.point_indices = cache.indexed_reference_points
+                             ? cache.point_indices.Read() : nullptr;
     kernel.factors = factors;
     kernel.volume_values = volume_values;
     kernel.face_values = face_values;

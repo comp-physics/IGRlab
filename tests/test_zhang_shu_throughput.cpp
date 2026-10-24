@@ -38,19 +38,24 @@ struct LimiterVariant
 {
   bool cooperative;
   bool fused_face;
+  bool reference_dedup;
 };
 
-// The repeated cooperative/off case forces the fused cache to return to its
-// original scalar scratch. The last case checks that serial ignores fusion.
+// Cycle each representation off/on/off on one FES, then enable both. The last
+// case checks that the serial selector ignores both representation requests.
 constexpr LimiterVariant kLimiterVariants[] = {
-  {false, false}, {true, false}, {true, true}, {true, false}, {false, true}};
+  {false, false, false}, {true, false, false}, {true, true, false},
+  {true, false, false}, {true, false, true}, {true, false, false},
+  {true, true, true}, {false, true, true}};
 
 void SelectVariant(const LimiterVariant& variant)
 {
   MFEM_VERIFY(setenv("IGRLAB_LIMITER_COOPERATIVE",
                       variant.cooperative ? "1" : "0", 1) == 0 &&
                 setenv("IGRLAB_LIMITER_FUSED_FACE",
-                       variant.fused_face ? "1" : "0", 1) == 0,
+                       variant.fused_face ? "1" : "0", 1) == 0 &&
+                setenv("IGRLAB_LIMITER_REFERENCE_DEDUP",
+                       variant.reference_dedup ? "1" : "0", 1) == 0,
               "Cannot select p5 limiter implementation.");
 }
 
@@ -98,6 +103,22 @@ void MapQ2Mesh(mfem::Mesh& mesh)
     coordinates[d + ndofs] =
       y - 0.15 * y * (1.0 - y) * (2.0 * x - 1.0);
   }
+}
+
+void RotateQuadrilateralVertices(mfem::Mesh& mesh)
+{
+  // Match the permutation construction in test_dgsem_operator.cpp: rotate
+  // neighboring cells differently while preserving their positive orientation.
+  for (int e = 0; e < mesh.GetNE(); ++e)
+  {
+    int* vertices = mesh.GetElement(e)->GetVertices();
+    int original[4];
+    std::copy_n(vertices, 4, original);
+    const int shift = 1 + e % 3;
+    for (int v = 0; v < 4; ++v) { vertices[v] = original[(v + shift) % 4]; }
+  }
+  mesh.FinalizeTopology();
+  mesh.Finalize(/*refine=*/false, /*fix_orientation=*/false);
 }
 
 void SetInitial(mfem::ParFiniteElementSpace& fes,
@@ -273,6 +294,47 @@ void CheckFinitePoints(mfem::ParFiniteElementSpace& fes,
   }
 }
 
+void CheckTransformedFacePoints(mfem::ParFiniteElementSpace& fes,
+                                const mfem::ParGridFunction& state,
+                                int e)
+{
+  mfem::Mesh& mesh = *fes.GetMesh();
+  const mfem::FiniteElement& fe = *fes.GetFE(e);
+  mfem::Vector values = ElementValues(fes, state, e);
+  mfem::DenseMatrix matrix(values.GetData(), fe.GetDof(), kNumEq);
+  mfem::Vector shape(fe.GetDof()), value(kNumEq);
+  // Evaluate actual transformed element-side points, including hanging-face
+  // subintervals. Do not replace them with an assumed reference face rule.
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
+  {
+    int e1 = -1, e2 = -1;
+    mesh.GetFaceElements(face, &e1, &e2);
+    if (e1 != e && e2 != e) { continue; }
+    auto* transformation = mesh.GetFaceElementTransformations(face);
+    if (transformation == nullptr) { continue; }
+    for (int order : {kQuadratureOrder, 2 * kOrder + 1})
+    {
+      const auto& rule = mfem::IntRules.Get(transformation->GetGeometryType(), order);
+      for (int q = 0; q < rule.GetNPoints(); ++q)
+      {
+        transformation->SetAllIntPoints(&rule.IntPoint(q));
+        const auto& point = e1 == e ? transformation->GetElement1IntPoint()
+                                    : transformation->GetElement2IntPoint();
+        fe.CalcShape(point, shape);
+        matrix.MultTranspose(shape, value);
+        for (int c = 0; c < kNumEq; ++c)
+        {
+          MFEM_VERIFY(std::isfinite(value(c)), "Non-finite transformed face state.");
+        }
+        MFEM_VERIFY(value(0) >= kRhoMin * (1.0 - 1.0e-7) &&
+                      std::isfinite(Pressure(value)) &&
+                      Pressure(value) >= kPressureMin * (1.0 - 1.0e-7),
+                    "Transformed p5 face point violates a production floor.");
+      }
+    }
+  }
+}
+
 int ActiveCount(const mfem::ZhangShuLimiterElementDiagnostics& diagnostics)
 {
   int active = 0;
@@ -381,7 +443,9 @@ void CompareDiagnostics(
   CompareVector(reference.average_repair, candidate.average_repair);
 }
 
-void PointPolicyParity(mfem::ParFiniteElementSpace& fes, bool gll)
+void PointPolicyParity(mfem::ParFiniteElementSpace& fes,
+                        bool gll,
+                        const char* topology)
 {
   mfem::ParGridFunction initial(&fes), state(&fes), reference(&fes);
   initial = 0.0;
@@ -431,6 +495,7 @@ void PointPolicyParity(mfem::ParFiniteElementSpace& fes, bool gll)
       for (int e = 0; e < fes.GetNE(); ++e)
       {
         CheckFinitePoints(fes, state, e, vtk, gll || consumer);
+        CheckTransformedFacePoints(fes, state, e);
       }
       if (!expected_active)
       {
@@ -454,14 +519,23 @@ void PointPolicyParity(mfem::ParFiniteElementSpace& fes, bool gll)
   if (mfem::Mpi::Root())
   {
     std::cout << "[PASS] p5 mapped-Q2 " << (gll ? "GLL" : "GL")
+              << " topology=" << topology
               << " quadrature/consumer/VTK point-policy parity\n";
   }
 }
 
-void Correctness(bool gll)
+void Correctness(bool gll, bool permuted = false, bool nonconforming = false)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-    4, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    permuted ? 3 : 4, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  if (permuted) { RotateQuadrilateralVertices(serial); }
+  if (nonconforming)
+  {
+    mfem::Array<int> refine(1);
+    refine[0] = 0;
+    serial.GeneralRefinement(refine, /*nonconforming=*/1);
+    MFEM_VERIFY(serial.Nonconforming(), "Expected a hanging-face GL fixture.");
+  }
   MapQ2Mesh(serial);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
   mfem::DG_FECollection fec(kOrder, kDim,
@@ -469,7 +543,9 @@ void Correctness(bool gll)
   mfem::ParFiniteElementSpace fes(&mesh, &fec, kNumEq, mfem::Ordering::byNODES);
   MFEM_VERIFY(!gll || mfem::FaceQuadratureInterpolator::SupportsFESpace(fes),
               "p5 GLL face parity fixture must admit MFEM face interpolation.");
-  PointPolicyParity(fes, gll);
+  const char* topology = nonconforming ? "rotated-nc"
+                         : (permuted ? "rotated" : "standard");
+  PointPolicyParity(fes, gll, topology);
   mfem::ParGridFunction initial(&fes), state(&fes), reference(&fes);
   for (Case kind : {Case::Noop, Case::Density, Case::Pressure, Case::Sequential,
                     Case::NearFloors, Case::InvalidMean, Case::NonfinitePressure})
@@ -512,6 +588,10 @@ void Correctness(bool gll)
         {
           MFEM_VERIFY(rejected_count == 0, "Admissible p5 fixture was rejected.");
           CheckAccepted(fes, initial, state, diagnostics, modified, kind, gll, vtk_points);
+          for (int e = 0; e < fes.GetNE(); ++e)
+          {
+            CheckTransformedFacePoints(fes, state, e);
+          }
         }
         if (!have_reference)
         {
@@ -529,8 +609,8 @@ void Correctness(bool gll)
     if (mfem::Mpi::Root())
     {
       std::cout << "[PASS] p5 mapped-Q2 " << (gll ? "GLL" : "GL")
-                << " case=" << CaseName(kind)
-                << " serial/cooperative/fused-face native points, mean, mutation and rejection\n";
+                << " topology=" << topology << " case=" << CaseName(kind)
+                << " serial/cooperative/fused-face/dedup native points, mean, mutation and rejection\n";
     }
   }
 }
@@ -635,6 +715,7 @@ void Benchmark(bool gll, Case kind, int nx, int calls)
   std::sort(events.begin(), events.end());
   const char* variant = ::igrlab::GetEnv("DG_IGR_LIMITER_COOPERATIVE");
   const char* fused_face = ::igrlab::GetEnv("DG_IGR_LIMITER_FUSED_FACE");
+  const char* reference_dedup = ::igrlab::GetEnv("DG_IGR_LIMITER_REFERENCE_DEDUP");
   std::cout << std::setprecision(17)
             << "[limiter-throughput] backend=" << (cuda ? "cuda" : "cpu")
             << " basis=" << (gll ? "GLL" : "GL") << " order=" << kOrder
@@ -642,6 +723,8 @@ void Benchmark(bool gll, Case kind, int nx, int calls)
             << " elements=" << fes.GetNE() << " case=" << CaseName(kind)
             << " cooperative=" << (variant ? variant : "default")
             << " fused_face_requested=" << (fused_face ? fused_face : "default")
+            << " reference_dedup_requested="
+            << (reference_dedup ? reference_dedup : "default")
             << " rho_min=" << kRhoMin << " p_min=" << kPressureMin
             << " bisections=" << kBisectionIterations
             << " volume_order=" << kQuadratureOrder << " face_orders=12,11"
@@ -685,5 +768,7 @@ int main(int argc, char** argv)
               "Cannot enable MFEM face interpolation for parity checks.");
   Correctness(false);
   Correctness(true);
+  Correctness(false, /*permuted=*/true);
+  Correctness(false, /*permuted=*/true, /*nonconforming=*/true);
   return 0;
 }
