@@ -1,0 +1,2446 @@
+{
+  "schema": "dg-mapped-throughput-checkpoint-results-v1",
+  "tested_source_commit": "bc0df2971a6de2f840d995aa45f75bb664523b85",
+  "binary_sha256": "08f468cb1d47d4c88c2e7e86e9f8d51dd708efe30bd1ed5b913e1904f6f12957",
+  "branch": "dg-mapped-throughput-checkpoint",
+  "baseline": "Same frozen binary with all six new options off; previous optimized mapped ordinary-DG pipeline retained. Not the original unoptimized solver.",
+  "jobs": {
+    "native": "3446171",
+    "individual_nsys": "3446226",
+    "paired_nsys": "3446320",
+    "full": "3446347",
+    "paired_ncu": "3446448"
+  },
+  "case": {
+    "elements": 262144,
+    "scalar_dofs": 9437184,
+    "conservative_dofs": 37748736,
+    "order": 5,
+    "geometry_order": 2,
+    "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "argv": [
+      "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-mapped-throughput-20261023/native-3446171/payload/native/frozen/sedov_taylor_blast",
+      "-m",
+      "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+      "--device",
+      "cuda",
+      "--discretization",
+      "dg",
+      "--regularization",
+      "igr",
+      "--time-integrator",
+      "rk3ssp",
+      "-o",
+      "5",
+      "-rs",
+      "0",
+      "-rp",
+      "0",
+      "-tf",
+      "0.1",
+      "-c",
+      "0.3",
+      "--element-assembly-divergence",
+      "--igr-space",
+      "L2",
+      "--igr-grad",
+      "BrokenL2",
+      "--c-alpha",
+      "0.16666666666666666",
+      "--igr-alpha-length",
+      "max",
+      "--igr-ip-kind",
+      "sipg",
+      "--igr-exact-dg-face",
+      "--igr-sigma-cadence",
+      "every-stage",
+      "--igr-stage-rtol-scale",
+      "1",
+      "--igr-linear-solver",
+      "fgmres",
+      "--igr-preconditioner",
+      "none",
+      "--igr-lin-rtol",
+      "1e-6",
+      "--igr-lin-atol",
+      "0",
+      "--igr-lin-maxit",
+      "1000",
+      "--igr-nonconvergence-policy",
+      "error",
+      "--igr-lin-print",
+      "0",
+      "--positivity-limiter",
+      "none",
+      "--modal-damping-rate",
+      "0",
+      "--dgsem-surface-flux",
+      "rusanov",
+      "--no-igr-sigma-cfl",
+      "--no-igr-sigma-rusanov",
+      "--no-igr-invariant-domain-flux",
+      "--no-admissibility-scan",
+      "--no-conservation-balance",
+      "--no-nan-scan",
+      "-no-glvis",
+      "-vtk",
+      "--time-step-save",
+      "0.02",
+      "--no-vtk-h1-diagnostics",
+      "--no-vtk-l2-diagnostics",
+      "--no-save-state",
+      "-vs",
+      "100",
+      "-as",
+      "500",
+      "--igr-solve-mode",
+      "element-block-jacobi",
+      "--igr-jacobi-blocks",
+      "tensor",
+      "--igr-sweeps",
+      "2",
+      "--igr-initial-sweeps",
+      "50",
+      "--igr-jacobi-omega",
+      "0.7"
+    ],
+    "controlled_environments": {
+      "baseline": {
+        "PMIX_MCA_gds": "hash",
+        "OMP_NUM_THREADS": "1",
+        "IGRLAB_PROFILE_NVTX": "0",
+        "IGRLAB_IGR_PARTIAL_ASSEMBLY": "1",
+        "IGRLAB_IGR_DEVICE_QF": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CUDA": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CACHE": "1",
+        "IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "IGRLAB_IGR_IPDG_PENALTY_SCALE": "1",
+        "IGRLAB_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "IGRLAB_IGR_TENSOR_VOLUME": "simt",
+        "IGRLAB_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "IGRLAB_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "IGRLAB_IGR_TENSOR_MG": "off",
+        "IGRLAB_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "IGRLAB_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_TRUE_RESIDUAL": "0",
+        "IGRLAB_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "IGRLAB_IGR_OPERATOR_PROBE_EVERY": "0",
+        "IGRLAB_IGR_PRECONDITIONER_PROBE": "0",
+        "IGRLAB_SHARED_OPERATOR_PRECISION": "off",
+        "IGRLAB_SHARED_EULER_LAYOUT": "dense",
+        "IGRLAB_SHARED_EULER_FLUX_EXECUTION": "element",
+        "IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "IGRLAB_DG_FORCE_MATRIX_FREE": "0",
+        "IGRLAB_DG_FORCE_NLFORM_FACE": "0",
+        "IGRLAB_DG_NATIVE_MASS_INV": "0",
+        "IGRLAB_DG_PACKED_INVMASS_DEVICE": "1",
+        "IGRLAB_DG_TENSOR_FACE": "fp64",
+        "IGRLAB_WEAKDIV_SIGMA_STORAGE": "auto",
+        "IGRLAB_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "IGRLAB_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "IGRLAB_IGR_COMPACT_FACE_QDATA": "1",
+        "IGRLAB_IGR_COMPACT_FACE_LIFT": "1",
+        "IGRLAB_VTK_PRESSURE_COEFFICIENT": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "IGRLAB_DG_PACKED_DENSE_EXECUTION": "rows",
+        "IGRLAB_VTK_PREFIX_PATH": "/tmp/igrlab-3446347-5jk23rf4/run/case/baseline/vtk",
+        "DG_IGR_PROFILE_NVTX": "0",
+        "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CUDA": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CACHE": "1",
+        "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "DG_IGR_IGR_IPDG_PENALTY_SCALE": "1",
+        "DG_IGR_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "DG_IGR_IGR_TENSOR_VOLUME": "simt",
+        "DG_IGR_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "DG_IGR_IGR_TENSOR_MG": "off",
+        "DG_IGR_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "DG_IGR_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "DG_IGR_IGR_TRUE_RESIDUAL": "0",
+        "DG_IGR_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "DG_IGR_IGR_OPERATOR_PROBE_EVERY": "0",
+        "DG_IGR_IGR_PRECONDITIONER_PROBE": "0",
+        "DG_IGR_SHARED_OPERATOR_PRECISION": "off",
+        "DG_IGR_SHARED_EULER_LAYOUT": "dense",
+        "DG_IGR_SHARED_EULER_FLUX_EXECUTION": "element",
+        "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "DG_IGR_DG_FORCE_MATRIX_FREE": "0",
+        "DG_IGR_DG_FORCE_NLFORM_FACE": "0",
+        "DG_IGR_DG_NATIVE_MASS_INV": "0",
+        "DG_IGR_DG_PACKED_INVMASS_DEVICE": "1",
+        "DG_IGR_DG_TENSOR_FACE": "fp64",
+        "DG_IGR_WEAKDIV_SIGMA_STORAGE": "auto",
+        "DG_IGR_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "DG_IGR_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "DG_IGR_IGR_COMPACT_FACE_QDATA": "1",
+        "DG_IGR_IGR_COMPACT_FACE_LIFT": "1",
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_DG_PACKED_DENSE_EXECUTION": "rows",
+        "DG_IGR_VTK_PREFIX_PATH": "/tmp/igrlab-3446347-5jk23rf4/run/case/baseline/vtk",
+        "DG_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_COEFFICIENT_EXECUTION": "fused",
+        "IGRLAB_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "DG_IGR_IGR_COEFFICIENT_EXECUTION": "fused",
+        "DG_IGR_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "IGRLAB_SOLVER_WALL_TIMING": "1",
+        "IGRLAB_IGR_TENSOR_VOLUME_COMPACT": "1",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+        "IGRLAB_DG_WEAKDIV_ROW_REUSE": "1",
+        "DG_IGR_SOLVER_WALL_TIMING": "1",
+        "DG_IGR_IGR_TENSOR_VOLUME_COMPACT": "1",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+        "DG_IGR_DG_WEAKDIV_ROW_REUSE": "1",
+        "IGRLAB_DG_INVMASS_ROW_REUSE": "0",
+        "IGRLAB_DG_TENSOR_FACE_ROW_REUSE": "0",
+        "IGRLAB_IGR_STAGE_STATE_DIRECT": "0",
+        "IGRLAB_IGR_FACE_COALESCED_TRACE": "0",
+        "IGRLAB_DG_MAPPED_WEAKDIV_TENSOR": "0",
+        "IGRLAB_VTK_CACHED_EVALUATION": "0",
+        "IGRLAB_JOB_OUTPUT_DIR": "/tmp/igrlab-3446347-5jk23rf4/run/case/baseline",
+        "IGRLAB_VTK_OUTPUT_TIMING": "1",
+        "DG_IGR_DG_INVMASS_ROW_REUSE": "0",
+        "DG_IGR_DG_TENSOR_FACE_ROW_REUSE": "0",
+        "DG_IGR_IGR_STAGE_STATE_DIRECT": "0",
+        "DG_IGR_IGR_FACE_COALESCED_TRACE": "0",
+        "DG_IGR_DG_MAPPED_WEAKDIV_TENSOR": "0",
+        "DG_IGR_VTK_CACHED_EVALUATION": "0",
+        "DG_IGR_JOB_OUTPUT_DIR": "/tmp/igrlab-3446347-5jk23rf4/run/case/baseline",
+        "DG_IGR_VTK_OUTPUT_TIMING": "1",
+        "IGRLAB_OUTPUT_ROOT": "/tmp/igrlab-3446347-5jk23rf4/builds",
+        "DG_IGR_OUTPUT_ROOT": "/tmp/igrlab-3446347-5jk23rf4/builds"
+      },
+      "recommended": {
+        "PMIX_MCA_gds": "hash",
+        "OMP_NUM_THREADS": "1",
+        "IGRLAB_PROFILE_NVTX": "0",
+        "IGRLAB_IGR_PARTIAL_ASSEMBLY": "1",
+        "IGRLAB_IGR_DEVICE_QF": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CUDA": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CACHE": "1",
+        "IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "IGRLAB_IGR_IPDG_PENALTY_SCALE": "1",
+        "IGRLAB_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "IGRLAB_IGR_TENSOR_VOLUME": "simt",
+        "IGRLAB_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "IGRLAB_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "IGRLAB_IGR_TENSOR_MG": "off",
+        "IGRLAB_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "IGRLAB_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_TRUE_RESIDUAL": "0",
+        "IGRLAB_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "IGRLAB_IGR_OPERATOR_PROBE_EVERY": "0",
+        "IGRLAB_IGR_PRECONDITIONER_PROBE": "0",
+        "IGRLAB_SHARED_OPERATOR_PRECISION": "off",
+        "IGRLAB_SHARED_EULER_LAYOUT": "dense",
+        "IGRLAB_SHARED_EULER_FLUX_EXECUTION": "element",
+        "IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "IGRLAB_DG_FORCE_MATRIX_FREE": "0",
+        "IGRLAB_DG_FORCE_NLFORM_FACE": "0",
+        "IGRLAB_DG_NATIVE_MASS_INV": "0",
+        "IGRLAB_DG_PACKED_INVMASS_DEVICE": "1",
+        "IGRLAB_DG_TENSOR_FACE": "fp64",
+        "IGRLAB_WEAKDIV_SIGMA_STORAGE": "auto",
+        "IGRLAB_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "IGRLAB_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "IGRLAB_IGR_COMPACT_FACE_QDATA": "1",
+        "IGRLAB_IGR_COMPACT_FACE_LIFT": "1",
+        "IGRLAB_VTK_PRESSURE_COEFFICIENT": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "IGRLAB_DG_PACKED_DENSE_EXECUTION": "rows",
+        "IGRLAB_VTK_PREFIX_PATH": "/tmp/igrlab-3446347-5jk23rf4/run/case/recommended/vtk",
+        "DG_IGR_PROFILE_NVTX": "0",
+        "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CUDA": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CACHE": "1",
+        "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "DG_IGR_IGR_IPDG_PENALTY_SCALE": "1",
+        "DG_IGR_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "DG_IGR_IGR_TENSOR_VOLUME": "simt",
+        "DG_IGR_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "DG_IGR_IGR_TENSOR_MG": "off",
+        "DG_IGR_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "DG_IGR_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "DG_IGR_IGR_TRUE_RESIDUAL": "0",
+        "DG_IGR_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "DG_IGR_IGR_OPERATOR_PROBE_EVERY": "0",
+        "DG_IGR_IGR_PRECONDITIONER_PROBE": "0",
+        "DG_IGR_SHARED_OPERATOR_PRECISION": "off",
+        "DG_IGR_SHARED_EULER_LAYOUT": "dense",
+        "DG_IGR_SHARED_EULER_FLUX_EXECUTION": "element",
+        "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "DG_IGR_DG_FORCE_MATRIX_FREE": "0",
+        "DG_IGR_DG_FORCE_NLFORM_FACE": "0",
+        "DG_IGR_DG_NATIVE_MASS_INV": "0",
+        "DG_IGR_DG_PACKED_INVMASS_DEVICE": "1",
+        "DG_IGR_DG_TENSOR_FACE": "fp64",
+        "DG_IGR_WEAKDIV_SIGMA_STORAGE": "auto",
+        "DG_IGR_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "DG_IGR_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "DG_IGR_IGR_COMPACT_FACE_QDATA": "1",
+        "DG_IGR_IGR_COMPACT_FACE_LIFT": "1",
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_DG_PACKED_DENSE_EXECUTION": "rows",
+        "DG_IGR_VTK_PREFIX_PATH": "/tmp/igrlab-3446347-5jk23rf4/run/case/recommended/vtk",
+        "DG_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_COEFFICIENT_EXECUTION": "fused",
+        "IGRLAB_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "DG_IGR_IGR_COEFFICIENT_EXECUTION": "fused",
+        "DG_IGR_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "IGRLAB_SOLVER_WALL_TIMING": "1",
+        "IGRLAB_IGR_TENSOR_VOLUME_COMPACT": "1",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+        "IGRLAB_DG_WEAKDIV_ROW_REUSE": "1",
+        "DG_IGR_SOLVER_WALL_TIMING": "1",
+        "DG_IGR_IGR_TENSOR_VOLUME_COMPACT": "1",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+        "DG_IGR_DG_WEAKDIV_ROW_REUSE": "1",
+        "IGRLAB_DG_INVMASS_ROW_REUSE": "1",
+        "IGRLAB_DG_TENSOR_FACE_ROW_REUSE": "1",
+        "IGRLAB_IGR_STAGE_STATE_DIRECT": "1",
+        "IGRLAB_IGR_FACE_COALESCED_TRACE": "0",
+        "IGRLAB_DG_MAPPED_WEAKDIV_TENSOR": "1",
+        "IGRLAB_VTK_CACHED_EVALUATION": "1",
+        "IGRLAB_JOB_OUTPUT_DIR": "/tmp/igrlab-3446347-5jk23rf4/run/case/recommended",
+        "IGRLAB_VTK_OUTPUT_TIMING": "1",
+        "DG_IGR_DG_INVMASS_ROW_REUSE": "1",
+        "DG_IGR_DG_TENSOR_FACE_ROW_REUSE": "1",
+        "DG_IGR_IGR_STAGE_STATE_DIRECT": "1",
+        "DG_IGR_IGR_FACE_COALESCED_TRACE": "0",
+        "DG_IGR_DG_MAPPED_WEAKDIV_TENSOR": "1",
+        "DG_IGR_VTK_CACHED_EVALUATION": "1",
+        "DG_IGR_JOB_OUTPUT_DIR": "/tmp/igrlab-3446347-5jk23rf4/run/case/recommended",
+        "DG_IGR_VTK_OUTPUT_TIMING": "1",
+        "IGRLAB_OUTPUT_ROOT": "/tmp/igrlab-3446347-5jk23rf4/builds",
+        "DG_IGR_OUTPUT_ROOT": "/tmp/igrlab-3446347-5jk23rf4/builds"
+      }
+    },
+    "gpu_full": {
+      "index": 0,
+      "uuid": "GPU-0db23969-1081-f667-0279-d91e41498832",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "steps": 6663,
+    "sigma_calls": 19990,
+    "new_flags": {
+      "baseline": {
+        "DG_INVMASS_ROW_REUSE": 0,
+        "DG_TENSOR_FACE_ROW_REUSE": 0,
+        "IGR_STAGE_STATE_DIRECT": 0,
+        "IGR_FACE_COALESCED_TRACE": 0,
+        "DG_MAPPED_WEAKDIV_TENSOR": 0,
+        "VTK_CACHED_EVALUATION": 0
+      },
+      "recommended": {
+        "DG_INVMASS_ROW_REUSE": 1,
+        "DG_TENSOR_FACE_ROW_REUSE": 1,
+        "IGR_STAGE_STATE_DIRECT": 1,
+        "IGR_FACE_COALESCED_TRACE": 0,
+        "DG_MAPPED_WEAKDIV_TENSOR": 1,
+        "VTK_CACHED_EVALUATION": 1
+      }
+    }
+  },
+  "full_wall_timing": {
+    "baseline": {
+      "five_bins_s": {
+        "setup_initial_output_s": 56.595974473,
+        "advancing_cfl_s": 280.002057318,
+        "scheduled_output_s": 150.06289960499998,
+        "diagnostics_s": 0.4857331639999999,
+        "final_output_postloop_s": 37.318697028
+      },
+      "solver_total_s": 524.465361588,
+      "application_wall_s": 574.6317966235802,
+      "external_to_RunEulerCase_s": 50.16643503558021,
+      "timing_scope": "Six additive host bins; asynchronous GPU work can cross their boundaries; GPU times not measured"
+    },
+    "recommended": {
+      "five_bins_s": {
+        "setup_initial_output_s": 35.777803686,
+        "advancing_cfl_s": 248.02841669200004,
+        "scheduled_output_s": 65.34347452099999,
+        "diagnostics_s": 0.4760131760000001,
+        "final_output_postloop_s": 16.201077180000002
+      },
+      "solver_total_s": 365.826785255,
+      "application_wall_s": 392.4944078559056,
+      "external_to_RunEulerCase_s": 26.667622600905588,
+      "timing_scope": "Six additive host bins; asynchronous GPU work can cross their boundaries; GPU times not measured"
+    }
+  },
+  "application_speedup": 1.464050914158608,
+  "application_time_reduction_fraction": 0.316963644959915,
+  "advance_speedup": 1.1289111991780547,
+  "advance_time_reduction_fraction": 0.1141907346405221,
+  "fields": {
+    "qualification_passed": true,
+    "reference_sha256": "db4d0b272baa028a1469006dc3a76a72b6fd055a069a0593aff947b01dc4d94b",
+    "candidate_sha256": "67ab5896aa1a911824c36ab2f549875df70e4a04eda22f046ea19688a8b812e7",
+    "components": {
+      "density": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 1.021068703547479,
+        "l2_candidate": 1.0210687035474793,
+        "l2_difference": 1.0020641395112452e-14,
+        "normalized_l2": 9.813875756154247e-15,
+        "normalized_linf_at_gl_points": 7.432875957961263e-14,
+        "linf_reference_at_gl_points": 1.2875396450035477,
+        "linf_candidate_at_gl_points": 1.2875396450035352,
+        "linf_difference_at_gl_points": 9.57012247226885e-14,
+        "reference_range_at_gl_points": [
+          0.4494201725888792,
+          1.2875396450035477
+        ],
+        "candidate_range_at_gl_points": [
+          0.4494201725888847,
+          1.2875396450035352
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 187330,
+          "gauss_ij": [
+            0,
+            0
+          ],
+          "physical_xy": [
+            0.9024212311469823,
+            0.736405606146982
+          ],
+          "reference": 1.0346532769191727,
+          "candidate": 1.0346532769192684
+        },
+        "integral_reference": 0.999999999999948,
+        "integral_candidate": 0.9999999999999482,
+        "integral_candidate_minus_reference": 2.564710943509209e-17,
+        "difference_of_separately_accumulated_integrals": 1.1102230246251565e-16,
+        "reference_gl_l1": 0.999999999999948,
+        "integral_abs_difference_over_abs_reference_integral": 2.5647109435093422e-17,
+        "integral_abs_difference_over_reference_gl_l1": 2.5647109435093422e-17,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "momentum_x": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 0.2773154888806501,
+        "l2_candidate": 0.2773154888806503,
+        "l2_difference": 4.4240593682242463e-14,
+        "normalized_l2": 1.5953163619101906e-13,
+        "normalized_linf_at_gl_points": 8.83146536196332e-13,
+        "linf_reference_at_gl_points": 0.8063063268306991,
+        "linf_candidate_at_gl_points": 0.8063063268306738,
+        "linf_difference_at_gl_points": 7.120866396537195e-13,
+        "reference_range_at_gl_points": [
+          -0.8063061995192938,
+          0.8063063268306991
+        ],
+        "candidate_range_at_gl_points": [
+          -0.8063061995193012,
+          0.8063063268306738
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 274,
+          "gauss_ij": [
+            3,
+            0
+          ],
+          "physical_xy": [
+            0.5359517669124917,
+            3.68692425691222e-05
+          ],
+          "reference": 0.0032279971355589866,
+          "candidate": 0.0032279971362710732
+        },
+        "integral_reference": -2.0115277240570344e-11,
+        "integral_candidate": -2.0108248667582542e-11,
+        "integral_candidate_minus_reference": 7.047071369716875e-15,
+        "difference_of_separately_accumulated_integrals": 7.028572987802185e-15,
+        "reference_gl_l1": 0.17727597402587186,
+        "integral_abs_difference_over_abs_reference_integral": 0.00035033428997457175,
+        "integral_abs_difference_over_reference_gl_l1": 3.975198223245084e-14,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "momentum_y": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 0.27731548888064855,
+        "l2_candidate": 0.27731548888064894,
+        "l2_difference": 4.397129169665978e-14,
+        "normalized_l2": 1.5856053289394234e-13,
+        "normalized_linf_at_gl_points": 8.00503090814374e-13,
+        "linf_reference_at_gl_points": 0.8063063268305279,
+        "linf_candidate_at_gl_points": 0.8063063268305044,
+        "linf_difference_at_gl_points": 6.454507067710225e-13,
+        "reference_range_at_gl_points": [
+          -0.8063061995110332,
+          0.8063063268305279
+        ],
+        "candidate_range_at_gl_points": [
+          -0.8063061995109965,
+          0.8063063268305044
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 197142,
+          "gauss_ij": [
+            0,
+            1
+          ],
+          "physical_xy": [
+            0.03366521782553764,
+            0.7428093812816738
+          ],
+          "reference": 0.006971563959932028,
+          "candidate": 0.006971563959286577
+        },
+        "integral_reference": -2.011784174409711e-11,
+        "integral_candidate": -2.0111398422065587e-11,
+        "integral_candidate_minus_reference": 6.420473602686698e-15,
+        "difference_of_separately_accumulated_integrals": 6.443322031523049e-15,
+        "reference_gl_l1": 0.17727597402587028,
+        "integral_abs_difference_over_abs_reference_integral": 0.00031914326021431025,
+        "integral_abs_difference_over_reference_gl_l1": 3.621739289809088e-14,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "energy": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 3.6233258178533894,
+        "l2_candidate": 3.62332581785339,
+        "l2_difference": 2.663626636904507e-14,
+        "normalized_l2": 7.351330713290784e-15,
+        "normalized_linf_at_gl_points": 3.428550213778306e-14,
+        "linf_reference_at_gl_points": 5.051546019233055,
+        "linf_candidate_at_gl_points": 5.0515460192331005,
+        "linf_difference_at_gl_points": 1.7319479184152442e-13,
+        "reference_range_at_gl_points": [
+          2.500796910004747,
+          5.051546019233055
+        ],
+        "candidate_range_at_gl_points": [
+          2.500796910004767,
+          5.0515460192331005
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 64626,
+          "gauss_ij": [
+            3,
+            0
+          ],
+          "physical_xy": [
+            0.25795775241967367,
+            0.2806366047497497
+          ],
+          "reference": 4.76658932782143,
+          "candidate": 4.766589327821257
+        },
+        "integral_reference": 3.499988835753553,
+        "integral_candidate": 3.499988835753553,
+        "integral_candidate_minus_reference": 2.3351515817382776e-16,
+        "difference_of_separately_accumulated_integrals": 0.0,
+        "reference_gl_l1": 3.499988835753553,
+        "integral_abs_difference_over_abs_reference_integral": 6.671882943979493e-17,
+        "integral_abs_difference_over_reference_gl_l1": 6.671882943979493e-17,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "sigma": {
+        "saved_polynomial_component": true,
+        "conservative_component": false,
+        "l2_reference": 1.9969487383323734e-05,
+        "l2_candidate": 1.996948738332399e-05,
+        "l2_difference": 2.112865157672164e-17,
+        "normalized_l2": 1.0580467676083618e-12,
+        "normalized_linf_at_gl_points": 4.1995149368244315e-12,
+        "linf_reference_at_gl_points": 5.63124137352507e-05,
+        "linf_candidate_at_gl_points": 5.631241373521854e-05,
+        "linf_difference_at_gl_points": 2.364848226098226e-16,
+        "reference_range_at_gl_points": [
+          7.729690841659997e-11,
+          5.63124137352507e-05
+        ],
+        "candidate_range_at_gl_points": [
+          7.729690841241504e-11,
+          5.631241373521854e-05
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 226553,
+          "gauss_ij": [
+            1,
+            3
+          ],
+          "physical_xy": [
+            0.48429552455776703,
+            0.8618475087715535
+          ],
+          "reference": 5.450233327060134e-05,
+          "candidate": 5.450233327083783e-05
+        },
+        "integral_reference": 1.319104363132022e-05,
+        "integral_candidate": 1.3191043631320283e-05,
+        "integral_candidate_minus_reference": 6.81079875336585e-20,
+        "difference_of_separately_accumulated_integrals": 6.268043809681823e-20,
+        "reference_gl_l1": 1.319104363132022e-05,
+        "integral_abs_difference_over_abs_reference_integral": 5.163199321996477e-15,
+        "integral_abs_difference_over_reference_gl_l1": 5.163199321996477e-15,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "pressure": {
+        "saved_polynomial_component": false,
+        "conservative_component": false,
+        "l2_reference": 1.411771141760437,
+        "l2_candidate": 1.4117711417604373,
+        "l2_difference": 8.338826515209796e-15,
+        "normalized_l2": 5.906641854721244e-15,
+        "normalized_linf_at_gl_points": 2.4737385930144967e-14,
+        "linf_reference_at_gl_points": 1.9119037469273337,
+        "linf_candidate_at_gl_points": 1.9119037469273454,
+        "linf_difference_at_gl_points": 4.729550084903167e-14,
+        "reference_range_at_gl_points": [
+          1.000318764001886,
+          1.9119037469273337
+        ],
+        "candidate_range_at_gl_points": [
+          1.000318764001894,
+          1.9119037469273454
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 64665,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.33397602803177484,
+            0.2812416530317749
+          ],
+          "reference": 1.899417178086568,
+          "candidate": 1.8994171780865208
+        },
+        "integral_reference": 1.370315042019142,
+        "integral_candidate": 1.370315042019142,
+        "integral_candidate_minus_reference": 4.642951880702064e-17,
+        "difference_of_separately_accumulated_integrals": 0.0,
+        "reference_gl_l1": 1.370315042019142,
+        "integral_abs_difference_over_abs_reference_integral": 3.3882368202429804e-17,
+        "integral_abs_difference_over_reference_gl_l1": 3.3882368202429804e-17,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": false
+      },
+      "speed": {
+        "saved_polynomial_component": false,
+        "conservative_component": false,
+        "l2_reference": 0.3906357679249167,
+        "l2_candidate": 0.39063576792491694,
+        "l2_difference": 4.83315895977097e-14,
+        "normalized_l2": 1.2372545876802406e-13,
+        "normalized_linf_at_gl_points": 1.6424153895628006e-12,
+        "linf_reference_at_gl_points": 0.706209780133295,
+        "linf_candidate_at_gl_points": 0.7062097801332737,
+        "linf_difference_at_gl_points": 1.1598898111506856e-12,
+        "reference_range_at_gl_points": [
+          2.5042951187474763e-07,
+          0.706209780133295
+        ],
+        "candidate_range_at_gl_points": [
+          2.50429511173283e-07,
+          0.7062097801332737
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 130815,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.49996122264096365,
+            0.4999612226409636
+          ],
+          "reference": 0.00019970018028446523,
+          "candidate": 0.00019970018144435504
+        },
+        "integral_reference": 0.2846030835037686,
+        "integral_candidate": 0.2846030835037688,
+        "integral_candidate_minus_reference": 2.3806738543904603e-16,
+        "difference_of_separately_accumulated_integrals": 1.6653345369377348e-16,
+        "reference_gl_l1": 0.2846030835037686,
+        "integral_abs_difference_over_abs_reference_integral": 8.364891290290381e-16,
+        "integral_abs_difference_over_reference_gl_l1": 8.364891290290381e-16,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": false
+      },
+      "q_sigma": {
+        "saved_polynomial_component": false,
+        "conservative_component": false,
+        "l2_reference": 1.9764854360568591,
+        "l2_candidate": 1.976485436056859,
+        "l2_difference": 1.1675308035475007e-14,
+        "normalized_l2": 5.9071055230073215e-15,
+        "normalized_linf_at_gl_points": 2.4886683339444584e-14,
+        "linf_reference_at_gl_points": 2.67666770091173,
+        "linf_candidate_at_gl_points": 2.6766677009117372,
+        "linf_difference_at_gl_points": 6.661338147750939e-14,
+        "reference_range_at_gl_points": [
+          1.4004462696343138,
+          2.67666770091173
+        ],
+        "candidate_range_at_gl_points": [
+          1.4004462696343252,
+          2.6766677009117372
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 64665,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.33397602803177484,
+            0.2812416530317749
+          ],
+          "reference": 2.6591871538159864,
+          "candidate": 2.6591871538159197
+        },
+        "integral_reference": 1.9184463352442507,
+        "integral_candidate": 1.9184463352442507,
+        "integral_candidate_minus_reference": 6.501128067436606e-17,
+        "difference_of_separately_accumulated_integrals": 0.0,
+        "reference_gl_l1": 1.9184463352442507,
+        "integral_abs_difference_over_abs_reference_integral": 3.388746376691794e-17,
+        "integral_abs_difference_over_reference_gl_l1": 3.388746376691794e-17,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": false
+      }
+    },
+    "sampled_admissibility": {
+      "reference": {
+        "density_min": 0.4494201725888792,
+        "pressure_min": 1.000318764001886,
+        "q_sigma_min": 1.4004462696343138
+      },
+      "candidate": {
+        "density_min": 0.4494201725888847,
+        "pressure_min": 1.000318764001894,
+        "q_sigma_min": 1.4004462696343252
+      }
+    },
+    "scope": "Complete saved Q5 conserved and sigma polynomials on matching ordered cells with verified Q2 geometry. GL8 integrates polynomial integrals and squared differences on the fitted Q2 map to FP64/geometry-fit roundoff. Pressure, speed and q_sigma metrics are quadrature estimates. Linf and positivity are sampled at GL8 points, with no continuous or between-frame claim."
+  },
+  "individual_profiles": {
+    "baseline": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 362,
+        "selected_stages": 1086,
+        "current_A_scopes": 2172,
+        "local_inverse_P_scopes": 2172,
+        "sweep_scopes": 2172,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2172
+      },
+      "whole_RK": {
+        "selected_complete_steps": 362,
+        "recorded_gpu_union_ms_per_RK": 40.90598709668508,
+        "recorded_gpu_union_distribution": {
+          "samples": 362,
+          "mean_ms": 40.90598709668508,
+          "median_ms": 40.869712,
+          "minimum_ms": 40.651455999999996,
+          "p95_ms": 41.15216165,
+          "maximum_ms": 41.309985
+        },
+        "selected_global_gpu_union_ms_per_RK": 40.90598709668509,
+        "kernel_sum_ms_per_RK": 38.22661861049724,
+        "host_elapsed_distribution": {
+          "samples": 362,
+          "mean_ms": 41.23816194475138,
+          "median_ms": 41.190272,
+          "minimum_ms": 40.965472,
+          "p95_ms": 41.600011200000004,
+          "maximum_ms": 41.890271999999996
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.1140443720073665,
+          "kernel_sum_ms_per_stage": 2.0801323572744015,
+          "activity_records": 17376,
+          "kernel_records": 15204
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.887749473296501,
+          "kernel_sum_ms_per_stage": 2.887749473296501,
+          "activity_records": 6516,
+          "kernel_records": 6516
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.43802436648250465,
+          "kernel_sum_ms_per_stage": 0.43802436648250465,
+          "activity_records": 2172,
+          "kernel_records": 2172
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 7.257954491712707,
+          "kernel_sum_ms_per_stage": 6.924973923572745,
+          "activity_records": 14118,
+          "kernel_records": 11946
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4113260828729282,
+          "kernel_sum_ms_per_stage": 0.4113260828729282,
+          "activity_records": 1810,
+          "kernel_records": 1810
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5262302458563537,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3258,
+          "kernel_records": 0
+        }
+      ]
+    },
+    "mass": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 367,
+        "selected_stages": 1101,
+        "current_A_scopes": 2202,
+        "local_inverse_P_scopes": 2202,
+        "sweep_scopes": 2202,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2202
+      },
+      "whole_RK": {
+        "selected_complete_steps": 367,
+        "recorded_gpu_union_ms_per_RK": 40.09372154768392,
+        "recorded_gpu_union_distribution": {
+          "samples": 367,
+          "mean_ms": 40.09372154768392,
+          "median_ms": 40.08096,
+          "minimum_ms": 39.864896,
+          "p95_ms": 40.27192,
+          "maximum_ms": 40.627424
+        },
+        "selected_global_gpu_union_ms_per_RK": 40.09372154768393,
+        "kernel_sum_ms_per_RK": 37.41437976566758,
+        "host_elapsed_distribution": {
+          "samples": 367,
+          "mean_ms": 40.405072217983644,
+          "median_ms": 40.393184,
+          "minimum_ms": 40.165472,
+          "p95_ms": 40.5906944,
+          "maximum_ms": 40.947488
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.1121829336966393,
+          "kernel_sum_ms_per_stage": 2.078351172570391,
+          "activity_records": 17616,
+          "kernel_records": 15414
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.887777105358765,
+          "kernel_sum_ms_per_stage": 2.887777105358765,
+          "activity_records": 6606,
+          "kernel_records": 6606
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.43736216439600367,
+          "kernel_sum_ms_per_stage": 0.43736216439600367,
+          "activity_records": 2202,
+          "kernel_records": 2202
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 6.989583025431426,
+          "kernel_sum_ms_per_stage": 6.656646653950954,
+          "activity_records": 14313,
+          "kernel_records": 12111
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.41132282561307904,
+          "kernel_sum_ms_per_stage": 0.41132282561307904,
+          "activity_records": 1835,
+          "kernel_records": 1835
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5263457947320619,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3303,
+          "kernel_records": 0
+        }
+      ]
+    },
+    "face-reuse": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 385,
+        "selected_stages": 1155,
+        "current_A_scopes": 2310,
+        "local_inverse_P_scopes": 2310,
+        "sweep_scopes": 2310,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2310
+      },
+      "whole_RK": {
+        "selected_complete_steps": 385,
+        "recorded_gpu_union_ms_per_RK": 38.44949486233766,
+        "recorded_gpu_union_distribution": {
+          "samples": 385,
+          "mean_ms": 38.44949486233766,
+          "median_ms": 38.447392,
+          "minimum_ms": 38.159712999999996,
+          "p95_ms": 38.645260799999996,
+          "maximum_ms": 38.873183999999995
+        },
+        "selected_global_gpu_union_ms_per_RK": 38.449494862337666,
+        "kernel_sum_ms_per_RK": 35.774304163636366,
+        "host_elapsed_distribution": {
+          "samples": 385,
+          "mean_ms": 38.77077635324675,
+          "median_ms": 38.763264,
+          "minimum_ms": 38.468576,
+          "p95_ms": 38.9772032,
+          "maximum_ms": 39.743392
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.125622276190476,
+          "kernel_sum_ms_per_stage": 2.092867962770563,
+          "activity_records": 18480,
+          "kernel_records": 16170
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.9175054683982684,
+          "kernel_sum_ms_per_stage": 2.9175054683982684,
+          "activity_records": 6930,
+          "kernel_records": 6930
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4426425350649351,
+          "kernel_sum_ms_per_stage": 0.4426425350649351,
+          "activity_records": 2310,
+          "kernel_records": 2310
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 6.3931706207792205,
+          "kernel_sum_ms_per_stage": 6.06022230909091,
+          "activity_records": 15015,
+          "kernel_records": 12705
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.41152977922077927,
+          "kernel_sum_ms_per_stage": 0.41152977922077927,
+          "activity_records": 1925,
+          "kernel_records": 1925
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5260276077922078,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3465,
+          "kernel_records": 0
+        }
+      ]
+    },
+    "igr-direct": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 366,
+        "selected_stages": 1098,
+        "current_A_scopes": 2196,
+        "local_inverse_P_scopes": 2196,
+        "sweep_scopes": 2196,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2196
+      },
+      "whole_RK": {
+        "selected_complete_steps": 366,
+        "recorded_gpu_union_ms_per_RK": 40.494191743169395,
+        "recorded_gpu_union_distribution": {
+          "samples": 366,
+          "mean_ms": 40.494191743169395,
+          "median_ms": 40.4899195,
+          "minimum_ms": 40.208416,
+          "p95_ms": 40.68553575,
+          "maximum_ms": 40.950176
+        },
+        "selected_global_gpu_union_ms_per_RK": 40.4941917431694,
+        "kernel_sum_ms_per_RK": 37.815146584699455,
+        "host_elapsed_distribution": {
+          "samples": 366,
+          "mean_ms": 40.784105005464475,
+          "median_ms": 40.782544,
+          "minimum_ms": 40.501536,
+          "p95_ms": 40.968088,
+          "maximum_ms": 41.240736
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 1.9444820081967211,
+          "kernel_sum_ms_per_stage": 1.9103909043715848,
+          "activity_records": 16470,
+          "kernel_records": 14274
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.8956797613843355,
+          "kernel_sum_ms_per_stage": 2.8956797613843355,
+          "activity_records": 6588,
+          "kernel_records": 6588
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.43909548907103824,
+          "kernel_sum_ms_per_stage": 0.43909548907103824,
+          "activity_records": 2196,
+          "kernel_records": 2196
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 7.2813487021857926,
+          "kernel_sum_ms_per_stage": 6.948613897996357,
+          "activity_records": 14274,
+          "kernel_records": 12078
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.41126880874316946,
+          "kernel_sum_ms_per_stage": 0.41126880874316946,
+          "activity_records": 1830,
+          "kernel_records": 1830
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5261891448087432,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3294,
+          "kernel_records": 0
+        }
+      ]
+    },
+    "coalesced-trace": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 360,
+        "selected_stages": 1080,
+        "current_A_scopes": 2160,
+        "local_inverse_P_scopes": 2160,
+        "sweep_scopes": 2160,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2160
+      },
+      "whole_RK": {
+        "selected_complete_steps": 360,
+        "recorded_gpu_union_ms_per_RK": 41.146569683333325,
+        "recorded_gpu_union_distribution": {
+          "samples": 360,
+          "mean_ms": 41.146569683333325,
+          "median_ms": 41.1432,
+          "minimum_ms": 40.847007999999995,
+          "p95_ms": 41.360112,
+          "maximum_ms": 41.547744
+        },
+        "selected_global_gpu_union_ms_per_RK": 41.14656968333334,
+        "kernel_sum_ms_per_RK": 38.47025491944444,
+        "host_elapsed_distribution": {
+          "samples": 360,
+          "mean_ms": 41.452071644444445,
+          "median_ms": 41.44784,
+          "minimum_ms": 41.159808,
+          "p95_ms": 41.669351999999996,
+          "maximum_ms": 41.849759999999996
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.120811262962963,
+          "kernel_sum_ms_per_stage": 2.0878989361111113,
+          "activity_records": 17280,
+          "kernel_records": 15120
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.93658320462963,
+          "kernel_sum_ms_per_stage": 2.93658320462963,
+          "activity_records": 6480,
+          "kernel_records": 6480
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.44124157222222227,
+          "kernel_sum_ms_per_stage": 0.44124157222222227,
+          "activity_records": 2160,
+          "kernel_records": 2160
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 7.279183807407408,
+          "kernel_sum_ms_per_stage": 6.946236636111111,
+          "activity_records": 14040,
+          "kernel_records": 11880
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4114579574074074,
+          "kernel_sum_ms_per_stage": 0.4114579574074074,
+          "activity_records": 1800,
+          "kernel_records": 1800
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5262454231481482,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3240,
+          "kernel_records": 0
+        }
+      ]
+    },
+    "mapped-weakdiv": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 370,
+        "selected_stages": 1110,
+        "current_A_scopes": 2220,
+        "local_inverse_P_scopes": 2220,
+        "sweep_scopes": 2220,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2220
+      },
+      "whole_RK": {
+        "selected_complete_steps": 370,
+        "recorded_gpu_union_ms_per_RK": 40.10124955405405,
+        "recorded_gpu_union_distribution": {
+          "samples": 370,
+          "mean_ms": 40.10124955405405,
+          "median_ms": 40.111104,
+          "minimum_ms": 39.877919999999996,
+          "p95_ms": 40.2127536,
+          "maximum_ms": 40.2696
+        },
+        "selected_global_gpu_union_ms_per_RK": 40.10124955405406,
+        "kernel_sum_ms_per_RK": 37.421331891891896,
+        "host_elapsed_distribution": {
+          "samples": 370,
+          "mean_ms": 40.40860722162162,
+          "median_ms": 40.42024,
+          "minimum_ms": 40.18944,
+          "p95_ms": 40.525504,
+          "maximum_ms": 40.625536
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.107803611711712,
+          "kernel_sum_ms_per_stage": 2.073855013513514,
+          "activity_records": 17760,
+          "kernel_records": 15540
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.8779321882882885,
+          "kernel_sum_ms_per_stage": 2.8779321882882885,
+          "activity_records": 6660,
+          "kernel_records": 6660
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.43593862162162167,
+          "kernel_sum_ms_per_stage": 0.43593862162162167,
+          "activity_records": 2220,
+          "kernel_records": 2220
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 7.00761979009009,
+          "kernel_sum_ms_per_stage": 6.674610637837838,
+          "activity_records": 14430,
+          "kernel_records": 12210
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4114408360360361,
+          "kernel_sum_ms_per_stage": 0.4114408360360361,
+          "activity_records": 1850,
+          "kernel_records": 1850
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5263481369369369,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3330,
+          "kernel_records": 0
+        }
+      ]
+    },
+    "combined": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-da1ef961-8877-567d-bbea-5545d951db11",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 406,
+        "selected_stages": 1218,
+        "current_A_scopes": 2436,
+        "local_inverse_P_scopes": 2436,
+        "sweep_scopes": 2436,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2436
+      },
+      "whole_RK": {
+        "selected_complete_steps": 406,
+        "recorded_gpu_union_ms_per_RK": 36.29213918965517,
+        "recorded_gpu_union_distribution": {
+          "samples": 406,
+          "mean_ms": 36.29213918965517,
+          "median_ms": 36.303408,
+          "minimum_ms": 36.105472,
+          "p95_ms": 36.376183999999995,
+          "maximum_ms": 36.456192
+        },
+        "selected_global_gpu_union_ms_per_RK": 36.292139189655174,
+        "kernel_sum_ms_per_RK": 33.612564492610844,
+        "host_elapsed_distribution": {
+          "samples": 406,
+          "mean_ms": 36.61797359605911,
+          "median_ms": 36.619327999999996,
+          "minimum_ms": 32.065951999999996,
+          "p95_ms": 36.795007999999996,
+          "maximum_ms": 36.909056
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 1.9380962577996717,
+          "kernel_sum_ms_per_stage": 1.9042032922824301,
+          "activity_records": 18270,
+          "kernel_records": 15834
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.908586133825944,
+          "kernel_sum_ms_per_stage": 2.908586133825944,
+          "activity_records": 7308,
+          "kernel_records": 7308
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.43718935796387526,
+          "kernel_sum_ms_per_stage": 0.43718935796387526,
+          "activity_records": 2436,
+          "kernel_records": 2436
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 5.876130404761905,
+          "kernel_sum_ms_per_stage": 5.543067757799672,
+          "activity_records": 15834,
+          "kernel_records": 13398
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4111416223316913,
+          "kernel_sum_ms_per_stage": 0.4111416223316913,
+          "activity_records": 2030,
+          "kernel_records": 2030
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5262359532019704,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3654,
+          "kernel_records": 0
+        }
+      ]
+    }
+  },
+  "final_profiles": {
+    "baseline": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-117f34d1-e72e-63d1-dc9d-a43412b9791e",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 332,
+        "selected_stages": 996,
+        "current_A_scopes": 1992,
+        "local_inverse_P_scopes": 1992,
+        "sweep_scopes": 1992,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 1992
+      },
+      "whole_RK": {
+        "selected_complete_steps": 332,
+        "recorded_gpu_union_ms_per_RK": 41.08412944578313,
+        "recorded_gpu_union_distribution": {
+          "samples": 332,
+          "mean_ms": 41.08412944578313,
+          "median_ms": 41.100767499999996,
+          "minimum_ms": 40.632256,
+          "p95_ms": 41.370512,
+          "maximum_ms": 41.598048
+        },
+        "selected_global_gpu_union_ms_per_RK": 41.084129445783134,
+        "kernel_sum_ms_per_RK": 38.404741978915666,
+        "host_elapsed_distribution": {
+          "samples": 332,
+          "mean_ms": 44.75663036144578,
+          "median_ms": 41.56912,
+          "minimum_ms": 36.175424,
+          "p95_ms": 63.785379199999895,
+          "maximum_ms": 374.185728
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.1246508443775096,
+          "kernel_sum_ms_per_stage": 2.0908147961847394,
+          "activity_records": 15936,
+          "kernel_records": 13944
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.90771840060241,
+          "kernel_sum_ms_per_stage": 2.90771840060241,
+          "activity_records": 5976,
+          "kernel_records": 5976
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.44123990160642573,
+          "kernel_sum_ms_per_stage": 0.44123990160642573,
+          "activity_records": 1992,
+          "kernel_records": 1992
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 7.2832337449799205,
+          "kernel_sum_ms_per_stage": 6.950279143574297,
+          "activity_records": 12948,
+          "kernel_records": 10956
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.41152841767068277,
+          "kernel_sum_ms_per_stage": 0.41152841767068277,
+          "activity_records": 1660,
+          "kernel_records": 1660
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5263385060240964,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 2988,
+          "kernel_records": 0
+        }
+      ],
+      "sigma_to_Euler_gpu_union_ratio": 0.8238027039494643,
+      "profiler_diagnostics": [
+        {
+          "timestamp": -148576365376,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+          "globalPid": 297054014275584
+        },
+        {
+          "timestamp": 1079128909,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 1079170315,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 297054114938880
+        },
+        {
+          "timestamp": 1079174219,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 297054114938880
+        },
+        {
+          "timestamp": 1079175211,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 297054014275584
+        },
+        {
+          "timestamp": 1079179403,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "CUDA profiling might have not been started correctly.",
+          "globalPid": 297054114938880
+        },
+        {
+          "timestamp": 1079180235,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No CUDA events collected. Does the process use CUDA?",
+          "globalPid": 297054114938880
+        },
+        {
+          "timestamp": 1079180779,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected.",
+          "globalPid": 297054014275584
+        },
+        {
+          "timestamp": 1079183467,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 297054114938880
+        },
+        {
+          "timestamp": 1079185003,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 297054014275584
+        }
+      ]
+    },
+    "recommended": {
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-117f34d1-e72e-63d1-dc9d-a43412b9791e",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "selected_counts": {
+        "selected_rk_steps": 368,
+        "selected_stages": 1104,
+        "current_A_scopes": 2208,
+        "local_inverse_P_scopes": 2208,
+        "sweep_scopes": 2208,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2208
+      },
+      "whole_RK": {
+        "selected_complete_steps": 368,
+        "recorded_gpu_union_ms_per_RK": 36.26790952445652,
+        "recorded_gpu_union_distribution": {
+          "samples": 368,
+          "mean_ms": 36.26790952445652,
+          "median_ms": 36.24008,
+          "minimum_ms": 36.03248,
+          "p95_ms": 36.508192,
+          "maximum_ms": 36.702528
+        },
+        "selected_global_gpu_union_ms_per_RK": 36.26790952445652,
+        "kernel_sum_ms_per_RK": 33.58711492391305,
+        "host_elapsed_distribution": {
+          "samples": 368,
+          "mean_ms": 40.275550869565215,
+          "median_ms": 36.623183999999995,
+          "minimum_ms": 35.69904,
+          "p95_ms": 79.5728048,
+          "maximum_ms": 103.858976
+        }
+      },
+      "phase_row_values": [
+        {
+          "label": "Per-stage coefficients/RHS + operator/P refresh",
+          "phase_keys": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 1.9409815932971015,
+          "kernel_sum_ms_per_stage": 1.9069015932971016,
+          "activity_records": 16560,
+          "kernel_records": 14352
+        },
+        {
+          "label": "Current A + residual",
+          "phase_keys": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_activity_union_ms_per_stage": 2.887069356884058,
+          "kernel_sum_ms_per_stage": 2.887069356884058,
+          "activity_records": 6624,
+          "kernel_records": 6624
+        },
+        {
+          "label": "P + solution update",
+          "phase_keys": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4373643759057972,
+          "kernel_sum_ms_per_stage": 0.4373643759057972,
+          "activity_records": 2208,
+          "kernel_records": 2208
+        },
+        {
+          "label": "Euler spatial RHS",
+          "phase_keys": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_activity_union_ms_per_stage": 5.886235731884058,
+          "kernel_sum_ms_per_stage": 5.553124546195653,
+          "activity_records": 14352,
+          "kernel_records": 12144
+        },
+        {
+          "label": "RK common other",
+          "phase_keys": [
+            "RK_common_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.4112451023550725,
+          "kernel_sum_ms_per_stage": 0.4112451023550725,
+          "activity_records": 1840,
+          "kernel_records": 1840
+        },
+        {
+          "label": "Other recorded work",
+          "phase_keys": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_activity_union_ms_per_stage": 0.5264070144927537,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3312,
+          "kernel_records": 0
+        }
+      ],
+      "sigma_to_Euler_gpu_union_ratio": 0.983960310866767,
+      "profiler_diagnostics": [
+        {
+          "timestamp": -149864280736,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+          "globalPid": 297165331103744
+        },
+        {
+          "timestamp": 983776465,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 983812912,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 297165431767040
+        },
+        {
+          "timestamp": 983815536,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 297165431767040
+        },
+        {
+          "timestamp": 983816496,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 297165331103744
+        },
+        {
+          "timestamp": 983822192,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "CUDA profiling might have not been started correctly.",
+          "globalPid": 297165431767040
+        },
+        {
+          "timestamp": 983822864,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No CUDA events collected. Does the process use CUDA?",
+          "globalPid": 297165431767040
+        },
+        {
+          "timestamp": 983823440,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected.",
+          "globalPid": 297165331103744
+        },
+        {
+          "timestamp": 983825616,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 297165431767040
+        },
+        {
+          "timestamp": 983826800,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 297165331103744
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "baseline": {
+      "schema": "dg-mapped-throughput-compact-counters-v1",
+      "families": {
+        "PackedWeakDivRowReuseEulerKernel": {
+          "samples": 2,
+          "configuration": {
+            "family": "PackedWeakDivRowReuseEulerKernel",
+            "name": "void mfem::CuKernel1D<mfem::<unnamed>::PackedWeakDivRowReuseEulerKernel>(int, T1)",
+            "grid": [
+              36864,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "static_shared": 0,
+            "dynamic_shared": 0,
+            "nsys_registers_per_thread": 47,
+            "nsys_local_memory_per_thread": 0,
+            "phase": "Euler_spatial_RHS",
+            "nsys_calls_per_stage": 1.0
+          },
+          "mean_metrics": {
+            "gpu__time_duration.sum": 2241296.0,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 20.174999999999997,
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 75.345,
+            "dram__bytes_read.sum": 6492921856.0,
+            "dram__bytes_write.sum": 300464000.0,
+            "lts__t_bytes.sum": 10337328272.0,
+            "l1tex__t_bytes.sum": 11475426736.0,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 92.66,
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 0.26,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.12,
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.01,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 59.35,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 2717908992.0,
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 11.685,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 0.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 0.0,
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.0,
+            "launch__registers_per_thread": 47.0,
+            "launch__stack_size": 1568.0,
+            "launch__occupancy_limit_registers": 5.0,
+            "launch__occupancy_limit_shared_mem": 32.0,
+            "launch__occupancy_limit_blocks": 32.0,
+            "launch__occupancy_limit_warps": 8.0
+          }
+        },
+        "PackedInverseMassRowsKernel": {
+          "samples": 2,
+          "configuration": {
+            "family": "PackedInverseMassRowsKernel",
+            "name": "void mfem::CuKernel1D<mfem::<unnamed>::PackedInverseMassRowsKernel>(int, T1)",
+            "grid": [
+              147456,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "static_shared": 0,
+            "dynamic_shared": 0,
+            "nsys_registers_per_thread": 32,
+            "nsys_local_memory_per_thread": 0,
+            "phase": "Euler_spatial_RHS",
+            "nsys_calls_per_stage": 1.0
+          },
+          "mean_metrics": {
+            "gpu__time_duration.sum": 1720928.0,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 36.41,
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 50.15,
+            "dram__bytes_read.sum": 3171039744.0,
+            "dram__bytes_write.sum": 300849664.0,
+            "lts__t_bytes.sum": 6709453776.0,
+            "l1tex__t_bytes.sum": 15704120512.0,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 88.355,
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 0.87,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.515,
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.02,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 96.015,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 1358954496.0,
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 5.08,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 0.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 0.0,
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.0,
+            "launch__registers_per_thread": 32.0,
+            "launch__stack_size": 1568.0,
+            "launch__occupancy_limit_registers": 8.0,
+            "launch__occupancy_limit_shared_mem": 32.0,
+            "launch__occupancy_limit_blocks": 32.0,
+            "launch__occupancy_limit_warps": 8.0
+          }
+        },
+        "tensor_face::LiftKernel": {
+          "samples": 2,
+          "configuration": {
+            "family": "tensor_face::LiftKernel",
+            "name": "void mfem::CuKernel1D<mfem::dg_igr_detail::tensor_face::LiftKernel>(int, T1)",
+            "grid": [
+              147456,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "static_shared": 0,
+            "dynamic_shared": 0,
+            "nsys_registers_per_thread": 48,
+            "nsys_local_memory_per_thread": 0,
+            "phase": "Euler_spatial_RHS",
+            "nsys_calls_per_stage": 1.0
+          },
+          "mean_metrics": {
+            "gpu__time_duration.sum": 1302320.0,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 66.22,
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 10.89,
+            "dram__bytes_read.sum": 285550208.0,
+            "dram__bytes_write.sum": 284957056.0,
+            "lts__t_bytes.sum": 1185136816.0,
+            "l1tex__t_bytes.sum": 5328896848.0,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 42.14,
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 2.12,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 6.205,
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.09,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 58.4,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 679477248.0,
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 9.325,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 0.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 0.0,
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.0,
+            "launch__registers_per_thread": 48.0,
+            "launch__stack_size": 1568.0,
+            "launch__occupancy_limit_registers": 5.0,
+            "launch__occupancy_limit_shared_mem": 32.0,
+            "launch__occupancy_limit_blocks": 32.0,
+            "launch__occupancy_limit_warps": 8.0
+          }
+        }
+      },
+      "metric_units": {
+        "gpu__time_duration.sum": "ns",
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed": "%",
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": "%",
+        "dram__bytes_read.sum": "byte",
+        "dram__bytes_write.sum": "byte",
+        "lts__t_bytes.sum": "byte",
+        "l1tex__t_bytes.sum": "byte",
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": "%",
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": "%",
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": "%",
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": "%",
+        "sm__warps_active.avg.pct_of_peak_sustained_active": "%",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": "sector",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": "sector",
+        "smsp__sass_inst_executed_op_local_ld.sum": "inst",
+        "smsp__sass_inst_executed_op_local_st.sum": "inst",
+        "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": "inst",
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": "",
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": "",
+        "smsp__warp_issue_stalled_barrier_per_warp_active.pct": "%",
+        "launch__registers_per_thread": "register/thread",
+        "launch__stack_size": "",
+        "launch__occupancy_limit_registers": "block",
+        "launch__occupancy_limit_shared_mem": "block",
+        "launch__occupancy_limit_blocks": "block",
+        "launch__occupancy_limit_warps": "block"
+      },
+      "coverage": {
+        "complete": true,
+        "launches_complete": true,
+        "supported_counters_complete": true,
+        "native_launch_count": 6,
+        "counts": {
+          "tensor_face::LiftKernel": 2,
+          "PackedWeakDivRowReuseEulerKernel": 2,
+          "PackedInverseMassRowsKernel": 2
+        },
+        "native_order": [
+          "tensor_face::LiftKernel",
+          "PackedWeakDivRowReuseEulerKernel",
+          "PackedInverseMassRowsKernel",
+          "tensor_face::LiftKernel",
+          "PackedWeakDivRowReuseEulerKernel",
+          "PackedInverseMassRowsKernel"
+        ],
+        "expected_order": [
+          "tensor_face::LiftKernel",
+          "PackedWeakDivRowReuseEulerKernel",
+          "PackedInverseMassRowsKernel",
+          "tensor_face::LiftKernel",
+          "PackedWeakDivRowReuseEulerKernel",
+          "PackedInverseMassRowsKernel"
+        ],
+        "missing_metrics": [],
+        "unsupported_metrics": [],
+        "mismatched_native_launches": [],
+        "expected_launch_count": 6,
+        "historical_parser_fixed_six_launch_coverage": true
+      },
+      "interpretation_limits": [
+        "NCU intentionally ends this partial continuously evolved application after at most six matching launches in the RK/Step range numbered 1200; no restart or saved-state replay is used.",
+        "The native report/CSV must match the kernel names, launch geometry, shared memory, register count and order established by the qualified same-variant NSys capture.",
+        "The NVTX range filter is the proven CLI ordinal selection, not a newly instrumented absolute-step payload. NSys capture-local RK ordinals do not establish equal physical states.",
+        "Standard kernel replay and all-cache flush perturb cache state. Two launches per family do not measure trajectory-wide distributions or application speedup.",
+        "Clocks remain unlocked. Counter ratios and stall percentages require their native denominators and do not establish a unique bottleneck or zero compiler-allocated stack.",
+        "Unsupported/missing metrics remain explicit missing data, never measured zeros; this bounded final capture requires all 21 requested counters to be supported and present (18 established plus shared-bank load/store conflicts and barrier stalls).",
+        "Diagnostic output interval .1 and writer cache off match all GPU ablations. Validated unprofiled application timing retains interval .02 and its declared writer policy."
+      ],
+      "source_commit": "bc0df2971a6de2f840d995aa45f75bb664523b85",
+      "binary_sha256": "08f468cb1d47d4c88c2e7e86e9f8d51dd708efe30bd1ed5b913e1904f6f12957",
+      "variant": "baseline",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-9bc7bc3f-98db-970f-fbb4-1765e11d82bd",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "metrics": {
+        "path": "/tmp/igrlab-3446448-y9dbnvue/run/ncu/metrics.json",
+        "bytes": 20223,
+        "sha256": "cabc3e810dadfe9c2635a832807c48426ed0e70490c75fc8aca7a35a10f87de2"
+      }
+    },
+    "recommended": {
+      "schema": "dg-mapped-throughput-compact-counters-v1",
+      "families": {
+        "MappedWeakDivTensorKernel2D": {
+          "samples": 2,
+          "configuration": {
+            "family": "MappedWeakDivTensorKernel2D",
+            "name": "void mfem::CuKernel2D<mfem::dg_igr_detail::MappedWeakDivTensorKernel2D>(int, T1)",
+            "grid": [
+              262144,
+              1,
+              1
+            ],
+            "block": [
+              7,
+              7,
+              1
+            ],
+            "static_shared": 4480,
+            "dynamic_shared": 0,
+            "nsys_registers_per_thread": 40,
+            "nsys_local_memory_per_thread": 0,
+            "phase": "Euler_spatial_RHS",
+            "nsys_calls_per_stage": 1.0
+          },
+          "mean_metrics": {
+            "gpu__time_duration.sum": 2033440.0,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 66.82,
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 21.564999999999998,
+            "dram__bytes_read.sum": 1468085248.0,
+            "dram__bytes_write.sum": 295956480.0,
+            "lts__t_bytes.sum": 2974119584.0,
+            "l1tex__t_bytes.sum": 9587898624.0,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 23.975,
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 21.729999999999997,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 1.55,
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 9.455,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 74.09,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 2128609280.0,
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 14.06,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 8982607.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 19987773.0,
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 4.575,
+            "launch__registers_per_thread": 40.0,
+            "launch__stack_size": 1568.0,
+            "launch__occupancy_limit_registers": 24.0,
+            "launch__occupancy_limit_shared_mem": 24.0,
+            "launch__occupancy_limit_blocks": 32.0,
+            "launch__occupancy_limit_warps": 32.0
+          }
+        },
+        "PackedInverseMassRowReuseKernel<": {
+          "samples": 2,
+          "configuration": {
+            "family": "PackedInverseMassRowReuseKernel<",
+            "name": "void mfem::CuKernel1D<mfem::<unnamed>::PackedInverseMassRowReuseKernel<(int)4>>(int, T1)",
+            "grid": [
+              36864,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "static_shared": 0,
+            "dynamic_shared": 0,
+            "nsys_registers_per_thread": 40,
+            "nsys_local_memory_per_thread": 0,
+            "phase": "Euler_spatial_RHS",
+            "nsys_calls_per_stage": 1.0
+          },
+          "mean_metrics": {
+            "gpu__time_duration.sum": 1452224.0,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 27.755000000000003,
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 60.705,
+            "dram__bytes_read.sum": 3247171200.0,
+            "dram__bytes_write.sum": 299063936.0,
+            "lts__t_bytes.sum": 5426325600.0,
+            "l1tex__t_bytes.sum": 8455641136.0,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 93.84,
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 0.43,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.11,
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.01,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 71.085,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 1358954496.0,
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 6.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 0.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 0.0,
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.0,
+            "launch__registers_per_thread": 40.0,
+            "launch__stack_size": 1568.0,
+            "launch__occupancy_limit_registers": 6.0,
+            "launch__occupancy_limit_shared_mem": 32.0,
+            "launch__occupancy_limit_blocks": 32.0,
+            "launch__occupancy_limit_warps": 8.0
+          }
+        },
+        "tensor_face::LiftRowReuseKernel": {
+          "samples": 2,
+          "configuration": {
+            "family": "tensor_face::LiftRowReuseKernel",
+            "name": "void mfem::CuKernel1D<mfem::dg_igr_detail::tensor_face::LiftRowReuseKernel>(int, T1)",
+            "grid": [
+              36864,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "static_shared": 0,
+            "dynamic_shared": 0,
+            "nsys_registers_per_thread": 64,
+            "nsys_local_memory_per_thread": 0,
+            "phase": "Euler_spatial_RHS",
+            "nsys_calls_per_stage": 1.0
+          },
+          "mean_metrics": {
+            "gpu__time_duration.sum": 485808.0,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 56.765,
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 29.095,
+            "dram__bytes_read.sum": 285560960.0,
+            "dram__bytes_write.sum": 283068800.0,
+            "lts__t_bytes.sum": 1053713744.0,
+            "l1tex__t_bytes.sum": 2782643680.0,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 46.230000000000004,
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 2.43,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 4.575,
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.05,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 45.879999999999995,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+            "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 679477248.0,
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 17.8,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 0.0,
+            "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 0.0,
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.0,
+            "launch__registers_per_thread": 64.0,
+            "launch__stack_size": 1568.0,
+            "launch__occupancy_limit_registers": 4.0,
+            "launch__occupancy_limit_shared_mem": 32.0,
+            "launch__occupancy_limit_blocks": 32.0,
+            "launch__occupancy_limit_warps": 8.0
+          }
+        }
+      },
+      "metric_units": {
+        "gpu__time_duration.sum": "ns",
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed": "%",
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": "%",
+        "dram__bytes_read.sum": "byte",
+        "dram__bytes_write.sum": "byte",
+        "lts__t_bytes.sum": "byte",
+        "l1tex__t_bytes.sum": "byte",
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": "%",
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": "%",
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": "%",
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": "%",
+        "sm__warps_active.avg.pct_of_peak_sustained_active": "%",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": "sector",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": "sector",
+        "smsp__sass_inst_executed_op_local_ld.sum": "inst",
+        "smsp__sass_inst_executed_op_local_st.sum": "inst",
+        "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": "inst",
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": "",
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": "",
+        "smsp__warp_issue_stalled_barrier_per_warp_active.pct": "%",
+        "launch__registers_per_thread": "register/thread",
+        "launch__stack_size": "",
+        "launch__occupancy_limit_registers": "block",
+        "launch__occupancy_limit_shared_mem": "block",
+        "launch__occupancy_limit_blocks": "block",
+        "launch__occupancy_limit_warps": "block"
+      },
+      "coverage": {
+        "complete": true,
+        "launches_complete": true,
+        "supported_counters_complete": true,
+        "native_launch_count": 6,
+        "counts": {
+          "tensor_face::LiftRowReuseKernel": 2,
+          "MappedWeakDivTensorKernel2D": 2,
+          "PackedInverseMassRowReuseKernel<": 2
+        },
+        "native_order": [
+          "tensor_face::LiftRowReuseKernel",
+          "MappedWeakDivTensorKernel2D",
+          "PackedInverseMassRowReuseKernel<",
+          "tensor_face::LiftRowReuseKernel",
+          "MappedWeakDivTensorKernel2D",
+          "PackedInverseMassRowReuseKernel<"
+        ],
+        "expected_order": [
+          "tensor_face::LiftRowReuseKernel",
+          "MappedWeakDivTensorKernel2D",
+          "PackedInverseMassRowReuseKernel<",
+          "tensor_face::LiftRowReuseKernel",
+          "MappedWeakDivTensorKernel2D",
+          "PackedInverseMassRowReuseKernel<"
+        ],
+        "missing_metrics": [],
+        "unsupported_metrics": [],
+        "mismatched_native_launches": [],
+        "expected_launch_count": 6,
+        "historical_parser_fixed_six_launch_coverage": true
+      },
+      "interpretation_limits": [
+        "NCU intentionally ends this partial continuously evolved application after at most six matching launches in the RK/Step range numbered 1200; no restart or saved-state replay is used.",
+        "The native report/CSV must match the kernel names, launch geometry, shared memory, register count and order established by the qualified same-variant NSys capture.",
+        "The NVTX range filter is the proven CLI ordinal selection, not a newly instrumented absolute-step payload. NSys capture-local RK ordinals do not establish equal physical states.",
+        "Standard kernel replay and all-cache flush perturb cache state. Two launches per family do not measure trajectory-wide distributions or application speedup.",
+        "Clocks remain unlocked. Counter ratios and stall percentages require their native denominators and do not establish a unique bottleneck or zero compiler-allocated stack.",
+        "Unsupported/missing metrics remain explicit missing data, never measured zeros; this bounded final capture requires all 21 requested counters to be supported and present (18 established plus shared-bank load/store conflicts and barrier stalls).",
+        "Diagnostic output interval .1 and writer cache off match all GPU ablations. Validated unprofiled application timing retains interval .02 and its declared writer policy."
+      ],
+      "source_commit": "bc0df2971a6de2f840d995aa45f75bb664523b85",
+      "binary_sha256": "08f468cb1d47d4c88c2e7e86e9f8d51dd708efe30bd1ed5b913e1904f6f12957",
+      "variant": "recommended",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-9bc7bc3f-98db-970f-fbb4-1765e11d82bd",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "metrics": {
+        "path": "/tmp/igrlab-3446448-vocwkzo8/run/ncu/metrics.json",
+        "bytes": 20345,
+        "sha256": "5b32c8a7d00e64099ecd3c1ec81a779b7994d175255a648bc0faa42669f73eae"
+      }
+    }
+  },
+  "qualification_notes": [
+    "Native 14 CPU/CUDA groups passed with unchanged installed dependencies.",
+    "Paired unprofiled full trajectories use one GPU, unchanged numerics and output cadence .02; scans off.",
+    "Nsight Systems paired comparison uses strict recorded-GPU-complete whole RK selection: baseline332, recommended368, with one incomplete final host-complete RK excluded. Original failed/raw receipts preserved in separate recovery graphs.",
+    "Actual Nsys delay150s/duration15s; first ablation audits retain a stale120s prose string, while commands and numeric receipts show150.",
+    "Nsight Systems reports CUDA driver13.2 versus12.9 trace-library compatibility/possible acquisition loss warnings. Recorded counts/reciprocity do not establish lossless acquisition.",
+    "NCU uses kernel replay/all-cacheflush, unlocked clocks, two launches per family,21 counters, matching actual names/configuration; these times are not application benchmarks."
+  ],
+  "evidence": {
+    "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-mapped-throughput-20261023",
+    "case_run_sha256": "454939cc8bb0918c429bfe521b95c86fbd88b35b9b8d76324ef88831b2a9cd5f",
+    "retention_map_sha256": "67d07fd7eae428c917dc29183c6f70312e284ce7c910381a0ee4867406195e78",
+    "field_comparison_sha256": "65f8d0c6a96c0757ee144775a15dc4e8c85584647ef31640345eec0e33e60deb",
+    "full_field_gate_sha256": "389f9acb845779be84e4cef878baa98844a9f6952fcfb0914d087267dcc88df1"
+  }
+}
