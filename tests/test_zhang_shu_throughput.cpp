@@ -34,6 +34,26 @@ constexpr double kPressureMin = 1.0e-6;
 enum class Case { Noop, Density, Pressure, Sequential, NearFloors,
                   InvalidMean, NonfinitePressure };
 
+struct LimiterVariant
+{
+  bool cooperative;
+  bool fused_face;
+};
+
+// The repeated cooperative/off case forces the fused cache to return to its
+// original scalar scratch. The last case checks that serial ignores fusion.
+constexpr LimiterVariant kLimiterVariants[] = {
+  {false, false}, {true, false}, {true, true}, {true, false}, {false, true}};
+
+void SelectVariant(const LimiterVariant& variant)
+{
+  MFEM_VERIFY(setenv("IGRLAB_LIMITER_COOPERATIVE",
+                      variant.cooperative ? "1" : "0", 1) == 0 &&
+                setenv("IGRLAB_LIMITER_FUSED_FACE",
+                       variant.fused_face ? "1" : "0", 1) == 0,
+              "Cannot select p5 limiter implementation.");
+}
+
 const char* CaseName(Case kind)
 {
   switch (kind)
@@ -345,8 +365,20 @@ void CompareVector(const mfem::Vector& reference, const mfem::Vector& candidate)
     MFEM_VERIFY(std::isfinite(a[i]) && std::isfinite(b[i]) &&
                   std::abs(a[i] - b[i]) <=
                     2.0e-12 * std::max({1.0, std::abs(a[i]), std::abs(b[i])}),
-                "Serial/cooperative p5 limiter values differ.");
+                "Serial/cooperative/fused-face p5 limiter values differ.");
   }
+}
+
+void CompareDiagnostics(
+  const mfem::ZhangShuLimiterElementDiagnostics& reference,
+  const mfem::ZhangShuLimiterElementDiagnostics& candidate)
+{
+  CompareVector(reference.active, candidate.active);
+  CompareVector(reference.theta_rho, candidate.theta_rho);
+  CompareVector(reference.theta_p, candidate.theta_p);
+  CompareVector(reference.inadmissible_average, candidate.inadmissible_average);
+  CompareVector(reference.collapsed_average, candidate.collapsed_average);
+  CompareVector(reference.average_repair, candidate.average_repair);
 }
 
 void PointPolicyParity(mfem::ParFiniteElementSpace& fes, bool gll)
@@ -383,10 +415,10 @@ void PointPolicyParity(mfem::ParFiniteElementSpace& fes, bool gll)
     const bool vtk = policy == 1;
     const bool expected_active = gll || consumer || vtk;
     mfem::ZhangShuLimiterElementDiagnostics reference_diagnostics;
-    for (int cooperative = 0; cooperative <= 1; ++cooperative)
+    bool have_reference = false;
+    for (const auto& variant : kLimiterVariants)
     {
-      MFEM_VERIFY(setenv("IGRLAB_LIMITER_COOPERATIVE", cooperative ? "1" : "0", 1) == 0,
-                  "Cannot select p5 limiter point-policy implementation.");
+      SelectVariant(variant);
       Reset(initial, state);
       bool modified = false;
       mfem::ZhangShuLimiterElementDiagnostics diagnostics;
@@ -406,16 +438,16 @@ void PointPolicyParity(mfem::ParFiniteElementSpace& fes, bool gll)
                                 initial.Size() * sizeof(double)) == 0,
                     "Quadrature-only GL p5 policy unexpectedly changed FE nodes.");
       }
-      if (cooperative == 0)
+      if (!have_reference)
       {
         reference = state;
         reference_diagnostics = diagnostics;
+        have_reference = true;
       }
       else
       {
         CompareVector(reference, state);
-        CompareVector(reference_diagnostics.theta_rho, diagnostics.theta_rho);
-        CompareVector(reference_diagnostics.theta_p, diagnostics.theta_p);
+        CompareDiagnostics(reference_diagnostics, diagnostics);
       }
     }
   }
@@ -435,6 +467,8 @@ void Correctness(bool gll)
   mfem::DG_FECollection fec(kOrder, kDim,
     gll ? mfem::BasisType::GaussLobatto : mfem::BasisType::GaussLegendre);
   mfem::ParFiniteElementSpace fes(&mesh, &fec, kNumEq, mfem::Ordering::byNODES);
+  MFEM_VERIFY(!gll || mfem::FaceQuadratureInterpolator::SupportsFESpace(fes),
+              "p5 GLL face parity fixture must admit MFEM face interpolation.");
   PointPolicyParity(fes, gll);
   mfem::ParGridFunction initial(&fes), state(&fes), reference(&fes);
   for (Case kind : {Case::Noop, Case::Density, Case::Pressure, Case::Sequential,
@@ -445,10 +479,10 @@ void Correctness(bool gll)
     const bool rejected = kind == Case::InvalidMean || kind == Case::NonfinitePressure;
     for (bool vtk_points : {false, true})
     {
-      for (int cooperative = 0; cooperative <= 1; ++cooperative)
+      bool have_reference = false;
+      for (const auto& variant : kLimiterVariants)
       {
-        MFEM_VERIFY(setenv("IGRLAB_LIMITER_COOPERATIVE", cooperative ? "1" : "0", 1) == 0,
-                    "Cannot select p5 limiter implementation.");
+        SelectVariant(variant);
         Reset(initial, state);
         mfem::ZhangShuLimiterElementDiagnostics diagnostics;
         bool modified = true;
@@ -478,18 +512,17 @@ void Correctness(bool gll)
         {
           MFEM_VERIFY(rejected_count == 0, "Admissible p5 fixture was rejected.");
           CheckAccepted(fes, initial, state, diagnostics, modified, kind, gll, vtk_points);
-          if (cooperative == 0)
-          {
-            reference = state;
-            reference_diagnostics = diagnostics;
-          }
-          else
-          {
-            CompareVector(reference, state);
-            CompareVector(reference_diagnostics.active, diagnostics.active);
-            CompareVector(reference_diagnostics.theta_rho, diagnostics.theta_rho);
-            CompareVector(reference_diagnostics.theta_p, diagnostics.theta_p);
-          }
+        }
+        if (!have_reference)
+        {
+          reference = state;
+          reference_diagnostics = diagnostics;
+          have_reference = true;
+        }
+        else
+        {
+          if (!rejected) { CompareVector(reference, state); }
+          CompareDiagnostics(reference_diagnostics, diagnostics);
         }
       }
     }
@@ -497,7 +530,7 @@ void Correctness(bool gll)
     {
       std::cout << "[PASS] p5 mapped-Q2 " << (gll ? "GLL" : "GL")
                 << " case=" << CaseName(kind)
-                << " serial/cooperative native points, mean, mutation and rejection\n";
+                << " serial/cooperative/fused-face native points, mean, mutation and rejection\n";
     }
   }
 }
@@ -601,12 +634,14 @@ void Benchmark(bool gll, Case kind, int nx, int calls)
   std::sort(wall.begin(), wall.end());
   std::sort(events.begin(), events.end());
   const char* variant = ::igrlab::GetEnv("DG_IGR_LIMITER_COOPERATIVE");
+  const char* fused_face = ::igrlab::GetEnv("DG_IGR_LIMITER_FUSED_FACE");
   std::cout << std::setprecision(17)
             << "[limiter-throughput] backend=" << (cuda ? "cuda" : "cpu")
             << " basis=" << (gll ? "GLL" : "GL") << " order=" << kOrder
             << " mesh=mapped-Q2 nx=" << nx << " ny=" << nx
             << " elements=" << fes.GetNE() << " case=" << CaseName(kind)
             << " cooperative=" << (variant ? variant : "default")
+            << " fused_face_requested=" << (fused_face ? fused_face : "default")
             << " rho_min=" << kRhoMin << " p_min=" << kPressureMin
             << " bisections=" << kBisectionIterations
             << " volume_order=" << kQuadratureOrder << " face_orders=12,11"
@@ -644,6 +679,10 @@ int main(int argc, char** argv)
               argc > 6 ? std::stoi(argv[6]) : 30);
     return 0;
   }
+  // Correctness must actually select the admitted GLL face path regardless of
+  // an inherited optimization-off environment. Benchmark settings are retained.
+  MFEM_VERIFY(setenv("IGRLAB_LIMITER_MFEM_FACE_QI", "1", 1) == 0,
+              "Cannot enable MFEM face interpolation for parity checks.");
   Correctness(false);
   Correctness(true);
   return 0;

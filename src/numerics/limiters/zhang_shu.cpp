@@ -113,6 +113,7 @@ struct DeviceLimiterCache
   bool shared_reference_points = false;
   bool mfem_volume_points = false;
   bool mfem_face_points = false;
+  bool fused_face_points = false;
   bool enforce_nodes = false;
   bool enforce_vtk_points = false;
   std::vector<int> face_qords;
@@ -154,6 +155,11 @@ struct DeviceLimiterCache
   const mfem::Operator* boundary_face_restriction = nullptr;
   std::vector<const mfem::FaceQuadratureInterpolator*> interior_face_qi;
   std::vector<const mfem::FaceQuadratureInterpolator*> boundary_face_qi;
+  std::vector<const mfem::DofToQuad*> face_value_maps;
+  const mfem::Operator* interior_vector_face_restriction = nullptr;
+  const mfem::Operator* boundary_vector_face_restriction = nullptr;
+  mfem::Vector interior_vector_face_evec;
+  mfem::Vector boundary_vector_face_evec;
   std::vector<FaceCopyPlan> interior_side0_plans;
   std::vector<FaceCopyPlan> interior_side1_plans;
   std::vector<FaceCopyPlan> boundary_plans;
@@ -1096,6 +1102,51 @@ struct CooperativeZhangShuQuadKernel
   }
 };
 
+void InterpolateVectorFaceValuesToElementMajor(
+  const mfem::Vector& face_evec,
+  const mfem::DofToQuad& maps,
+  const DeviceLimiterCache::FaceCopyPlan& plan,
+  int side,
+  int sides,
+  int total_face_points,
+  mfem::Vector& element_major_values)
+{
+  if (plan.dst.Size() == 0) { return; }
+  constexpr int face_dof = CooperativeZhangShuQuadKernel::kD1D;
+  constexpr int num_eq = CooperativeZhangShuQuadKernel::kNumEq;
+  const int entries = plan.dst.Size();
+  const int nq = plan.nq;
+  const int* dst_index = plan.dst.Read();
+  const int* src_index = plan.src.Read();
+  const double* basis = maps.B.Read();
+  const double* src = face_evec.Read();
+  double* dst = element_major_values.ReadWrite();
+  mfem::forall(entries, [=] MFEM_HOST_DEVICE(int i)
+  {
+    const int q = src_index[i] % nq;
+    const int face = src_index[i] / nq;
+    // MFEM's vector face restriction has layout (dof,component,side,face).
+    // It supplies the same oriented scalar trace for every component.
+    const int face_base = face_dof * num_eq * (side + sides * face);
+    double value[num_eq] = {0.0, 0.0, 0.0, 0.0};
+    // Retain FaceQuadratureInterpolator::Eval2D's increasing-dof sum,
+    // including zero products and its initial positive zero. Only independent
+    // quadrature points/components are batched; no dot-product reduction moves.
+    for (int d = 0; d < face_dof; ++d)
+    {
+      const double b = basis[q + nq * d];
+      for (int c = 0; c < num_eq; ++c)
+      {
+        value[c] += b * src[face_base + d + face_dof * c];
+      }
+    }
+    for (int c = 0; c < num_eq; ++c)
+    {
+      dst[dst_index[i] + total_face_points * c] = value[c];
+    }
+  });
+}
+
 
 inline int NativeDof(const mfem::FiniteElement& fe, int lex_dof)
 {
@@ -1230,12 +1281,38 @@ DeviceLimiterCache& GetDeviceLimiterCache(
      l2_fec->GetBasisType() == mfem::BasisType::GaussLobatto) ||
     consumer_points;
   const bool requested_enforce_vtk_points = enforce_vtk_points;
+  const bool cooperative_enabled =
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_COOPERATIVE", true);
   const bool requested_compact_reference_points =
     requested_mfem_volume_points && requested_mfem_face_points &&
     mesh.Dimension() == 2 && dof == CooperativeZhangShuQuadKernel::kDof &&
     ne > 0 && vfes.GetFE(0)->GetOrder() + 1 ==
       CooperativeZhangShuQuadKernel::kD1D &&
-    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_COOPERATIVE", true);
+    cooperative_enabled;
+  bool requested_fused_face_points =
+    requested_mfem_face_points && requested_collocated_lgl_average &&
+    !mesh.Nonconforming() && mesh.Dimension() == 2 &&
+    dof == CooperativeZhangShuQuadKernel::kDof &&
+    num_eq == CooperativeZhangShuQuadKernel::kNumEq &&
+    vfes.GetFE(0)->GetOrder() + 1 == CooperativeZhangShuQuadKernel::kD1D &&
+    mesh.GetElementGeometry(0) == mfem::Geometry::SQUARE &&
+    cooperative_enabled &&
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_FUSED_FACE", true);
+  if (requested_fused_face_points)
+  {
+    // Retain the existing scalar FaceQI rule bound as well as its point set.
+    // Unsupported rules and layouts continue through the original path.
+    for (int face_qord : face_qords)
+    {
+      const auto& rule =
+        mfem::IntRules.Get(mesh.GetTypicalFaceGeometry(), face_qord);
+      if (rule.GetNPoints() > 10)
+      {
+        requested_fused_face_points = false;
+        break;
+      }
+    }
+  }
   const mfem::QuadratureInterpolator* current_volume_interpolator = nullptr;
   int current_volume_nq = 0;
   if (requested_mfem_volume_points)
@@ -1259,6 +1336,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
       requested_collocated_lgl_average ||
     cache_ptr->mfem_volume_points != requested_mfem_volume_points ||
     cache_ptr->mfem_face_points != requested_mfem_face_points ||
+    cache_ptr->fused_face_points != requested_fused_face_points ||
     cache_ptr->enforce_nodes != requested_enforce_nodes ||
     cache_ptr->enforce_vtk_points != requested_enforce_vtk_points ||
     cache_ptr->compact_reference_requested != requested_compact_reference_points;
@@ -1292,6 +1370,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
 
   cache.mfem_volume_points = requested_mfem_volume_points;
   cache.mfem_face_points = requested_mfem_face_points;
+  cache.fused_face_points = requested_fused_face_points;
   cache.enforce_nodes = requested_enforce_nodes;
   cache.enforce_vtk_points = requested_enforce_vtk_points;
   cache.compact_reference_requested = requested_compact_reference_points;
@@ -1340,6 +1419,23 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     MFEM_VERIFY(cache.interior_face_restriction != nullptr &&
                   cache.boundary_face_restriction != nullptr,
                 "Device positivity limiter requires face restrictions.");
+    if (cache.fused_face_points)
+    {
+      cache.interior_vector_face_restriction = vfes.GetFaceRestriction(
+        mfem::ElementDofOrdering::LEXICOGRAPHIC,
+        mfem::FaceType::Interior, mfem::L2FaceValues::DoubleValued);
+      cache.boundary_vector_face_restriction = vfes.GetFaceRestriction(
+        mfem::ElementDofOrdering::LEXICOGRAPHIC,
+        mfem::FaceType::Boundary, mfem::L2FaceValues::SingleValued);
+      MFEM_VERIFY(cache.interior_vector_face_restriction != nullptr &&
+                    cache.boundary_vector_face_restriction != nullptr &&
+                    cache.interior_vector_face_restriction->Height() ==
+                      num_eq * cache.interior_face_restriction->Height() &&
+                    cache.boundary_vector_face_restriction->Height() ==
+                      num_eq * cache.boundary_face_restriction->Height(),
+                  "Batched limiter face restrictions have unexpected layouts.");
+      cache.face_value_maps.resize(face_qords.size(), nullptr);
+    }
     cache.interior_face_qi.resize(face_qords.size(), nullptr);
     cache.boundary_face_qi.resize(face_qords.size(), nullptr);
     cache.interior_side0_plans.resize(face_qords.size());
@@ -1349,6 +1445,17 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     {
       const mfem::IntegrationRule& face_rule =
         mfem::IntRules.Get(mesh.GetTypicalFaceGeometry(), face_qords[qi]);
+      if (cache.fused_face_points)
+      {
+        const auto& maps =
+          cache.face_scalar_fes->GetTypicalTraceElement()->GetDofToQuad(
+            face_rule, mfem::DofToQuad::TENSOR);
+        MFEM_VERIFY(maps.ndof == CooperativeZhangShuQuadKernel::kD1D &&
+                      maps.nqpt == face_rule.GetNPoints() &&
+                      maps.B.Size() == maps.ndof * maps.nqpt,
+                    "Batched limiter face basis has an unexpected layout.");
+        cache.face_value_maps[qi] = &maps;
+      }
       cache.interior_face_qi[qi] =
         cache.face_scalar_fes->GetFaceQuadratureInterpolator(
           face_rule, mfem::FaceType::Interior);
@@ -1625,7 +1732,14 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.rejected_element.SetSize(ne);
   cache.collapsed_average.SetSize(ne);
   cache.average_repair.SetSize(ne * num_eq);
-  if (cache.mfem_face_points)
+  if (cache.fused_face_points)
+  {
+    cache.interior_vector_face_evec.SetSize(
+      cache.interior_vector_face_restriction->Height());
+    cache.boundary_vector_face_evec.SetSize(
+      cache.boundary_vector_face_restriction->Height());
+  }
+  if (cache.mfem_face_points && !cache.fused_face_points)
   {
     cache.face_component_lvec.SetSize(vfes.GetNDofs());
     cache.interior_face_double.SetSize(cache.interior_face_restriction
@@ -1673,6 +1787,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.interior_face_side1.UseDevice(true);
   cache.boundary_face_evec.UseDevice(true);
   cache.face_q_values.UseDevice(true);
+  cache.interior_vector_face_evec.UseDevice(true);
+  cache.boundary_vector_face_evec.UseDevice(true);
   return cache;
 }
 
@@ -1691,6 +1807,38 @@ void PopulateMfemFaceLimiterValues(const mfem::ParFiniteElementSpace& vfes,
     cache.ne > 0 ? cache.face_point_offsets[cache.ne] : 0;
   if (total_face_points <= 0)
   {
+    return;
+  }
+
+  if (cache.fused_face_points)
+  {
+    if (cache.interior_faces > 0)
+    {
+      cache.interior_vector_face_restriction->Mult(
+        U, cache.interior_vector_face_evec);
+    }
+    if (cache.boundary_faces > 0)
+    {
+      cache.boundary_vector_face_restriction->Mult(
+        U, cache.boundary_vector_face_evec);
+    }
+    // Every destination is appended once to exactly one existing copy plan.
+    // The kernels overwrite all four components, so no zero-fill is needed.
+    // Mark device output before partial writes to avoid a cold host upload.
+    cache.face_values.Write();
+    for (std::size_t qi = 0; qi < cache.face_value_maps.size(); ++qi)
+    {
+      const auto& maps = *cache.face_value_maps[qi];
+      InterpolateVectorFaceValuesToElementMajor(
+        cache.interior_vector_face_evec, maps, cache.interior_side0_plans[qi],
+        0, 2, total_face_points, cache.face_values);
+      InterpolateVectorFaceValuesToElementMajor(
+        cache.interior_vector_face_evec, maps, cache.interior_side1_plans[qi],
+        1, 2, total_face_points, cache.face_values);
+      InterpolateVectorFaceValuesToElementMajor(
+        cache.boundary_vector_face_evec, maps, cache.boundary_plans[qi],
+        0, 1, total_face_points, cache.face_values);
+    }
     return;
   }
 
