@@ -58,3 +58,26 @@ All large fields and profiler data remain on DeltaAI. Field analysis uses a
 prebuilt ARM VTK wheel unpacked into job-local temporary storage; only compact
 metrics and selected render images return to the local machine. Runtime/build
 scratch is cleaned, while installed application dependencies are reused.
+
+
+## Fixed-large short trajectory
+
+DeltaAI job **3446717** completed three fresh same-binary runs on the same
+GH200, each reaching t=0.0025 in 162 steps on the 512² Q2-mapped p5 GLL case.
+The converged reference uses FP64 FGMRES/two-level preconditioning and
+RHS-relative tolerance 1e-6. Both fixed arms use projected FP64 WMMA, 50/2
+corrections at omega=0.7; only coefficient/face refresh, direct state and VTK
+execution differ between them.
+
+Remote native-VTK Q2/Q5 comparison at GL8×8 gives maximum conserved relative
+L2 difference **2.875811589e-8** between the converged and fixed baselines.
+Sigma differs by **0.2302145822 relative L2 (23.02%)** and is reported separately
+from the flow budget. The two fixed arms have zero measured conserved/sigma
+field differences; file hashes differ because writer metadata also differs.
+Final sampled density, pressure and q_sigma checks pass. This is short-horizon
+correctness evidence, not full-time stability or a performance claim.
+
+The [compact pilot record](benchmarks/dgsem_mapped_short_validation.json) retains
+raw timing scopes and the exact receipt hashes. All comparison work ran on
+DeltaAI with prebuilt VTK 9.7.1 in job `/tmp`; all short-run snapshots were
+removed after qualification. No large field was downloaded to WSL.
