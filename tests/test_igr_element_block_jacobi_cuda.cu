@@ -1004,13 +1004,14 @@ void CheckDGSEMMappedFixedLifecycle()
             << "rhs_relative_max=" << max_rhs_error << " cfl_relative_error=" << max_speed_error << '\n';
 }
 
-void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
+void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
+                                  const char* execution = "simt-fp64")
 {
   LifecycleEnvironment environment;
   const std::pair<const char*, const char*> settings[] = {
     {"IGRLAB_IGR_TRUE_RESIDUAL", "0"},
     {"IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", "projected"},
-    {"IGRLAB_IGR_LOCAL_TENSOR_EXECUTION", "simt-fp64"},
+    {"IGRLAB_IGR_LOCAL_TENSOR_EXECUTION", execution},
     {"IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor"},
     {"IGRLAB_IGR_STAGE_STATE_DIRECT", "1"},
     {"IGRLAB_IGR_TENSOR_VOLUME_COMPACT", "1"},
@@ -1054,15 +1055,16 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
   struct Scenario
   {
     bool warm, prefetch, entry_mutation, output, terminal;
+    int rejections = 1;
   };
   const Scenario scenarios[] = {
     {false, false, false, false, false},
     {true, false, false, true, false},
     {false, true, false, false, false},
-    {true, true, false, true, false},
+    {true, true, false, true, false, 2},
     {false, true, false, true, false},
     {false, false, true, false, false},
-    {false, true, true, false, false},
+    {false, true, true, false, false, 2},
     {false, true, false, false, true}};
   struct Result
   {
@@ -1080,6 +1082,14 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
 
   for (const auto& scenario : scenarios)
   {
+    // Cover the production WMMA factor path with three bounded cases: a
+    // repeated warm retry, output before initialization, and repeated entry
+    // mutation. The complete policy/scenario matrix remains on portable SIMT.
+    if (std::strcmp(execution, "wmma-factor-fp64") == 0 &&
+        !(scenario.prefetch && (scenario.warm || scenario.output || scenario.entry_mutation)))
+    {
+      continue;
+    }
     const auto run = [&](bool reject)
     {
       int phase = 0;
@@ -1122,7 +1132,36 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
       stepper.LimitInitial(scenario.entry_mutation);
       bool force_failure = false;
       int callback = 0;
+      int rejection_index = 0;
       std::vector<int> sweeps;
+      std::vector<int> solves;
+      int previous_calls = solver.GetLinearSolveCalls();
+      int previous_iterations = solver.GetTotalLinearIterations();
+      bool check_prefetched_sigma = false;
+      Vector expected_stage0_sigma;
+      const auto reset_observations = [&]()
+      {
+        callback = 0; sweeps.clear(); solves.clear();
+        previous_calls = solver.GetLinearSolveCalls();
+        previous_iterations = solver.GetTotalLinearIterations();
+      };
+      const auto context = [&]()
+      {
+        std::ostringstream os;
+        os << "backend=" << (dgsem ? "dgsem" : "dg") << " blocks=" << block_policy
+           << " execution=" << execution << " warm=" << scenario.warm
+           << " prefetch=" << scenario.prefetch << " entry_mutation=" << scenario.entry_mutation
+           << " output=" << scenario.output << " terminal=" << scenario.terminal
+           << " reject=" << reject << " rejection_index=" << rejection_index
+           << " total_calls=" << solver.GetLinearSolveCalls()
+           << " total_iterations=" << solver.GetTotalLinearIterations()
+           << " output_iterations=" << solver.GetOutputOnlyLinearIterations()
+           << " last_solve_iterations=" << solver.GetLastLinearIters()
+           << " stage_work=(solves,iterations)";
+        for (std::size_t i = 0; i < sweeps.size(); ++i)
+        { os << " (" << solves[i] << ',' << sweeps[i] << ')'; }
+        return os.str();
+      };
       stepper.AddAlwaysCallback([&](ParFiniteElementSpace&, ParGridFunction& stage, double)
       {
         ++callback;
@@ -1131,11 +1170,19 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
           // Model an earlier limiter that changes the entry state. The failed
           // attempt deliberately chooses a different reference coefficient
           // from the accepted retry, exposing leaked first-initialization data.
-          phase = force_failure ? 4 : 2;
+          phase = force_failure ? 4+rejection_index : 2;
           stage.ProjectCoefficient(initial);
           return;
         }
-        sweeps.push_back(solver.GetLastLinearIters());
+        solves.push_back(solver.GetLinearSolveCalls() - previous_calls);
+        sweeps.push_back(solver.GetTotalLinearIterations() - previous_iterations);
+        previous_calls = solver.GetLinearSolveCalls();
+        previous_iterations = solver.GetTotalLinearIterations();
+        if (check_prefetched_sigma && sweeps.size() == 1)
+        {
+          MFEM_VERIFY(same(solver.GetSigma(), expected_stage0_sigma),
+                      "Stage zero changed the consumed prefetched sigma: " << context());
+        }
         if (force_failure && sweeps.size() == 2)
         {
           // The real Zhang-Shu gate below rejects these negative means after
@@ -1170,12 +1217,13 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
                       solver.HasPendingStage0PrefetchAccounting(),
                     "Rollback fixture did not initialize its stage-zero prefetch.");
       }
-      if (reject)
+      for (rejection_index = 0; reject && rejection_index < scenario.rejections;
+           ++rejection_index)
       {
         Vector accepted(state), accepted_sigma(solver.GetSigma());
         const double accepted_time = time;
-        callback = 0; sweeps.clear(); force_failure = true;
-        dt = 2.e-5;
+        reset_observations(); force_failure = true;
+        dt = std::ldexp(1.e-5, scenario.rejections-rejection_index);
         bool rejected = false;
         try { stepper.Step(state, time, dt); }
         catch (const mfem::RecoverableLimiterFailure& failure)
@@ -1183,47 +1231,64 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
           rejected = failure.GlobalRejectedElementCount() == mesh.GetNE();
         }
         MFEM_VERIFY(rejected && sweeps.size() == 2,
-                    "Rollback fixture did not force the intended late Zhang-Shu rejection.");
+                    "Rollback fixture did not force the intended late Zhang-Shu rejection: " << context());
         state = accepted;
         time = accepted_time;
         stepper.RestoreStateGeneration(generation);
         const int calls = solver.GetLinearSolveCalls();
-        wrapped.AbortRKStep(state, time, generation, scenario.terminal ? 0.0 : 1.e-5);
+        wrapped.AbortRKStep(state, time, generation, scenario.terminal ? 0.0 : .5*dt);
         MFEM_VERIFY(solver.GetLinearSolveCalls() == calls &&
                       same(solver.GetSigma(), accepted_sigma) &&
                       solver.HasPendingStage0PrefetchAccounting() ==
                         (scenario.prefetch && !scenario.terminal),
-                    "Fixed rollback changed the accepted sigma/prefetch or performed an extra solve.");
+                    "Fixed rollback changed the accepted sigma/prefetch or performed an extra solve: " << context());
         if (scenario.entry_mutation && scenario.prefetch)
         {
           MFEM_VERIFY(solver.GetOutputOnlyLinearIterations() == 0 &&
                         wrapped.GetSigmaPrefetchInvalidationCount() == 0 &&
                         wrapped.GetSigmaOutputOnlySolveCount() == 0,
-                      "Restoring an entry-invalidated prefetch retained output-only accounting.");
+                      "Restoring an entry-invalidated prefetch retained output-only accounting: " << context());
         }
       }
-      callback = 0; sweeps.clear(); force_failure = false;
+      reset_observations(); force_failure = false;
+      check_prefetched_sigma = solver.HasPendingStage0PrefetchAccounting() &&
+        !scenario.entry_mutation;
+      if (check_prefetched_sigma) { expected_stage0_sigma = solver.GetSigma(); }
       dt = 1.e-5;
       stepper.Step(state, time, dt);
+      // Consuming a restored prefetch performs no solve. GetLastLinearIters()
+      // can still describe a solve from the failed attempt, so verify measured
+      // work deltas at each RHS rather than interpreting that diagnostic as
+      // new work by the current stage.
       MFEM_VERIFY(sweeps.size() == 3 &&
-                    sweeps[0] == (scenario.warm ? 2 : 50) &&
-                    sweeps[1] == 2 && sweeps[2] == 2 &&
+                    solves[0] == (check_prefetched_sigma ? 0 : 1) &&
+                    sweeps[0] == (check_prefetched_sigma ? 0 : (scenario.warm ? 2 : 50)) &&
+                    solves[1] == 1 && sweeps[1] == 2 &&
+                    solves[2] == 1 && sweeps[2] == 2 &&
                     !solver.GetLastLinearConverged() &&
                     !solver.HasPendingStage0PrefetchAccounting(),
-                  "Accepted retry changed the initialization/regular sweep budget or certificate.");
+                  "Accepted retry changed the initialization/regular sweep budget or certificate: " << context());
       // A subsequent accepted step witnesses the retained reference factors
       // and proves accept releases the transaction for another begin.
-      callback = 0; sweeps.clear();
+      reset_observations(); check_prefetched_sigma = false;
       stepper.Step(state, time, dt);
-      MFEM_VERIFY(sweeps.size() == 3 && sweeps[0] == 2 &&
-                    sweeps[1] == 2 && sweeps[2] == 2,
-                  "Accepted fixed history was not retained for the following step.");
+      MFEM_VERIFY(sweeps.size() == 3 &&
+                    solves[0] == 1 && sweeps[0] == 2 &&
+                    solves[1] == 1 && sweeps[1] == 2 &&
+                    solves[2] == 1 && sweeps[2] == 2,
+                  "Accepted fixed history was not retained for the following step: " << context());
       if (dgsem)
       {
         const auto selection = base.GetDGSEMProductionSelection();
         MFEM_VERIFY(selection.supported && selection.strict && selection.uses_sigma &&
                       base.GetDGSEMProductionBridgeEvidence().fallback_mult_calls == 0,
                     "Rollback fixture left the native packed DGSEM sigma path.");
+      }
+      if (config.element_jacobi_tensor_blocks)
+      {
+        MFEM_VERIFY(solver.GetLastPrecondName() ==
+                      std::string("tensor-element-projected-")+execution,
+                    "Rollback fixture changed the requested tensor factor backend: " << context());
       }
       Result result;
       result.state = state; result.sigma = solver.GetSigma();
@@ -1236,13 +1301,25 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
     const auto retried = run(true);
     MFEM_VERIFY(same(clean.state, retried.state) && same(clean.sigma, retried.sigma) &&
                   retried.iterations > clean.iterations,
-                "Rejected fixed closure history changed the accepted retry state/sigma or hid rejected work.");
+                "Rejected fixed closure history changed the accepted retry state/sigma or hid rejected work: "
+                  << "backend=" << (dgsem ? "dgsem" : "dg") << " blocks=" << block_policy
+                  << " execution=" << execution << " warm=" << scenario.warm
+                  << " prefetch=" << scenario.prefetch << " entry_mutation=" << scenario.entry_mutation
+                  << " output=" << scenario.output << " terminal=" << scenario.terminal
+                  << " rejections=" << scenario.rejections
+                  << " state_equal=" << same(clean.state, retried.state)
+                  << " sigma_equal=" << same(clean.sigma, retried.sigma)
+                  << " clean_iterations=" << clean.iterations
+                  << " retried_iterations=" << retried.iterations);
     if (scenario.prefetch && !scenario.entry_mutation && !scenario.terminal)
     {
-      MFEM_VERIFY(clean.reuses == 1 && retried.reuses == 2 &&
+      MFEM_VERIFY(clean.reuses == 1 && retried.reuses == 1+scenario.rejections &&
                     clean.iterations == (scenario.warm ? 66 : 60) &&
-                    retried.iterations == clean.iterations + 2,
-                  "Restored stage-zero prefetch was recomputed or counted twice.");
+                    retried.iterations == clean.iterations + 2*scenario.rejections,
+                  "Restored stage-zero prefetch was recomputed or counted twice: clean_reuses="
+                    << clean.reuses << " retried_reuses=" << retried.reuses
+                    << " clean_iterations=" << clean.iterations
+                    << " retried_iterations=" << retried.iterations);
     }
     if (scenario.output)
     {
@@ -1252,9 +1329,11 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
     }
     std::cout << "fixed_positivity_rollback passed backend=" << (dgsem ? "dgsem" : "dg")
               << " basis=" << (dgsem ? "gll" : "gl") << " geometry=q2 p=5 blocks=" << block_policy
+              << " execution=" << execution
               << " warm=" << scenario.warm << " prefetch=" << scenario.prefetch
               << " entry_mutation=" << scenario.entry_mutation << " output=" << scenario.output
               << " terminal=" << scenario.terminal
+              << " rejections=" << scenario.rejections
               << " accepted_state=bitwise accepted_sigma=bitwise abort_solves=0 "
                  "initial_sweeps=50 regular_sweeps=2 rejected_work=retained\n";
   }
@@ -1282,6 +1361,15 @@ int main(int argc, char** argv)
       CheckFixedPositivityRollback(false, "reference");
     }
     CheckFixedPositivityRollback(rollback_dgsem, "tensor");
+    int current_device = 0;
+    cudaDeviceProp properties{};
+    MFEM_VERIFY(cudaGetDevice(&current_device) == cudaSuccess &&
+                  cudaGetDeviceProperties(&properties, current_device) == cudaSuccess,
+                "Could not inspect the CUDA device for WMMA rollback qualification.");
+    if (properties.major >= 8)
+    {
+      CheckFixedPositivityRollback(rollback_dgsem, "tensor", "wmma-factor-fp64");
+    }
     return 0;
   }
   if (gll_only)

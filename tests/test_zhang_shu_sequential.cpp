@@ -45,12 +45,18 @@ void CurveMesh(mfem::Mesh& mesh)
   }
 }
 
-void CurveDGSEMMesh(mfem::Mesh& mesh)
+void CurveDGSEMMesh(mfem::Mesh& mesh, int solution_order)
 {
-  // Use two independent polynomial perturbations so the metric determinant is
-  // not integrated exactly by the p+1 point GLL rule accidentally.  The
-  // boundary remains fixed and the modest amplitudes keep the map regular.
-  mesh.SetCurvature(3, false, kDim, mfem::Ordering::byNODES);
+  // The p5 corner polynomial times the original cubic map's Jacobian is
+  // integrated exactly by its six-point GLL rule. Use a quartic map for that
+  // case so its discrete mass mean differs from the consistent integral and
+  // this conservation oracle still distinguishes the two contraction centers.
+  // Retain the original cubic fixture for p1--3. Every perturbation vanishes
+  // on the boundary, and the modest amplitudes keep both maps regular.
+  const bool quartic_map = solution_order >= 5;
+  const double quartic_factor = quartic_map ? 0.5 : 0.0;
+  mesh.SetCurvature(quartic_map ? 4 : 3,
+                     false, kDim, mfem::Ordering::byNODES);
   mfem::GridFunction* nodes = mesh.GetNodes();
   MFEM_VERIFY(nodes != nullptr,
               "Curved DGSEM limiter test requires mesh nodes.");
@@ -61,9 +67,11 @@ void CurveDGSEMMesh(mfem::Mesh& mesh)
     const double x = coordinates[i];
     const double y = coordinates[i + ndofs];
     const double bubble = x * (1.0 - x) * y * (1.0 - y);
-    coordinates[i] = x + 0.45 * bubble * (1.0 + 0.5 * x);
+    coordinates[i] =
+      x + 0.45 * bubble * (1.0 + 0.5 * x + quartic_factor * x * x);
     coordinates[i + ndofs] =
-      y - 0.35 * bubble * (1.0 + 0.3 * x + 0.4 * y);
+      y - 0.35 * bubble *
+            (1.0 + 0.3 * x + 0.4 * y + quartic_factor * y * y);
   }
 }
 
@@ -371,7 +379,7 @@ int CurvedDGSEMConservationCase(int order)
 {
   mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
     1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
-  CurveDGSEMMesh(serial_mesh);
+  CurveDGSEMMesh(serial_mesh, order);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
   mfem::DG_FECollection fec(order,
                             kDim,
