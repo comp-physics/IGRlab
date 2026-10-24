@@ -11,8 +11,10 @@
 #include "mfem.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -1069,6 +1071,7 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
   struct Result
   {
     Vector state, sigma;
+    std::vector<Vector> stage_states, stage_sigmas;
     int iterations = 0;
     int output_iterations = 0;
     long long reuses = 0;
@@ -1078,6 +1081,70 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
     return a.Size() == b.Size() &&
       std::memcmp(a.HostRead(), b.HostRead(),
                   std::size_t(a.Size())*sizeof(double)) == 0;
+  };
+  const auto report_difference = [&](const char* comparison, const char* field,
+                                      const Vector& a, const Vector& b, int stage)
+  {
+    MFEM_VERIFY(a.Size() == b.Size(), "Rollback comparison vector sizes differ.");
+    const double* left = a.HostRead();
+    const double* right = b.HostRead();
+    double maximum_absolute = 0.0, maximum_value = 0.0;
+    long double squared_difference = 0.0L;
+    std::uint64_t maximum_ulp = 0;
+    int mismatches = 0, first = -1;
+    for (int i = 0; i < a.Size(); ++i)
+    {
+      MFEM_VERIFY(std::isfinite(left[i]) && std::isfinite(right[i]),
+                  "Rollback comparison contains a nonfinite value.");
+      std::uint64_t left_bits = 0, right_bits = 0;
+      std::memcpy(&left_bits, left+i, sizeof(left_bits));
+      std::memcpy(&right_bits, right+i, sizeof(right_bits));
+      if (left_bits != right_bits)
+      {
+        ++mismatches;
+        if (first < 0) { first = i; }
+      }
+      const auto ordered = [](std::uint64_t bits)
+      {
+        constexpr std::uint64_t sign = std::uint64_t{1} << 63;
+        return bits & sign ? ~bits : bits | sign;
+      };
+      const std::uint64_t l = ordered(left_bits), r = ordered(right_bits);
+      maximum_ulp = std::max(maximum_ulp, l > r ? l-r : r-l);
+      const double difference = std::abs(left[i]-right[i]);
+      maximum_absolute = std::max(maximum_absolute, difference);
+      maximum_value = std::max({maximum_value, std::abs(left[i]), std::abs(right[i])});
+      const long double extended_difference =
+        static_cast<long double>(left[i])-right[i];
+      squared_difference += extended_difference*extended_difference;
+    }
+    std::cout << std::setprecision(17)
+              << "fixed_rollback_difference comparison=" << comparison << " field=" << field
+              << " backend=" << (dgsem ? "dgsem" : "dg") << " blocks=" << block_policy
+              << " execution=" << execution << " stage=" << stage
+              << " mismatches=" << mismatches << " max_absolute=" << maximum_absolute
+              << " relative_infinity=" << maximum_absolute/std::max(maximum_value, 1.e-300)
+              << " l2_difference=" << std::sqrt(static_cast<double>(squared_difference))
+              << " max_ulp=" << maximum_ulp << " first_index=" << first;
+    if (first >= 0) { std::cout << " first_left=" << left[first] << " first_right=" << right[first]; }
+    std::cout << std::endl;
+  };
+  const auto report_results = [&](const char* comparison, const Result& a, const Result& b)
+  {
+    report_difference(comparison, "state", a.state, b.state, -1);
+    report_difference(comparison, "sigma", a.sigma, b.sigma, -1);
+    MFEM_VERIFY(a.stage_sigmas.size() == b.stage_sigmas.size() &&
+                  a.stage_states.size() == b.stage_states.size(),
+                "Rollback accepted-stage observation counts differ.");
+    for (std::size_t stage = 0; stage < a.stage_sigmas.size(); ++stage)
+    {
+      if (!same(a.stage_sigmas[stage], b.stage_sigmas[stage]) ||
+          !same(a.stage_states[stage], b.stage_states[stage]))
+      {
+        report_difference(comparison, "rhs_state", a.stage_states[stage], b.stage_states[stage], int(stage));
+        report_difference(comparison, "rhs_sigma", a.stage_sigmas[stage], b.stage_sigmas[stage], int(stage));
+      }
+    }
   };
 
   for (const auto& scenario : scenarios)
@@ -1139,6 +1206,8 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
       int previous_iterations = solver.GetTotalLinearIterations();
       bool check_prefetched_sigma = false;
       Vector expected_stage0_sigma;
+      bool observe_accepted_stages = false;
+      std::vector<Vector> accepted_stage_states, accepted_stage_sigmas;
       const auto reset_observations = [&]()
       {
         callback = 0; sweeps.clear(); solves.clear();
@@ -1178,6 +1247,11 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
         sweeps.push_back(solver.GetTotalLinearIterations() - previous_iterations);
         previous_calls = solver.GetLinearSolveCalls();
         previous_iterations = solver.GetTotalLinearIterations();
+        if (observe_accepted_stages)
+        {
+          accepted_stage_states.emplace_back(stage);
+          accepted_stage_sigmas.emplace_back(solver.GetSigma());
+        }
         if (check_prefetched_sigma && sweeps.size() == 1)
         {
           MFEM_VERIFY(same(solver.GetSigma(), expected_stage0_sigma),
@@ -1251,6 +1325,7 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
         }
       }
       reset_observations(); force_failure = false;
+      observe_accepted_stages = true;
       check_prefetched_sigma = solver.HasPendingStage0PrefetchAccounting() &&
         !scenario.entry_mutation;
       if (check_prefetched_sigma) { expected_stage0_sigma = solver.GetSigma(); }
@@ -1292,6 +1367,8 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
       }
       Result result;
       result.state = state; result.sigma = solver.GetSigma();
+      result.stage_states = std::move(accepted_stage_states);
+      result.stage_sigmas = std::move(accepted_stage_sigmas);
       result.iterations = solver.GetProductionLinearIterations();
       result.output_iterations = solver.GetOutputOnlyLinearIterations();
       result.reuses = wrapped.GetSigmaStage0ReuseCount();
@@ -1299,8 +1376,25 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
     };
     const auto clean = run(false);
     const auto retried = run(true);
+    if (!same(clean.state, retried.state) || !same(clean.sigma, retried.sigma))
+    {
+      report_results("clean-vs-retry", clean, retried);
+    }
+    bool clean_repeats_bitwise = true;
+    if (std::strcmp(block_policy, "current") == 0 && !scenario.warm && !scenario.prefetch &&
+        !scenario.entry_mutation && !scenario.output && !scenario.terminal)
+    {
+      for (int repeat = 0; repeat < 4; ++repeat)
+      {
+        const auto independent = run(false);
+        const std::string comparison = "clean-vs-clean-"+std::to_string(repeat+1);
+        report_results(comparison.c_str(), clean, independent);
+        clean_repeats_bitwise = clean_repeats_bitwise &&
+          same(clean.state, independent.state) && same(clean.sigma, independent.sigma);
+      }
+    }
     MFEM_VERIFY(same(clean.state, retried.state) && same(clean.sigma, retried.sigma) &&
-                  retried.iterations > clean.iterations,
+                  clean_repeats_bitwise && retried.iterations > clean.iterations,
                 "Rejected fixed closure history changed the accepted retry state/sigma or hid rejected work: "
                   << "backend=" << (dgsem ? "dgsem" : "dg") << " blocks=" << block_policy
                   << " execution=" << execution << " warm=" << scenario.warm
@@ -1309,6 +1403,7 @@ void CheckFixedPositivityRollback(bool dgsem, const char* block_policy,
                   << " rejections=" << scenario.rejections
                   << " state_equal=" << same(clean.state, retried.state)
                   << " sigma_equal=" << same(clean.sigma, retried.sigma)
+                  << " clean_repeats_bitwise=" << clean_repeats_bitwise
                   << " clean_iterations=" << clean.iterations
                   << " retried_iterations=" << retried.iterations);
     if (scenario.prefetch && !scenario.entry_mutation && !scenario.terminal)
