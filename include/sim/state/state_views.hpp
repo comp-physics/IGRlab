@@ -19,6 +19,8 @@ namespace dg_sim
 struct EulerStateViews
 {
 private:
+  mfem::ParGridFunction& owner_;
+
   static mfem::real_t* ComponentData(mfem::ParGridFunction& state,
                                      const int offset) noexcept
   {
@@ -37,7 +39,8 @@ public:
                   mfem::ParFiniteElementSpace& dfes,
                   mfem::ParGridFunction& sol,
                   int dim)
-    : density(&fes, ComponentData(sol, 0)),
+    : owner_(sol),
+      density(&fes, ComponentData(sol, 0)),
       momentum(&dfes, ComponentData(sol, fes.GetNDofs())),
       momentum_x(&fes, ComponentData(sol, 1 * fes.GetNDofs())),
       momentum_y(&fes, ComponentData(sol, 2 * fes.GetNDofs())),
@@ -45,6 +48,11 @@ public:
   {
     MFEM_VERIFY(dim == 2, "EulerStateViews assumes a 2D Euler state layout.");
   }
+
+  // These output views borrow fixed offsets in the owner's host allocation.
+  // Reading a view cannot see that RK made the owner's device copy current.
+  // Refresh the owner before host output; never copy stale view data back to it.
+  void RefreshHost() const { (void)owner_.HostRead(); }
 };
 
 /**

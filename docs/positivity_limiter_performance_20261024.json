@@ -1,0 +1,659 @@
+{
+  "schema": "igrlab-positivity-limiter-results-v1",
+  "date": "2026-10-24",
+  "branch": "dg-positivity-throughput",
+  "tested_source": "30a472fdf7ee761724c56a72bacb005e782928dc",
+  "base_source": "706229fa23c34423a0e6226f905ea26b1da444c1",
+  "status": "native-and-performance-qualified",
+  "implementation": {
+    "cooperative": "One warp per p5 cell, shared state, serial-order means and per-point sums; unchanged density-then-pressure contraction and 12 bisections; combined admission/activity reduction and inactive-scatter avoidance.",
+    "gll_faces": "Vector face restrictions with batched interpolation/scatter; 65 face-phase launches become 8.",
+    "gl_reference": "Exact FE identity and x/y bit keys share rows. Logical point order/count remain unchanged. Failed factorization expands the exact dense fallback.",
+    "rollback": "Transactional fixed-sigma RK history, factors and prefetch restoration. Abort does no closure solve.",
+    "default_controls": {
+      "IGRLAB_LIMITER_COOPERATIVE": "1",
+      "IGRLAB_LIMITER_FUSED_FACE": "1",
+      "IGRLAB_LIMITER_REFERENCE_DEDUP": "1"
+    },
+    "precision": "Existing FP64 arithmetic/point sets; positivity kernels use ordinary CUDA, not TF32."
+  },
+  "scope": {
+    "fast_kernel": "2D p5 tensor quadrilaterals; other orders/dimensions retain the existing implementation.",
+    "gll_face_batch": "Rank-one conforming p5 GLL path; existing fallback otherwise.",
+    "gl_dedup": "Built-in VALUE-map p5 GL quads; actual transformed face coordinates, including qualified rotated/NC fixtures.",
+    "large_case": "One 512x512 mapped-Q2 Sedov case, 37748736 conserved DOFs, t=0..0.01; not a mesh study."
+  },
+  "native": {
+    "job": "3448740",
+    "tests": [
+      "dg_igr_euler_admissibility_cache_cpu",
+      "dg_igr_euler_admissibility_cache_cuda",
+      "dg_igr_modal_damping_cpu",
+      "dg_igr_modal_damping_cuda",
+      "dg_igr_explicit_ssprk_cpu",
+      "dg_igr_explicit_ssprk_cuda",
+      "dg_igr_zhang_shu_sequential_cpu",
+      "dg_igr_zhang_shu_sequential_cuda",
+      "dg_igr_zhang_shu_throughput_cpu",
+      "dg_igr_zhang_shu_throughput_cuda",
+      "dg_igr_limiter_device_alias_cuda",
+      "dg_igr_limiter_tests",
+      "dg_igr_igr_tests",
+      "dg_igr_time_defaults_tests",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_dgsem_mapped_fixed_cuda",
+      "dg_igr_fixed_positivity_rollback_dg_cuda",
+      "dg_igr_fixed_positivity_rollback_dgsem_cuda"
+    ],
+    "dependencies_unchanged": true,
+    "application_sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26",
+    "benchmark_sha256": "08a314948878a992eb13820927b9d4296a2b455ed343f3d46c353caef084a45e"
+  },
+  "final_window": {
+    "job": "3448830",
+    "node": "gh074",
+    "case_sha256": "54a74166ca27dca62518c0bcda18a2260cb19260fa99f6ef3f1556777cbe32d2",
+    "execution_context": {
+      "cuda_visible_devices": "0",
+      "one_sequential_allocation": true,
+      "application_gpu_uuid": "not recorded by application runner; native validation GPU is a separate context"
+    },
+    "workload": {
+      "elements": 262144,
+      "conserved_dofs": 37748736,
+      "scalar_dofs": 9437184,
+      "geometry_order": 2,
+      "order": 5
+    },
+    "arm_descriptions": {
+      "off": "Positivity disabled; same new application binary",
+      "cooperative-only": "Cooperative F7 execution path: face batching and exact reference-row dedup disabled; same new application binary",
+      "final": "Cooperative execution with fused face batch and exact reference-row dedup enabled; same new application binary"
+    },
+    "direct": {
+      "dg": {
+        "actual_rk_counts_equal": true,
+        "actual_sigma_work_equal": true,
+        "backend_dispatch_equal": true,
+        "cooperative_overhead": {
+          "reference_label": "off",
+          "candidate_label": "cooperative-only",
+          "advancing": {
+            "first_s": 29.941361636,
+            "second_s": 36.986042796,
+            "added_s": 7.04468116,
+            "second_over_first": 1.2352825915415224,
+            "added_percent": 23.52825915415224,
+            "first_over_second_speedup": 0.8095313629831772
+          },
+          "end_to_end": {
+            "first_s": 110.69552181195468,
+            "second_s": 158.10218124906532,
+            "added_s": 47.40665943711065,
+            "second_over_first": 1.4282617639911692,
+            "added_percent": 42.826176399116925,
+            "first_over_second_speedup": 0.7001517685424665
+          },
+          "host_bin_changes_s": {
+            "setup_initial_output_s": -0.6159253189999987,
+            "advancing_cfl_s": 7.04468116,
+            "scheduled_output_s": 0.0,
+            "diagnostics_s": -0.02480814599999999,
+            "final_output_postloop_s": -0.16557532100000216
+          },
+          "advancing_ns_per_conserved_dof_rhs_change": 0.09609697175825305
+        },
+        "final_overhead": {
+          "reference_label": "off",
+          "candidate_label": "final",
+          "advancing": {
+            "first_s": 29.941361636,
+            "second_s": 36.641363,
+            "added_s": 6.7000013639999985,
+            "second_over_first": 1.2237707638501067,
+            "added_percent": 22.377076385010675,
+            "first_over_second_speedup": 0.8171465028743609
+          },
+          "end_to_end": {
+            "first_s": 110.69552181195468,
+            "second_s": 125.91771420883015,
+            "added_s": 15.22219239687547,
+            "second_over_first": 1.1375140759780178,
+            "added_percent": 13.75140759780178,
+            "first_over_second_speedup": 0.8791100005863354
+          },
+          "host_bin_changes_s": {
+            "setup_initial_output_s": 0.6533169450000003,
+            "advancing_cfl_s": 6.7000013639999985,
+            "scheduled_output_s": 0.0,
+            "diagnostics_s": -0.007409083999999996,
+            "final_output_postloop_s": -0.5247747720000007
+          },
+          "advancing_ns_per_conserved_dof_rhs_change": 0.09139517136877279
+        },
+        "incremental_final_gain": {
+          "reference_label": "cooperative-only",
+          "candidate_label": "final",
+          "advancing": {
+            "first_s": 36.986042796,
+            "second_s": 36.641363,
+            "added_s": -0.3446797960000012,
+            "second_over_first": 0.9906808144385406,
+            "added_percent": -0.9319185561459387,
+            "first_over_second_speedup": 1.0094068497397326
+          },
+          "end_to_end": {
+            "first_s": 158.10218124906532,
+            "second_s": 125.91771420883015,
+            "added_s": -32.18446704023518,
+            "second_over_first": 0.7964324920379589,
+            "added_percent": -20.356750796204114,
+            "first_over_second_speedup": 1.255599200179717
+          },
+          "host_bin_changes_s": {
+            "setup_initial_output_s": 1.269242263999999,
+            "advancing_cfl_s": -0.3446797960000012,
+            "scheduled_output_s": 0.0,
+            "diagnostics_s": 0.017399061999999993,
+            "final_output_postloop_s": -0.3591994509999985
+          },
+          "advancing_ns_per_conserved_dof_rhs_change": -0.00470180038948026
+        }
+      },
+      "dgsem": {
+        "actual_rk_counts_equal": true,
+        "actual_sigma_work_equal": true,
+        "backend_dispatch_equal": true,
+        "cooperative_overhead": {
+          "reference_label": "off",
+          "candidate_label": "cooperative-only",
+          "advancing": {
+            "first_s": 23.652474706,
+            "second_s": 33.528987656,
+            "added_s": 9.876512949999999,
+            "second_over_first": 1.4175678474563422,
+            "added_percent": 41.75678474563422,
+            "first_over_second_speedup": 0.7054336071422485
+          },
+          "end_to_end": {
+            "first_s": 100.75020108604804,
+            "second_s": 112.76895265094936,
+            "added_s": 12.018751564901322,
+            "second_over_first": 1.1192925814077177,
+            "added_percent": 11.92925814077177,
+            "first_over_second_speedup": 0.8934214490569702
+          },
+          "host_bin_changes_s": {
+            "setup_initial_output_s": -0.6088922580000045,
+            "advancing_cfl_s": 9.876512949999999,
+            "scheduled_output_s": 0.0,
+            "diagnostics_s": -0.013242098999999993,
+            "final_output_postloop_s": -0.15653308800000332
+          },
+          "advancing_ns_per_conserved_dof_rhs_change": 0.1347261805708423
+        },
+        "final_overhead": {
+          "reference_label": "off",
+          "candidate_label": "final",
+          "advancing": {
+            "first_s": 23.652474706,
+            "second_s": 30.577747122,
+            "added_s": 6.925272416000002,
+            "second_over_first": 1.2927927205115348,
+            "added_percent": 29.279272051153484,
+            "first_over_second_speedup": 0.7735192070112509
+          },
+          "end_to_end": {
+            "first_s": 100.75020108604804,
+            "second_s": 109.73674686299637,
+            "added_s": 8.986545776948333,
+            "second_over_first": 1.089196306112314,
+            "added_percent": 8.9196306112314,
+            "first_over_second_speedup": 0.918108144866297
+          },
+          "host_bin_changes_s": {
+            "setup_initial_output_s": -0.4679090420000023,
+            "advancing_cfl_s": 6.925272416000002,
+            "scheduled_output_s": 0.0,
+            "diagnostics_s": -0.005016460999999986,
+            "final_output_postloop_s": -0.10876796000000155
+          },
+          "advancing_ns_per_conserved_dof_rhs_change": 0.09446810901212754
+        },
+        "incremental_final_gain": {
+          "reference_label": "cooperative-only",
+          "candidate_label": "final",
+          "advancing": {
+            "first_s": 33.528987656,
+            "second_s": 30.577747122,
+            "added_s": -2.9512405339999965,
+            "second_over_first": 0.9119794321176925,
+            "added_percent": -8.80205678823075,
+            "first_over_second_speedup": 1.0965159572490757
+          },
+          "end_to_end": {
+            "first_s": 112.76895265094936,
+            "second_s": 109.73674686299637,
+            "added_s": -3.0322057879529893,
+            "second_over_first": 0.9731113421143629,
+            "added_percent": -2.68886578856371,
+            "first_over_second_speedup": 1.0276316354788486
+          },
+          "host_bin_changes_s": {
+            "setup_initial_output_s": 0.1409832160000022,
+            "advancing_cfl_s": -2.9512405339999965,
+            "scheduled_output_s": 0.0,
+            "diagnostics_s": 0.008225638000000007,
+            "final_output_postloop_s": 0.047765128000001766
+          },
+          "advancing_ns_per_conserved_dof_rhs_change": -0.04025807155871475
+        }
+      }
+    }
+  },
+  "microbenchmarks": {
+    "warmups": 4,
+    "timed_calls": 30,
+    "paired_final_round": {
+      "dg/noop": {
+        "active_elements": 0,
+        "cooperative_only": {
+          "cold_wall_ms": 41795.528718,
+          "cold_event_ms": 41796.65234375,
+          "mean_wall_ms": 3.563495833333333,
+          "median_wall_ms": 3.561254,
+          "mean_event_ms": 3.5581056038538614,
+          "median_event_ms": 3.555999994277954
+        },
+        "final": {
+          "cold_wall_ms": 9481.161007,
+          "cold_event_ms": 9481.4072265625,
+          "mean_wall_ms": 3.3591745666666664,
+          "median_wall_ms": 3.356427,
+          "mean_event_ms": 3.353492291768392,
+          "median_event_ms": 3.350752115249634
+        },
+        "cold_wall_speedup": 4.4082711692315,
+        "warm_median_wall_speedup": 1.0610253105460061,
+        "warm_median_event_speedup": 1.0612542712706843,
+        "warm_median_wall_ns_per_conserved_dof": {
+          "cooperative-only": 0.09434101316663954,
+          "final": 0.08891495068868001
+        }
+      },
+      "dg/fully-active": {
+        "active_elements": 262144,
+        "cooperative_only": {
+          "cold_wall_ms": 41607.217466999995,
+          "cold_event_ms": 41608.39453125,
+          "mean_wall_ms": 4.3164907,
+          "median_wall_ms": 4.320273,
+          "mean_event_ms": 4.310322125752767,
+          "median_event_ms": 4.314688205718994
+        },
+        "final": {
+          "cold_wall_ms": 9285.087916,
+          "cold_event_ms": 9285.326171875,
+          "mean_wall_ms": 4.1346991,
+          "median_wall_ms": 4.121846000000001,
+          "mean_event_ms": 4.12781974474589,
+          "median_event_ms": 4.114816188812256
+        },
+        "cold_wall_speedup": 4.48107953779336,
+        "warm_median_wall_speedup": 1.0481403235346491,
+        "warm_median_event_speedup": 1.0485737412645961,
+        "warm_median_wall_ns_per_conserved_dof": {
+          "cooperative-only": 0.11444814999898274,
+          "final": 0.10919162962171768
+        }
+      },
+      "dgsem/noop": {
+        "active_elements": 0,
+        "cooperative_only": {
+          "cold_wall_ms": 3194.716715,
+          "cold_event_ms": 3194.8046875,
+          "mean_wall_ms": 5.427927666666666,
+          "median_wall_ms": 5.427989,
+          "mean_event_ms": 5.421905072530111,
+          "median_event_ms": 5.421951770782471
+        },
+        "final": {
+          "cold_wall_ms": 3251.013364,
+          "cold_event_ms": 3251.111328125,
+          "mean_wall_ms": 3.9221165666666664,
+          "median_wall_ms": 3.922674,
+          "mean_event_ms": 3.915577602386475,
+          "median_event_ms": 3.915872097015381
+        },
+        "cold_wall_speedup": 0.9826833535588013,
+        "warm_median_wall_speedup": 1.3837471581885215,
+        "warm_median_event_speedup": 1.3846090057218674,
+        "warm_median_wall_ns_per_conserved_dof": {
+          "cooperative-only": 0.14379260275099012,
+          "final": 0.10391537348429362
+        }
+      },
+      "dgsem/fully-active": {
+        "active_elements": 262144,
+        "cooperative_only": {
+          "cold_wall_ms": 2942.59705,
+          "cold_event_ms": 2942.7080078125,
+          "mean_wall_ms": 6.3193063999999985,
+          "median_wall_ms": 6.32043,
+          "mean_event_ms": 6.31280746459961,
+          "median_event_ms": 6.314303874969482
+        },
+        "final": {
+          "cold_wall_ms": 3268.1878229999998,
+          "cold_event_ms": 3268.28515625,
+          "mean_wall_ms": 4.809613366666667,
+          "median_wall_ms": 4.809144,
+          "mean_event_ms": 4.803068749109904,
+          "median_event_ms": 4.802847862243652
+        },
+        "cold_wall_speedup": 0.9003757462442513,
+        "warm_median_wall_speedup": 1.3142525987992875,
+        "warm_median_event_speedup": 1.3146999563754145,
+        "warm_median_wall_ns_per_conserved_dof": {
+          "cooperative-only": 0.1674342155456543,
+          "final": 0.12739880879720053
+        }
+      }
+    },
+    "historical_serial_round": {
+      "gl-noop": {
+        "original_wall_ms": 229.066102,
+        "optimized_wall_ms": 3.5359599999999998,
+        "wall_speedup": 64.78187027002568,
+        "original_event_ms": 229.06723022460938,
+        "optimized_event_ms": 3.5304319858551025,
+        "optimized_ns_per_conserved_dof": 0.09367095099555121
+      },
+      "gl-sequential": {
+        "original_wall_ms": 230.3174,
+        "optimized_wall_ms": 4.307392999999999,
+        "wall_speedup": 53.47025451357701,
+        "original_event_ms": 230.31832885742188,
+        "optimized_event_ms": 4.301760196685791,
+        "optimized_ns_per_conserved_dof": 0.11410694652133516
+      },
+      "gll-noop": {
+        "original_wall_ms": 101.379379,
+        "optimized_wall_ms": 5.383489,
+        "wall_speedup": 18.83153824592193,
+        "original_event_ms": 101.37648010253906,
+        "optimized_event_ms": 5.37772798538208,
+        "optimized_ns_per_conserved_dof": 0.14261375533209908
+      },
+      "gll-sequential": {
+        "original_wall_ms": 103.075736,
+        "optimized_wall_ms": 6.307398,
+        "wall_speedup": 16.342037715076803,
+        "original_event_ms": 103.07337951660156,
+        "optimized_event_ms": 6.301023960113525,
+        "optimized_ns_per_conserved_dof": 0.16708898544311523
+      }
+    },
+    "limit": "Final/cooperative pairs are same-job direct measurements. Historical serial timings are a separate round; no compounded cross-GPU overall speedup."
+  },
+  "historical_first_tranche": {
+    "job": "3448649",
+    "source": "f7b69da28a399f70b4390c7990c3719dd5e6d095",
+    "settings": "Same physical window and accelerated PDE/sigma backend, comparing positivity off, original serial limiter, and first cooperative limiter.",
+    "results": {
+      "dg": {
+        "counts": {
+          "off": {
+            "steps": "647",
+            "rhs": "1942",
+            "rejected": "0"
+          },
+          "original": {
+            "steps": "647",
+            "rhs": "1942",
+            "rejected": "0"
+          },
+          "optimized": {
+            "steps": "647",
+            "rhs": "1942",
+            "rejected": "0"
+          }
+        },
+        "advancing": {
+          "off_s": 29.854903980999996,
+          "original_s": 476.008194361,
+          "optimized_s": 37.018720742000006,
+          "original_overhead_percent": 1494.405376965664,
+          "optimized_overhead_percent": 23.99544398320339,
+          "speedup_original_to_optimized": 12.858580329626019,
+          "added_cost_removed_percent": 98.39431493267742
+        },
+        "application": {
+          "off_s": 107.8454234660021,
+          "original_s": 595.2326654620119,
+          "optimized_s": 154.90443496100488,
+          "original_overhead_percent": 451.93131644539096,
+          "optimized_overhead_percent": 43.63561288239364,
+          "speedup_original_to_optimized": 3.8425798823116577,
+          "added_cost_removed_percent": 90.34463616604309
+        },
+        "solver_timer": {
+          "off_s": 82.253953376,
+          "original_s": 527.314748422,
+          "optimized_s": 88.505175816,
+          "original_overhead_percent": 541.0813423295706,
+          "optimized_overhead_percent": 7.599905151579001,
+          "speedup_original_to_optimized": 5.95801029216951,
+          "added_cost_removed_percent": 98.59542280300067
+        },
+        "outside_solver_timer_s": {
+          "off": 25.591470090002105,
+          "original": 67.91791704001196,
+          "optimized": 66.39925914500488
+        },
+        "per_rhs_s": {
+          "off": 0.015373277024201852,
+          "original": 0.24511235548970134,
+          "optimized": 0.01906216310092688
+        }
+      },
+      "dgsem": {
+        "counts": {
+          "off": {
+            "steps": "647",
+            "rhs": "1942",
+            "rejected": "0"
+          },
+          "original": {
+            "steps": "647",
+            "rhs": "1942",
+            "rejected": "0"
+          },
+          "optimized": {
+            "steps": "647",
+            "rhs": "1942",
+            "rejected": "0"
+          }
+        },
+        "advancing": {
+          "off_s": 23.566939367,
+          "original_s": 221.320424868,
+          "optimized_s": 33.453717454,
+          "original_overhead_percent": 839.1139910934196,
+          "optimized_overhead_percent": 41.951896820527004,
+          "speedup_original_to_optimized": 6.615719917295383,
+          "added_cost_removed_percent": 95.00045318445221
+        },
+        "application": {
+          "off_s": 98.75243669000338,
+          "original_s": 312.6219002860016,
+          "optimized_s": 112.27252581299399,
+          "original_overhead_percent": 216.57132802440313,
+          "optimized_overhead_percent": 13.690891664204607,
+          "speedup_original_to_optimized": 2.784491557682761,
+          "added_cost_removed_percent": 93.67834524122144
+        },
+        "solver_timer": {
+          "off_s": 75.119578729,
+          "original_s": 272.793417412,
+          "optimized_s": 85.439736347,
+          "original_overhead_percent": 263.1455634171279,
+          "optimized_overhead_percent": 13.738306035009607,
+          "speedup_original_to_optimized": 3.1928167042100015,
+          "added_cost_removed_percent": 94.77919906510748
+        },
+        "outside_solver_timer_s": {
+          "off": 23.63285796100338,
+          "original": 39.82848287400162,
+          "optimized": 26.832789465993997
+        },
+        "per_rhs_s": {
+          "off": 0.012135396172502574,
+          "original": 0.11396520333058703,
+          "optimized": 0.017226425053553037
+        }
+      }
+    }
+  },
+  "fields": {
+    "max_normalized_error": 0.0,
+    "sampled_density_pressure_positive": true,
+    "identities": {
+      "dg": {
+        "final": {
+          "bytes": 1160774963,
+          "sha256": "e2ef48720c8efc3c4e29936990c627ce8f6c73380b258d1a7302fcd96116bf8b",
+          "extracted": false
+        },
+        "f7_optimized": {
+          "path": "case/finals/dg-optimized.vtu",
+          "bytes": 1160774963,
+          "sha256": "e2ef48720c8efc3c4e29936990c627ce8f6c73380b258d1a7302fcd96116bf8b"
+        },
+        "byte_identical_to_f7_optimized": true,
+        "cross_source_scope": "Byte agreement when identical; different hashes alone would not establish error"
+      },
+      "dgsem": {
+        "final": {
+          "bytes": 1160774963,
+          "sha256": "b118cf1be8ba1052045be955c3a6441d81bfb8c644ea81edc9471230d3ec66b1",
+          "extracted": false
+        },
+        "f7_optimized": {
+          "path": "case/finals/dgsem-optimized.vtu",
+          "bytes": 1160774963,
+          "sha256": "b118cf1be8ba1052045be955c3a6441d81bfb8c644ea81edc9471230d3ec66b1"
+        },
+        "byte_identical_to_f7_optimized": true,
+        "cross_source_scope": "Byte agreement when identical; different hashes alone would not establish error"
+      }
+    },
+    "scope": "Saved Q5 fields with GL8 comparison; not continuous positivity or discretization accuracy."
+  },
+  "hardware": {
+    "final_job": "3448839",
+    "status": "passed",
+    "baseline_source": "f7b69da28a399f70b4390c7990c3719dd5e6d095",
+    "baseline_gpu": {
+      "index": 0,
+      "uuid": "GPU-9bc7bc3f-98db-970f-fbb4-1765e11d82bd",
+      "name": "NVIDIA GH200 120GB",
+      "cuda_visible_devices": "0"
+    },
+    "final_source": "30a472fdf7ee761724c56a72bacb005e782928dc",
+    "final_gpu": {
+      "index": 0,
+      "uuid": "GPU-b7de2193-6349-6d24-39b1-464c7bef6ca1",
+      "name": "NVIDIA GH200 120GB",
+      "cuda_visible_devices": "0"
+    },
+    "old_gl_kernel_dram_bytes_per_apply": 575217874499.9999,
+    "final_gl_kernel_dram_bytes_per_apply": 902941952,
+    "dram_traffic_reduction_percent": 99.84302609636654,
+    "old_local_load_instructions": 234070016,
+    "final_local_load_instructions": 0,
+    "old_local_store_instructions": 223272960,
+    "final_local_store_instructions": 0,
+    "final_kernel_launches_per_call": {
+      "gl-1-noop": 4.0,
+      "gll-1-noop": 12.0,
+      "gll-1-sequential": 13.0
+    },
+    "limit": "Counter diagnosis only; no profiler-duration speedup. Baseline and final source/GPU identities differ."
+  },
+  "cylinder": {
+    "source": "f7b69da28a399f70b4390c7990c3719dd5e6d095",
+    "scope": "First cooperative limiter with rollback; later data-layout changes qualified separately on native fixtures and large Sedov.",
+    "mesh": "1322 Q2 quads, p5, 190368 conserved DOFs; compatibility check, not a saturated-GPU benchmark.",
+    "settings": "L2/BrokenL2, max-h alpha=.0004, modal rate80000, positivity consumer points, dt1e-5; scans off.",
+    "dg": {
+      "target_time": 0.1,
+      "steps": 10000,
+      "rejections": 0,
+      "application_wall_s": 25.42300047702156,
+      "advancing_s": 11.918862492
+    },
+    "dgsem_controls": {
+      "fixed-original": {
+        "dispatch_valid": true,
+        "target_reached": false,
+        "final_accepted_time": 0.0006117298531532297,
+        "accepted_attempts": "69",
+        "rejected_attempts": "25",
+        "last_solver": "fixed-element-jacobi",
+        "last_preconditioner": "tensor-element-projected-wmma-factor-fp64",
+        "fixed_failure_reproduced": true,
+        "final_current_equation_certificate": {}
+      },
+      "fgmres-local-wmma": {
+        "dispatch_valid": true,
+        "target_reached": true,
+        "final_accepted_time": 0.0025,
+        "accepted_attempts": "250",
+        "rejected_attempts": "0",
+        "last_solver": "fgmres-cuda-fp64",
+        "last_preconditioner": "tensor-element-projected-wmma-factor-fp64",
+        "fixed_failure_reproduced": false,
+        "final_current_equation_certificate": {
+          "event": "accepted-state",
+          "scope": "final-committed-accepted-state",
+          "precision": "fp64",
+          "time": "0.0025000000000000001",
+          "state_generation": "750",
+          "solved": "1",
+          "supported": "1",
+          "certified": "1",
+          "residual_rel_rhs": "9.682145745802409e-07",
+          "run_success": "1",
+          "residual_abs": "9.8694535404309046e-10",
+          "relative_limit": "9.9999999999999995e-07",
+          "absolute_limit": "0",
+          "skipped_nonfinite": "0",
+          "q_sigma_admitted": "1",
+          "q_sigma_nonpositive_samples": "0",
+          "q_sigma_nonfinite_samples": "0"
+        }
+      }
+    },
+    "conclusion": "Old limiter exactly reproduces the fixed-two-correction failure. Converged FP64 FGMRES plus WMMA P passes t=.0025. DGSEM cylinder stability through t=.1 is not established."
+  },
+  "limits": [
+    "Single matched window, not repeated trial statistics or Sedov t=.1 completion.",
+    "Host advancing bins are asynchronous; they are not exclusive GPU kernel sums.",
+    "Cold benchmark calls include cache construction. Four warmups precede 30 measured calls; resets/diagnostic capture are excluded.",
+    "Application limiter activity was not separately timed; identical saved fields do not prove every-stage no-op.",
+    "GL8 equivalence and sampled rho/p positivity do not prove continuous positivity or discretization accuracy.",
+    "No cross-GPU/source serial-to-final timing ratio or compounded speedup is computed."
+  ],
+  "retention": {
+    "latest_fields_archive": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/final-measurements-r1/selected/measurement/selected-results.tar.gz",
+      "bytes": 1445703051,
+      "sha256": "f9d2e9a2d73e56c035d70d5e364966d86582c1862cca845ef44baa45f7e76ad7"
+    },
+    "large_fields_downloaded": false,
+    "builds_intermediates": "Job-private /tmp, automatically cleaned.",
+    "old_duplicate_fields": "Retired after byte identity was verified.",
+    "native_binaries": "Current tested application, cylinder and benchmark binaries retained; older executables retired."
+  }
+}

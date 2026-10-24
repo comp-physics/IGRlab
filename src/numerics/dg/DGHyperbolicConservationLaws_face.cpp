@@ -7,6 +7,7 @@ namespace mfem
 {
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
+#include "DGTensorFaceKernels.hpp"
 
 void DGHyperbolicConservationLaws::SetP0FaceReferenceXSlopes(const Vector* slopes)
 {
@@ -307,8 +308,495 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
   return true;
 }
 
+bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
+{
+  using dg_igr_detail::tensor_face::CheckedSize;
+  const FluxFunction& physical = formIntegrator->GetFluxFunction();
+  const auto* igr = dynamic_cast<const FluxWithIGR*>(&physical);
+  const auto* sigma = igr ? igr->GetSigmaField() : nullptr;
+  face_tensor_data_ = std::make_shared<dg_igr_detail::TensorFaceData>();
+  auto& data = *face_tensor_data_;
+  data.key = dg_igr_detail::MakeTensorFaceKey(vfes, sigma, num_flux_,
+    p0_face_reference_x_slopes_, formIntegrator->GetIntegrationRule(),
+    face_int_order_offset_, dgsem_gamma_, true, igr);
+  const auto fallback = [](const char* reason)
+  {
+    if (mfem::Mpi::Root())
+      std::cout << "[dg-tensor-face] event=fallback reason=" << reason
+                << " row_reuse_requested="
+                << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+                << " row_reuse=0" << std::endl;
+    return false;
+  };
+#ifndef DG_IGR_HAS_ACCEL_FORALL
+  return fallback("backend");
+#else
+  const unsigned long native = static_cast<unsigned long>(Backend::CPU) |
+                               static_cast<unsigned long>(Backend::CUDA);
+  Mesh* mesh = vfes.GetMesh();
+  if (!Device::Allows(Backend::CUDA) || Device::Allows(~native) ||
+      sizeof(real_t) != sizeof(double)) { return fallback("backend"); }
+  if (!mesh || !mesh->Conforming() || mesh->Dimension() != 2 ||
+      mesh->SpaceDimension() != 2 || dim != 2 || num_equations != 4 ||
+      vfes.GetVDim() != 4 || !invmass_apply_ready_ || !HasPreassembledWeakDivergence_() ||
+      vol_mode_ != VolumeMode::WeakDivergence || vfes.GetNE() <= 0 ||
+      !dynamic_cast<const L2_FECollection*>(vfes.FEColl()))
+    { return fallback("state-layout"); }
+#ifdef MFEM_USE_MPI
+  if (const auto* parallel = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+  {
+    int ranks = 0;
+    MPI_Comm_size(parallel->GetComm(), &ranks);
+    if (ranks != 1 || parallel->GetParMesh()->GetNSharedFaces() != 0)
+      { return fallback("mpi"); }
+  }
+#endif
+  if (!standard_face_integrator_ || !num_flux_ ||
+      num_flux_ != standard_face_flux_ ||
+      face_int_order_offset_ != standard_face_int_order_offset_ ||
+      p0_face_reference_x_slopes_ || &physical != &num_flux_->GetFluxFunction())
+    { return fallback("flux-policy"); }
+  const bool rusanov = typeid(*num_flux_) == typeid(RusanovFluxWithSides) ||
+    (typeid(*num_flux_) == typeid(DGSEMSurfaceFlux) &&
+      static_cast<const DGSEMSurfaceFlux*>(num_flux_)->GetSurfaceFluxType() ==
+        DGSEMSurfaceFluxType::Rusanov);
+  const FluxFunction* base = &physical;
+  if (igr)
+  {
+    if (typeid(physical) != typeid(FluxWithIGR) || !igr->HasEulerBase() ||
+        igr->GetGamma() != dgsem_gamma_) { return fallback("flux-policy"); }
+    base = &igr->GetBaseFlux();
+  }
+  if (!rusanov || typeid(*base) != typeid(EulerFlux) || base->dim != 2 ||
+      !(dgsem_gamma_ > 1.0 && dgsem_gamma_ <= 2.0))
+    { return fallback("flux-policy"); }
+  // The exact Euler type exposes gamma through this stationary unit-state
+  // flux. Subtraction is exact for the admitted gamma interval.
+  real_t probe_data[4] = {1.0, 0.0, 0.0, 1.0}, probe_n[2] = {1.0, 0.0};
+  real_t probe_flux[4];
+  Vector probe(probe_data, 4), normal_probe(probe_n, 2), flux_probe(probe_flux, 4);
+  FaceElementTransformations probe_tr;
+  base->ComputeFluxDotN(probe, normal_probe, probe_tr, flux_probe);
+  if (probe_flux[1] != dgsem_gamma_ - 1.0) { return fallback("flux-policy"); }
+
+  const auto& reference = *vfes.GetFE(0);
+  const int order = reference.GetOrder(), n = order + 1, dof = n * n;
+  const auto* tensor = dynamic_cast<const TensorBasisElement*>(&reference);
+  if (!tensor || tensor->GetBasisType() != BasisType::GaussLegendre ||
+      reference.GetMapType() != FiniteElement::VALUE ||
+      reference.GetRangeType() != FiniteElement::SCALAR ||
+      reference.GetGeomType() != Geometry::SQUARE || n < 2 || n > 16 ||
+      dof != invmass_elem_dof_ || reference.GetDof() != dof ||
+      reference.GetNodes().Size() != dof)
+    { return fallback("state-layout"); }
+  data.n = n;
+  data.elements = vfes.GetNE();
+  data.lex_to_local.SetSize(dof);
+  auto* local = data.lex_to_local.HostWrite();
+  const auto& permutation = tensor->GetDofMap();
+  if (permutation.Size() != 0 && permutation.Size() != dof)
+    { return fallback("state-layout"); }
+  const auto& line_rule = IntRules.Get(Geometry::SEGMENT, 2 * order + 1);
+  if (line_rule.GetNPoints() != n) { return fallback("quadrature"); }
+  std::vector<char> used(static_cast<std::size_t>(dof), 0);
+  for (int j = 0; j < n; ++j) for (int i = 0; i < n; ++i)
+  {
+    const int lex = i + n * j, index = permutation.Size() ? permutation[lex] : lex;
+    if (index < 0 || index >= dof || used[static_cast<std::size_t>(index)])
+      { return fallback("state-layout"); }
+    used[static_cast<std::size_t>(index)] = 1;
+    local[lex] = index;
+    const auto& point = reference.GetNodes().IntPoint(index);
+    if (point.x != line_rule.IntPoint(i).x || point.y != line_rule.IntPoint(j).x)
+      { return fallback("state-layout"); }
+  }
+  const auto positive_jacobian = [](ElementTransformation& transform,
+                                    const IntegrationPoint& point)
+  {
+    transform.SetIntPoint(&point);
+    const auto& jacobian = transform.Jacobian();
+    if (jacobian.Height() != 2 || jacobian.Width() != 2) { return false; }
+    const real_t a = jacobian(0, 0), b = jacobian(0, 1);
+    const real_t c = jacobian(1, 0), d = jacobian(1, 1);
+    const real_t determinant = a * d - b * c;
+    return std::isfinite(a) && std::isfinite(b) && std::isfinite(c) &&
+      std::isfinite(d) && std::isfinite(determinant) && determinant > 0.0 &&
+      std::isfinite(transform.Weight()) && transform.Weight() > 0.0;
+  };
+  int maximum_geometry_order = 1;
+  Array<int> element_dofs;
+  for (int e = 0; e < data.elements; ++e)
+  {
+    const auto& fe = *vfes.GetFE(e);
+    if (&fe != &reference || fe.GetDof() != dof ||
+        vfes.GetElementDofs(e, element_dofs) || element_dofs.Size() != dof)
+      { return fallback("state-layout"); }
+    for (int i = 0; i < dof; ++i)
+      if (element_dofs[i] < 0 || element_dofs[i] >= vfes.GetNDofs())
+        { return fallback("state-layout"); }
+    auto* transform = vfes.GetElementTransformation(e);
+    if (!transform) { return fallback("geometry"); }
+    if (transform->Order() == 1)
+    {
+      Vector corners[4] = {Vector(2), Vector(2), Vector(2), Vector(2)};
+      for (int c = 0; c < 4; ++c)
+      {
+        IntegrationPoint point;
+        point.Set2(c % 2, c / 2);
+        transform->Transform(point, corners[c]);
+      }
+      for (int d = 0; d < 2; ++d)
+        if (!std::isfinite(corners[0][d]) || !std::isfinite(corners[1][d]) ||
+            !std::isfinite(corners[2][d]) || !std::isfinite(corners[3][d]) ||
+            corners[3][d] - corners[1][d] != corners[2][d] - corners[0][d])
+          { return fallback("geometry"); }
+    }
+    else
+    {
+      const auto* isoparametric = dynamic_cast<const IsoparametricTransformation*>(transform);
+      const auto* geometry_fe = isoparametric ? isoparametric->GetFE() : nullptr;
+      if (transform->Order() != 2 || mesh->NURBSext || !geometry_fe ||
+          (typeid(*geometry_fe) != typeid(H1_QuadrilateralElement) &&
+           typeid(*geometry_fe) != typeid(L2_QuadrilateralElement)) ||
+          geometry_fe->GetGeomType() != Geometry::SQUARE ||
+          geometry_fe->GetMapType() != FiniteElement::VALUE ||
+          geometry_fe->GetRangeType() != FiniteElement::SCALAR ||
+          geometry_fe->GetDof() != 9 || geometry_fe->GetNodes().Size() != 9)
+        { return fallback("geometry"); }
+      const auto& coordinates = isoparametric->GetPointMat();
+      if (coordinates.Height() != 2 || coordinates.Width() != 9)
+        { return fallback("geometry"); }
+      for (int j = 0; j < 9; ++j) for (int d = 0; d < 2; ++d)
+        if (!std::isfinite(coordinates(d, j))) { return fallback("geometry"); }
+      // These setup samples reject invalid metrics where observed; they do not
+      // certify positivity between samples of the polynomial Q2 map.
+      const IntegrationRule* samples[] = {
+        Geometries.GetVertices(Geometry::SQUARE), &geometry_fe->GetNodes(),
+        &fe.GetNodes(), &MassIntegrator::GetRule(fe, fe, *transform),
+        &GradientIntegrator::GetRule(fe, fe, *transform),
+        &DiffusionIntegrator::GetRule(fe, fe)};
+      for (int sample = 0; sample < 6; ++sample)
+      {
+        bool duplicate = false;
+        for (int previous = 0; previous < sample; ++previous)
+          duplicate = duplicate || samples[previous] == samples[sample];
+        if (duplicate) { continue; }
+        for (int q = 0; q < samples[sample]->GetNPoints(); ++q)
+          if (!positive_jacobian(*transform, samples[sample]->IntPoint(q)))
+            { return fallback("geometry"); }
+      }
+      maximum_geometry_order = 2;
+    }
+  }
+
+  // Matching sigma coefficients may have a different local-node permutation.
+  // Build that permutation from actual coordinates; never infer it from p/dof.
+  if (sigma)
+  {
+    const auto* scalar = sigma->ParFESpace();
+    if (!scalar || scalar->GetMesh() != mesh || scalar->GetNE() != data.elements ||
+        scalar->GetVDim() != 1 || !dynamic_cast<const L2_FECollection*>(scalar->FEColl()))
+      { return fallback("sigma-layout"); }
+    data.sigma_map.SetSize(CheckedSize(std::size_t(data.elements) * dof));
+    auto* scalar_map = data.sigma_map.HostWrite();
+    const FiniteElement* previous = nullptr;
+    std::vector<int> scalar_permutation(static_cast<std::size_t>(dof), -1);
+    for (int e = 0; e < data.elements; ++e)
+    {
+      const auto& fe = *scalar->GetFE(e);
+      const auto* scalar_tensor = dynamic_cast<const TensorBasisElement*>(&fe);
+      if (!scalar_tensor || scalar_tensor->GetBasisType() != BasisType::GaussLegendre ||
+          fe.GetMapType() != FiniteElement::VALUE ||
+          fe.GetRangeType() != FiniteElement::SCALAR ||
+          fe.GetGeomType() != Geometry::SQUARE || fe.GetOrder() != order ||
+          fe.GetDof() != dof || fe.GetNodes().Size() != dof ||
+          scalar->GetElementDofs(e, element_dofs) || element_dofs.Size() != dof)
+        { return fallback("sigma-layout"); }
+      if (previous != &fe)
+      {
+        std::fill(used.begin(), used.end(), 0);
+        for (int j = 0; j < dof; ++j)
+        {
+          const auto& target = reference.GetNodes().IntPoint(j);
+          int match = -1;
+          for (int k = 0; k < dof; ++k)
+          {
+            const auto& point = fe.GetNodes().IntPoint(k);
+            if (point.x == target.x && point.y == target.y) { match = k; break; }
+          }
+          if (match < 0 || used[static_cast<std::size_t>(match)])
+            { return fallback("sigma-layout"); }
+          used[static_cast<std::size_t>(match)] = 1;
+          scalar_permutation[static_cast<std::size_t>(j)] = match;
+        }
+        previous = &fe;
+      }
+      for (int j = 0; j < dof; ++j)
+      {
+        const int global = element_dofs[scalar_permutation[static_cast<std::size_t>(j)]];
+        if (global < 0 || global >= sigma->Size()) { return fallback("sigma-layout"); }
+        scalar_map[e * dof + j] = global;
+      }
+    }
+  }
+
+  L2_FECollection line_collection(order, 1, BasisType::GaussLegendre);
+  const auto& line = *line_collection.FiniteElementForGeometry(Geometry::SEGMENT);
+  data.endpoints.SetSize(2 * n);
+  auto* endpoint = data.endpoints.HostWrite();
+  Vector line_shape(n), shape(dof), normal(2);
+  for (int end = 0; end < 2; ++end)
+  {
+    IntegrationPoint point;
+    point.x = end;
+    line.CalcShape(point, line_shape);
+    for (int k = 0; k < n; ++k) { endpoint[end * n + k] = line_shape[k]; }
+  }
+  data.tangents.SetSize(8 * n * n);
+  data.tangents = 0.0;
+  auto* tangent = data.tangents.HostWrite();
+  std::array<bool, 8> reference_ready{};
+  std::vector<real_t> tangent_points(static_cast<std::size_t>(8 * n));
+  data.element_faces.SetSize(CheckedSize(std::size_t(data.elements) * 4));
+  data.side_maps.SetSize(data.element_faces.Size());
+  data.element_faces = -1;
+  data.side_maps = -1;
+  auto* incidence_faces = data.element_faces.HostWrite();
+  auto* side_maps = data.side_maps.HostWrite();
+  std::vector<int> interior_e1, interior_e2, interior_mesh, boundary_e, boundary_attr;
+  std::vector<int> boundary_mesh, interior_side1, interior_side2, boundary_side;
+  std::vector<real_t> interior_normal, boundary_normal, interior_weights, boundary_weights;
+
+  const auto rule_supported = [&](const IntegrationRule& rule)
+  {
+    if (rule.GetNPoints() != n) { return false; }
+    for (int q = 0; q < n; ++q)
+      if (rule.IntPoint(q).x != line_rule.IntPoint(q).x ||
+          rule.IntPoint(q).weight != line_rule.IntPoint(q).weight) { return false; }
+    return true;
+  };
+  const auto map_side = [&](FaceElementTransformations& transform, bool second,
+                            const IntegrationRule& rule, int& incidence) -> bool
+  {
+    transform.SetAllIntPoints(&rule.IntPoint(0));
+    const auto& first = second ? transform.GetElement2IntPoint() :
+                                 transform.GetElement1IntPoint();
+    const int side = first.x == 0.0 ? 0 : first.x == 1.0 ? 1 :
+                     first.y == 0.0 ? 2 : first.y == 1.0 ? 3 : -1;
+    if (side < 0) { return false; }
+    const real_t first_t = side < 2 ? first.y : first.x;
+    const bool reverse = std::abs(first_t - line_rule.IntPoint(n - 1).x) <
+                         std::abs(first_t - line_rule.IntPoint(0).x);
+    const int signature = 2 * side + static_cast<int>(reverse);
+    const int e = second ? transform.Elem2No : transform.Elem1No;
+    if (e < 0 || e >= data.elements) { return false; }
+    incidence = 4 * e + side;
+    if (incidence_faces[incidence] != -1) { return false; }
+    for (int q = 0; q < n; ++q)
+    {
+      transform.SetAllIntPoints(&rule.IntPoint(q));
+      const auto& point = second ? transform.GetElement2IntPoint() :
+                                  transform.GetElement1IntPoint();
+      const real_t fixed = side < 2 ? point.x : point.y;
+      const real_t t = side < 2 ? point.y : point.x;
+      const real_t expected = reverse ? 1.0 - rule.IntPoint(q).x : rule.IntPoint(q).x;
+      if (fixed != real_t(side % 2) || !std::isfinite(t) ||
+          std::abs(t - expected) > 32 * std::numeric_limits<real_t>::epsilon())
+        { return false; }
+      if (reference_ready[static_cast<std::size_t>(signature)])
+      {
+        if (t != tangent_points[static_cast<std::size_t>(signature * n + q)])
+          { return false; }
+      }
+      else
+      {
+        tangent_points[static_cast<std::size_t>(signature * n + q)] = t;
+        IntegrationPoint line_point;
+        line_point.x = t;
+        line.CalcShape(line_point, line_shape);
+        for (int k = 0; k < n; ++k)
+          tangent[(signature * n + q) * n + k] = line_shape[k];
+        // Prove the reference tensor factorization against the original FE.
+        reference.CalcShape(point, shape);
+        for (int lex = 0; lex < dof; ++lex)
+        {
+          const int i = lex % n, j = lex / n;
+          const real_t reconstructed = endpoint[(side % 2) * n + (side < 2 ? i : j)] *
+            line_shape[side < 2 ? j : i];
+          if (!std::isfinite(reconstructed) || !std::isfinite(shape[local[lex]]) ||
+              std::abs(shape[local[lex]] - reconstructed) >
+                64 * dof * std::numeric_limits<real_t>::epsilon() *
+                  std::max(real_t(1.0), std::abs(shape[local[lex]])))
+            { return false; }
+        }
+      }
+    }
+    reference_ready[static_cast<std::size_t>(signature)] = true;
+    side_maps[incidence] = signature;
+    return true;
+  };
+  const auto append_metrics = [&](FaceElementTransformations& transform,
+    const IntegrationRule& rule, std::vector<real_t>& normals,
+    std::vector<real_t>& weights)
+  {
+    for (int q = 0; q < n; ++q)
+    {
+      transform.SetAllIntPoints(&rule.IntPoint(q));
+      if (maximum_geometry_order == 2 &&
+          (!transform.Elem1 ||
+           !positive_jacobian(*transform.Elem1, transform.GetElement1IntPoint()) ||
+           (transform.Elem2No >= 0 && (!transform.Elem2 ||
+            !positive_jacobian(*transform.Elem2, transform.GetElement2IntPoint())))))
+        { return false; }
+      CalcOrtho(transform.Jacobian(), normal);
+      if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+          !(normal[0] * normal[0] + normal[1] * normal[1] > 0.0)) { return false; }
+      normals.push_back(normal[0]); normals.push_back(normal[1]);
+      weights.push_back(rule.IntPoint(q).weight);
+    }
+    return true;
+  };
+  for (int f = 0; f < mesh->GetNumFaces(); ++f)
+  {
+    auto* transform = mesh->GetFaceElementTransformations(f);
+    if (!transform || transform->Elem2No < 0) { continue; }
+    const auto* rule = formIntegrator->GetIntegrationRule();
+    if (!rule) { rule = &IntRules.Get(transform->GetGeometryType(), 2 * order + face_int_order_offset_); }
+    if (transform->GetGeometryType() != Geometry::SEGMENT || !rule_supported(*rule))
+      { return fallback("quadrature"); }
+    int left = -1, right = -1;
+    if (!map_side(*transform, false, *rule, left) ||
+        !map_side(*transform, true, *rule, right)) { return fallback("orientation"); }
+    const int packed = static_cast<int>(interior_e1.size());
+    incidence_faces[left] = 2 * packed;
+    incidence_faces[right] = 2 * packed + 1;
+    interior_e1.push_back(transform->Elem1No); interior_e2.push_back(transform->Elem2No);
+    interior_mesh.push_back(f); interior_side1.push_back(left); interior_side2.push_back(right);
+    if (!append_metrics(*transform, *rule, interior_normal, interior_weights))
+      { return fallback("geometry"); }
+  }
+  data.interior_faces = static_cast<int>(interior_e1.size());
+  for (int b = 0; b < mesh->GetNBE(); ++b)
+  {
+    auto* transform = mesh->GetBdrFaceTransformations(b);
+    // MakePeriodic retains boundary element records for identified seams.
+    // MFEM returns null for those now-interior faces, already packed above.
+    // Match the legacy boundary loop and count only physical boundaries.
+    if (!transform) { continue; }
+    const auto* integrator = FindBdrIntegrator_(transform->Attribute);
+    if (!integrator || typeid(*integrator) != typeid(BdrHyperbolicFluxIntegrator) ||
+        &integrator->GetNumericalFlux() != num_flux_)
+      { return fallback("boundary-policy"); }
+    const auto* rule = integrator->GetIntegrationRule();
+    if (!rule) { rule = &IntRules.Get(transform->GetGeometryType(), 2 * order + face_int_order_offset_); }
+    if (transform->GetGeometryType() != Geometry::SEGMENT || !rule_supported(*rule))
+      { return fallback("quadrature"); }
+    int side = -1;
+    if (!map_side(*transform, false, *rule, side)) { return fallback("orientation"); }
+    const int packed = static_cast<int>(boundary_e.size());
+    incidence_faces[side] = 2 * (data.interior_faces + packed);
+    boundary_e.push_back(transform->Elem1No); boundary_attr.push_back(transform->Attribute);
+    boundary_mesh.push_back(b); boundary_side.push_back(side);
+    if (!append_metrics(*transform, *rule, boundary_normal, boundary_weights))
+      { return fallback("geometry"); }
+  }
+  for (int incidence = 0; incidence < data.element_faces.Size(); ++incidence)
+    if (incidence_faces[incidence] < 0 || side_maps[incidence] < 0)
+      { return fallback("topology"); }
+  data.boundary_faces = static_cast<int>(boundary_e.size());
+  data.tangent_sparse.SetSize(8);
+  data.tangent_permutation.SetSize(8 * n);
+  data.tangent_inverse.SetSize(8 * n);
+  auto* sparse_maps = data.tangent_sparse.HostWrite();
+  auto* tangent_permutation = data.tangent_permutation.HostWrite();
+  auto* tangent_inverse = data.tangent_inverse.HostWrite();
+  int sparse_count = 0, reference_count = 0;
+  for (int map = 0; map < 8; ++map)
+  {
+    bool sparse = reference_ready[static_cast<std::size_t>(map)];
+    if (sparse) { ++reference_count; }
+    for (int q = 0; q < n; ++q)
+    {
+      const int pivot = map % 2 ? n - 1 - q : q;
+      tangent_permutation[map * n + q] = pivot;
+      tangent_inverse[map * n + pivot] = q;
+      for (int t = 0; t < n; ++t)
+      {
+        const real_t value = tangent[(map * n + q) * n + t];
+        if ((t != pivot && value != 0.0) ||
+            (t == pivot && (!std::isfinite(value) || value == 0.0))) { sparse = false; }
+      }
+    }
+    sparse_maps[map] = sparse ? 1 : 0;
+    if (sparse) { ++sparse_count; }
+  }
+  const auto copy_array = [](const std::vector<int>& input, Array<int>& output)
+  {
+    output.SetSize(dg_igr_detail::tensor_face::CheckedSize(input.size()));
+    std::copy(input.begin(), input.end(), output.HostWrite());
+  };
+  const auto copy_vector = [](const std::vector<real_t>& input, Vector& output)
+  {
+    output.SetSize(dg_igr_detail::tensor_face::CheckedSize(input.size()));
+    std::copy(input.begin(), input.end(), output.HostWrite());
+  };
+  copy_array(interior_e1, face_int_e1_); copy_array(interior_e2, face_int_e2_);
+  copy_array(interior_mesh, face_int_mesh_id_);
+  copy_array(boundary_e, face_bdr_e1_); copy_array(boundary_attr, face_bdr_attr_);
+  copy_array(boundary_mesh, face_bdr_mesh_id_);
+  if (!BuildBoundaryPolicyData_()) { return fallback("boundary-policy"); }
+  copy_array(interior_side1, data.interior_side1);
+  copy_array(interior_side2, data.interior_side2); copy_array(boundary_side, data.boundary_side);
+  copy_vector(interior_normal, face_int_normals_); copy_vector(interior_weights, face_int_weights_);
+  copy_vector(boundary_normal, face_bdr_normals_); copy_vector(boundary_weights, face_bdr_weights_);
+  face_elem_dof_ = dof;
+  face_int_nq_ = data.interior_faces ? n : 0;
+  face_bdr_nq_ = data.boundary_faces ? n : 0;
+  face_int_speed_.SetSize(data.interior_faces);
+  face_bdr_speed_.SetSize(data.boundary_faces);
+  face_int_speed_q_.SetSize(CheckedSize(std::size_t(data.interior_faces) * n));
+  face_bdr_speed_q_.SetSize(CheckedSize(std::size_t(data.boundary_faces) * n));
+  data.boundary_rejected.SetSize(face_bdr_speed_q_.Size());
+  if (igr && sigma && igr->GetInvariantDomainFlux())
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(face_int_q_sigma_telemetry_, face_int_speed_q_.Size());
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(face_bdr_q_sigma_telemetry_, face_bdr_speed_q_.Size());
+  }
+  data.traces.SetSize(CheckedSize(std::size_t(sigma ? 5 : 4) * 4 * data.elements * n));
+  data.flux.SetSize(CheckedSize(std::size_t(4) *
+    (data.interior_faces + data.boundary_faces) * n));
+  // Release any former dense policy allocation when a live operator opts in.
+  face_int_shape1_.Destroy(); face_int_shape2_.Destroy(); face_bdr_shape1_.Destroy();
+  face_shared_shape1_.Destroy(); face_shared_shape2_.Destroy();
+  face_int_sigma_shape1_.Destroy(); face_int_sigma_shape2_.Destroy();
+  face_bdr_sigma_shape1_.Destroy(); face_shared_sigma_shape1_.Destroy();
+  face_shared_sigma_shape2_.Destroy();
+  face_int_ip1_ref_.Destroy(); face_int_ip2_ref_.Destroy(); face_bdr_ip1_ref_.Destroy();
+  face_shared_ip1_ref_.Destroy(); face_shared_ip2_ref_.Destroy();
+  data.ready = true;
+  if (mfem::Mpi::Root())
+    std::cout << "[dg-tensor-face] event=setup selected=fp64 n1d=" << n
+              << " elements=" << data.elements << " interior_faces=" << data.interior_faces
+              << " boundary_faces=" << data.boundary_faces
+              << " geometry_order_max=" << maximum_geometry_order
+              << " jacobian_validation=" << (maximum_geometry_order == 2 ? "sampled-q2" : "affine-q1")
+              << " reference_maps=" << reference_count << " sparse_tangent_maps=" << sparse_count
+              << " dense_shape_entries=0 trace_bytes=" << std::size_t(data.traces.Size()) * sizeof(real_t)
+              << " flux_bytes=" << std::size_t(data.flux.Size()) * sizeof(real_t)
+              << " state=fp64 nonlinear_flux=fp64 lift=element-owned residual_atomics=0"
+              << " row_reuse_requested="
+              << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+              << " row_reuse="
+              << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+              << std::endl;
+  return true;
+#endif
+}
+
 void DGHyperbolicConservationLaws::BuildFaceApplyData_()
 {
+  face_tensor_requested_ = dg_igr_detail::tensor_face::Requested();
+  face_tensor_data_.reset();
   face_entropy_ready_ = false;
   face_built_entropy_policy_ = SupportsPackedEntropyFacePolicy_();
   face_entropy_element_offsets_.SetSize(0);
@@ -366,7 +854,14 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_shared_sigma_shape2_.SetSize(0);
   face_shared_sigma_nbr_dof_map_.SetSize(0);
 
-  if (!invmass_apply_ready_ || weakdiv.empty() || !num_flux_)
+  // Admission precedes all per-face dense shape construction/allocation.
+  if (face_tensor_requested_ && BuildTensorFaceApplyData_())
+  {
+    face_apply_ready_ = true;
+    return;
+  }
+
+  if (!invmass_apply_ready_ || !HasPreassembledWeakDivergence_() || !num_flux_)
   {
     return;
   }
@@ -1272,7 +1767,7 @@ bool DGHyperbolicConservationLaws::SupportsPackedEntropyFacePolicy_() const
 bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
 {
   if (!Device::Allows(Backend::DEVICE_MASK) ||
-      vol_mode_ != VolumeMode::WeakDivergence || weakdiv.empty() ||
+      vol_mode_ != VolumeMode::WeakDivergence || !HasPreassembledWeakDivergence_() ||
       !invmass_apply_ready_) { return false; }
   const bool entropy = SupportsPackedEntropyFacePolicy_();
   const unsigned long native = static_cast<unsigned long>(Backend::CPU) |
@@ -1283,7 +1778,19 @@ bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
   const bool rusanov = dynamic_cast<const RusanovFluxWithSides*>(num_flux_) ||
     (surface && surface->GetSurfaceFluxType() == DGSEMSurfaceFluxType::Rusanov);
   if (!entropy && !rusanov) { return false; }
-  if (face_data_dirty_ || (entropy && !face_built_entropy_policy_))
+  const bool tensor_requested = dg_igr_detail::tensor_face::Requested();
+  bool tensor_stale = tensor_requested != face_tensor_requested_;
+  if (tensor_requested)
+  {
+    const auto* igr = dynamic_cast<const FluxWithIGR*>(&formIntegrator->GetFluxFunction());
+    const auto* sigma = igr ? igr->GetSigmaField() : nullptr;
+    const auto key = dg_igr_detail::MakeTensorFaceKey(vfes, sigma, num_flux_,
+      p0_face_reference_x_slopes_, formIntegrator->GetIntegrationRule(),
+      face_int_order_offset_, dgsem_gamma_, true, igr);
+    tensor_stale = tensor_stale || !face_tensor_data_ ||
+      !(face_tensor_data_->key == key);
+  }
+  if (face_data_dirty_ || tensor_stale || (entropy && !face_built_entropy_policy_))
     const_cast<DGHyperbolicConservationLaws*>(this)->BuildFaceApplyData_();
   if (entropy)
   {
@@ -1295,6 +1802,122 @@ bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
   }
   // A mutable flux policy can safely return to the independent host route.
   return face_apply_ready_ && !face_entropy_ready_;
+}
+
+bool DGHyperbolicConservationLaws::AddTensorFaceContributions_(
+  const Vector& x_in, Vector& z_out, real_t& max_face_speed,
+  bool capture_boundary_flux) const
+{
+#ifndef DG_IGR_HAS_ACCEL_FORALL
+  (void)x_in; (void)z_out; (void)capture_boundary_flux;
+  max_face_speed = 0.0;
+  return false;
+#else
+  if (!face_tensor_data_ || !face_tensor_data_->ready) { return false; }
+  auto& data = *face_tensor_data_;
+  const auto* igr = dynamic_cast<const FluxWithIGR*>(&formIntegrator->GetFluxFunction());
+  const auto* sigma = igr ? igr->GetSigmaField() : nullptr;
+  const bool use_sigma = sigma != nullptr;
+  const bool invariant = use_sigma && igr->GetInvariantDomainFlux();
+  MFEM_VERIFY(!use_sigma || data.sigma_map.Size() == data.elements * data.n * data.n,
+              "Tensor DG faces require their current matching scalar map.");
+  if (invariant)
+  {
+    if (face_int_q_sigma_telemetry_.Size() !=
+        face_int_speed_q_.Size() * dg_igr_detail::kFrozenSigmaTelemetryWidth)
+      dg_igr_detail::InitializeFrozenSigmaTelemetry(
+        face_int_q_sigma_telemetry_, face_int_speed_q_.Size());
+    if (face_bdr_q_sigma_telemetry_.Size() !=
+        face_bdr_speed_q_.Size() * dg_igr_detail::kFrozenSigmaTelemetryWidth)
+      dg_igr_detail::InitializeFrozenSigmaTelemetry(
+        face_bdr_q_sigma_telemetry_, face_bdr_speed_q_.Size());
+  }
+  dg_igr_detail::tensor_face::TraceKernel trace;
+  trace.n = data.n; trace.elements = data.elements; trace.use_sigma = use_sigma;
+  trace.local = data.lex_to_local.Read(); trace.state_map = invmass_elem_vdof_map_.Read();
+  trace.sigma_map = use_sigma ? data.sigma_map.Read() : nullptr;
+  trace.endpoints = data.endpoints.Read(); trace.state = x_in.Read();
+  trace.sigma = use_sigma ? sigma->Read() : nullptr;
+  trace.traces = data.traces.Write();
+  const bool row_reuse = dg_igr_detail::tensor_face::RowReuseRequested();
+  if (row_reuse)
+  {
+    dg_igr_detail::tensor_face::TraceRowReuseKernel reuse;
+    static_cast<dg_igr_detail::tensor_face::TraceKernel&>(reuse) = trace;
+    mfem::forall(data.elements * 4 * data.n, reuse);
+  }
+  else
+  {
+    mfem::forall(data.elements * 4 * data.n, trace);
+  }
+
+  dg_igr_detail::tensor_face::FluxKernel flux;
+  flux.n = data.n; flux.elements = data.elements;
+  flux.interior_faces = data.interior_faces; flux.boundary_faces = data.boundary_faces;
+  flux.max_attr = face_bdr_max_attr_; flux.use_sigma = use_sigma;
+  flux.invariant_domain = invariant;
+  flux.sigma_cfl = use_sigma && igr->GetSigmaAwareCFL();
+  flux.sigma_rusanov = use_sigma && igr->GetSigmaAwareRusanov();
+  flux.gamma = dgsem_gamma_;
+  flux.rho_floor = use_sigma ? igr->GetVelocityRhoFloor() : 1.0e-12;
+  flux.pressure_floor = use_sigma ? igr->GetInvariantDomainPressureFloor() :
+                                     igrlab::LimiterDefaults::kPMin;
+  flux.side1 = data.interior_side1.Read(); flux.side2 = data.interior_side2.Read();
+  flux.boundary_side = data.boundary_side.Read(); flux.side_maps = data.side_maps.Read();
+  flux.tangent_sparse = data.tangent_sparse.Read();
+  flux.tangent_permutation = data.tangent_permutation.Read();
+  flux.boundary_attr = face_bdr_attr_.Read(); flux.boundary_type = face_bdr_type_by_attr_.Read();
+  flux.tangents = data.tangents.Read(); flux.traces = data.traces.Read();
+  flux.interior_normal = face_int_normals_.Read(); flux.boundary_normal = face_bdr_normals_.Read();
+  flux.boundary_gamma = face_bdr_gamma_by_attr_.Read();
+  flux.boundary_pressure = face_bdr_pressure_by_attr_.Read();
+  flux.boundary_state = face_bdr_state_by_attr_.Read();
+  flux.flux = data.flux.Write(); flux.interior_speed = face_int_speed_q_.Write();
+  flux.boundary_speed = face_bdr_speed_q_.Write();
+  flux.boundary_rejected = data.boundary_rejected.Write();
+  flux.interior_telemetry = invariant ? face_int_q_sigma_telemetry_.ReadWrite() : nullptr;
+  flux.boundary_telemetry = invariant ? face_bdr_q_sigma_telemetry_.ReadWrite() : nullptr;
+  mfem::forall((data.interior_faces + data.boundary_faces) * data.n, flux);
+
+  dg_igr_detail::tensor_face::LiftKernel lift;
+  lift.n = data.n; lift.interior_faces = data.interior_faces;
+  lift.boundary_faces = data.boundary_faces;
+  lift.local = data.lex_to_local.Read(); lift.state_map = invmass_elem_vdof_map_.Read();
+  lift.element_faces = data.element_faces.Read(); lift.side_maps = data.side_maps.Read();
+  lift.tangent_sparse = data.tangent_sparse.Read(); lift.tangent_inverse = data.tangent_inverse.Read();
+  lift.boundary_rejected = data.boundary_rejected.Read();
+  lift.endpoints = data.endpoints.Read(); lift.tangents = data.tangents.Read();
+  lift.interior_weights = face_int_weights_.Read(); lift.boundary_weights = face_bdr_weights_.Read();
+  lift.flux = data.flux.Read(); lift.residual = z_out.Write();
+  if (row_reuse)
+  {
+    dg_igr_detail::tensor_face::LiftRowReuseKernel reuse;
+    static_cast<dg_igr_detail::tensor_face::LiftKernel&>(reuse) = lift;
+    mfem::forall(data.elements * data.n * data.n, reuse);
+  }
+  else
+  {
+    mfem::forall(data.elements * data.n * data.n * 4, lift);
+  }
+  if (capture_boundary_flux)
+    mfem::forall(4, dg_igr_detail::tensor_face::BoundaryIntegralKernel{
+      data.n, data.interior_faces, data.boundary_faces,
+      face_bdr_weights_.Read(), data.flux.Read(), physical_boundary_flux_integral_.Write()});
+  FaceSpeedQReduceKernel reduce_interior;
+  reduce_interior.nq = data.n;
+  reduce_interior.face_speed_q = face_int_speed_q_.Read();
+  reduce_interior.face_speed = face_int_speed_.Write();
+  mfem::forall(data.interior_faces, reduce_interior);
+  FaceSpeedQReduceKernel reduce_boundary;
+  reduce_boundary.nq = data.n;
+  reduce_boundary.face_speed_q = face_bdr_speed_q_.Read();
+  reduce_boundary.face_speed = face_bdr_speed_.Write();
+  mfem::forall(data.boundary_faces, reduce_boundary);
+  const real_t interior_max = ReduceFaceMaxSpeed_(face_int_speed_, face_int_speed_reduce_workspace_);
+  const real_t boundary_max = ReduceFaceMaxSpeed_(face_bdr_speed_, face_bdr_speed_reduce_workspace_);
+  max_face_speed = std::max(interior_max, boundary_max);
+  return true;
+#endif
 }
 
 bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEntropyStable_(
@@ -1356,6 +1979,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
     max_face_speed = 0.0;
     return false;
   }
+  if (face_tensor_data_ && face_tensor_data_->ready)
+    return AddTensorFaceContributions_(x_in, z_inout, max_face_speed, capture_boundary_flux);
 
   const FluxFunction& flux_fn = formIntegrator->GetFluxFunction();
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_fn);

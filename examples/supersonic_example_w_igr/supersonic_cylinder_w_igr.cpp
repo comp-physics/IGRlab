@@ -53,6 +53,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -124,12 +125,12 @@ int main(int argc, char* argv[])
   spec.gamma = 1.4;
   spec.dg_backend_default = dg_sim::DGBackend::DG;
   spec.use_igr = true;
-  spec.need_h1 = true;
-  spec.diagnostics.h1_diagnostics = true;
+  spec.need_h1 = false;
+  spec.diagnostics.h1_diagnostics = false;
   spec.diagnostics.l2_diagnostics = true;
   spec.diagnostics.mpi_rank_field = true;
   spec.diagnostics.zhang_shu_limiter = true;
-  spec.glvis.precision = 8;
+  spec.glvis.precision = std::numeric_limits<mfem::real_t>::max_digits10;
   spec.vtk.enabled = true;
   spec.vtk.print_dataset_name = true;
 

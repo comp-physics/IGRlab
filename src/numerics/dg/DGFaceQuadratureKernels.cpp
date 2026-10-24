@@ -21,13 +21,14 @@ void LaunchDGDiffusionCoefficientUpdate2D(
   mfem::Vector& weighted_normal_dshape,
   mfem::Vector& penalty,
   mfem::real_t kappa,
-  DGDiffusionFaceScaling face_scaling)
+  DGDiffusionFaceScaling face_scaling,
+  bool update_normals = true)
 {
   const int side_q_size = 2 * nq * nf;
   const int normal_size = 2 * nq * dof * nf;
   MFEM_VERIFY(dof > 0 && nq > 0 && nf >= 0 &&
                 side_q.Size() == side_q_size &&
-                normal_dshape_base.Size() == normal_size &&
+                (!update_normals || normal_dshape_base.Size() == normal_size) &&
                 penalty_metric.Size() == side_q_size,
               "Exact DG face coefficient refresh received inconsistent "
               "persistent geometry or qdata.");
@@ -35,15 +36,18 @@ void LaunchDGDiffusionCoefficientUpdate2D(
   side_coefficient.SetSize(side_q_size);
   side_coefficient.UseDevice(true);
   side_coefficient = side_q;
-  weighted_normal_dshape.SetSize(normal_size);
-  weighted_normal_dshape.UseDevice(true);
+  if (update_normals)
+  {
+    weighted_normal_dshape.SetSize(normal_size);
+    weighted_normal_dshape.UseDevice(true);
+  }
   penalty.SetSize(nq * nf);
   penalty.UseDevice(true);
 
   const mfem::real_t* coefficient = side_coefficient.Read();
-  const mfem::real_t* normal_base = normal_dshape_base.Read();
+  const mfem::real_t* normal_base = update_normals ? normal_dshape_base.Read() : nullptr;
   const mfem::real_t* metric = penalty_metric.Read();
-  mfem::real_t* weighted_normal = weighted_normal_dshape.Write();
+  mfem::real_t* weighted_normal = update_normals ? weighted_normal_dshape.Write() : nullptr;
   mfem::real_t* penalty_out = penalty.Write();
   const int scaling = static_cast<int>(face_scaling);
 
@@ -60,21 +64,24 @@ void LaunchDGDiffusionCoefficientUpdate2D(
       const mfem::real_t metric1 = q1 * metric[qbase + 1];
       const mfem::real_t metric_sum = metric0 + metric1;
 
-      mfem::real_t normal_scale0 = q0;
-      mfem::real_t normal_scale1 = q1;
-      if (scaling ==
-            static_cast<int>(DGDiffusionFaceScaling::HarmonicWeighted) &&
-          metric_sum > 0.0)
+      if (update_normals)
       {
-        normal_scale0 *= 2.0 * metric1 / metric_sum;
-        normal_scale1 *= 2.0 * metric0 / metric_sum;
-      }
-      for (int d = 0; d < dof; ++d)
-      {
-        const int nbase = 2 * (q + nq * (d + dof * face));
-        weighted_normal[nbase] = normal_scale0 * normal_base[nbase];
-        weighted_normal[nbase + 1] =
-          normal_scale1 * normal_base[nbase + 1];
+        mfem::real_t normal_scale0 = q0;
+        mfem::real_t normal_scale1 = q1;
+        if (scaling ==
+              static_cast<int>(DGDiffusionFaceScaling::HarmonicWeighted) &&
+            metric_sum > 0.0)
+        {
+          normal_scale0 *= 2.0 * metric1 / metric_sum;
+          normal_scale1 *= 2.0 * metric0 / metric_sum;
+        }
+        for (int d = 0; d < dof; ++d)
+        {
+          const int nbase = 2 * (q + nq * (d + dof * face));
+          weighted_normal[nbase] = normal_scale0 * normal_base[nbase];
+          weighted_normal[nbase + 1] =
+            normal_scale1 * normal_base[nbase + 1];
+        }
       }
 
       mfem::real_t penalty_value = 0.5 * metric_sum;
@@ -97,7 +104,66 @@ void LaunchDGDiffusionCoefficientUpdate2D(
     });
 }
 
+void LaunchDGDiffusionNormalUpdate2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  const int dof = info.dof, nq = info.nq, nf = info.nf;
+  MFEM_VERIFY(dof > 0 && nq > 0 && nf >= 0 &&
+                work.side_coefficient.Size() == 2 * nq * nf &&
+                work.normal_dshape_base.Size() == 2 * nq * dof * nf &&
+                work.penalty_metric.Size() == 2 * nq * nf,
+              "Lazy exact DG face normals require current coefficients and "
+              "the exact persistent geometry.");
+  work.weighted_normal_dshape.SetSize(2 * nq * dof * nf);
+  work.weighted_normal_dshape.UseDevice(true);
+  const mfem::real_t* coefficient = work.side_coefficient.Read();
+  const mfem::real_t* normal_base = work.normal_dshape_base.Read();
+  const mfem::real_t* metric = work.penalty_metric.Read();
+  mfem::real_t* weighted_normal = work.weighted_normal_dshape.Write();
+  const bool harmonic =
+    work.coefficient_scaling == DGDiffusionFaceScaling::HarmonicWeighted;
+  mfem::forall(nq * nf, [=] MFEM_HOST_DEVICE(int entry)
+  {
+    const int q = entry % nq, face = entry / nq;
+    const int qbase = 2 * (q + nq * face);
+    mfem::real_t scale0 = coefficient[qbase];
+    mfem::real_t scale1 = coefficient[qbase + 1];
+    if (harmonic)
+    {
+      const mfem::real_t metric0 = scale0 * metric[qbase];
+      const mfem::real_t metric1 = scale1 * metric[qbase + 1];
+      const mfem::real_t sum = metric0 + metric1;
+      if (sum > 0.0)
+      {
+        scale0 *= 2.0 * metric1 / sum;
+        scale1 *= 2.0 * metric0 / sum;
+      }
+    }
+    for (int d = 0; d < dof; ++d)
+    {
+      const int nbase = 2 * (q + nq * (d + dof * face));
+      weighted_normal[nbase] = scale0 * normal_base[nbase];
+      weighted_normal[nbase + 1] = scale1 * normal_base[nbase + 1];
+    }
+  });
+}
+
 } // namespace
+
+void EnsureInteriorFaceDGDiffusionDenseNormals2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  // A vector-only geometry rebuild already supplied a new, current dense
+  // table. Its old scratch state must neither overwrite it nor reuse old Q.
+  if (work.coefficient_geometry_revision != info.connectivity_revision ||
+      work.coefficient_generation == 0 ||
+      work.dense_normal_generation == work.coefficient_generation)
+  { return; }
+  LaunchDGDiffusionNormalUpdate2D(info, work);
+  work.dense_normal_generation = work.coefficient_generation;
+}
 
 void LaunchInteriorFaceDGDiffusionApply2D(
   const InteriorFaceDGDiffusionApplyInfo& info,
@@ -134,6 +200,51 @@ bool TryLaunchInteriorFaceDGDiffusionAddToBase2D(
   return false;
 }
 
+bool CanLaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  const mfem::Vector& rhs,
+  const mfem::Vector& y)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  if (!UsesInteriorFaceDGDiffusionCompactLift2D(info, work) ||
+      info.vdim != 1 || info.ne <= 0 || info.nf <= 0 || info.dof != 36 ||
+      std::size_t(info.ne) * info.dof != std::size_t(scalar.Size()) ||
+      rhs.Size() != scalar.Size() || y.Size() != scalar.Size())
+  { return false; }
+  const auto input = reinterpret_cast<std::uintptr_t>(scalar.Read());
+  const auto source = reinterpret_cast<std::uintptr_t>(rhs.Read());
+  const auto output = reinterpret_cast<std::uintptr_t>(y.Read());
+  const auto bytes = std::size_t(y.Size()) * sizeof(mfem::real_t);
+  // Pointer differences avoid overflowing an end address. Object identity or
+  // unequal starting pointers alone do not exclude overlapping MFEM aliases.
+  const auto disjoint = [bytes](std::uintptr_t a, std::uintptr_t b)
+  { return a < b ? b - a >= bytes : a - b >= bytes; };
+  return disjoint(input, output) && disjoint(source, output);
+#else
+  (void)info; (void)work; (void)scalar; (void)rhs; (void)y;
+  return false;
+#endif
+}
+
+void LaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  const mfem::Vector& rhs,
+  mfem::Vector& y)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  AddInteriorFaceDGDiffusionApplyDevice2D(
+    info, work, scalar, ip_sigma, y, false, &rhs);
+#else
+  (void)info; (void)work; (void)scalar; (void)ip_sigma; (void)rhs; (void)y;
+  MFEM_ABORT("Fused exact-face residual requires native FP64 CUDA preflight.");
+#endif
+}
+
 void LaunchSharedFaceDGDiffusionApply2D(
   const SharedFaceDGDiffusionApplyInfo& info,
   const SharedFaceDGDiffusionApplyScratch& work,
@@ -157,6 +268,16 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
   mfem::real_t kappa,
   DGDiffusionFaceScaling face_scaling)
 {
+  // A failed/aborted refresh cannot leave an earlier coefficient stamp valid.
+  work.normal_factorization.coefficient_revision = 0;
+  work.coefficient_geometry_revision = 0;
+  work.dense_normal_generation = 0;
+  const bool compact = work.compact_qdata &&
+    UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
+    work.normal_factorization.TensorMatches(info) &&
+    (face_scaling == DGDiffusionFaceScaling::Arithmetic ||
+     face_scaling == DGDiffusionFaceScaling::Max ||
+     face_scaling == DGDiffusionFaceScaling::Sum);
   LaunchDGDiffusionCoefficientUpdate2D(info.dof,
                                        info.nq,
                                        info.nf,
@@ -167,7 +288,23 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
                                        work.weighted_normal_dshape,
                                        work.penalty,
                                        kappa,
-                                       face_scaling);
+                                       face_scaling,
+                                       !compact);
+  if (++work.coefficient_generation == 0) { ++work.coefficient_generation; }
+  work.coefficient_geometry_revision = info.connectivity_revision;
+  work.coefficient_scaling = face_scaling;
+  if (compact)
+  {
+    // Keep the exact host geometry for generic/initial paths, but release any
+    // full device allocations left by an earlier dense application. N belongs
+    // to an older stage and must not trigger a full, useless copy to the host.
+    work.shape.DeleteDevice();
+    work.normal_dshape_base.DeleteDevice();
+    work.weighted_normal_dshape.DeleteDevice(false);
+  }
+  else { work.dense_normal_generation = work.coefficient_generation; }
+  work.normal_factorization.coefficient_scaling = face_scaling;
+  work.normal_factorization.coefficient_revision = info.connectivity_revision;
 }
 
 void LaunchSharedFaceDGDiffusionCoefficientUpdate2D(

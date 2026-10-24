@@ -1,0 +1,1672 @@
+{
+  "schema": "dgsem-sedov-correction-comparison-results-v1",
+  "date": "2026-10-24",
+  "status": "completed",
+  "source_commit": "30a472fdf7ee761724c56a72bacb005e782928dc",
+  "job": "3449778",
+  "GPU": {
+    "node": "gh006.hsn.cm.delta.internal.ncsa.edu",
+    "identity": [
+      "GPU-caba4199-1d9f-bc00-16cc-2d4132ddefa5, NVIDIA GH200 120GB"
+    ]
+  },
+  "case": {
+    "elements": 262144,
+    "conserved_dofs": 37748736,
+    "scalar_dofs": 9437184,
+    "geometry_order": 2,
+    "order": 5,
+    "state_basis": "GLL",
+    "sigma_basis": "GLL"
+  },
+  "limiter_policy": "No positivity or modal limiting in any arm; all optional nonfinite/admissibility/conservation scans off",
+  "configuration": {
+    "schema": "dgsem-sedov-correction-comparison-case-v1",
+    "native_case_schema": "dg-positivity-final-measurement-case-v1",
+    "status": "prepared-not-run",
+    "source_commit": "30a472fdf7ee761724c56a72bacb005e782928dc",
+    "source_worktree_head": "2fe1a4b65e2acfd00e8c959ed88f03648c19696c",
+    "numerical_source_note": "The worktree HEAD contains documentation after numerical source 30a472fd; use the already qualified frozen binary without rebuilding.",
+    "parent_case": {
+      "path": "/tmp/igr-positivity-strengthen-20261024/profile/case.json",
+      "bytes": 9041,
+      "sha256": "54a74166ca27dca62518c0bcda18a2260cb19260fa99f6ef3f1556777cbe32d2"
+    },
+    "binary": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+      "bytes": 61881200,
+      "sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26"
+    },
+    "benchmark": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/dg_igr_zhang_shu_throughput_test",
+      "bytes": 61108160,
+      "sha256": "08a314948878a992eb13820927b9d4296a2b455ed343f3d46c353caef084a45e"
+    },
+    "native_receipt": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/run.json",
+      "bytes": 121189,
+      "sha256": "12460aa210db4d00fe5f40d74eddbbf07e1b632f6d2271b0edd9d4bed9ee2dc9"
+    },
+    "source_manifest": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/source-manifest.json",
+      "bytes": 103555,
+      "sha256": "50e9184f6076830358e2cdebd3190b69580cb682563e87d11fb8d6747d748fab"
+    },
+    "native_tests": [
+      "dg_igr_time_defaults_tests",
+      "dg_igr_igr_tests",
+      "dg_igr_limiter_tests",
+      "dg_igr_zhang_shu_sequential_cpu",
+      "dg_igr_zhang_shu_sequential_cuda",
+      "dg_igr_zhang_shu_throughput_cpu",
+      "dg_igr_zhang_shu_throughput_cuda",
+      "dg_igr_limiter_device_alias_cuda",
+      "dg_igr_explicit_ssprk_cpu",
+      "dg_igr_explicit_ssprk_cuda",
+      "dg_igr_euler_admissibility_cache_cpu",
+      "dg_igr_euler_admissibility_cache_cuda",
+      "dg_igr_modal_damping_cpu",
+      "dg_igr_modal_damping_cuda",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_dgsem_mapped_fixed_cuda",
+      "dg_igr_fixed_positivity_rollback_dg_cuda",
+      "dg_igr_fixed_positivity_rollback_dgsem_cuda"
+    ],
+    "required_source_sha256": {
+      "src/numerics/limiters/zhang_shu.cpp": "884a4cc3613bd941442c93e1244483eada8e032694d9e681c05b64e8d060a8a0",
+      "tests/test_zhang_shu_throughput.cpp": "4367127c77bdfc2030cc6e7f0b591345fa9b088300ecc917a160be3aa5f8acb9"
+    },
+    "mesh": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+      "sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836"
+    },
+    "case": {
+      "elements": 262144,
+      "conserved_dofs": 37748736,
+      "scalar_dofs": 9437184,
+      "geometry_order": 2,
+      "order": 5,
+      "state_basis": "GLL",
+      "sigma_basis": "GLL"
+    },
+    "inputs": {
+      "binary": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+        "bytes": 61881200,
+        "sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26"
+      },
+      "benchmark": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/dg_igr_zhang_shu_throughput_test",
+        "bytes": 61108160,
+        "sha256": "08a314948878a992eb13820927b9d4296a2b455ed343f3d46c353caef084a45e"
+      },
+      "native_receipt": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/run.json",
+        "bytes": 121189,
+        "sha256": "12460aa210db4d00fe5f40d74eddbbf07e1b632f6d2271b0edd9d4bed9ee2dc9"
+      },
+      "source_manifest": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/source-manifest.json",
+        "bytes": 103555,
+        "sha256": "50e9184f6076830358e2cdebd3190b69580cb682563e87d11fb8d6747d748fab"
+      },
+      "mesh": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+        "sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836"
+      }
+    },
+    "physical_configuration": {
+      "application": "Sedov-Taylor blast",
+      "discretization": "dgsem",
+      "elements_per_direction": [
+        512,
+        512
+      ],
+      "elements": 262144,
+      "scalar_dofs": 9437184,
+      "conserved_dofs": 37748736,
+      "geometry_order": 2,
+      "order": 5,
+      "state_basis": "GLL",
+      "sigma_basis": "GLL",
+      "regularization": "igr",
+      "IGR_space": "L2",
+      "gradient": "BrokenL2",
+      "c_alpha": 0.16666666666666666,
+      "alpha_length": "max",
+      "alpha_formula": "c_alpha * h_eff^2",
+      "time_integrator": "rk3ssp",
+      "CFL": 0.3,
+      "full_target_time": 0.1,
+      "positivity_limiter": "none",
+      "modal_damping_rate": 0,
+      "surface_flux": "rusanov",
+      "volume_flux": "central",
+      "volume_dissipation": "none",
+      "dgsem_stabilization": "none",
+      "subcell_blend": false,
+      "optional_nonfinite_admissibility_conservation_scans": "off",
+      "sigma_cfl": false,
+      "sigma_rusanov": false,
+      "invariant_domain_flux": false
+    },
+    "save_interval": 0.02,
+    "expected_output_times": [
+      0.0,
+      0.02,
+      0.04,
+      0.06,
+      0.08,
+      0.1
+    ],
+    "common_operator": {
+      "A": "Current original FP64 consistent mass/diffusion/exact SIPG face operator; refreshed coefficients at every stage",
+      "P": "Projected element-local spectral inverse, FP64 WMMA factors, initial reference once and current heterogeneous mass scaling",
+      "fixed_update": "sigma <- sigma + omega * P * (b - A sigma)",
+      "P_backend": "tensor-element-projected-wmma-factor-fp64",
+      "reference": "projected",
+      "local_execution": "wmma-factor-fp64",
+      "tensor_volume": "simt",
+      "coarse": "none",
+      "global_or_two_level_preconditioner": false
+    },
+    "omega_explanation": "Omega 0.2 applies a smaller relaxation correction than 0.7. It is stronger under-relaxation, with modal damping still zero. It changes the initial 50 corrections as well as regular corrections.",
+    "arms": {
+      "fixed-50-2-w07": {
+        "label": "DGSEM fixed 50/2, omega=0.7, projected local FP64 WMMA P",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "igr",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "element-block-jacobi",
+          "--igr-jacobi-blocks",
+          "tensor",
+          "--igr-sweeps",
+          "2",
+          "--igr-initial-sweeps",
+          "50",
+          "--igr-jacobi-omega",
+          "0.7",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "fixed-sweeps",
+        "expected_last_solver": "fixed-element-jacobi",
+        "expected_last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "target_time": 0.1,
+        "timeout_seconds": 900,
+        "initial_sweeps": 50,
+        "regular_sweeps": 2,
+        "omega": 0.7,
+        "convergence_claim": false
+      },
+      "fixed-50-4-w02": {
+        "label": "DGSEM fixed 50/4, omega=0.2, projected local FP64 WMMA P",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "igr",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "element-block-jacobi",
+          "--igr-jacobi-blocks",
+          "tensor",
+          "--igr-sweeps",
+          "4",
+          "--igr-initial-sweeps",
+          "50",
+          "--igr-jacobi-omega",
+          "0.2",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "fixed-sweeps",
+        "expected_last_solver": "fixed-element-jacobi",
+        "expected_last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "target_time": 0.1,
+        "timeout_seconds": 900,
+        "initial_sweeps": 50,
+        "regular_sweeps": 4,
+        "omega": 0.2,
+        "convergence_claim": false
+      },
+      "fgmres-local-wmma": {
+        "label": "DGSEM converged CUDA FP64 FGMRES, same projected local FP64 WMMA P",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "igr",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "krylov",
+          "--igr-jacobi-blocks",
+          "current",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "1",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "converged-fgmres",
+        "expected_last_solver": "fgmres-cuda-fp64",
+        "expected_last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "target_time": 0.1,
+        "timeout_seconds": 10800,
+        "residual_contract": {
+          "scale": "rhs",
+          "relative_tolerance": 1e-06,
+          "absolute_tolerance": 0,
+          "maximum_iterations": 1000,
+          "restart": 50,
+          "independent_current_fp64_A_certificate_factor": 1,
+          "nonconvergence_policy": "error",
+          "require_all_actual_calls_converged": true
+        }
+      }
+    },
+    "arm_order": [
+      "fixed-50-2-w07",
+      "fixed-50-4-w02",
+      "fgmres-local-wmma"
+    ],
+    "environment_policy": {
+      "control_names": "Canonical unprefixed keys; runner clears inherited IGRLAB_ and DG_IGR_ variables and applies each control under both aliases",
+      "inherited_solver_overrides": "must be removed before execution",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "PMIX_MCA_gds": "hash",
+      "CUDA_VISIBLE_DEVICES": "preserve scheduler binding; never choose a second device"
+    },
+    "diagnostic_policy": {
+      "profilers": false,
+      "new_instrumentation": false,
+      "PROFILE_NVTX": "0",
+      "SOLVER_WALL_TIMING": "1",
+      "VTK_OUTPUT_TIMING": "1",
+      "other_optional_timers": "0",
+      "IGR_TRUE_RESIDUAL": "0",
+      "operator_and_preconditioner_probes": "off",
+      "event_capture": "off",
+      "note": "Existing wall timing partitions remain identical in all arms. The converged method still performs its required current FP64 residual certificate."
+    },
+    "budget": {
+      "job_seconds": 14400,
+      "analysis_seconds_total": 600,
+      "cleanup_reserve_seconds": 300,
+      "log_bytes_cap_per_stream": 8388608,
+      "min_free_tmp_gib": 32,
+      "retained_bytes_cap": 3221225472,
+      "final_vtu_bytes_cap_per_arm": 1500000000,
+      "fixed_application_seconds": 900,
+      "matched_fgmres_application_seconds": 10800
+    },
+    "resources": {
+      "account": "bdiy-dtai-gh",
+      "partition": "ghx4",
+      "constraint": "projects",
+      "nodes": 1,
+      "ntasks": 1,
+      "cpus_per_task": 8,
+      "gpus_per_node": 1,
+      "concurrent_gpu_applications": 1,
+      "memory": "96G",
+      "slurm_time": "04:00:00",
+      "scratch": "job-local /tmp",
+      "no_requeue": true
+    },
+    "execution_policy": {
+      "full_trajectories": 3,
+      "each_starts_at_time": 0.0,
+      "each_target_time": 0.1,
+      "all_on_same_allocated_gpu": true,
+      "pilot_or_tiny_substitute": false,
+      "duplicate_runs": false,
+      "builds": false,
+      "restarts": false,
+      "automatic_parameter_fallback": false,
+      "automatic_retry": false,
+      "native_failure_is_reportable": true,
+      "do_not_form_speed_ratio_for_incomplete_or_unusable_arm": true
+    },
+    "count_expectations": {
+      "acceptance_gate": false,
+      "basis": "Historical full DGSEM Sedov no-limiter trajectory; prediction only, actual CFL trajectories may differ",
+      "accepted_steps": 6663,
+      "rejected_attempts": 0,
+      "rhs_evaluations": 19990,
+      "linear_calls": 19990,
+      "production_linear_calls": 19989,
+      "output_only_linear_calls": 1,
+      "fixed_correction_formula": "50 + (actual_linear_calls - 1) * regular_sweeps",
+      "fixed_50_2_corrections": 40028,
+      "fixed_50_4_corrections": 80006,
+      "correction_counters": "One current A and one P application per fixed correction; no extra true-residual probe requested"
+    },
+    "comparison_policy": {
+      "endpoint": 0.1,
+      "reference_arm": "fgmres-local-wmma",
+      "require_primary_native_zero_rejections": true,
+      "report_all_actual_counts": true,
+      "minor_CFL_step_count_differences": "report; do not reject solely for differing nominal counts",
+      "require_completed_native_target": true,
+      "conserved_components": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "sigma": "compare separately",
+      "physical_sampling": "Native polynomial fields evaluated with existing mapped GL8 comparison, finite native and derived fields and positive sampled density/pressure required for usability",
+      "q_sigma": "report final native admission and sampled minimum",
+      "error_metrics": [
+        "normalized L2",
+        "normalized sampled Linf",
+        "integrals"
+      ],
+      "error_thresholds": "No user-approved approximation error threshold; report differences without inventing a pass budget",
+      "fixed_residual": "No convergence certificate or tolerance claim for fixed sweeps",
+      "accuracy_scope": "Comparison to a converged closure on this spatial/temporal discretization; no discretization error or continuous positivity claim"
+    },
+    "retention_policy": {
+      "keep_three_final_native_vtu": false,
+      "keep_original_series_metadata": true,
+      "prune_intermediate_cycles_after_each_arm": true,
+      "large_field_download": false,
+      "compressed_archive_bound": true,
+      "note": "Compare all qualified final fields remotely. Retain two preferred raw final VTUs in the compressed archive: fixed50/4 omega.2 plus FGMRES when available, otherwise the two fixed finals. Prune the old fixed final after comparisons; 3 GiB bounds the compressed archive plus compact receipts. Intermediate native cycles are removed after each arm.",
+      "preferred_final_labels": [
+        "fixed-50-4-w02",
+        "fgmres-local-wmma"
+      ],
+      "fallback_if_FGMRES_unavailable": [
+        "fixed-50-2-w07",
+        "fixed-50-4-w02"
+      ]
+    },
+    "context_not_control": {
+      "historical_full_case": "/home/jarias9/.codex/worktrees/dg-positivity-throughput/IGRlab/docs/benchmarks/dgsem_mapped_full_comparison.json",
+      "reason": "Its reference uses a two-level element Q1 preconditioner and is not the matched same-P converged control.",
+      "cylinder_winner": "/home/jarias9/.cache/igrlab-experiments/dgsem-cylinder-correction-sweep-20261024/cylinder_spectral_corrections_20261024.json",
+      "reason_cylinder": "Only solver settings 50/4 and omega .2 are adopted; cylinder limiter/modal damping/mesh/timestep are not copied."
+    },
+    "comparator_sha256": "f3cb6b0baaf8c0e54c1fa99e1fe63868b93f0064e013002edbfc0fa5ca2da615"
+  },
+  "matched_runs": {
+    "fixed-50-2-w07": {
+      "name": "fixed-50-2-w07",
+      "status": "completed",
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 19990.0,
+        "converged_calls": 0.0,
+        "production_calls": 19989.0,
+        "output_only_calls": 1.0,
+        "total_iters": 40028.0,
+        "total_krylov_operator_apply_count": 40028.0,
+        "total_krylov_preconditioner_apply_count": 40028.0
+      },
+      "metrics": {
+        "application_wall_s": 330.3598987022415,
+        "solver_total_s": 304.815619029,
+        "host_bins_s": {
+          "setup_initial_output_s": 35.349298135,
+          "advancing_cfl_s": 188.10073153699997,
+          "scheduled_output_s": 64.74090750100001,
+          "diagnostics_s": 0.42559375700000013,
+          "final_output_postloop_s": 16.199088099
+        },
+        "advancing_s_per_accepted_step": 0.028230636580669363,
+        "advancing_s_per_actual_rhs": 0.009409741447573786,
+        "advancing_ns_per_conserved_dof_rhs": 0.24927302062706908
+      },
+      "linear": {
+        "calls": "19990",
+        "converged_calls": "0",
+        "production_calls": "19989",
+        "output_only_calls": "1",
+        "total_iters": "40028",
+        "avg_iters": "2.0024012006003002",
+        "max_iters": "50",
+        "total_solve_s": "95.023134934000623",
+        "total_igr_s": "150.56751625700053",
+        "total_krylov_operator_apply_count": "40028",
+        "total_krylov_preconditioner_apply_count": "40028",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64"
+      },
+      "final_closure_record": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "dispatch_valid": true,
+      "fixed_work_accounting": {
+        "formula": "50+(actual_calls-1)*regular_sweeps",
+        "expected_iters": 40028.0,
+        "actual_iters": 40028.0,
+        "A_applications": 40028.0,
+        "P_applications": 40028.0
+      },
+      "final_field": {
+        "path": "/tmp/igrlab-3449778-nijxggzy/run/comparison/fixed-50-2-w07/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114",
+        "retention": "pruned-after-comparisons; two-final3GiBretention-cap"
+      },
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ]
+    },
+    "fixed-50-4-w02": {
+      "name": "fixed-50-4-w02",
+      "status": "completed",
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 19990.0,
+        "converged_calls": 0.0,
+        "production_calls": 19989.0,
+        "output_only_calls": 1.0,
+        "total_iters": 80006.0,
+        "total_krylov_operator_apply_count": 80006.0,
+        "total_krylov_preconditioner_apply_count": 80006.0
+      },
+      "metrics": {
+        "application_wall_s": 395.83820292912424,
+        "solver_total_s": 371.545351306,
+        "host_bins_s": {
+          "setup_initial_output_s": 35.366903851,
+          "advancing_cfl_s": 254.637061187,
+          "scheduled_output_s": 64.95377618299999,
+          "diagnostics_s": 0.4257248920000001,
+          "final_output_postloop_s": 16.161885193
+        },
+        "advancing_s_per_accepted_step": 0.038216578296112864,
+        "advancing_s_per_actual_rhs": 0.012738222170435218,
+        "advancing_ns_per_conserved_dof_rhs": 0.3374476477950207
+      },
+      "linear": {
+        "calls": "19990",
+        "converged_calls": "0",
+        "production_calls": "19989",
+        "output_only_calls": "1",
+        "total_iters": "80006",
+        "avg_iters": "4.0023011505752875",
+        "max_iters": "50",
+        "total_solve_s": "160.98092841100055",
+        "total_igr_s": "216.64494780000035",
+        "total_krylov_operator_apply_count": "80006",
+        "total_krylov_preconditioner_apply_count": "80006",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64"
+      },
+      "final_closure_record": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "dispatch_valid": true,
+      "fixed_work_accounting": {
+        "formula": "50+(actual_calls-1)*regular_sweeps",
+        "expected_iters": 80006.0,
+        "actual_iters": 80006.0,
+        "A_applications": 80006.0,
+        "P_applications": 80006.0
+      },
+      "final_field": {
+        "path": "/tmp/igrlab-3449778-nijxggzy/run/comparison/fixed-50-4-w02/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "95be45927e738f7b63e7e6f13a3765419f106251782398f42421d4664ac3b1dd"
+      },
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ]
+    },
+    "fgmres-local-wmma": {
+      "name": "fgmres-local-wmma",
+      "status": "completed",
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 19990.0,
+        "converged_calls": 19990.0,
+        "production_calls": 19989.0,
+        "output_only_calls": 1.0,
+        "total_iters": 897273.0,
+        "total_krylov_operator_apply_count": 941225.0,
+        "total_krylov_preconditioner_apply_count": 897273.0
+      },
+      "metrics": {
+        "application_wall_s": 4238.231838151813,
+        "solver_total_s": 4212.868859274,
+        "host_bins_s": {
+          "setup_initial_output_s": 36.386340422,
+          "advancing_cfl_s": 4094.255187869,
+          "scheduled_output_s": 65.416512374,
+          "diagnostics_s": 0.42752527000000007,
+          "final_output_postloop_s": 16.383293338999998
+        },
+        "advancing_s_per_accepted_step": 0.6144762401124119,
+        "advancing_s_per_actual_rhs": 0.20481516697693847,
+        "advancing_ns_per_conserved_dof_rhs": 5.4257490098989924
+      },
+      "linear": {
+        "calls": "19990",
+        "converged_calls": "19990",
+        "production_calls": "19989",
+        "output_only_calls": "1",
+        "total_iters": "897273",
+        "avg_iters": "44.886093046523264",
+        "max_iters": "121",
+        "total_solve_s": "3991.9506630540004",
+        "total_igr_s": "4048.7586950130003",
+        "total_krylov_operator_apply_count": "941225",
+        "total_krylov_preconditioner_apply_count": "897273",
+        "last_solver": "fgmres-cuda-fp64",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64"
+      },
+      "final_closure_record": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "1",
+        "certified": "1",
+        "residual_rel_rhs": "9.2789017061061775e-07",
+        "run_success": "1",
+        "residual_abs": "8.7240051974706465e-15",
+        "relative_limit": "9.9999999999999995e-07",
+        "absolute_limit": "0",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0"
+      },
+      "dispatch_valid": true,
+      "fixed_work_accounting": {},
+      "final_field": {
+        "path": "/tmp/igrlab-3449778-nijxggzy/run/comparison/fgmres-local-wmma/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "5a7a4e7040d6fd03b71d409cfe5192c41725f7ef92e88f3cf60791085bd62242"
+      },
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ]
+    }
+  },
+  "FGMRES_over_fixed_ratios": {
+    "fixed-50-2-w07": {
+      "fgmres_over_fixed_application_wall": 12.82913530001956,
+      "fgmres_over_fixed_advancing": 21.766290616810537,
+      "actual_work_counts_equal": true,
+      "source": "matched complete trajectories; distinct sigma acceptance policies"
+    },
+    "fixed-50-4-w02": {
+      "fgmres_over_fixed_application_wall": 10.706980293437413,
+      "fgmres_over_fixed_advancing": 16.078787466299993,
+      "actual_work_counts_equal": true,
+      "source": "matched complete trajectories; distinct sigma acceptance policies"
+    }
+  },
+  "new4_vs_current2": {
+    "application_seconds": {
+      "current2": 330.3598987022415,
+      "new4": 395.83820292912424
+    },
+    "new_over_current_application": 1.1982029431662327,
+    "new_application_added_percent": 19.820294316623265,
+    "advancing_seconds": {
+      "current2": 188.10073153699997,
+      "new4": 254.637061187
+    },
+    "new_advancing_added_percent": 35.37271179453767,
+    "actual_RHS_count_equal": true
+  },
+  "field_comparisons": [
+    {
+      "reference": "fixed-50-2-w07",
+      "candidate": "fixed-50-4-w02",
+      "status": "completed",
+      "finite_and_GL8_positive": true,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        },
+        "candidate": {
+          "density_min": 0.4494201411126782,
+          "pressure_min": 1.000318763998638,
+          "q_sigma_min": 1.4004462696296247
+        }
+      },
+      "components": {
+        "density": {
+          "normalized_l2": 1.2779605438337783e-07,
+          "normalized_linf_at_gl_points": 5.370635976804343e-07,
+          "integral_candidate_minus_reference": -2.4801457785244276e-18,
+          "integral_abs_difference_over_reference_gl_l1": 2.480145778525544e-18,
+          "reference_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ],
+          "candidate_range_at_gl_points": [
+            0.4494201411126782,
+            1.2875398570855066
+          ]
+        },
+        "momentum_x": {
+          "normalized_l2": 6.061466787641433e-07,
+          "normalized_linf_at_gl_points": 1.4184022873845805e-06,
+          "integral_candidate_minus_reference": -1.3821110229251014e-11,
+          "integral_abs_difference_over_reference_gl_l1": 7.796380928208065e-11,
+          "reference_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ],
+          "candidate_range_at_gl_points": [
+            -0.806305556906564,
+            0.8063058828626808
+          ]
+        },
+        "momentum_y": {
+          "normalized_l2": 6.061466787790641e-07,
+          "normalized_linf_at_gl_points": 1.418402282151906e-06,
+          "integral_candidate_minus_reference": -1.3821111205971787e-11,
+          "integral_abs_difference_over_reference_gl_l1": 7.796381479168805e-11,
+          "reference_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063055569094429,
+            0.8063058828628864
+          ]
+        },
+        "energy": {
+          "normalized_l2": 1.9421132326560436e-07,
+          "normalized_linf_at_gl_points": 6.610428204909116e-07,
+          "integral_candidate_minus_reference": 2.1141534678132034e-18,
+          "integral_abs_difference_over_reference_gl_l1": 6.0404577472283965e-19,
+          "reference_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969099966267,
+            5.051545317061569
+          ]
+        },
+        "sigma": {
+          "normalized_l2": 0.0115711448795755,
+          "normalized_linf_at_gl_points": 0.01882167481552857,
+          "integral_candidate_minus_reference": -1.5287851991975048e-08,
+          "integral_abs_difference_over_reference_gl_l1": 0.00115895711788717,
+          "reference_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ],
+          "candidate_range_at_gl_points": [
+            7.531954612577666e-11,
+            5.612419673735984e-05
+          ]
+        },
+        "pressure": {
+          "normalized_l2": 1.7242841644290497e-07,
+          "normalized_linf_at_gl_points": 6.140430413358169e-07,
+          "integral_candidate_minus_reference": -1.8660296712844667e-09,
+          "integral_abs_difference_over_reference_gl_l1": 1.3617523080938408e-09,
+          "reference_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ],
+          "candidate_range_at_gl_points": [
+            1.000318763998638,
+            1.9119035392138712
+          ]
+        },
+        "speed": {
+          "normalized_l2": 3.936258754119527e-07,
+          "normalized_linf_at_gl_points": 9.596019905432549e-07,
+          "integral_candidate_minus_reference": -5.110389810050333e-09,
+          "integral_abs_difference_over_reference_gl_l1": 1.795619972606843e-08,
+          "reference_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ],
+          "candidate_range_at_gl_points": [
+            2.5042749360271493e-07,
+            0.7062098100025097
+          ]
+        },
+        "q_sigma": {
+          "normalized_l2": 1.653647349428892e-07,
+          "normalized_linf_at_gl_points": 5.737607012889913e-07,
+          "integral_candidate_minus_reference": -8.727582336701615e-09,
+          "integral_abs_difference_over_reference_gl_l1": 4.549297093367599e-09,
+          "reference_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ],
+          "candidate_range_at_gl_points": [
+            1.4004462696296247,
+            2.6766674171423936
+          ]
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "raw_report": {
+        "path": "/tmp/igrlab-3449778-nijxggzy/run/comparison/fixed-50-2-w07--fixed-50-4-w02.json",
+        "bytes": 22060,
+        "sha256": "e91fd6ef81bec0dc9140a9fe60a3b63cda3f0915e2266bb37d9a0355e328e0d8"
+      }
+    },
+    {
+      "reference": "fgmres-local-wmma",
+      "candidate": "fixed-50-2-w07",
+      "status": "completed",
+      "finite_and_GL8_positive": true,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.44942021429526346,
+          "pressure_min": 1.0003187640062439,
+          "q_sigma_min": 1.400446269640606
+        },
+        "candidate": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        }
+      },
+      "components": {
+        "density": {
+          "normalized_l2": 1.7335609660964615e-07,
+          "normalized_linf_at_gl_points": 7.338060742626756e-07,
+          "integral_candidate_minus_reference": 1.7215031631137968e-17,
+          "integral_abs_difference_over_reference_gl_l1": 1.7215031631145678e-17,
+          "reference_range_at_gl_points": [
+            0.44942021429526346,
+            1.2875394415303878
+          ],
+          "candidate_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ]
+        },
+        "momentum_x": {
+          "normalized_l2": 8.208254865304558e-07,
+          "normalized_linf_at_gl_points": 1.961087474657517e-06,
+          "integral_candidate_minus_reference": -2.0129875207293072e-11,
+          "integral_abs_difference_over_reference_gl_l1": 1.1355105772629237e-10,
+          "reference_range_at_gl_points": [
+            -0.8063070434192471,
+            0.8063069054240473
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ]
+        },
+        "momentum_y": {
+          "normalized_l2": 8.208254865290991e-07,
+          "normalized_linf_at_gl_points": 1.961087474650524e-06,
+          "integral_candidate_minus_reference": -2.0129874699914424e-11,
+          "integral_abs_difference_over_reference_gl_l1": 1.1355105486421073e-10,
+          "reference_range_at_gl_points": [
+            -0.8063070434221223,
+            0.8063069054242503
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ]
+        },
+        "energy": {
+          "normalized_l2": 2.616172223853126e-07,
+          "normalized_linf_at_gl_points": 8.996327436759509e-07,
+          "integral_candidate_minus_reference": 2.4152239519848568e-17,
+          "integral_abs_difference_over_reference_gl_l1": 6.900661874442277e-18,
+          "reference_range_at_gl_points": [
+            2.5007969100156417,
+            5.051546878203936
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ]
+        },
+        "sigma": {
+          "normalized_l2": 0.01529115300491985,
+          "normalized_linf_at_gl_points": 0.025345503657780592,
+          "integral_candidate_minus_reference": -1.9676320140442255e-08,
+          "integral_abs_difference_over_reference_gl_l1": 0.0014894209154554332,
+          "reference_range_at_gl_points": [
+            7.966015186505985e-11,
+            5.652925188878557e-05
+          ],
+          "candidate_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ]
+        },
+        "pressure": {
+          "normalized_l2": 2.3244822564647642e-07,
+          "normalized_linf_at_gl_points": 8.358245678295e-07,
+          "integral_candidate_minus_reference": -2.5221144650059917e-09,
+          "integral_abs_difference_over_reference_gl_l1": 1.8405362146858853e-09,
+          "reference_range_at_gl_points": [
+            1.0003187640062439,
+            1.9119039968843488
+          ],
+          "candidate_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ]
+        },
+        "speed": {
+          "normalized_l2": 5.3289213680794e-07,
+          "normalized_linf_at_gl_points": 1.3393232435676222e-06,
+          "integral_candidate_minus_reference": -6.732037364617365e-09,
+          "integral_abs_difference_over_reference_gl_l1": 2.365412602876974e-08,
+          "reference_range_at_gl_points": [
+            2.504275075965358e-07,
+            0.7062097222104
+          ],
+          "candidate_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ]
+        },
+        "q_sigma": {
+          "normalized_l2": 2.2373179467933538e-07,
+          "normalized_linf_at_gl_points": 7.879987095686936e-07,
+          "integral_candidate_minus_reference": -1.140148830717727e-08,
+          "integral_abs_difference_over_reference_gl_l1": 5.943084270832385e-09,
+          "reference_range_at_gl_points": [
+            1.400446269640606,
+            2.6766680461727446
+          ],
+          "candidate_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ]
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "raw_report": {
+        "path": "/tmp/igrlab-3449778-nijxggzy/run/comparison/fgmres-local-wmma--fixed-50-2-w07.json",
+        "bytes": 22065,
+        "sha256": "eb0fb0de724c64d02e6e7608c3ac43dc4e51d019d321dcb2ad3467f307839261"
+      }
+    },
+    {
+      "reference": "fgmres-local-wmma",
+      "candidate": "fixed-50-4-w02",
+      "status": "completed",
+      "finite_and_GL8_positive": true,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.44942021429526346,
+          "pressure_min": 1.0003187640062439,
+          "q_sigma_min": 1.400446269640606
+        },
+        "candidate": {
+          "density_min": 0.4494201411126782,
+          "pressure_min": 1.000318763998638,
+          "q_sigma_min": 1.4004462696296247
+        }
+      },
+      "components": {
+        "density": {
+          "normalized_l2": 3.0081956058019915e-07,
+          "normalized_linf_at_gl_points": 1.2693008938674583e-06,
+          "integral_candidate_minus_reference": 1.473499781259997e-17,
+          "integral_abs_difference_over_reference_gl_l1": 1.473499781260657e-17,
+          "reference_range_at_gl_points": [
+            0.44942021429526346,
+            1.2875394415303878
+          ],
+          "candidate_range_at_gl_points": [
+            0.4494201411126782,
+            1.2875398570855066
+          ]
+        },
+        "momentum_x": {
+          "normalized_l2": 1.4255705088948356e-06,
+          "normalized_linf_at_gl_points": 3.374198879268198e-06,
+          "integral_candidate_minus_reference": -3.395098543655107e-11,
+          "integral_abs_difference_over_reference_gl_l1": 1.9151486372720238e-10,
+          "reference_range_at_gl_points": [
+            -0.8063070434192471,
+            0.8063069054240473
+          ],
+          "candidate_range_at_gl_points": [
+            -0.806305556906564,
+            0.8063058828626808
+          ]
+        },
+        "momentum_y": {
+          "normalized_l2": 1.4255705089090715e-06,
+          "normalized_linf_at_gl_points": 3.3741988838000126e-06,
+          "integral_candidate_minus_reference": -3.395098590612369e-11,
+          "integral_abs_difference_over_reference_gl_l1": 1.9151486637602795e-10,
+          "reference_range_at_gl_points": [
+            -0.8063070434221223,
+            0.8063069054242503
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063055569094429,
+            0.8063058828628864
+          ]
+        },
+        "energy": {
+          "normalized_l2": 4.5537560529176657e-07,
+          "normalized_linf_at_gl_points": 1.5587140786904752e-06,
+          "integral_candidate_minus_reference": 2.6266050744081465e-17,
+          "integral_abs_difference_over_reference_gl_l1": 7.504609864973118e-18,
+          "reference_range_at_gl_points": [
+            2.5007969100156417,
+            5.051546878203936
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969099966267,
+            5.051545317061569
+          ]
+        },
+        "sigma": {
+          "normalized_l2": 0.02681383980509349,
+          "normalized_linf_at_gl_points": 0.04391895671691572,
+          "integral_candidate_minus_reference": -3.496417213241743e-08,
+          "integral_abs_difference_over_reference_gl_l1": 0.0026466518583711167,
+          "reference_range_at_gl_points": [
+            7.966015186505985e-11,
+            5.652925188878557e-05
+          ],
+          "candidate_range_at_gl_points": [
+            7.531954612577666e-11,
+            5.612419673735984e-05
+          ]
+        },
+        "pressure": {
+          "normalized_l2": 4.044537712004674e-07,
+          "normalized_linf_at_gl_points": 1.447689226786949e-06,
+          "integral_candidate_minus_reference": -4.38814413629034e-09,
+          "integral_abs_difference_over_reference_gl_l1": 3.2022885202732853e-09,
+          "reference_range_at_gl_points": [
+            1.0003187640062439,
+            1.9119039968843488
+          ],
+          "candidate_range_at_gl_points": [
+            1.000318763998638,
+            1.9119035392138712
+          ]
+        },
+        "speed": {
+          "normalized_l2": 9.255400845502563e-07,
+          "normalized_linf_at_gl_points": 2.294816189273548e-06,
+          "integral_candidate_minus_reference": -1.1842427174667711e-08,
+          "integral_abs_difference_over_reference_gl_l1": 4.1610325330100003e-08,
+          "reference_range_at_gl_points": [
+            2.504275075965358e-07,
+            0.7062097222104
+          ],
+          "candidate_range_at_gl_points": [
+            2.5042749360271493e-07,
+            0.7062098100025097
+          ]
+        },
+        "q_sigma": {
+          "normalized_l2": 3.886598956422331e-07,
+          "normalized_linf_at_gl_points": 1.3593633593300121e-06,
+          "integral_candidate_minus_reference": -2.0129070643878775e-08,
+          "integral_abs_difference_over_reference_gl_l1": 1.049238133716308e-08,
+          "reference_range_at_gl_points": [
+            1.400446269640606,
+            2.6766680461727446
+          ],
+          "candidate_range_at_gl_points": [
+            1.4004462696296247,
+            2.6766674171423936
+          ]
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "raw_report": {
+        "path": "/tmp/igrlab-3449778-nijxggzy/run/comparison/fgmres-local-wmma--fixed-50-4-w02.json",
+        "bytes": 22059,
+        "sha256": "2eadf98528f90fb23b022e7e49f755297dbb4d8d70295bb07b99ea5f495a239a"
+      }
+    }
+  ],
+  "interpretation_limits": [
+    "Omega .2 is stronger under-relaxation per correction than.7. This is solver relaxation, not modal damping or a change to physical IGR alpha.",
+    "Changing omega also changes the50 initial approximate corrections; current2andnew4 change both regular count and relaxation.",
+    "FGMRES uses the same projected element-local FP64 WMMA P as fixed corrections. It is not the historical Q1/two-level or global Cartesian TF32 reference.",
+    "Full physical window, executable, geometry, discretization, optional scans, output schedule and GPU are matched. No repeat-based confidence interval is claimed.",
+    "Fixed sigma has no convergence certificate. Conserved flow and sigma differences are reported independently; engineering thresholds are not discretization-error bounds.",
+    "Saved-field GL8 positivity does not prove positivity between samples or all times.",
+    "Only this fixed512\u00b2Q2mappedp5GLL case is measured; no mesh/p-order/MPI/3D extrapolation."
+  ],
+  "receipts": [
+    {
+      "file": "result.json",
+      "bytes": 120898,
+      "sha256": "4375c4410fe1cec64e1105b0bf858f0abb9ce419076e0888a9ccf88c8fe8c132"
+    },
+    {
+      "file": "submission.json",
+      "bytes": 1577,
+      "sha256": "e722a4f9241bd9a229a8efffc56f49f522a7e982c7e0794932fe610e197f2cdb"
+    },
+    {
+      "file": "case-work/case.json",
+      "bytes": 29615,
+      "sha256": "6302c0820a8e814a48d15384d0e38af370861810d16cdf2aefa5a0ba5435e9f2"
+    },
+    {
+      "file": "harness/hashes.json",
+      "bytes": 2637,
+      "sha256": "f82629ed9b627135d284767bbb222120292bd04ffdad6796a1ce0e1f06b6c5ab"
+    }
+  ],
+  "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-sedov-correction-comparison-20261024",
+  "retained_final_labels": [
+    "fixed-50-4-w02",
+    "fgmres-local-wmma"
+  ],
+  "bulk_fields_downloaded": false,
+  "no_application_build_or_source_changes": true,
+  "allocation_runtime": {
+    "authority": "Slurm sacct",
+    "jobs": [
+      {
+        "job": "3449778",
+        "state": "COMPLETED",
+        "elapsed_seconds": 5122,
+        "exit_code": "0:0",
+        "allocated_TRES": "billing=1000,cpu=8,gres/gpu=1,mem=96G,node=1"
+      }
+    ],
+    "GPU_count": 1,
+    "allocated_GPU_hours": 1.4227777777777777,
+    "billed_credits_claim": false
+  },
+  "retention": {
+    "remote_archive": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-sedov-correction-comparison-20261024/r1/selected/comparison/selected-results.tar.gz",
+    "archive_bytes": 1462896477,
+    "archive_sha256": "0d7296f3bd16e90e4ff5cd95e12efa5773162f8efac0ae599d62ffd8cc7c8786",
+    "VTU_members": [
+      "fgmres-local-wmma/final.vtu",
+      "fixed-50-4-w02/final.vtu"
+    ],
+    "wrapper_exit": 0,
+    "child_exit": 0,
+    "intermediate_VTK_retained": false,
+    "large_field_downloads": false
+  },
+  "postrun_identity_checks": {
+    "raw_run_matches_wrapper_SHA256": true,
+    "binary_SHA256_unchanged": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26",
+    "all_applications_same_GPU": true
+  }
+}

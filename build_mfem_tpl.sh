@@ -152,8 +152,9 @@ if [[ "${MODE}" == "gpu" ]]; then
     exit 2
   fi
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
-  if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]]; then
-    # The SM70/SM80 manifests pin compatible releases; identity still binds the DAG hash.
+  if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ||
+        "${SPACK_CUDA_ARCH}" == "90" ]]; then
+    # SM70/SM80/SM90 environments select compatible releases; identity still binds the DAG hash.
     HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
   fi
   MPI_SPEC="openmpi+cuda"
@@ -208,7 +209,8 @@ spack_location() {
 }
 
 configure_cuda_hypre_linalg() {
-  [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
+  [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ||
+     "${SPACK_CUDA_ARCH}" == "90" ]] || return 0
   local prefix hash dependencies library="" candidate
   prefix="$(spack_location openblas)"
   prefix="$(realpath -e -- "${prefix}")" || exit 3

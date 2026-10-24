@@ -35,7 +35,8 @@ constexpr bool NativeArchitectureAdmissionPolicy() noexcept
       CudaDeviceMatchesNativeArchitecture(12, 0) ==
              (configured_native_architecture == 120) &&
       !CudaDeviceMatchesNativeArchitecture(8, 6) &&
-      !CudaDeviceMatchesNativeArchitecture(9, 0) &&
+      CudaDeviceMatchesNativeArchitecture(9, 0) ==
+             (configured_native_architecture == 90) &&
       !CudaDeviceMatchesNativeArchitecture(12, 1) &&
       !CudaDeviceMatchesNativeArchitecture(0, 0);
 }

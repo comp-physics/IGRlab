@@ -8,6 +8,8 @@
 #include <memory>
 #include <string>
 
+namespace mfem { class EulerWithIGR; }
+
 /**
  * @file physics/igr/IGR.hpp
  * @brief Information Geometric Regularization (IGR) solver for sigma coupled to Euler.
@@ -30,7 +32,7 @@
  */
 namespace igrlab
 {
-namespace igr_internal { struct FaceDensityCUDAProjectionCache; class HostFaceDensityPreparationCache; struct NodalVelocitySourceCache; }
+namespace igr_internal { struct FaceDensityCUDAProjectionCache; class HostFaceDensityPreparationCache; struct NodalVelocitySourceCache; struct FusedStageCoefficientCache; }
 
 enum class IGRSolvePurpose
 {
@@ -76,6 +78,17 @@ public:
   /// Clamp for rho to avoid division by very small numbers (default IGRDefaults::kRhoFloor).
   void SetRhoFloor(double rho_floor);
 
+  /// Opt in to routine nonfinite diagnostics without changing residual gates.
+  void SetDiagnosticNanScan(bool enabled)
+  {
+    if (enabled && !diagnostic_nan_scan_)
+    {
+      device_coeff_diagnostics_logged_ = false;
+    }
+    diagnostic_nan_scan_ = enabled;
+  }
+  bool GetDiagnosticNanScan() const { return diagnostic_nan_scan_; }
+
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
   void SetDirichletBC(const mfem::Array<int>& ess_bdr);
 
@@ -103,6 +116,28 @@ public:
   // ---- Legacy smoother-sweep knobs (still supported) ----
   void SetSmoother(SmootherType t);
   void SetSweeps(int regular_sweeps, int warm_start_sweeps);
+  void SetElementJacobiDamping(double omega);
+  void SetElementJacobiReferenceBlocks(bool reference)
+  {
+    MFEM_VERIFY(!reference || !element_jacobi_tensor_blocks_,
+                "Reference and tensor element-Jacobi blocks are mutually exclusive.");
+    MFEM_VERIFY(!element_jacobi_blocks_ ||
+                  reference == element_jacobi_reference_blocks_,
+                "Cannot change element-Jacobi block policy on a live cache.");
+    element_jacobi_reference_blocks_ = reference;
+  }
+  /// Retain initial tensor structure at fixed geometry/alpha and refresh
+  /// current physical-mass density scaling. Heterogeneous density is an SPD
+  /// surrogate; fixed sweeps do not certify the current elliptic solution.
+  void SetElementJacobiTensorBlocks(bool tensor)
+  {
+    MFEM_VERIFY(!tensor || !element_jacobi_reference_blocks_,
+                "Reference and tensor element-Jacobi blocks are mutually exclusive.");
+    MFEM_VERIFY(!element_jacobi_blocks_ ||
+                  tensor == element_jacobi_tensor_blocks_,
+                "Cannot change element-Jacobi block policy on a live cache.");
+    element_jacobi_tensor_blocks_ = tensor;
+  }
 
   // ---- Recommended Krylov-solve knobs ----
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
@@ -172,11 +207,25 @@ public:
     SetAlpha(cfg.alpha);
     SetAlphaLengthScalePolicy(cfg.alpha_length_scale_policy);
     SetRhoFloor(cfg.rho_floor);
+    SetDiagnosticNanScan(cfg.nan_scan);
     SetGradBackend(cfg.backend);
     SetIPKind(cfg.ip_kind);
 
     SetSmoother(cfg.smoot);
     SetSweeps(cfg.regular_sweeps, cfg.warm_start_sweeps);
+    SetElementJacobiDamping(cfg.element_jacobi_omega);
+    MFEM_VERIFY(!(cfg.element_jacobi_reference_blocks && cfg.element_jacobi_tensor_blocks),
+                "Reference and tensor element-Jacobi blocks are mutually exclusive.");
+    if (cfg.element_jacobi_tensor_blocks)
+    {
+      SetElementJacobiReferenceBlocks(false);
+      SetElementJacobiTensorBlocks(true);
+    }
+    else
+    {
+      SetElementJacobiTensorBlocks(false);
+      SetElementJacobiReferenceBlocks(cfg.element_jacobi_reference_blocks);
+    }
 
     SetSolveMode(cfg.solve_mode);
     SetLinearSolver(cfg.lin_solver_type);
@@ -523,6 +572,8 @@ public:
   int NumEquations() const { return num_eq_; }
 
 private:
+  friend class mfem::EulerWithIGR;
+
   struct SolveAccountingDelta
   {
     bool valid = false;
@@ -536,6 +587,11 @@ private:
   };
 
   void AddOutputOnlyAccounting_(const SolveAccountingDelta& delta);
+  void BeginFixedElementJacobiRKStep_();
+  void AcceptFixedElementJacobiRKStep_();
+  bool AbortFixedElementJacobiRKStep_();
+  void CommitElementJacobiHistory_();
+  void DiscardUncommittedElementJacobiBlocks_();
 
   // --- QuadratureFunction coefficient path for PA/device operators. ---
   // On CUDA this is the default host-sync-free path. On CPU it is explicit
@@ -579,7 +635,7 @@ private:
     double rho_floor_;
   };
 
-  /// f(x) = α ( ||∇u||_F^2 + (∇·u)^2 ), with u = m / ρ (componentwise).
+  /// f(x) = α ( tr((∇u)^2) + (∇·u)^2 ), with u = m / ρ (componentwise).
   class SigmaSourceCoefficient : public mfem::Coefficient
   {
   public:
@@ -612,6 +668,8 @@ private:
   // Device/QF coefficient cache.
   bool using_device_coeffs_ = false;
   bool device_coeff_logged_ = false;
+  bool diagnostic_nan_scan_ = false;
+  bool device_coeff_diagnostics_logged_ = false;
   long device_mesh_sequence_ = -1;
   long device_sfes_sequence_ = -1;
   long device_vfes_sequence_ = -1;
@@ -620,6 +678,10 @@ private:
   int device_diff_qorder_ = 0;
   int device_rhs_qorder_ = 0;
   int device_face_qorder_ = 0;
+  // Cache-setup proofs for reusing current byVDIM state interpolation owners.
+  bool device_diff_values_share_mass_ = false;
+  bool device_rhs_values_share_mass_ = false;
+  bool device_rhs_values_share_diff_ = false;
 
   std::unique_ptr<mfem::QuadratureSpace> mass_qs_;
   std::unique_ptr<mfem::QuadratureSpace> sigma_qs_;
@@ -629,6 +691,7 @@ private:
   std::unique_ptr<mfem::QuadratureFunction> u_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> u_face_qf_;
+  // Diagnostic-only diffusion gradient, allocated on explicit demand.
   std::unique_ptr<mfem::QuadratureFunction> grad_u_qf_;
   std::unique_ptr<mfem::QuadratureFunction> grad_u_rhs_qf_;
   std::unique_ptr<mfem::QuadratureFunction> invrho_qf_;
@@ -640,6 +703,8 @@ private:
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> src_qf_coef_;
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_face_qf_coef_;
   mfem::Vector device_qinterp_evec_;
+  std::shared_ptr<igr_internal::FusedStageCoefficientCache> fused_stage_coefficients_;
+  std::string device_coeff_execution_logged_;
   std::shared_ptr<igr_internal::NodalVelocitySourceCache> nodal_velocity_source_cache_;
   mfem::Vector device_face_restr_evec_;
   // Per-solver reference/geometry metadata only; current face coefficients
@@ -708,6 +773,43 @@ private:
   int warm_start_sweeps_ = mfem::igrlab::IGRDefaults::kWarmStartSweeps;
   bool first_call_ = true;
 
+  // Fixed-sweep closure keeps production history separate from output-only
+  // evaluations. Tensor factors retain the first production state's operator
+  // structure at fixed geometry/alpha and refresh only their physical-mass
+  // density scaling thereafter.
+  double element_jacobi_omega_ = 0.7;
+  bool element_jacobi_reference_blocks_ = false;
+  bool element_jacobi_tensor_blocks_ = false;
+  std::unique_ptr<mfem::Solver> element_jacobi_blocks_;
+  std::string element_jacobi_tensor_key_;
+  mfem::Vector element_jacobi_history_;
+  mfem::Vector element_jacobi_residual_, element_jacobi_correction_;
+  bool element_jacobi_history_valid_ = false;
+
+  // Protect the accepted history on its first overwrite by swapping buffers;
+  // accepted steps add no history copy. Only the live scalar field needs a
+  // checkpoint, because output or a pending prefetch can differ from history.
+  struct FixedElementJacobiRKSnapshot
+  {
+    bool active = false;
+    bool history_saved = false;
+    bool history_valid = false;
+    bool first_call = true;
+    bool blocks_present = false;
+    bool original_prefetch_pending = false;
+    bool original_prefetch_reclassified = false;
+    bool last_converged = false;
+    double last_final_norm = std::numeric_limits<double>::quiet_NaN();
+    mfem::Vector sigma, history, prefetch_sigma_checkpoint;
+    std::unique_ptr<mfem::Solver> abandoned_blocks;
+    std::string tensor_key;
+    SolveAccountingDelta prefetch_accounting;
+    bool prefetch_first_call = true;
+    bool prefetch_last_converged = false;
+    double prefetch_last_final_norm =
+      std::numeric_limits<double>::quiet_NaN();
+  } fixed_element_jacobi_rk_snapshot_;
+
   // New solve controls
   SolveMode solve_mode_ = SolveMode::Krylov;
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
@@ -716,12 +818,25 @@ private:
   // rebuild every stage. This cache owns only the first operator's inverse.
   std::unique_ptr<mfem::Solver> dense_inverse_preconditioner_;
   std::string dense_inverse_precision_;
+  // Local tensor factors are a preconditioner for the current FP64 operator.
+  // Output-only initialization does not commit the reference coefficient.
+  std::unique_ptr<mfem::Solver> local_tensor_preconditioner_;
+  std::string local_tensor_preconditioner_key_;
+  bool local_tensor_preconditioner_committed_ = false;
   std::unique_ptr<mfem::Solver> two_level_inverse_preconditioner_;
   std::string two_level_coarse_mode_;
   std::unique_ptr<mfem::Solver> screened_patch_preconditioner_;
   std::string screened_patch_key_;
+  // Opt-in tensor pipeline. Preconditioner data can be deliberately lagged;
+  // current coefficients and the original FP64 residual remain authoritative.
+  std::unique_ptr<mfem::Solver> tensor_multigrid_preconditioner_;
+  std::string tensor_multigrid_key_;
+  std::unique_ptr<mfem::Operator> tensor_volume_operator_;
+  std::string tensor_volume_mode_;
   std::unique_ptr<mfem::IterativeSolver> stationary_correction_;
   int stationary_sweeps_ = 0;
+  // Cached rank-one CUDA FGMRES workspace; selected only by explicit opt-in.
+  std::unique_ptr<mfem::IterativeSolver> device_fgmres_;
   NonconvergencePolicy nonconvergence_policy_ =
     NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;

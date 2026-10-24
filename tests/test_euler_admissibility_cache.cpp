@@ -734,10 +734,23 @@ Summary ProbeGlobalSummary(const ProbePlan& plan, const probe::Result& result,
 void CheckCudaArithmeticPrototype(int& failures)
 {
   if (!mfem::Device::Allows(mfem::Backend::CUDA)) { return; }
+#if defined(__SSE2__) && !defined(__FAST_MATH__)
   Check(ProbeEnvironmentSupported(),
         "native thread admits the bounded nearest-even prototype", MPI_COMM_WORLD,
         failures);
   if (!ProbeEnvironmentSupported()) { return; }
+#else
+  // This test-only arithmetic prototype deliberately requires the x86 MXCSR
+  // contract. ARM CUDA hosts still exercise the production cache parity tests.
+  Check(!ProbeEnvironmentSupported(),
+        "unsupported host declines the bounded arithmetic prototype",
+        MPI_COMM_WORLD, failures);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[SKIP] test-only nearest-even CUDA prototype requires SSE2 host controls\n";
+  }
+  return;
+#endif
   int admitted_cases = 0, decline_cases = 0;
   for (int basis : {mfem::BasisType::GaussLegendre, mfem::BasisType::GaussLobatto})
   {

@@ -1,0 +1,159 @@
+{
+  "schema": "igr-dg-reference-block-jacobi-measurements-v1",
+  "status": "full-physical-trial-failed",
+  "control": "Latest optimized ordinary-DG, not historical original GPU baseline",
+  "candidate_source_commit": "e3a32d91672c5d968d12493b24361a4e4cd0e303",
+  "candidate_binary_sha256": "8782cdc2d4d54191901040ee4e291e2fef80c03f2d087ea1affb5e80f7d1dafd",
+  "control_source_commit": "97ba1681ac27e07145df790d4c23ed837a21caea",
+  "control_binary_sha256": "5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495",
+  "native_job": 3431758,
+  "native_status": "passed",
+  "native_scope": "12 block math oracles and both current/reference history lifecycles; config and existing CUDA Krylov suites also passed",
+  "case": {
+    "mesh_n": 512,
+    "elements": 262144,
+    "order": 5,
+    "euler_dofs": 37748736,
+    "sigma_dofs": 9437184,
+    "target_time": 0.1,
+    "cfl": 0.3,
+    "c_alpha": 0.16666666666666666,
+    "physical_alpha": 6.357828776041666e-07,
+    "linear_rtol": 1e-06,
+    "residual_scale": "rhs",
+    "nan_scan": false,
+    "admissibility_scan": false,
+    "positivity_limiter": "none",
+    "modal_damping_rate": 0
+  },
+  "candidate_iteration": "50initial then2regular warm-started damped sweeps,omega0.7,initial referenceFP64 inverse reused,currentFP64 A/RHS refreshed,no certificate/coarse/fallback",
+  "scan_policy": "--no-nan-scan --no-admissibility-scan",
+  "short_trial": {
+    "job": 3431802,
+    "time": 0.0025,
+    "steps_per_arm": 120,
+    "conserved_max_relative_l2": 3.645620175e-08,
+    "pressure_relative_l2": 2.990347147e-09,
+    "sigma_relative_l2": 0.28830780297,
+    "fields_gl6": "all9437184samplesfinitepositive",
+    "claim_limit": "Early weak-sigma state only, not late-time accuracy or discretization-error proof",
+    "evidence": {
+      "comparison": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/admission-3431802/comparison.json",
+        "sha256": "ce8112902532c2d6e8fea0561f48a91d7a4b97b6dbeaea5ce709412de9c7e200"
+      },
+      "conserved": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/admission-3431802/field-analysis/conserved.json",
+        "sha256": "62837ee27a7097921d1efb1fdd5615f75d7e39714619fbc07504b1cb5f0c92d2"
+      },
+      "sigma": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/admission-3431802/field-analysis/sigma.json",
+        "sha256": "041c36a9bfded61a6a8d0424a30c999c23ab964157e0a2c8b1866fdc54e28dff"
+      },
+      "gl6": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/admission-3431802/field-analysis/gl6.json",
+        "sha256": "4a0e49616b35b4bb146b7638bcba1b63fb8a4fb6a7f42e1b08009b920c040d68"
+      }
+    }
+  },
+  "full_trial": {
+    "job": 3431903,
+    "node": "gh115",
+    "gpu_uuid": "GPU-2c7530aa-cda3-9454-e092-48fdcc5e5579",
+    "time": 0.1,
+    "control": {
+      "steps": 4939,
+      "application_wall_seconds": 684.776180410001,
+      "native_elapsed_seconds": 597.928548856,
+      "sigma_updates": 14818,
+      "krylov_iterations": 51742,
+      "maximum_current_fp64_residual_rel_rhs": 9.9954522e-07,
+      "final_vtu_sha256": "81d8bf54ddec7ab4f0b6293d77283d6c1ee0f9d19304c1b04f6846bc191debb3",
+      "gl6_min_density": 0.44942023773057554,
+      "gl6_min_pressure": 1.0003187644903997,
+      "gl6_samples": 9437184,
+      "nonfinite_conservative_samples": 0
+    },
+    "candidate": {
+      "steps": 3571,
+      "valid_physical_solution": false,
+      "final_vtu_sha256": "600660d12d2f713ae0633d79a782a173722020bf0b93d26114cf8ca29d9710cd",
+      "gl6_samples": 9437184,
+      "nonfinite_conservative_samples": 9437184,
+      "reported_diagnostic_transition": {
+        "last_reported_finite_extrema": {
+          "step": 2500,
+          "printed_physical_time": 0.050602,
+          "step_time_line": 190,
+          "rho_min_max_as_printed": [
+            "6.976e-01",
+            "1.075e+00"
+          ],
+          "rho_line": 197,
+          "p_min_max_as_printed": [
+            "1.000e+00",
+            "2.792e+00"
+          ],
+          "p_line": 198,
+          "reported_extrema_all_finite": true
+        },
+        "first_reported_nonfinite_extrema": {
+          "step": 3000,
+          "printed_physical_time": 0.069641,
+          "step_time_line": 209,
+          "rho_min_max_as_printed": [
+            "inf",
+            "-inf"
+          ],
+          "rho_line": 216,
+          "p_min_max_as_printed": [
+            "inf",
+            "-inf"
+          ],
+          "p_line": 217,
+          "reported_extrema_all_finite": false
+        },
+        "printed_time_interval": [
+          0.050602,
+          0.069641
+        ],
+        "interpretation": "Bracket between reported extrema diagnostics only. It is not the exact failure onset; finite extrema do not establish that every earlier state sample was finite."
+      },
+      "speedup": null,
+      "speedup_claim_allowed": false
+    },
+    "evidence": {
+      "control_run": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/full-3431903/reference/run.json",
+        "sha256": "db857f02759d7c3fd9dc76b62c092b9020101159c85395ec55196df713dc18e7"
+      },
+      "candidate_run": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/full-3431903/candidate/run.json",
+        "sha256": "90e6d2e8dd6d709eedf75a68e280244001d168f7105af88201250b002ca3d2db"
+      },
+      "final_fields": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/full-3431903/final-fields.json",
+        "sha256": "9ad6099634b8e7f57ac6127f49d216964e471fe487c631bd6d2776115c6059e0"
+      },
+      "gl6": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/full-3431903/field-analysis/gl6.json",
+        "sha256": "9c927f295a6a244d110349c7327a898c4e4e7cffd8024f7b579298ed9c1603e8"
+      },
+      "physical_failure": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/full-3431903/physical-failure.json",
+        "sha256": "eac0a298615f248538f9bbbb2ee9c3cfb12c31cba6b8da22d86a2f0c1b791777"
+      },
+      "control_only_qualification": {
+        "path": "/tmp/igr-dg-reference-block-jacobi-20261021/full-3431903/control-only-field-qualification.json",
+        "sha256": "1eefd7fe078c89712c067d419d2544a3c10432f44c627bc0e09c9f883fa341ed"
+      }
+    }
+  },
+  "interpretation": [
+    "The reused initial blocks with fixedomega0.7 did not produce a valid full Sedov solution.",
+    "The test does not establish the behavior of current-block Jacobi; that is a separate pending full trial.",
+    "Scans remained off; saved-field validation is offline and outside application timing.",
+    "A single fixed mesh cannot quantify accuracy as a fraction of discretization error.",
+    "The exact failure onset is unknown; the reported extrema bracket is not proof of every earlier sample being finite."
+  ]
+}

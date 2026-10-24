@@ -1,5 +1,8 @@
 #include "igrlab/compat.hpp"
 #include "IGR_two_level_inverse.hpp"
+#include "IGR_device_krylov.hpp"
+#include "IGR_two_level_blocks_cuda.cuh"
+#include "IGR_shared_patch_cuda.cuh"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -85,7 +88,8 @@ public:
   TwoLevelInverse(const mfem::Operator& op, mfem::ParFiniteElementSpace& sfes,
                   const std::string& coarse_mode, int coarse_order)
     : mfem::Solver(op.Height()), ne_(sfes.GetNE()),
-      dof_(ne_ > 0 ? sfes.GetFE(0)->GetDof() : 0), coarse_mode_(coarse_mode)
+      dof_(ne_ > 0 ? sfes.GetFE(0)->GetDof() : 0), coarse_mode_(coarse_mode),
+      local_mode_(TwoLevelLocalMode()), patch_composition_(TwoLevelPatchComposition())
   {
     const auto start = std::chrono::steady_clock::now();
     int ranks = 0;
@@ -116,7 +120,13 @@ public:
         adjacent[right].insert(left);
       }
     }
-    const auto element_colors = ColorGraph(adjacent);
+    const bool shared_patch = local_mode_ != "element";
+    MFEM_VERIFY(shared_patch || patch_composition_ == "additive",
+                "Multiplicative patch composition requires a shared-patch local mode.");
+    const auto patch = shared_patch ? SharedPatchTopology(sfes) : std::vector<std::array<int,5>>{};
+    Graph sample_support = adjacent;
+    if (shared_patch) for (int e = 0; e < ne_; ++e) sample_support[e].insert(e);
+    const auto element_colors = shared_patch ? ColorColumns(sample_support) : ColorGraph(adjacent);
     const int element_color_count = ColorCount(element_colors);
     mfem::H1_FECollection coarse_collection(coarse_order, 2);
     mfem::FiniteElementSpace coarse_space(sfes.GetMesh(), &coarse_collection);
@@ -168,6 +178,9 @@ public:
     MFEM_VERIFY(block_entries <= std::numeric_limits<int>::max(),
                 "Two-level block storage exceeds MFEM vector index range.");
     std::vector<double> blocks(block_entries);
+    MFEM_VERIFY(!shared_patch || 5 * block_entries <= (std::size_t(1) << 26),
+                "Shared patch setup exceeds bounded512MiB stencil storage.");
+    std::vector<double> stencil(shared_patch ? 5 * block_entries : 0, 0.0);
     mfem::Vector basis(height), action(height);
     basis.UseDevice(true);
     action.UseDevice(true);
@@ -191,6 +204,12 @@ public:
           for (int i = 0; i < dof_; ++i)
           { blocks[(std::size_t(e) * dof_ + j) * dof_ + i] = result[element_dofs_[e * dof_ + i]]; }
         }
+        if (shared_patch)
+          for (int e = 0; e < ne_; ++e) for (int slot = 0; slot < 5; ++slot)
+            if (element_colors[patch[e][slot]] == color)
+              for (int i = 0; i < dof_; ++i)
+                stencil[((std::size_t(e) * 5 + slot) * dof_ + j) * dof_ + i] =
+                    result[element_dofs_[e * dof_ + i]];
       }
     }
     // Independently check a few blocks against single-element probes. This
@@ -218,16 +237,48 @@ public:
     }
     MFEM_VERIFY(block_probe_error < 1.0e-10,
                 "Two-level block-coloring reconstruction failed: " << block_probe_error);
-    inverse_blocks_.SetSize(static_cast<int>(block_entries));
-    double* inverse_data = inverse_blocks_.HostWrite();
-    for (int e = 0; e < ne_; ++e)
+    if (shared_patch)
     {
-      mfem::DenseMatrix block(dof_);
-      std::copy(blocks.begin() + std::size_t(e) * dof_ * dof_,
-                blocks.begin() + std::size_t(e + 1) * dof_ * dof_, block.Data());
-      InvertChecked(block);
-      std::copy(block.Data(), block.Data() + dof_ * dof_,
-                inverse_data + std::size_t(e) * dof_ * dof_);
+      // Independently validate the full sampled face graph, not only the
+      // diagonal blocks; omitted/colliding couplings invalidate patch setup.
+      mfem::Vector expected(height);
+      double graph_error = 0.0;
+      for (int probe = 0; probe < 3; ++probe)
+      {
+        double* values = basis.HostWrite();
+        for (int i = 0; i < height; ++i) values[i] = std::sin((0.23 + 0.13 * probe) * (i + 1));
+        op.Mult(basis, action); ++operator_probes;
+        const double* input = basis.HostRead(); double* output = expected.HostWrite();
+        for (int e = 0; e < ne_; ++e) for (int i = 0; i < dof_; ++i)
+        {
+          long double sum = 0.0L;
+          for (int slot = 0; slot < 5; ++slot) for (int j = 0; j < dof_; ++j)
+            sum += static_cast<long double>(stencil[((std::size_t(e) * 5 + slot) * dof_ + j) * dof_ + i]) *
+                   input[element_dofs_[patch[e][slot] * dof_ + j]];
+          output[element_dofs_[e * dof_ + i]] = static_cast<double>(sum);
+        }
+        graph_error = std::max(graph_error, RelativeDifference(expected, action));
+      }
+      MFEM_VERIFY(graph_error < 1e-10, "Shared patch graph reconstruction failed: " << graph_error);
+      ConfigureSharedPatch(shared_patch_, dof_, patch, element_dofs_, stencil, local_mode_, patch_composition_);
+      std::cout << "[igr-shared-patch] event=graph-certificate relative_error=" << graph_error
+                << " probes=3 colors=" << element_color_count << '\n';
+    }
+    else
+    {
+      inverse_blocks_.SetSize(static_cast<int>(block_entries));
+      double* inverse_data = inverse_blocks_.HostWrite();
+      for (int e = 0; e < ne_; ++e)
+      {
+        mfem::DenseMatrix block(dof_);
+        std::copy(blocks.begin() + std::size_t(e) * dof_ * dof_,
+                  blocks.begin() + std::size_t(e + 1) * dof_ * dof_, block.Data());
+        InvertChecked(block);
+        std::copy(block.Data(), block.Data() + dof_ * dof_,
+                  inverse_data + std::size_t(e) * dof_ * dof_);
+      }
+
+      blocks_.Configure(ne_, dof_, inverse_blocks_);
     }
 
     Graph coarse_graph(nc);
@@ -300,7 +351,19 @@ public:
       { MFEM_VERIFY(diagonal(i) > 0.0 && std::isfinite(diagonal(i)), "Nonpositive H1 coarse diagonal."); }
       coarse_jacobi_ = std::make_unique<mfem::OperatorJacobiSmoother>(
         diagonal, coarse_essential_, 1.0);
-      coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm());
+      device_coarse_cg_ = DeviceKrylovRequested("DG_IGR_IGR_COARSE_CG_BACKEND",
+        DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"));
+      if (CooperativeCoarseCGRequested())
+      {
+        MFEM_VERIFY(device_coarse_cg_,
+                    "Cooperative coarse execution requires cuda-fp64 coarse CG.");
+        coarse_cg_ = MakeCooperativeCGSolver(sfes.GetComm());
+        cooperative_coarse_cg_ = bool(coarse_cg_);
+        if (!cooperative_coarse_cg_)
+        { mfem::out << "[igr-cooperative-cg] fallback=host-polled reason=unsupported-hardware\n"; }
+      }
+      if (device_coarse_cg_ && !coarse_cg_) { coarse_cg_ = MakeDeviceCGSolver(sfes.GetComm()); }
+      else if (!device_coarse_cg_) { coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm()); }
       coarse_cg_->SetOperator(*coarse_);
       coarse_cg_->SetPreconditioner(*coarse_jacobi_);
       coarse_cg_->SetRelTol(1.0e-2);
@@ -309,19 +372,22 @@ public:
       coarse_cg_->SetPrintLevel(0);
       coarse_cg_->iterative_mode = false;
     }
-    (void)inverse_blocks_.Read();
+    if (inverse_blocks_.Size()) { (void)inverse_blocks_.Read(); }
     (void)element_dofs_.Read();
     MFEM_VERIFY(cudaDeviceSynchronize() == cudaSuccess, "Two-level setup CUDA failure.");
     const double elapsed = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - start).count();
     std::cout << "[igr-two-level] n=" << height << " elements=" << ne_
               << " block_dof=" << dof_ << " coarse_n=" << nc
-              << " coarse_mode=" << coarse_mode
+              << " coarse_mode=" << coarse_mode << " local_mode=" << local_mode_
+              << " patch_composition=" << patch_composition_
+              << " coarse_cg_backend=" << (device_coarse_cg_ ? "cuda-fp64" : "mfem")
+              << " coarse_cg_execution=" << (cooperative_coarse_cg_ ? "cooperative" : "host-polled")
               << " coarse_order=" << coarse_order
               << " element_colors=" << element_color_count
               << " coarse_colors=" << coarse_color_count
               << " operator_probes=" << operator_probes
-              << " block_inverse_bytes=" << block_entries * sizeof(double)
+              << " block_inverse_bytes=" << std::size_t(inverse_blocks_.Size()) * sizeof(double)
               << " dense_coarse_bytes=" << coarse_inverse_.Size() * sizeof(double)
               << " block_probe_rel=" << block_probe_error
               << " coarse_probe_rel=" << coarse_probe_error
@@ -360,33 +426,23 @@ public:
                   "Two-level coarse CG did not reach its 1e-2 tolerance in 100 iterations.");
     }
     prolong_->Mult(coarse_solution_, coarse_fine_);
-    y.SetSize(height);
-    y.UseDevice(true);
-    const double* input = x.Read();
-    const double* coarse_value = coarse_fine_.Read();
-    const double* inverse = inverse_blocks_.Read();
-    const int* map = element_dofs_.Read();
-    double* output = y.Write();
-    const int d = dof_;
-    mfem::forall(height, [=] MFEM_HOST_DEVICE(int entry)
-    {
-      const int e = entry / d, i = entry % d;
-      double value = coarse_value[map[entry]];
-      for (int j = 0; j < d; ++j)
-      { value += inverse[(e * d + j) * d + i] * input[map[e * d + j]]; }
-      output[map[entry]] = value;
-    });
+    if (local_mode_ == "element") blocks_.Mult(x, coarse_fine_, element_dofs_, y);
+    else shared_patch_.Mult(x, coarse_fine_, y);
   }
 
 private:
   int ne_, dof_;
-  std::string coarse_mode_;
+  std::string coarse_mode_, local_mode_, patch_composition_;
   mfem::Array<int> element_dofs_;
   mfem::Array<int> coarse_essential_;
   mfem::Vector inverse_blocks_, coarse_inverse_;
+  TwoLevelBlocks blocks_;
+  SharedPatchBatch shared_patch_;
   std::unique_ptr<mfem::SparseMatrix> prolong_, coarse_;
   std::unique_ptr<mfem::OperatorJacobiSmoother> coarse_jacobi_;
-  std::unique_ptr<mfem::CGSolver> coarse_cg_;
+  std::unique_ptr<mfem::IterativeSolver> coarse_cg_;
+  bool device_coarse_cg_ = false;
+  bool cooperative_coarse_cg_ = false;
   mutable mfem::Vector coarse_rhs_, coarse_solution_, coarse_fine_;
   cublasHandle_t handle_ = nullptr;
 };

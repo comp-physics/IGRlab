@@ -1,4 +1,5 @@
 #pragma once
+#include "numerics/shared_reference_map.hpp"
 
 /**
  * @file numerics/dgsem/dgsem_device.hpp
@@ -242,6 +243,15 @@ void ApplyCentralVolumeDevice(int dim,
                               const DenseMatrix& contravariant_flux,
                               DenseMatrix& weak_volume);
 
+// Same central split-flux algebra, using one shared n1d x n1d map and real
+// directional-line columns across all elements/equations. Nonlinear flux,
+// geometric metrics, tensor weights and anchor restoration remain FP64.
+void ApplySharedCentralVolumeDevice(
+  int n1d, const Array<int>& lex_to_local, const DenseMatrix& split_matrix,
+  const Vector& weights, const DenseMatrix& contravariant_flux,
+  DenseMatrix& weak_volume, ::igrlab::shared_reference::Map& map,
+  Vector& row_sums, ::igrlab::shared_reference::Precision precision);
+
 /// Number of unique coordinate-line pairs used by the LLF volume kernel.
 int DGSEMVolumePairCount(int dim, int ne, int n1d);
 
@@ -379,8 +389,28 @@ void ApplyInverseMassDevice(int ne,
 /// Deterministic component sums, one MFEM kernel iteration per component.
 void ComponentSumsDevice(const DenseMatrix& values, Vector& sums);
 
-/// Deterministic nonnegative maximum, evaluated by one MFEM kernel iteration.
+/// Original single-block/serial maximum; requires no reduction workspace.
 void DeterministicMaximumDevice(const Vector& values, Vector& maximum);
+
+/** Number of retained partial maxima needed by the workspace overload.
+ *
+ * Returns zero for the small-vector single-block path. The bound depends only
+ * on the input length and is valid for every supported backend.
+ */
+int DeterministicMaximumWorkspaceSize(int value_count);
+
+/** Deterministic nonnegative maximum using retained reduction workspace.
+ *
+ * The caller prepares workspace.Size() >=
+ * DeterministicMaximumWorkspaceSize(values.Size()) once. This function never
+ * resizes workspace. Large native-CUDA inputs use parallel block maxima and a
+ * final reduction; small inputs and other backends retain the original path.
+ * All three vectors must have disjoint storage. The result preserves the
+ * literal ordered fmax(+0, values[i]) loop, including exceptional zero bits.
+ */
+void DeterministicMaximumDevice(const Vector& values,
+                                Vector& maximum,
+                                Vector& workspace);
 
 } // namespace dgsem
 } // namespace mfem

@@ -1,0 +1,2425 @@
+{
+  "schema": "igr-operator-residual-results-v1",
+  "status": "complete",
+  "branch": "igr-operator-residual-fusion",
+  "tested_source_commit": "c42cb2710255f13e41ad61a76aa8dac51b07d078",
+  "tested_binary_sha256": {
+    "baseline": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb",
+    "optimized": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb"
+  },
+  "resources": {
+    "system": "DeltaAI",
+    "account": "bdiy-dtai-gh",
+    "partition": "ghx4",
+    "constraint": "projects",
+    "gpus_at_a_time": 1,
+    "full_pair_node": "gh040",
+    "full_pair_gpu": {
+      "index": 0,
+      "uuid": "GPU-ba2a550d-9c19-6753-14d7-9fe3cd80a747",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    }
+  },
+  "comparison_scope": {
+    "full_case": "Same qualified binary; baseline has three new execution selectors disabled, optimized enables them. Both retain the previously optimized stage preparation and local FP64 WMMA inverse. This is incremental, not an original-GPU-to-current comparison.",
+    "profiling": "Independent historical and optimized continuous-evolution captures; replay and event-collection caveats retained.",
+    "defaults": "Three new execution selectors remain opt-in. Optional diagnostic scans remain off."
+  },
+  "configuration": {
+    "application_argv": {
+      "baseline": [
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/native-3444198/frozen/sedov_taylor_blast",
+        "-m",
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+        "--device",
+        "cuda",
+        "--discretization",
+        "dg",
+        "--regularization",
+        "igr",
+        "--time-integrator",
+        "rk3ssp",
+        "-o",
+        "5",
+        "-rs",
+        "0",
+        "-rp",
+        "0",
+        "-tf",
+        "0.1",
+        "-c",
+        "0.3",
+        "--element-assembly-divergence",
+        "--igr-space",
+        "L2",
+        "--igr-grad",
+        "BrokenL2",
+        "--c-alpha",
+        "0.16666666666666666",
+        "--igr-alpha-length",
+        "max",
+        "--igr-ip-kind",
+        "sipg",
+        "--igr-exact-dg-face",
+        "--igr-sigma-cadence",
+        "every-stage",
+        "--igr-stage-rtol-scale",
+        "1",
+        "--igr-linear-solver",
+        "fgmres",
+        "--igr-preconditioner",
+        "none",
+        "--igr-lin-rtol",
+        "1e-6",
+        "--igr-lin-atol",
+        "0",
+        "--igr-lin-maxit",
+        "1000",
+        "--igr-nonconvergence-policy",
+        "error",
+        "--igr-lin-print",
+        "0",
+        "--positivity-limiter",
+        "none",
+        "--modal-damping-rate",
+        "0",
+        "--dgsem-surface-flux",
+        "rusanov",
+        "--no-igr-sigma-cfl",
+        "--no-igr-sigma-rusanov",
+        "--no-igr-invariant-domain-flux",
+        "--no-admissibility-scan",
+        "--no-conservation-balance",
+        "--no-nan-scan",
+        "-no-glvis",
+        "-vtk",
+        "--time-step-save",
+        "0.02",
+        "--no-vtk-h1-diagnostics",
+        "--no-vtk-l2-diagnostics",
+        "--no-save-state",
+        "-vs",
+        "100",
+        "-as",
+        "500",
+        "--igr-solve-mode",
+        "element-block-jacobi",
+        "--igr-jacobi-blocks",
+        "tensor",
+        "--igr-sweeps",
+        "2",
+        "--igr-initial-sweeps",
+        "50",
+        "--igr-jacobi-omega",
+        "0.7"
+      ],
+      "optimized": [
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/native-3444198/frozen/sedov_taylor_blast",
+        "-m",
+        "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+        "--device",
+        "cuda",
+        "--discretization",
+        "dg",
+        "--regularization",
+        "igr",
+        "--time-integrator",
+        "rk3ssp",
+        "-o",
+        "5",
+        "-rs",
+        "0",
+        "-rp",
+        "0",
+        "-tf",
+        "0.1",
+        "-c",
+        "0.3",
+        "--element-assembly-divergence",
+        "--igr-space",
+        "L2",
+        "--igr-grad",
+        "BrokenL2",
+        "--c-alpha",
+        "0.16666666666666666",
+        "--igr-alpha-length",
+        "max",
+        "--igr-ip-kind",
+        "sipg",
+        "--igr-exact-dg-face",
+        "--igr-sigma-cadence",
+        "every-stage",
+        "--igr-stage-rtol-scale",
+        "1",
+        "--igr-linear-solver",
+        "fgmres",
+        "--igr-preconditioner",
+        "none",
+        "--igr-lin-rtol",
+        "1e-6",
+        "--igr-lin-atol",
+        "0",
+        "--igr-lin-maxit",
+        "1000",
+        "--igr-nonconvergence-policy",
+        "error",
+        "--igr-lin-print",
+        "0",
+        "--positivity-limiter",
+        "none",
+        "--modal-damping-rate",
+        "0",
+        "--dgsem-surface-flux",
+        "rusanov",
+        "--no-igr-sigma-cfl",
+        "--no-igr-sigma-rusanov",
+        "--no-igr-invariant-domain-flux",
+        "--no-admissibility-scan",
+        "--no-conservation-balance",
+        "--no-nan-scan",
+        "-no-glvis",
+        "-vtk",
+        "--time-step-save",
+        "0.02",
+        "--no-vtk-h1-diagnostics",
+        "--no-vtk-l2-diagnostics",
+        "--no-save-state",
+        "-vs",
+        "100",
+        "-as",
+        "500",
+        "--igr-solve-mode",
+        "element-block-jacobi",
+        "--igr-jacobi-blocks",
+        "tensor",
+        "--igr-sweeps",
+        "2",
+        "--igr-initial-sweeps",
+        "50",
+        "--igr-jacobi-omega",
+        "0.7"
+      ]
+    },
+    "controlled_environments": {
+      "baseline": {
+        "OMP_NUM_THREADS": "1",
+        "IGRLAB_PROFILE_NVTX": "0",
+        "IGRLAB_IGR_PARTIAL_ASSEMBLY": "1",
+        "IGRLAB_IGR_DEVICE_QF": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CUDA": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CACHE": "1",
+        "IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "IGRLAB_IGR_IPDG_PENALTY_SCALE": "1",
+        "IGRLAB_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "IGRLAB_IGR_TENSOR_VOLUME": "simt",
+        "IGRLAB_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "IGRLAB_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "IGRLAB_IGR_TENSOR_MG": "off",
+        "IGRLAB_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "IGRLAB_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_TRUE_RESIDUAL": "0",
+        "IGRLAB_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "IGRLAB_IGR_OPERATOR_PROBE_EVERY": "0",
+        "IGRLAB_IGR_PRECONDITIONER_PROBE": "0",
+        "IGRLAB_SHARED_OPERATOR_PRECISION": "off",
+        "IGRLAB_SHARED_EULER_LAYOUT": "dense",
+        "IGRLAB_SHARED_EULER_FLUX_EXECUTION": "element",
+        "IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "IGRLAB_DG_FORCE_MATRIX_FREE": "0",
+        "IGRLAB_DG_FORCE_NLFORM_FACE": "0",
+        "IGRLAB_DG_NATIVE_MASS_INV": "0",
+        "IGRLAB_DG_PACKED_INVMASS_DEVICE": "1",
+        "IGRLAB_DG_TENSOR_FACE": "fp64",
+        "IGRLAB_WEAKDIV_SIGMA_STORAGE": "auto",
+        "IGRLAB_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "IGRLAB_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "IGRLAB_IGR_COMPACT_FACE_QDATA": "1",
+        "IGRLAB_IGR_COMPACT_FACE_LIFT": "1",
+        "IGRLAB_VTK_PRESSURE_COEFFICIENT": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "IGRLAB_DG_PACKED_DENSE_EXECUTION": "rows",
+        "IGRLAB_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/full-3444291/baseline/vtk",
+        "DG_IGR_PROFILE_NVTX": "0",
+        "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CUDA": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CACHE": "1",
+        "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "DG_IGR_IGR_IPDG_PENALTY_SCALE": "1",
+        "DG_IGR_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "DG_IGR_IGR_TENSOR_VOLUME": "simt",
+        "DG_IGR_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "DG_IGR_IGR_TENSOR_MG": "off",
+        "DG_IGR_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "DG_IGR_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "DG_IGR_IGR_TRUE_RESIDUAL": "0",
+        "DG_IGR_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "DG_IGR_IGR_OPERATOR_PROBE_EVERY": "0",
+        "DG_IGR_IGR_PRECONDITIONER_PROBE": "0",
+        "DG_IGR_SHARED_OPERATOR_PRECISION": "off",
+        "DG_IGR_SHARED_EULER_LAYOUT": "dense",
+        "DG_IGR_SHARED_EULER_FLUX_EXECUTION": "element",
+        "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "DG_IGR_DG_FORCE_MATRIX_FREE": "0",
+        "DG_IGR_DG_FORCE_NLFORM_FACE": "0",
+        "DG_IGR_DG_NATIVE_MASS_INV": "0",
+        "DG_IGR_DG_PACKED_INVMASS_DEVICE": "1",
+        "DG_IGR_DG_TENSOR_FACE": "fp64",
+        "DG_IGR_WEAKDIV_SIGMA_STORAGE": "auto",
+        "DG_IGR_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "DG_IGR_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "DG_IGR_IGR_COMPACT_FACE_QDATA": "1",
+        "DG_IGR_IGR_COMPACT_FACE_LIFT": "1",
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_DG_PACKED_DENSE_EXECUTION": "rows",
+        "DG_IGR_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/full-3444291/baseline/vtk",
+        "DG_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_COEFFICIENT_EXECUTION": "fused",
+        "IGRLAB_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "DG_IGR_IGR_COEFFICIENT_EXECUTION": "fused",
+        "DG_IGR_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "IGRLAB_SOLVER_WALL_TIMING": "1",
+        "IGRLAB_IGR_TENSOR_VOLUME_COMPACT": "0",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "0",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "0",
+        "DG_IGR_SOLVER_WALL_TIMING": "1",
+        "DG_IGR_IGR_TENSOR_VOLUME_COMPACT": "0",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "0",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "0"
+      },
+      "optimized": {
+        "OMP_NUM_THREADS": "1",
+        "IGRLAB_PROFILE_NVTX": "0",
+        "IGRLAB_IGR_PARTIAL_ASSEMBLY": "1",
+        "IGRLAB_IGR_DEVICE_QF": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CUDA": "1",
+        "IGRLAB_IGR_FACE_DENSITY_CACHE": "1",
+        "IGRLAB_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "IGRLAB_IGR_IPDG_PENALTY_SCALE": "1",
+        "IGRLAB_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "IGRLAB_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "IGRLAB_IGR_TENSOR_VOLUME": "simt",
+        "IGRLAB_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "IGRLAB_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "IGRLAB_IGR_TENSOR_MG": "off",
+        "IGRLAB_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "IGRLAB_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_TRUE_RESIDUAL": "0",
+        "IGRLAB_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "IGRLAB_IGR_OPERATOR_PROBE_EVERY": "0",
+        "IGRLAB_IGR_PRECONDITIONER_PROBE": "0",
+        "IGRLAB_SHARED_OPERATOR_PRECISION": "off",
+        "IGRLAB_SHARED_EULER_LAYOUT": "dense",
+        "IGRLAB_SHARED_EULER_FLUX_EXECUTION": "element",
+        "IGRLAB_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "IGRLAB_DG_FORCE_MATRIX_FREE": "0",
+        "IGRLAB_DG_FORCE_NLFORM_FACE": "0",
+        "IGRLAB_DG_NATIVE_MASS_INV": "0",
+        "IGRLAB_DG_PACKED_INVMASS_DEVICE": "1",
+        "IGRLAB_DG_TENSOR_FACE": "fp64",
+        "IGRLAB_WEAKDIV_SIGMA_STORAGE": "auto",
+        "IGRLAB_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "IGRLAB_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "IGRLAB_IGR_COMPACT_FACE_QDATA": "1",
+        "IGRLAB_IGR_COMPACT_FACE_LIFT": "1",
+        "IGRLAB_VTK_PRESSURE_COEFFICIENT": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE": "0",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGRLAB_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "IGRLAB_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "IGRLAB_DG_PACKED_DENSE_EXECUTION": "rows",
+        "IGRLAB_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/full-3444291/optimized/vtk",
+        "DG_IGR_PROFILE_NVTX": "0",
+        "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CUDA": "1",
+        "DG_IGR_IGR_FACE_DENSITY_CACHE": "1",
+        "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM": "1",
+        "DG_IGR_IGR_IPDG_PENALTY_SCALE": "1",
+        "DG_IGR_IGR_KRYLOV_BACKEND": "cuda-fp64",
+        "DG_IGR_IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+        "DG_IGR_IGR_TENSOR_VOLUME": "simt",
+        "DG_IGR_IGR_TENSOR_VOLUME_STORAGE": "cached",
+        "DG_IGR_IGR_TENSOR_VOLUME_COLLOCATED": "0",
+        "DG_IGR_IGR_TENSOR_MG": "off",
+        "DG_IGR_IGR_TENSOR_MG_OPERATOR": "sampled",
+        "DG_IGR_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "DG_IGR_IGR_TRUE_RESIDUAL": "0",
+        "DG_IGR_IGR_EVENT_LOG_MIN_ITERS": "0",
+        "DG_IGR_IGR_OPERATOR_PROBE_EVERY": "0",
+        "DG_IGR_IGR_PRECONDITIONER_PROBE": "0",
+        "DG_IGR_SHARED_OPERATOR_PRECISION": "off",
+        "DG_IGR_SHARED_EULER_LAYOUT": "dense",
+        "DG_IGR_SHARED_EULER_FLUX_EXECUTION": "element",
+        "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION": "0",
+        "DG_IGR_DG_FORCE_MATRIX_FREE": "0",
+        "DG_IGR_DG_FORCE_NLFORM_FACE": "0",
+        "DG_IGR_DG_NATIVE_MASS_INV": "0",
+        "DG_IGR_DG_PACKED_INVMASS_DEVICE": "1",
+        "DG_IGR_DG_TENSOR_FACE": "fp64",
+        "DG_IGR_WEAKDIV_SIGMA_STORAGE": "auto",
+        "DG_IGR_IGR_SHARE_STATE_INTERPOLATION": "1",
+        "DG_IGR_IGR_FACTORIZED_FACE_NORMALS": "1",
+        "DG_IGR_IGR_COMPACT_FACE_QDATA": "1",
+        "DG_IGR_IGR_COMPACT_FACE_LIFT": "1",
+        "DG_IGR_VTK_PRESSURE_COEFFICIENT": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE": "0",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_START": "1",
+        "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+        "DG_IGR_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_DG_PACKED_DENSE_EXECUTION": "rows",
+        "DG_IGR_VTK_PREFIX_PATH": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/full-3444291/optimized/vtk",
+        "DG_IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+        "DG_IGR_LOCAL_TENSOR_REFERENCE": "projected",
+        "IGRLAB_IGR_COEFFICIENT_EXECUTION": "fused",
+        "IGRLAB_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "DG_IGR_IGR_COEFFICIENT_EXECUTION": "fused",
+        "DG_IGR_IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "IGRLAB_SOLVER_WALL_TIMING": "1",
+        "IGRLAB_IGR_TENSOR_VOLUME_COMPACT": "1",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+        "IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+        "DG_IGR_SOLVER_WALL_TIMING": "1",
+        "DG_IGR_IGR_TENSOR_VOLUME_COMPACT": "1",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1"
+      }
+    },
+    "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "restart": false,
+    "scans": "NaN, admissibility and conservation scans off; positivity/modal limiters off",
+    "output_cadence": 0.02,
+    "time_final": 0.1
+  },
+  "qualification": {
+    "native_job": "3444198",
+    "required_native_tests": [
+      "dg_igr_exact_face_cpu",
+      "dg_igr_exact_face_cuda",
+      "dg_igr_tensor_volume_cuda",
+      "dg_igr_stage_refresh_cuda",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_local_tensor_jacobi_cuda_projected_backends",
+      "dg_igr_time_defaults_tests",
+      "dg_igr_explicit_ssprk_cpu"
+    ],
+    "all_native_tests_passed": true,
+    "short_job": "3444217",
+    "full_job": "3444291",
+    "final_fields_byte_identical": true,
+    "final_vtu_sha256": "db4d0b272baa028a1469006dc3a76a72b6fd055a069a0593aff947b01dc4d94b",
+    "field_transfer_provenance": "Remote full post-timing SHA inventories match a complete retained prior file independently rehashed locally. Verified bytes reused after partial network transfers failed; comparison-recovered.json is the successful analysis. Original failed comparison.json is preserved separately.",
+    "independent_review": "Source/numerical, full timing/field receipts, and final hardware counter/interpretation reviews completed; no blocking findings."
+  },
+  "total_solver_accounting": {
+    "schema": "igr-operator-residual-total-solver-summary-v1",
+    "status": "measured-record-summary",
+    "pair_status": "two-arms-completed-awaiting-field-comparison",
+    "field_comparison_passed": false,
+    "field_qualification_note": "field_comparison_passed preserves the raw pair flag; parent_accuracy_qualification separately records an optional validated external check.",
+    "parent_accuracy_qualification": {
+      "status": "passed",
+      "scope": "External complete-Q5 baseline-versus-optimized field comparison at t=0.1",
+      "raw_pair_field_comparison_passed": false,
+      "raw_pair_record_changed": false,
+      "VTU_fingerprints": {
+        "baseline": {
+          "sha256": "db4d0b272baa028a1469006dc3a76a72b6fd055a069a0593aff947b01dc4d94b",
+          "bytes": 1160775042,
+          "pair_native_path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/full-3444291/baseline/vtk/sedov_taylor_blast_p_5_ref_0_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+          "comparison_input_path": "/tmp/igr-operator-residual-20261023/full-fields/baseline.vtu",
+          "comparison_verified_hash": true
+        },
+        "optimized": {
+          "sha256": "db4d0b272baa028a1469006dc3a76a72b6fd055a069a0593aff947b01dc4d94b",
+          "bytes": 1160775042,
+          "pair_native_path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/full-3444291/optimized/vtk/sedov_taylor_blast_p_5_ref_0_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000005/proc000000.vtu",
+          "comparison_input_path": "/tmp/igr-operator-residual-20261023/full-fields/optimized.vtu",
+          "comparison_verified_hash": true
+        }
+      },
+      "time": 0.1,
+      "cells": 262144,
+      "points": 9437184,
+      "primary_metrics": {
+        "density": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "l2_reference": 1.021068703547479,
+          "l2_candidate": 1.021068703547479,
+          "l2_difference": 0.0,
+          "linf_reference_at_gl_points": 1.2875396450035477,
+          "linf_candidate_at_gl_points": 1.2875396450035477,
+          "linf_difference_at_gl_points": 0.0,
+          "normalized_l2_limit": 1e-10,
+          "normalized_linf_at_gl_points_limit": 1e-08,
+          "passed": true
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "l2_reference": 0.2773154888806501,
+          "l2_candidate": 0.2773154888806501,
+          "l2_difference": 0.0,
+          "linf_reference_at_gl_points": 0.8063063268306991,
+          "linf_candidate_at_gl_points": 0.8063063268306991,
+          "linf_difference_at_gl_points": 0.0,
+          "normalized_l2_limit": 1e-10,
+          "normalized_linf_at_gl_points_limit": 1e-08,
+          "passed": true
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "l2_reference": 0.27731548888064855,
+          "l2_candidate": 0.27731548888064855,
+          "l2_difference": 0.0,
+          "linf_reference_at_gl_points": 0.8063063268305279,
+          "linf_candidate_at_gl_points": 0.8063063268305279,
+          "linf_difference_at_gl_points": 0.0,
+          "normalized_l2_limit": 1e-10,
+          "normalized_linf_at_gl_points_limit": 1e-08,
+          "passed": true
+        },
+        "energy": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "l2_reference": 3.6233258178533894,
+          "l2_candidate": 3.6233258178533894,
+          "l2_difference": 0.0,
+          "linf_reference_at_gl_points": 5.051546019233055,
+          "linf_candidate_at_gl_points": 5.051546019233055,
+          "linf_difference_at_gl_points": 0.0,
+          "normalized_l2_limit": 1e-10,
+          "normalized_linf_at_gl_points_limit": 1e-08,
+          "passed": true
+        },
+        "sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "l2_reference": 1.9969487383323734e-05,
+          "l2_candidate": 1.9969487383323734e-05,
+          "l2_difference": 0.0,
+          "linf_reference_at_gl_points": 5.63124137352507e-05,
+          "linf_candidate_at_gl_points": 5.63124137352507e-05,
+          "linf_difference_at_gl_points": 0.0,
+          "normalized_l2_limit": 1e-08,
+          "normalized_linf_at_gl_points_limit": 1e-08,
+          "passed": true
+        }
+      },
+      "sampled_admissibility_all_positive": true,
+      "comparison_report_qualification_passed": true,
+      "hash_validation": "Comparison hash_verified SHA256/byte fingerprints cross-checked against the full pair inventory; VTUs are not reread by this summarizer.",
+      "limitation": "L2 norms cover complete saved Q5 polynomials on fitted Q2 geometry; Linf and admissibility checks are at the report's GL8 samples, not continuous-domain extrema.",
+      "bindings": {
+        "pair_run": {
+          "path": "/tmp/igr-operator-residual-20261023/full-3444291/run.json",
+          "sha256": "00947d25aa6ed477e75a6c9dfa0f9c8548ec7926b538896ba46d7d11585aaca4",
+          "bytes": 94336
+        },
+        "field_comparison": {
+          "path": "/tmp/igr-operator-residual-20261023/full-fields/comparison-recovered.json",
+          "sha256": "3500ebaa1a4546f8fc5ab05c4b5f60985eabf3549ca68d89efa683432fdd5ac3",
+          "bytes": 20811
+        }
+      }
+    },
+    "target_time": 0.1,
+    "source_commit": "c42cb2710255f13e41ad61a76aa8dac51b07d078",
+    "binary_sha256": {
+      "baseline": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb",
+      "optimized": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb"
+    },
+    "same_gpu": true,
+    "host_wall": {
+      "baseline": {
+        "application_wall_s": 697.2225184349954,
+        "solver_total_s": 645.578051139,
+        "loop_s": 580.063393155,
+        "bins": [
+          {
+            "key": "setup_initial_output_s",
+            "label": "RunEulerCase setup and initial output",
+            "seconds": 65.485285449,
+            "percent_of_application_wall": 9.392307866933221
+          },
+          {
+            "key": "advancing_cfl_s",
+            "label": "Advancing, CFL and remaining loop work",
+            "seconds": 354.003729111,
+            "percent_of_application_wall": 50.77342164817143
+          },
+          {
+            "key": "scheduled_output_s",
+            "label": "Scheduled output, staging and existing waits",
+            "seconds": 178.241431224,
+            "percent_of_application_wall": 25.56449720299992
+          },
+          {
+            "key": "diagnostics_s",
+            "label": "Configured analysis and visualization hooks",
+            "seconds": 2.3693714789999993,
+            "percent_of_application_wall": 0.3398300279110828
+          },
+          {
+            "key": "final_output_postloop_s",
+            "label": "Final output and RunEulerCase postloop reports",
+            "seconds": 45.478233876,
+            "percent_of_application_wall": 6.522771808644631
+          },
+          {
+            "key": "external_to_RunEulerCase_s",
+            "label": "Outside RunEulerCase: pre/post work and process lifecycle",
+            "seconds": 51.64446729599547,
+            "percent_of_application_wall": 7.407171445339724
+          }
+        ],
+        "five_bin_sum_s": 645.578051139,
+        "five_bin_sum_minus_solver_total_s": 0.0,
+        "six_bin_sum_s": 697.2225184349954,
+        "six_bin_sum_minus_application_wall_s": 0.0,
+        "percentage_sum": 100.00000000000001,
+        "observed_accepted_steps": 6663,
+        "observed_linear_calls": 19990,
+        "raw_timings": {
+          "application_wall_seconds": 697.2225184349954,
+          "native_done_seconds": 580.066732266,
+          "pre_final_output_analysis_seconds": 534.309057
+        },
+        "timing_origin": {
+          "scope": "RunEulerCase",
+          "clock": "steady-host-wall",
+          "rank": "0",
+          "origin": "before-communicator-query",
+          "end": "before-return-and-destruction",
+          "loop_entered": "1",
+          "success": "1"
+        }
+      },
+      "optimized": {
+        "application_wall_s": 671.6184260180016,
+        "solver_total_s": 621.172968266,
+        "loop_s": 559.445440604,
+        "bins": [
+          {
+            "key": "setup_initial_output_s",
+            "label": "RunEulerCase setup and initial output",
+            "seconds": 61.727183063,
+            "percent_of_application_wall": 9.190811429784315
+          },
+          {
+            "key": "advancing_cfl_s",
+            "label": "Advancing, CFL and remaining loop work",
+            "seconds": 331.7454958640001,
+            "percent_of_application_wall": 49.394936620620385
+          },
+          {
+            "key": "scheduled_output_s",
+            "label": "Scheduled output, staging and existing waits",
+            "seconds": 182.148903958,
+            "percent_of_application_wall": 27.12089140227338
+          },
+          {
+            "key": "diagnostics_s",
+            "label": "Configured analysis and visualization hooks",
+            "seconds": 0.7213609700000002,
+            "percent_of_application_wall": 0.10740636975624986
+          },
+          {
+            "key": "final_output_postloop_s",
+            "label": "Final output and RunEulerCase postloop reports",
+            "seconds": 44.830024411000004,
+            "percent_of_application_wall": 6.674924730221504
+          },
+          {
+            "key": "external_to_RunEulerCase_s",
+            "label": "Outside RunEulerCase: pre/post work and process lifecycle",
+            "seconds": 50.44545775200163,
+            "percent_of_application_wall": 7.511029447344186
+          }
+        ],
+        "five_bin_sum_s": 621.1729682660001,
+        "five_bin_sum_minus_solver_total_s": 1.1368683772161603e-13,
+        "six_bin_sum_s": 671.6184260180017,
+        "six_bin_sum_minus_application_wall_s": 1.1368683772161603e-13,
+        "percentage_sum": 100.00000000000001,
+        "observed_accepted_steps": 6663,
+        "observed_linear_calls": 19990,
+        "raw_timings": {
+          "application_wall_seconds": 671.6184260180016,
+          "native_done_seconds": 559.445483451,
+          "pre_final_output_analysis_seconds": 514.49505
+        },
+        "timing_origin": {
+          "scope": "RunEulerCase",
+          "clock": "steady-host-wall",
+          "rank": "0",
+          "origin": "before-communicator-query",
+          "end": "before-return-and-destruction",
+          "loop_entered": "1",
+          "success": "1"
+        }
+      },
+      "comparison": {
+        "rows": [
+          {
+            "key": "setup_initial_output_s",
+            "label": "RunEulerCase setup and initial output",
+            "baseline_s": 65.485285449,
+            "optimized_s": 61.727183063,
+            "optimized_minus_baseline_s": -3.7581023860000045,
+            "saved_baseline_minus_optimized_s": 3.7581023860000045,
+            "baseline_percent_of_wall": 9.392307866933221,
+            "optimized_percent_of_wall": 9.190811429784315,
+            "percentage_points_change": -0.20149643714890608
+          },
+          {
+            "key": "advancing_cfl_s",
+            "label": "Advancing, CFL and remaining loop work",
+            "baseline_s": 354.003729111,
+            "optimized_s": 331.7454958640001,
+            "optimized_minus_baseline_s": -22.258233246999907,
+            "saved_baseline_minus_optimized_s": 22.258233246999907,
+            "baseline_percent_of_wall": 50.77342164817143,
+            "optimized_percent_of_wall": 49.394936620620385,
+            "percentage_points_change": -1.3784850275510436
+          },
+          {
+            "key": "scheduled_output_s",
+            "label": "Scheduled output, staging and existing waits",
+            "baseline_s": 178.241431224,
+            "optimized_s": 182.148903958,
+            "optimized_minus_baseline_s": 3.9074727340000095,
+            "saved_baseline_minus_optimized_s": -3.9074727340000095,
+            "baseline_percent_of_wall": 25.56449720299992,
+            "optimized_percent_of_wall": 27.12089140227338,
+            "percentage_points_change": 1.5563941992734591
+          },
+          {
+            "key": "diagnostics_s",
+            "label": "Configured analysis and visualization hooks",
+            "baseline_s": 2.3693714789999993,
+            "optimized_s": 0.7213609700000002,
+            "optimized_minus_baseline_s": -1.6480105089999992,
+            "saved_baseline_minus_optimized_s": 1.6480105089999992,
+            "baseline_percent_of_wall": 0.3398300279110828,
+            "optimized_percent_of_wall": 0.10740636975624986,
+            "percentage_points_change": -0.23242365815483296
+          },
+          {
+            "key": "final_output_postloop_s",
+            "label": "Final output and RunEulerCase postloop reports",
+            "baseline_s": 45.478233876,
+            "optimized_s": 44.830024411000004,
+            "optimized_minus_baseline_s": -0.6482094649999937,
+            "saved_baseline_minus_optimized_s": 0.6482094649999937,
+            "baseline_percent_of_wall": 6.522771808644631,
+            "optimized_percent_of_wall": 6.674924730221504,
+            "percentage_points_change": 0.15215292157687266
+          },
+          {
+            "key": "external_to_RunEulerCase_s",
+            "label": "Outside RunEulerCase: pre/post work and process lifecycle",
+            "baseline_s": 51.64446729599547,
+            "optimized_s": 50.44545775200163,
+            "optimized_minus_baseline_s": -1.1990095439938386,
+            "saved_baseline_minus_optimized_s": 1.1990095439938386,
+            "baseline_percent_of_wall": 7.407171445339724,
+            "optimized_percent_of_wall": 7.511029447344186,
+            "percentage_points_change": 0.10385800200446216
+          }
+        ],
+        "application_wall_optimized_minus_baseline_s": -25.604092416993808,
+        "application_wall_saved_s": 25.604092416993808,
+        "application_wall_reduction_percent": 3.672298547451601,
+        "baseline_over_optimized_wall_ratio": 1.0381229749290821,
+        "sum_of_bin_deltas_s": -25.604092416993733,
+        "bin_delta_sum_minus_wall_delta_s": 7.460698725481052e-14
+      }
+    },
+    "recorded_GPU_window": {
+      "candidate_capture": {
+        "source_commit": "c42cb2710255f13e41ad61a76aa8dac51b07d078",
+        "binary_sha256": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb",
+        "selected_complete_RK_steps": 305,
+        "selected_stages": 915,
+        "phase_rows": [
+          {
+            "label": "Per-stage coefficients/RHS + operator/P refresh",
+            "phase_keys": [
+              "sigma_coefficient_source_interpolation",
+              "sigma_exact_face_coefficient_setup",
+              "sigma_public_form_RHS_assembly",
+              "sigma_preconditioner_refresh",
+              "sigma_volume_operator_coefficient_refresh",
+              "sigma_assembly_other"
+            ],
+            "activity_union_ms_per_stage": 2.0920640699453554,
+            "activity_union_ms_per_complete_RK": 6.276192209836067,
+            "percent_of_selected_gpu_activity_union": 12.972173832241936,
+            "kernel_sum_ms_per_stage": 2.058094268852459,
+            "activity_records": 14640,
+            "kernel_records": 12810
+          },
+          {
+            "label": "Current A + residual",
+            "phase_keys": [
+              "sigma_current_A_plus_residual"
+            ],
+            "activity_union_ms_per_stage": 2.8443859934426228,
+            "activity_union_ms_per_complete_RK": 8.533157980327868,
+            "percent_of_selected_gpu_activity_union": 17.637064793094815,
+            "kernel_sum_ms_per_stage": 2.8443859934426228,
+            "activity_records": 5490,
+            "kernel_records": 5490
+          },
+          {
+            "label": "P + solution update",
+            "phase_keys": [
+              "sigma_P_plus_solution_update"
+            ],
+            "activity_union_ms_per_stage": 0.4302732240437159,
+            "activity_union_ms_per_complete_RK": 1.2908196721311478,
+            "percent_of_selected_gpu_activity_union": 2.667977113052782,
+            "kernel_sum_ms_per_stage": 0.4302732240437159,
+            "activity_records": 1830,
+            "kernel_records": 1830
+          },
+          {
+            "label": "Euler spatial RHS",
+            "phase_keys": [
+              "Euler_spatial_RHS"
+            ],
+            "activity_union_ms_per_stage": 9.823297468852461,
+            "activity_union_ms_per_complete_RK": 29.46989240655738,
+            "percent_of_selected_gpu_activity_union": 60.91090813251469,
+            "kernel_sum_ms_per_stage": 9.490408043715847,
+            "activity_records": 11895,
+            "kernel_records": 10065
+          },
+          {
+            "label": "RK common other",
+            "phase_keys": [
+              "RK_common_other"
+            ],
+            "activity_union_ms_per_stage": 0.4110345792349727,
+            "activity_union_ms_per_complete_RK": 1.233103737704918,
+            "percent_of_selected_gpu_activity_union": 2.548684856022483,
+            "kernel_sum_ms_per_stage": 0.4110345792349727,
+            "activity_records": 1525,
+            "kernel_records": 1525
+          },
+          {
+            "label": "Other recorded work",
+            "phase_keys": [
+              "sigma_solve_updates_copies_reductions",
+              "sigma_update_other"
+            ],
+            "activity_union_ms_per_stage": 0.5262653202185793,
+            "activity_union_ms_per_complete_RK": 1.578795960655738,
+            "percent_of_selected_gpu_activity_union": 3.2631912730732924,
+            "kernel_sum_ms_per_stage": 0.0,
+            "activity_records": 2745,
+            "kernel_records": 0
+          }
+        ],
+        "recorded_activity_union_s": 14.756498400000002,
+        "recorded_kernel_sum_s": 13.939289440000001,
+        "recorded_global_activity_union_ms_per_complete_RK": 48.38196196721312,
+        "recorded_global_activity_union_ms_per_stage": 16.12732065573771,
+        "mean_per_RK_activity_union_ms": 48.381961967213115,
+        "whole_RK": {
+          "selected_complete_steps": 305,
+          "recorded_gpu_union_ms_per_RK": 48.381961967213115,
+          "selected_global_gpu_union_ms_per_RK": 48.38196196721312,
+          "kernel_sum_ms_per_RK": 45.70258832786885,
+          "recorded_gpu_union_distribution": {
+            "samples": 305,
+            "mean_ms": 48.381961967213115,
+            "median_ms": 48.383424,
+            "minimum_ms": 48.239776,
+            "p95_ms": 48.4292736,
+            "maximum_ms": 48.518848
+          },
+          "kernel_sum_distribution": {
+            "samples": 305,
+            "mean_ms": 45.702588327868845,
+            "median_ms": 45.704927999999995,
+            "minimum_ms": 45.55952,
+            "p95_ms": 45.7476352,
+            "maximum_ms": 45.83904
+          },
+          "host_elapsed_distribution": {
+            "samples": 305,
+            "mean_ms": 48.67545253770491,
+            "median_ms": 48.69936,
+            "minimum_ms": 41.057536,
+            "p95_ms": 48.7559296,
+            "maximum_ms": 48.824192
+          }
+        },
+        "phase_union_sum_s": 14.756498400000002,
+        "phase_union_sum_minus_all_activity_union_s": 0.0,
+        "phase_percent_sum": 100.0,
+        "profiler_diagnostics": [
+          {
+            "timestamp": -178710628704,
+            "timestampType": 1,
+            "source": 1,
+            "severity": 2,
+            "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+            "globalPid": 299205138579456
+          },
+          {
+            "timestamp": 968119379,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+            "globalPid": -144115188075855872
+          },
+          {
+            "timestamp": 968157234,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all NVTX events might have been collected.",
+            "globalPid": 299205876776960
+          },
+          {
+            "timestamp": 968158706,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "No NVTX events collected. Does the process use NVTX?",
+            "globalPid": 299205876776960
+          },
+          {
+            "timestamp": 968159474,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all NVTX events might have been collected.",
+            "globalPid": 299205138579456
+          },
+          {
+            "timestamp": 968163122,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "CUDA profiling might have not been started correctly.",
+            "globalPid": 299205876776960
+          },
+          {
+            "timestamp": 968163794,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "No CUDA events collected. Does the process use CUDA?",
+            "globalPid": 299205876776960
+          },
+          {
+            "timestamp": 968164465,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all CUDA events might have been collected.",
+            "globalPid": 299205138579456
+          },
+          {
+            "timestamp": 968166321,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all OS runtime libraries events might have been collected.",
+            "globalPid": 299205876776960
+          },
+          {
+            "timestamp": 968168209,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all OS runtime libraries events might have been collected.",
+            "globalPid": 299205138579456
+          }
+        ],
+        "diagnostic_review_required": true
+      },
+      "exact_phase_details": [
+        {
+          "phase": "Euler_spatial_RHS",
+          "activity_union_ms_per_stage": 9.823297468852461,
+          "activity_union_ms_per_complete_RK": 29.46989240655738,
+          "percent_of_selected_gpu_activity_union": 60.91090813251469,
+          "memcpy_sum_ms_per_stage": 0.33288942513661207,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "RK_common_other",
+          "activity_union_ms_per_stage": 0.4110345792349727,
+          "activity_union_ms_per_complete_RK": 1.233103737704918,
+          "percent_of_selected_gpu_activity_union": 2.548684856022483,
+          "memcpy_sum_ms_per_stage": 0.0,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_P_plus_solution_update",
+          "activity_union_ms_per_stage": 0.4302732240437159,
+          "activity_union_ms_per_complete_RK": 1.2908196721311478,
+          "percent_of_selected_gpu_activity_union": 2.6679771130527823,
+          "memcpy_sum_ms_per_stage": 0.0,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_coefficient_source_interpolation",
+          "activity_union_ms_per_stage": 0.7311036852459016,
+          "activity_union_ms_per_complete_RK": 2.193311055737705,
+          "percent_of_selected_gpu_activity_union": 4.53332392188651,
+          "memcpy_sum_ms_per_stage": 0.0,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_current_A_plus_residual",
+          "activity_union_ms_per_stage": 2.8443859934426228,
+          "activity_union_ms_per_complete_RK": 8.533157980327868,
+          "percent_of_selected_gpu_activity_union": 17.637064793094815,
+          "memcpy_sum_ms_per_stage": 0.0,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_exact_face_coefficient_setup",
+          "activity_union_ms_per_stage": 0.20271958032786888,
+          "activity_union_ms_per_complete_RK": 0.6081587409836067,
+          "percent_of_selected_gpu_activity_union": 1.2569947894955893,
+          "memcpy_sum_ms_per_stage": 0.026637744262295083,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_preconditioner_refresh",
+          "activity_union_ms_per_stage": 0.198864087431694,
+          "activity_union_ms_per_complete_RK": 0.596592262295082,
+          "percent_of_selected_gpu_activity_union": 1.233088196587342,
+          "memcpy_sum_ms_per_stage": 0.0,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_public_form_RHS_assembly",
+          "activity_union_ms_per_stage": 0.6152439256830602,
+          "activity_union_ms_per_complete_RK": 1.8457317770491806,
+          "percent_of_selected_gpu_activity_union": 3.814917175744077,
+          "memcpy_sum_ms_per_stage": 0.007332056830601093,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_solve_updates_copies_reductions",
+          "activity_union_ms_per_stage": 0.48645099016393445,
+          "activity_union_ms_per_complete_RK": 1.4593529704918033,
+          "percent_of_selected_gpu_activity_union": 3.016316228516651,
+          "memcpy_sum_ms_per_stage": 0.48645099016393445,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_update_other",
+          "activity_union_ms_per_stage": 0.03981433005464481,
+          "activity_union_ms_per_complete_RK": 0.11944299016393443,
+          "percent_of_selected_gpu_activity_union": 0.24687504455664086,
+          "memcpy_sum_ms_per_stage": 0.03981433005464481,
+          "memset_sum_ms_per_stage": 0.0
+        },
+        {
+          "phase": "sigma_volume_operator_coefficient_refresh",
+          "activity_union_ms_per_stage": 0.3441327912568306,
+          "activity_union_ms_per_complete_RK": 1.0323983737704918,
+          "percent_of_selected_gpu_activity_union": 2.1338497485284176,
+          "memcpy_sum_ms_per_stage": 0.0,
+          "memset_sum_ms_per_stage": 0.0
+        }
+      ],
+      "Euler_kernel_groups": {
+        "measure": "sum of recorded kernel durations; excludes copies and can overlap across streams",
+        "grouping": "Readable exact kernel markers within audited Euler_spatial_RHS; exact names retained below",
+        "Euler_kernel_sum_ms_per_stage": 9.490408043715847,
+        "rows": [
+          {
+            "key": "speed_reductions",
+            "label": "Characteristic speed reductions",
+            "calls": 3660,
+            "kernel_sum_ms_per_stage": 0.018168900546448086,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::<unnamed>::FaceSpeedQReduceKernel>(int, T1)",
+                "calls": 1830,
+                "kernel_sum_ms_per_stage": 0.012826264480874316
+              },
+              {
+                "kernel_name": "void mfem::CuKernel2D<mfem::internal::reduction_kernel<mfem::<unnamed>::MaxSpeedReductionBody, mfem::MaxReducer<double>>>(int, T1)",
+                "calls": 1830,
+                "kernel_sum_ms_per_stage": 0.005342636065573771
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 0.05450670163934426,
+            "percent_of_recorded_Euler_kernel_sum": 0.19144488269372964,
+            "percent_of_all_selected_kernel_sum": 0.1192639271288422
+          },
+          {
+            "key": "inverse_mass",
+            "label": "Euler inverse mass",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 1.7140560786885248,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::<unnamed>::PackedInverseMassRowsKernel>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 1.7140560786885248
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 5.142168236065575,
+            "percent_of_recorded_Euler_kernel_sum": 18.060931319212365,
+            "percent_of_all_selected_kernel_sum": 11.251372021155191
+          },
+          {
+            "key": "volume_flux",
+            "label": "Euler volume flux evaluation",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 0.49013193442622954,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::<unnamed>::PackedSharedWeakDivEulerPointKernel>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 0.49013193442622954
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 1.4703958032786886,
+            "percent_of_recorded_Euler_kernel_sum": 5.164498008605378,
+            "percent_of_all_selected_kernel_sum": 3.217314067050465
+          },
+          {
+            "key": "weak_divergence",
+            "label": "Weak divergence matrix action",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 4.842858631693989,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::<unnamed>::PackedWeakDivRowsKernel>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 4.842858631693989
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 14.528575895081968,
+            "percent_of_recorded_Euler_kernel_sum": 51.028982203781304,
+            "percent_of_all_selected_kernel_sum": 31.789394051064342
+          },
+          {
+            "key": "vector_clear",
+            "label": "Euler vector clearing",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 0.08977510819672133,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::Vector::operator =(double)::[lambda(int) (instance 1)]>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 0.08977510819672133
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 0.26932532459016395,
+            "percent_of_recorded_Euler_kernel_sum": 0.94595625165102,
+            "percent_of_all_selected_kernel_sum": 0.5892999378022816
+          },
+          {
+            "key": "face_flux",
+            "label": "Euler numerical face flux",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 0.6894939278688524,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::dg_igr_detail::tensor_face::FluxKernel>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 0.6894939278688524
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 2.068481783606557,
+            "percent_of_recorded_Euler_kernel_sum": 7.265166309950251,
+            "percent_of_all_selected_kernel_sum": 4.525962006281433
+          },
+          {
+            "key": "face_lift",
+            "label": "Euler face lift",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 1.3006682928961748,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::dg_igr_detail::tensor_face::LiftKernel>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 1.3006682928961748
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 3.9020048786885244,
+            "percent_of_recorded_Euler_kernel_sum": 13.705082931154084,
+            "percent_of_all_selected_kernel_sum": 8.537820332397086
+          },
+          {
+            "key": "face_trace",
+            "label": "Euler face traces",
+            "calls": 915,
+            "kernel_sum_ms_per_stage": 0.34525516939890716,
+            "exact_kernels": [
+              {
+                "kernel_name": "void mfem::CuKernel1D<mfem::dg_igr_detail::tensor_face::TraceKernel>(int, T1)",
+                "calls": 915,
+                "kernel_sum_ms_per_stage": 0.34525516939890716
+              }
+            ],
+            "kernel_sum_ms_per_complete_RK": 1.0357655081967214,
+            "percent_of_recorded_Euler_kernel_sum": 3.63793809295187,
+            "percent_of_all_selected_kernel_sum": 2.266316955105855
+          }
+        ],
+        "percent_sum": 100.0,
+        "unrecognized_kernel_records": 0,
+        "Euler_memcpy_sum_ms_per_stage": 0.33288942513661207,
+        "Euler_memset_sum_ms_per_stage": 0.0
+      },
+      "verification": {
+        "grouped_activity_records": 38125,
+        "selected_activity_records": 38125,
+        "grouped_kernel_records": 31720,
+        "selected_kernel_records": 31720,
+        "work_counts_match_expected": true
+      },
+      "work_counts": {
+        "SourceAndDiffusionKernel<": {
+          "calls": 915,
+          "calls_per_stage": 1.0,
+          "expected_per_stage": 1,
+          "per_stage_count_distribution": {
+            "1": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "void igrlab::igr_internal::<unnamed>::SourceAndDiffusionKernel<(bool)0>(int, const double *, const double *, const double *, double, double, const double *, double *, double *)"
+          ]
+        },
+        "InverseDensityKernel(": {
+          "calls": 915,
+          "calls_per_stage": 1.0,
+          "expected_per_stage": 1,
+          "per_stage_count_distribution": {
+            "1": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "igrlab::igr_internal::<unnamed>::InverseDensityKernel(int, const double *, const double *, double, double *)"
+          ]
+        },
+        "TensorDensityTraces(": {
+          "calls": 915,
+          "calls_per_stage": 1.0,
+          "expected_per_stage": 1,
+          "per_stage_count_distribution": {
+            "1": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "igrlab::igr_internal::<unnamed>::TensorDensityTraces(int, const int *, const double *, const double *, double *)"
+          ]
+        },
+        "PackTensorDensity(": {
+          "calls": 915,
+          "calls_per_stage": 1.0,
+          "expected_per_stage": 1,
+          "per_stage_count_distribution": {
+            "1": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "igrlab::igr_internal::<unnamed>::PackTensorDensity(int, const int *, const int *, const int *, const int *, const double *, const double *, double, const double *, double, double *, double *)"
+          ]
+        },
+        "IGRTensorVolumeRefreshKernel(": {
+          "calls": 915,
+          "calls_per_stage": 1.0,
+          "expected_per_stage": 1,
+          "per_stage_count_distribution": {
+            "1": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "igrlab::igr_internal::<unnamed>::IGRTensorVolumeRefreshKernel(int, int, int, const double *, const double *, const double *, const double *, double *, double *)"
+          ]
+        },
+        "IGRCompactTensorVolumeKernel(": {
+          "calls": 1830,
+          "calls_per_stage": 2.0,
+          "expected_per_stage": 2,
+          "per_stage_count_distribution": {
+            "2": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "igrlab::igr_internal::<unnamed>::IGRCompactTensorVolumeKernel(int, const int *, const double *, const double *, const double *, const double *, double *)"
+          ]
+        },
+        "IGRFusedTensorVolumeKernel<(bool)0>": {
+          "calls": 0,
+          "calls_per_stage": 0.0,
+          "expected_per_stage": 0,
+          "per_stage_count_distribution": {
+            "0": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": []
+        },
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp": {
+          "calls": 1830,
+          "calls_per_stage": 2.0,
+          "expected_per_stage": 2,
+          "per_stage_count_distribution": {
+            "2": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp>(int, T1)"
+          ]
+        },
+        "InteriorFaceDGDiffusionTensorLiftGather2D": {
+          "calls": 0,
+          "calls_per_stage": 0.0,
+          "expected_per_stage": 0,
+          "per_stage_count_distribution": {
+            "0": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": []
+        },
+        "InteriorFaceDGDiffusionTensorLiftResidual2D": {
+          "calls": 1830,
+          "calls_per_stage": 2.0,
+          "expected_per_stage": 2,
+          "per_stage_count_distribution": {
+            "2": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "void mfem::CuKernel1D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftResidual2D>(int, T1)"
+          ]
+        },
+        "ApplyTensorFactorFP64<(bool)1>": {
+          "calls": 1830,
+          "calls_per_stage": 2.0,
+          "expected_per_stage": 2,
+          "per_stage_count_distribution": {
+            "2": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": [
+            "void igrlab::igr_internal::<unnamed>::ApplyTensorFactorFP64<(bool)1>(const int *, const int *, const int *, const double *, const double *, const double *, const double *, double *, double)"
+          ]
+        },
+        "ApplyTensorFactorFP64(": {
+          "calls": 0,
+          "calls_per_stage": 0.0,
+          "expected_per_stage": 0,
+          "per_stage_count_distribution": {
+            "0": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": []
+        },
+        "mfem::subtract(": {
+          "calls": 0,
+          "calls_per_stage": 0.0,
+          "expected_per_stage": 0,
+          "per_stage_count_distribution": {
+            "0": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": []
+        },
+        "mfem::Vector::Add(double": {
+          "calls": 0,
+          "calls_per_stage": 0.0,
+          "expected_per_stage": 0,
+          "per_stage_count_distribution": {
+            "0": 915
+          },
+          "every_selected_stage_matches": true,
+          "resolved_names": []
+        }
+      },
+      "limits": [
+        "Profiler activity estimates concern this evolved capture window; they are not unprofiled timings, full-run partitions or speedup evidence.",
+        "Ownership follows the unique CUDA runtime launch correlation and full application NVTX ancestry; asynchronous GPU start times do not determine host-scope ownership.",
+        "Phase ownership is disjoint by event. Union sums can overlap across phases/streams; the explicit difference quantifies overlap.",
+        "Host NVTX times are inclusive, nested and asynchronous; they are never added to GPU activity time.",
+        "Recorded API/device correlations and scope counts cannot rule out records absent from both inventories or prove acquisition losslessness.",
+        "The capture intentionally terminates a fresh trajectory and cannot replace full physical-result qualification.",
+        "Initial global setup and final output are outside the selected evolved-window stages.",
+        "Unmatched full-trace activity is retained as a coverage count and cannot be assigned to selected RK steps.",
+        "Current A + residual and P + solution update are combined work groups; no pure A/P speedup can be inferred.",
+        "Baseline/current captures begin after the same 180-second wall delay but can cover different physical states and different GPUs.",
+        "Cross-window ratios are descriptive recorded-activity ratios, not unprofiled application speedups.",
+        "Complete-RK selection, launch reciprocity and matching work counts do not establish lossless acquisition; retained profiler warnings require review."
+      ],
+      "selected_host_RK_union_seconds": 14.846013024000001,
+      "host_and_gpu_times_added": false,
+      "full_run_GPU_extrapolation_performed": false,
+      "historical_GPU_reference_capture": {
+        "source_commit": "b6f20b909034e13614791b4b15031b02c0405f41",
+        "binary_sha256": "cc27f58382d492b728f9e839130d5334fb0da32c1a5db94ee0bdc85427f783c9",
+        "selected_complete_RK_steps": 290,
+        "selected_stages": 870,
+        "phase_rows": [
+          {
+            "label": "Per-stage coefficients/RHS + operator/P refresh",
+            "phase_keys": [
+              "sigma_coefficient_source_interpolation",
+              "sigma_exact_face_coefficient_setup",
+              "sigma_public_form_RHS_assembly",
+              "sigma_preconditioner_refresh",
+              "sigma_volume_operator_coefficient_refresh",
+              "sigma_assembly_other"
+            ],
+            "activity_union_ms_per_stage": 2.113435034482759,
+            "activity_union_ms_per_complete_RK": 6.3403051034482765,
+            "percent_of_selected_gpu_activity_union": 12.449179488004296,
+            "kernel_sum_ms_per_stage": 2.079457471264368,
+            "activity_records": 13920,
+            "kernel_records": 12180
+          },
+          {
+            "label": "Current A + residual",
+            "phase_keys": [
+              "sigma_current_A_plus_residual"
+            ],
+            "activity_union_ms_per_stage": 3.527906682758621,
+            "activity_union_ms_per_complete_RK": 10.583720048275863,
+            "percent_of_selected_gpu_activity_union": 20.78111831875672,
+            "kernel_sum_ms_per_stage": 3.3628979103448278,
+            "activity_records": 13920,
+            "kernel_records": 10440
+          },
+          {
+            "label": "P + solution update",
+            "phase_keys": [
+              "sigma_P_plus_solution_update"
+            ],
+            "activity_union_ms_per_stage": 0.5385032827586208,
+            "activity_union_ms_per_complete_RK": 1.6155098482758625,
+            "percent_of_selected_gpu_activity_union": 3.1720511454388354,
+            "kernel_sum_ms_per_stage": 0.5385032827586208,
+            "activity_records": 3480,
+            "kernel_records": 3480
+          },
+          {
+            "label": "Euler spatial RHS",
+            "phase_keys": [
+              "Euler_spatial_RHS"
+            ],
+            "activity_union_ms_per_stage": 9.857298464367815,
+            "activity_union_ms_per_complete_RK": 29.571895393103446,
+            "percent_of_selected_gpu_activity_union": 58.06437190995906,
+            "kernel_sum_ms_per_stage": 9.524290574712644,
+            "activity_records": 11310,
+            "kernel_records": 9570
+          },
+          {
+            "label": "RK common other",
+            "phase_keys": [
+              "RK_common_other"
+            ],
+            "activity_union_ms_per_stage": 0.4113244689655173,
+            "activity_union_ms_per_complete_RK": 1.2339734068965518,
+            "percent_of_selected_gpu_activity_union": 2.422904919437471,
+            "kernel_sum_ms_per_stage": 0.4113244689655173,
+            "activity_records": 1450,
+            "kernel_records": 1450
+          },
+          {
+            "label": "Other recorded work",
+            "phase_keys": [
+              "sigma_solve_updates_copies_reductions",
+              "sigma_update_other"
+            ],
+            "activity_union_ms_per_stage": 0.5280326988505747,
+            "activity_union_ms_per_complete_RK": 1.5840980965517242,
+            "percent_of_selected_gpu_activity_union": 3.1103742184036127,
+            "kernel_sum_ms_per_stage": 0.0,
+            "activity_records": 2610,
+            "kernel_records": 0
+          }
+        ],
+        "recorded_activity_union_s": 14.769555550000002,
+        "recorded_kernel_sum_s": 13.847332126,
+        "recorded_global_activity_union_ms_per_complete_RK": 50.92950189655173,
+        "recorded_global_activity_union_ms_per_stage": 16.97650063218391,
+        "mean_per_RK_activity_union_ms": 50.92950189655172,
+        "whole_RK": {
+          "selected_complete_steps": 290,
+          "recorded_gpu_union_ms_per_RK": 50.92950189655172,
+          "selected_global_gpu_union_ms_per_RK": 50.92950189655173,
+          "kernel_sum_ms_per_RK": 47.74942112413793,
+          "recorded_gpu_union_distribution": {
+            "samples": 290,
+            "mean_ms": 50.92950189655172,
+            "median_ms": 50.9244,
+            "minimum_ms": 50.774144,
+            "p95_ms": 51.0390176,
+            "maximum_ms": 51.083456
+          },
+          "kernel_sum_distribution": {
+            "samples": 290,
+            "mean_ms": 47.74942112413793,
+            "median_ms": 47.745231999999994,
+            "minimum_ms": 47.59344,
+            "p95_ms": 47.8588592,
+            "maximum_ms": 47.902848
+          },
+          "host_elapsed_distribution": {
+            "samples": 290,
+            "mean_ms": 51.257919448275864,
+            "median_ms": 51.277392,
+            "minimum_ms": 43.626656,
+            "p95_ms": 51.3951136,
+            "maximum_ms": 51.505088
+          }
+        },
+        "phase_union_sum_s": 14.76955555,
+        "phase_union_sum_minus_all_activity_union_s": -1.7763568394002505e-15,
+        "phase_percent_sum": 100.0,
+        "profiler_diagnostics": [
+          {
+            "timestamp": -178805493728,
+            "timestampType": 1,
+            "source": 1,
+            "severity": 2,
+            "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+            "globalPid": 340728379080704
+          },
+          {
+            "timestamp": 944942383,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+            "globalPid": -144115188075855872
+          },
+          {
+            "timestamp": 944977614,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all NVTX events might have been collected.",
+            "globalPid": 340728479744000
+          },
+          {
+            "timestamp": 944979182,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "No NVTX events collected. Does the process use NVTX?",
+            "globalPid": 340728479744000
+          },
+          {
+            "timestamp": 944980110,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all NVTX events might have been collected.",
+            "globalPid": 340728379080704
+          },
+          {
+            "timestamp": 944983502,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "CUDA profiling might have not been started correctly.",
+            "globalPid": 340728479744000
+          },
+          {
+            "timestamp": 944984302,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "No CUDA events collected. Does the process use CUDA?",
+            "globalPid": 340728479744000
+          },
+          {
+            "timestamp": 944984782,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all CUDA events might have been collected.",
+            "globalPid": 340728379080704
+          },
+          {
+            "timestamp": 944986446,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all OS runtime libraries events might have been collected.",
+            "globalPid": 340728479744000
+          },
+          {
+            "timestamp": 944988142,
+            "timestampType": 2,
+            "source": 3,
+            "severity": 2,
+            "text": "Not all OS runtime libraries events might have been collected.",
+            "globalPid": 340728379080704
+          }
+        ],
+        "diagnostic_review_required": true
+      },
+      "historical_GPU_comparison": {
+        "matched_group_boundaries": true,
+        "both_work_counts_match_expected": true,
+        "metrics": {
+          "full_sweep_union_ms": {
+            "baseline": 2.0332049827586207,
+            "current": 1.6373296087431697,
+            "current_over_baseline": 0.805294902691841
+          },
+          "sigma_current_A_plus_residual_union_ms_per_apply": {
+            "baseline": 1.7639533413793105,
+            "current": 1.4221929967213114,
+            "current_over_baseline": 0.8062531833235668
+          },
+          "sigma_P_plus_solution_update_union_ms_per_apply": {
+            "baseline": 0.2692516413793104,
+            "current": 0.21513661202185794,
+            "current_over_baseline": 0.7990169007689818
+          },
+          "whole_RK_gpu_union_ms": {
+            "baseline": 50.92950189655172,
+            "current": 48.381961967213115,
+            "current_over_baseline": 0.9499790919904698
+          },
+          "whole_RK_kernel_sum_ms": {
+            "baseline": 47.74942112413793,
+            "current": 45.70258832786885,
+            "current_over_baseline": 0.9571338720327569
+          },
+          "sigma_gpu_union_ms_per_stage": {
+            "baseline": 6.707877698850575,
+            "current": 5.892988607650273,
+            "current_over_baseline": 0.8785175985930787
+          },
+          "Euler_gpu_union_ms_per_stage": {
+            "baseline": 9.857298464367815,
+            "current": 9.823297468852461,
+            "current_over_baseline": 0.996550678095194
+          }
+        },
+        "interpretation": "Grouped descriptive comparison against frozen stage-fused NSys3443736, including its standalone subtract/Add costs. Different evolved states/GPU scheduling and profiler warnings preclude an application speedup claim."
+      },
+      "historical_reference_note": "Historical GPU reference is a separate capture, not a GPU measurement of this full pair's baseline arm."
+    },
+    "interpretation": [
+      "The six host bins partition measured application wall time; GPU tables are separate descriptive profile-window measurements.",
+      "RunEulerCase begins before its communicator queries and ends before its timing line and local destruction; the external residual includes work on both sides of that scope.",
+      "Host phases include their existing staging and waits. Asynchronous GPU work may cross these phase boundaries; no synchronization was added for timing.",
+      "Diagnostics covers configured on_visualize (alive/GLVis) and on_analysis hooks. Other existing loop checks remain in the advancing complement.",
+      "Existing IGR production host totals include initialization and prefetched output work, so they are not subtracted to infer exclusive Euler time.",
+      "GPU percentages use recorded activity unions. Group union sums can overlap across streams; their difference from the all-activity union is reported, never normalized away.",
+      "Euler kernel subgroup percentages use recorded kernel-duration sums, excluding copies; these are distinct from activity-union percentages.",
+      "Current A plus residual and P plus solution update are combined work groups; fused pure A/P and residual/update times cannot be separated.",
+      "Per-RK GPU numbers normalize only by selected complete RK steps. No GPU window is multiplied by full-run stage counts or added to host wall time.",
+      "A single sequential same-GPU unprofiled pair is a measured comparison; it does not establish repeatability or isolate clock and run-order effects."
+    ],
+    "input_bindings": {
+      "pair_run": {
+        "path": "/tmp/igr-operator-residual-20261023/full-3444291/run.json",
+        "sha256": "00947d25aa6ed477e75a6c9dfa0f9c8548ec7926b538896ba46d7d11585aaca4",
+        "bytes": 94336
+      },
+      "gpu_audit": {
+        "path": "/tmp/igr-operator-residual-20261023/nsys-3444260/gpu-audit.json",
+        "sha256": "87d5a96c228f91232ae339a4ad82031a8717404029a7e202950172005e84ea73",
+        "bytes": 56267
+      },
+      "summarizer": {
+        "path": "/tmp/igr-operator-residual-20261023/summarize_total.py",
+        "sha256": "6fba8d1c4cea5061b3bbb60f8e1c18a4cf21b47d27b9a42a59148d8088227b43"
+      },
+      "field_comparison": {
+        "path": "/tmp/igr-operator-residual-20261023/full-fields/comparison-recovered.json",
+        "sha256": "3500ebaa1a4546f8fc5ab05c4b5f60985eabf3549ca68d89efa683432fdd5ac3",
+        "bytes": 20811
+      }
+    }
+  },
+  "hardware_counters": {
+    "baseline_job": "3444049",
+    "candidate_job": "3444300",
+    "candidate_source_commit": "c42cb2710255f13e41ad61a76aa8dac51b07d078",
+    "candidate_binary_sha256": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb",
+    "candidate_coverage": {
+      "complete": true,
+      "launches_complete": true,
+      "supported_counters_complete": true,
+      "native_launch_count": 6,
+      "counts": {
+        "IGRCompactTensorVolumeKernel": 2,
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp": 2,
+        "InteriorFaceDGDiffusionTensorLiftResidual2D": 2
+      },
+      "native_order": [
+        "IGRCompactTensorVolumeKernel",
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "InteriorFaceDGDiffusionTensorLiftResidual2D",
+        "IGRCompactTensorVolumeKernel",
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "InteriorFaceDGDiffusionTensorLiftResidual2D"
+      ],
+      "expected_order": [
+        "IGRCompactTensorVolumeKernel",
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "InteriorFaceDGDiffusionTensorLiftResidual2D",
+        "IGRCompactTensorVolumeKernel",
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "InteriorFaceDGDiffusionTensorLiftResidual2D"
+      ],
+      "missing_metrics": [],
+      "unsupported_metrics": [],
+      "mismatched_native_launches": []
+    },
+    "candidate_selection": {
+      "profiler": "/opt/nvidia/hpc_sdk/Linux_aarch64/25.5/compilers/bin/ncu",
+      "profiler_version": "2025.2.0",
+      "nvtx_include": "RK\\/Step/",
+      "metrics": [
+        "gpu__time_duration.sum",
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+        "dram__bytes_read.sum",
+        "dram__bytes_write.sum",
+        "lts__t_bytes.sum",
+        "l1tex__t_bytes.sum",
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct",
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
+        "sm__warps_active.avg.pct_of_peak_sustained_active",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
+        "smsp__sass_inst_executed_op_local_ld.sum",
+        "smsp__sass_inst_executed_op_local_st.sum",
+        "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum",
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed"
+      ],
+      "launch_metrics": [
+        "launch__registers_per_thread",
+        "launch__stack_size",
+        "launch__occupancy_limit_registers",
+        "launch__occupancy_limit_shared_mem",
+        "launch__occupancy_limit_blocks",
+        "launch__occupancy_limit_warps"
+      ],
+      "interpretation_limits": [
+        "NCU intentionally ends the diagnostic application after six matching launches; physical completion is not claimed.",
+        "The application evolves continuously from the ordinary initial condition to RK/Step1200; no restart or state replay.",
+        "Only the first two currentA applications in the selected RK step are sampled; they are not an average over stages or the trajectory.",
+        "Kernel replay with all-cache flush changes cache state; profiler durations do not measure full-case performance.",
+        "Local-memory traffic and instructions do not alone establish compiler spill counts.",
+        "Unsupported or missing counters are null, never a measured zero.",
+        "Output cadence .1 is diagnostic only; matched application timings retain their original .02 cadence."
+      ],
+      "schema": "igr-operator-residual-candidate-ncu-selection-v1",
+      "range_filter": "no::1200",
+      "source_rk_step_zero_based": 1199,
+      "launch_skip": 0,
+      "launch_count": 6,
+      "kernel_regex": ".*(?:IGRCompactTensorVolumeKernel|InteriorFaceDGDiffusionTensorLiftRecord2DWarp|InteriorFaceDGDiffusionTensorLiftResidual2D).*",
+      "expected_order": [
+        "IGRCompactTensorVolumeKernel",
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "InteriorFaceDGDiffusionTensorLiftResidual2D",
+        "IGRCompactTensorVolumeKernel",
+        "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "InteriorFaceDGDiffusionTensorLiftResidual2D"
+      ],
+      "expected_configs": [
+        {
+          "family": "IGRCompactTensorVolumeKernel",
+          "name": "igrlab::igr_internal::<unnamed>::IGRCompactTensorVolumeKernel(int, const int *, const double *, const double *, const double *, const double *, double *)",
+          "grid": [
+            65536,
+            1,
+            1
+          ],
+          "block": [
+            128,
+            1,
+            1
+          ],
+          "static_shared": 9040,
+          "dynamic_shared": 0,
+          "nsys_registers_per_thread": 40,
+          "nsys_local_memory_per_thread": 0
+        },
+        {
+          "family": "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+          "name": "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp>(int, T1)",
+          "grid": [
+            130816,
+            1,
+            1
+          ],
+          "block": [
+            32,
+            1,
+            4
+          ],
+          "static_shared": 0,
+          "dynamic_shared": 0,
+          "nsys_registers_per_thread": 38,
+          "nsys_local_memory_per_thread": 0
+        },
+        {
+          "family": "InteriorFaceDGDiffusionTensorLiftResidual2D",
+          "name": "void mfem::CuKernel1D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftResidual2D>(int, T1)",
+          "grid": [
+            36864,
+            1,
+            1
+          ],
+          "block": [
+            256,
+            1,
+            1
+          ],
+          "static_shared": 0,
+          "dynamic_shared": 0,
+          "nsys_registers_per_thread": 32,
+          "nsys_local_memory_per_thread": 0
+        }
+      ],
+      "sequence_evidence": {
+        "sqlite_sha256": "cf4fee08e84f76464c568f52cbf56385a27aca9f64e47ec1e2f541ec2575d095",
+        "complete_native_rk_steps": 306,
+        "matching_launches_per_complete_RK": 18,
+        "all_first_six_equal_expected": true,
+        "authority": "Unique runtime launch correlation and same-thread complete RK/Step containment; actual NCU export must establish fresh range1200 coverage."
+      },
+      "source_commit": "c42cb2710255f13e41ad61a76aa8dac51b07d078",
+      "binary_sha256": "ce68e27c50e3cf2cd5f93cf456f404f667fcfe575590e46fb3cf6f82db79f5eb"
+    },
+    "candidate_native_report": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023/ncu-candidate-3444300/capture.ncu-rep",
+      "sha256": "2921fdd5fceb16c3423b65b641b09edb1365100b7812291087633a38aa0575e4",
+      "bytes": 24145951
+    },
+    "comparison": {
+      "groups": {
+        "volume": {
+          "baseline_family": "IGRFusedTensorVolumeKernel<(bool)0>",
+          "candidate_family": "IGRCompactTensorVolumeKernel",
+          "metrics": {
+            "gpu__time_duration.sum": {
+              "baseline_mean": 870304.0,
+              "candidate_mean": 777776.0,
+              "candidate_minus_baseline": -92528.0,
+              "candidate_over_baseline": 0.8936831268154576
+            },
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 69.61,
+              "candidate_mean": 66.125,
+              "candidate_minus_baseline": -3.4849999999999994,
+              "candidate_over_baseline": 0.949935354115788
+            },
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 17.28,
+              "candidate_mean": 19.345,
+              "candidate_minus_baseline": 2.0649999999999977,
+              "candidate_over_baseline": 1.1195023148148147
+            },
+            "dram__bytes_read.sum": {
+              "baseline_mean": 532773504.0,
+              "candidate_mean": 532764288.0,
+              "candidate_minus_baseline": -9216.0,
+              "candidate_over_baseline": 0.99998270184247
+            },
+            "dram__bytes_write.sum": {
+              "baseline_mean": 72218624.0,
+              "candidate_mean": 72506624.0,
+              "candidate_minus_baseline": 288000.0,
+              "candidate_over_baseline": 1.0039878909905566
+            },
+            "lts__t_bytes.sum": {
+              "baseline_mean": 933168352.0,
+              "candidate_mean": 930767168.0,
+              "candidate_minus_baseline": -2401184.0,
+              "candidate_over_baseline": 0.9974268480120938
+            },
+            "l1tex__t_bytes.sum": {
+              "baseline_mean": 5108662272.0,
+              "candidate_mean": 784334848.0,
+              "candidate_minus_baseline": -4324327424.0,
+              "candidate_over_baseline": 0.1535303776683087
+            },
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": {
+              "baseline_mean": 28.380000000000003,
+              "candidate_mean": 11.435,
+              "candidate_minus_baseline": -16.945,
+              "candidate_over_baseline": 0.4029245947850599
+            },
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": {
+              "baseline_mean": 10.57,
+              "candidate_mean": 18.37,
+              "candidate_minus_baseline": 7.800000000000001,
+              "candidate_over_baseline": 1.7379375591296122
+            },
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": {
+              "baseline_mean": 2.635,
+              "candidate_mean": 0.59,
+              "candidate_minus_baseline": -2.045,
+              "candidate_over_baseline": 0.2239089184060721
+            },
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": {
+              "baseline_mean": 0.5,
+              "candidate_mean": 30.16,
+              "candidate_minus_baseline": 29.66,
+              "candidate_over_baseline": 60.32
+            },
+            "sm__warps_active.avg.pct_of_peak_sustained_active": {
+              "baseline_mean": 60.595,
+              "candidate_mean": 72.745,
+              "candidate_minus_baseline": 12.150000000000006,
+              "candidate_over_baseline": 1.2005115933657893
+            },
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_inst_executed_op_local_ld.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_inst_executed_op_local_st.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": {
+              "baseline_mean": 1260388352.0,
+              "candidate_mean": 758120448.0,
+              "candidate_minus_baseline": -502267904.0,
+              "candidate_over_baseline": 0.6014975041597338
+            },
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 11.15,
+              "candidate_mean": 16.63,
+              "candidate_minus_baseline": 5.479999999999999,
+              "candidate_over_baseline": 1.4914798206278026
+            },
+            "launch__registers_per_thread": {
+              "baseline_mean": 44.0,
+              "candidate_mean": 40.0,
+              "candidate_minus_baseline": -4.0,
+              "candidate_over_baseline": 0.9090909090909091
+            },
+            "launch__stack_size": {
+              "baseline_mean": 1568.0,
+              "candidate_mean": 1568.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_registers": {
+              "baseline_mean": 10.0,
+              "candidate_mean": 12.0,
+              "candidate_minus_baseline": 2.0,
+              "candidate_over_baseline": 1.2
+            },
+            "launch__occupancy_limit_shared_mem": {
+              "baseline_mean": 10.0,
+              "candidate_mean": 13.0,
+              "candidate_minus_baseline": 3.0,
+              "candidate_over_baseline": 1.3
+            },
+            "launch__occupancy_limit_blocks": {
+              "baseline_mean": 32.0,
+              "candidate_mean": 32.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_warps": {
+              "baseline_mean": 16.0,
+              "candidate_mean": 16.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            }
+          },
+          "work_boundary": "Same operator role and mesh; candidate uses a separately evolved trajectory."
+        },
+        "face_record": {
+          "baseline_family": "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+          "candidate_family": "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+          "metrics": {
+            "gpu__time_duration.sum": {
+              "baseline_mean": 490928.0,
+              "candidate_mean": 487936.0,
+              "candidate_minus_baseline": -2992.0,
+              "candidate_over_baseline": 0.9939054199393801
+            },
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 57.19,
+              "candidate_mean": 57.085,
+              "candidate_minus_baseline": -0.10499999999999687,
+              "candidate_over_baseline": 0.9981640146878825
+            },
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 19.689999999999998,
+              "candidate_mean": 19.799999999999997,
+              "candidate_minus_baseline": 0.10999999999999943,
+              "candidate_over_baseline": 1.005586592178771
+            },
+            "dram__bytes_read.sum": {
+              "baseline_mean": 295376256.0,
+              "candidate_mean": 295392256.0,
+              "candidate_minus_baseline": 16000.0,
+              "candidate_over_baseline": 1.0000541681996267
+            },
+            "dram__bytes_write.sum": {
+              "baseline_mean": 93387392.0,
+              "candidate_mean": 93217920.0,
+              "candidate_minus_baseline": -169472.0,
+              "candidate_over_baseline": 0.998185279657451
+            },
+            "lts__t_bytes.sum": {
+              "baseline_mean": 865374192.0,
+              "candidate_mean": 865820832.0,
+              "candidate_minus_baseline": 446640.0,
+              "candidate_over_baseline": 1.0005161235499382
+            },
+            "l1tex__t_bytes.sum": {
+              "baseline_mean": 6530318336.0,
+              "candidate_mean": 6530318336.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": {
+              "baseline_mean": 61.17,
+              "candidate_mean": 61.22,
+              "candidate_minus_baseline": 0.04999999999999716,
+              "candidate_over_baseline": 1.0008173941474579
+            },
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": {
+              "baseline_mean": 5.485,
+              "candidate_mean": 5.485,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": {
+              "baseline_mean": 1.44,
+              "candidate_mean": 1.435,
+              "candidate_minus_baseline": -0.004999999999999893,
+              "candidate_over_baseline": 0.9965277777777779
+            },
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": {
+              "baseline_mean": 0.9299999999999999,
+              "candidate_mean": 0.93,
+              "candidate_minus_baseline": 1.1102230246251565e-16,
+              "candidate_over_baseline": 1.0000000000000002
+            },
+            "sm__warps_active.avg.pct_of_peak_sustained_active": {
+              "baseline_mean": 68.21,
+              "candidate_mean": 68.195,
+              "candidate_minus_baseline": -0.015000000000000568,
+              "candidate_over_baseline": 0.999780090895763
+            },
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_inst_executed_op_local_ld.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_inst_executed_op_local_st.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": {
+              "baseline_mean": 282562560.0,
+              "candidate_mean": 282562560.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 14.3,
+              "candidate_mean": 14.27,
+              "candidate_minus_baseline": -0.030000000000001137,
+              "candidate_over_baseline": 0.9979020979020978
+            },
+            "launch__registers_per_thread": {
+              "baseline_mean": 38.0,
+              "candidate_mean": 38.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__stack_size": {
+              "baseline_mean": 1568.0,
+              "candidate_mean": 1568.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_registers": {
+              "baseline_mean": 12.0,
+              "candidate_mean": 12.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_shared_mem": {
+              "baseline_mean": 32.0,
+              "candidate_mean": 32.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_blocks": {
+              "baseline_mean": 32.0,
+              "candidate_mean": 32.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_warps": {
+              "baseline_mean": 16.0,
+              "candidate_mean": 16.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            }
+          },
+          "work_boundary": "Same operator role and mesh; candidate uses a separately evolved trajectory."
+        },
+        "residual_vs_prior_gather": {
+          "baseline_family": "InteriorFaceDGDiffusionTensorLiftGather2D",
+          "candidate_family": "InteriorFaceDGDiffusionTensorLiftResidual2D",
+          "metrics": {
+            "gpu__time_duration.sum": {
+              "baseline_mean": 178864.0,
+              "candidate_mean": 186640.0,
+              "candidate_minus_baseline": 7776.0,
+              "candidate_over_baseline": 1.0434743715895876
+            },
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 34.955,
+              "candidate_mean": 33.875,
+              "candidate_minus_baseline": -1.0799999999999983,
+              "candidate_over_baseline": 0.969103132599056
+            },
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 40.375,
+              "candidate_mean": 49.095,
+              "candidate_minus_baseline": 8.719999999999999,
+              "candidate_over_baseline": 1.2159752321981423
+            },
+            "dram__bytes_read.sum": {
+              "baseline_mean": 225254912.0,
+              "candidate_mean": 300754560.0,
+              "candidate_minus_baseline": 75499648.0,
+              "candidate_over_baseline": 1.3351742580423729
+            },
+            "dram__bytes_write.sum": {
+              "baseline_mean": 65207936.0,
+              "candidate_mean": 67777664.0,
+              "candidate_minus_baseline": 2569728.0,
+              "candidate_over_baseline": 1.039408209454751
+            },
+            "lts__t_bytes.sum": {
+              "baseline_mean": 479407664.0,
+              "candidate_mean": 592300848.0,
+              "candidate_minus_baseline": 112893184.0,
+              "candidate_over_baseline": 1.2354847293388285
+            },
+            "l1tex__t_bytes.sum": {
+              "baseline_mean": 987739072.0,
+              "candidate_mean": 1063236544.0,
+              "candidate_minus_baseline": 75497472.0,
+              "candidate_over_baseline": 1.076434631513696
+            },
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": {
+              "baseline_mean": 86.445,
+              "candidate_mean": 86.81,
+              "candidate_minus_baseline": 0.3650000000000091,
+              "candidate_over_baseline": 1.0042223379027129
+            },
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": {
+              "baseline_mean": 0.75,
+              "candidate_mean": 0.73,
+              "candidate_minus_baseline": -0.020000000000000018,
+              "candidate_over_baseline": 0.9733333333333333
+            },
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": {
+              "baseline_mean": 0.735,
+              "candidate_mean": 0.71,
+              "candidate_minus_baseline": -0.025000000000000022,
+              "candidate_over_baseline": 0.9659863945578231
+            },
+            "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": {
+              "baseline_mean": 0.07,
+              "candidate_mean": 0.065,
+              "candidate_minus_baseline": -0.0050000000000000044,
+              "candidate_over_baseline": 0.9285714285714285
+            },
+            "sm__warps_active.avg.pct_of_peak_sustained_active": {
+              "baseline_mean": 91.945,
+              "candidate_mean": 91.64500000000001,
+              "candidate_minus_baseline": -0.29999999999998295,
+              "candidate_over_baseline": 0.9967371798357716
+            },
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_inst_executed_op_local_ld.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_inst_executed_op_local_st.sum": {
+              "baseline_mean": 0.0,
+              "candidate_mean": 0.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": null
+            },
+            "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": {
+              "baseline_mean": 37675008.0,
+              "candidate_mean": 37675008.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+              "baseline_mean": 5.01,
+              "candidate_mean": 4.835,
+              "candidate_minus_baseline": -0.17499999999999982,
+              "candidate_over_baseline": 0.9650698602794412
+            },
+            "launch__registers_per_thread": {
+              "baseline_mean": 32.0,
+              "candidate_mean": 32.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__stack_size": {
+              "baseline_mean": 1568.0,
+              "candidate_mean": 1568.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_registers": {
+              "baseline_mean": 8.0,
+              "candidate_mean": 8.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_shared_mem": {
+              "baseline_mean": 32.0,
+              "candidate_mean": 32.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_blocks": {
+              "baseline_mean": 32.0,
+              "candidate_mean": 32.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            },
+            "launch__occupancy_limit_warps": {
+              "baseline_mean": 8.0,
+              "candidate_mean": 8.0,
+              "candidate_minus_baseline": 0.0,
+              "candidate_over_baseline": 1.0
+            }
+          },
+          "work_boundary": "Candidate includes b-(volume+faces); baseline gather only completes the face contribution. No direct gather speedup claim."
+        }
+      },
+      "limits": [
+        "Kernel replay and all-cache flush perturb cache behavior; compare these identical controls only.",
+        "Two samples per family at RK/Step1200 do not establish trajectory-wide or application speedup.",
+        "Use DFMA count/L1 requests jointly with duration, registers, occupancy limits and actual local traffic.",
+        "The six-launch selection excludes P+solution-update counters; no claim about that fusion follows.",
+        "Missing or unsupported counters are null; zero local traffic is meaningful only when actually measured."
+      ]
+    }
+  },
+  "raw_records_remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-operator-residual-20261023",
+  "raw_records_local": "/home/jarias9/.cache/igrlab-experiments/igr-operator-residual-20261023",
+  "input_bindings": {
+    "native-3444198/run.json": {
+      "path": "/tmp/igr-operator-residual-20261023/native-3444198/run.json",
+      "sha256": "f21ae0abd2607c926556264d87123a4dc2323c6c345dc59f01fed56d8270933c",
+      "bytes": 100461
+    },
+    "short-3444217/run.json": {
+      "path": "/tmp/igr-operator-residual-20261023/short-3444217/run.json",
+      "sha256": "13faaaf57b4c0a29abc27c5a2532c38261cb7f56e7dc2daf54b4ebc1d68b04b0",
+      "bytes": 80908
+    },
+    "full-3444291/run.json": {
+      "path": "/tmp/igr-operator-residual-20261023/full-3444291/run.json",
+      "sha256": "00947d25aa6ed477e75a6c9dfa0f9c8548ec7926b538896ba46d7d11585aaca4",
+      "bytes": 94336
+    },
+    "source-freeze-r3/source-manifest.json": {
+      "path": "/tmp/igr-operator-residual-20261023/source-freeze-r3/source-manifest.json",
+      "sha256": "a468618503946f63b0d1cbe503fc1b5811fb056d1ca583140576fb92868234e0",
+      "bytes": 189665
+    },
+    "short-fields/field-gate.json": {
+      "path": "/tmp/igr-operator-residual-20261023/short-fields/field-gate.json",
+      "sha256": "96a25e90314d8505f22e7116460e4eaf4f02b0fa80d39507dff84f71b092a88f",
+      "bytes": 921
+    },
+    "full-fields/comparison-recovered.json": {
+      "path": "/tmp/igr-operator-residual-20261023/full-fields/comparison-recovered.json",
+      "sha256": "3500ebaa1a4546f8fc5ab05c4b5f60985eabf3549ca68d89efa683432fdd5ac3",
+      "bytes": 20811
+    },
+    "full-fields/baseline.transfer.json": {
+      "path": "/tmp/igr-operator-residual-20261023/full-fields/baseline.transfer.json",
+      "sha256": "f35d115bdd3a13f783cb5440ad190248345438f5534d84d71aa4dc01cb37d26f",
+      "bytes": 1048
+    },
+    "full-fields/optimized.transfer.json": {
+      "path": "/tmp/igr-operator-residual-20261023/full-fields/optimized.transfer.json",
+      "sha256": "ce36145a91f2ff2bcab1fa782f841c867333753c7c922511a7964d1a56fcd7ee",
+      "bytes": 1051
+    },
+    "nsys-3444260/run.json": {
+      "path": "/tmp/igr-operator-residual-20261023/nsys-3444260/run.json",
+      "sha256": "5d5e4f626bd259c166e1a9c408d7c3589d608da8bb0ddb5aa4d8c1eb313fcf82",
+      "bytes": 129652
+    },
+    "nsys-3444260/gpu-audit.json": {
+      "path": "/tmp/igr-operator-residual-20261023/nsys-3444260/gpu-audit.json",
+      "sha256": "87d5a96c228f91232ae339a4ad82031a8717404029a7e202950172005e84ea73",
+      "bytes": 56267
+    },
+    "nsys-3444260/trace-validation.json": {
+      "path": "/tmp/igr-operator-residual-20261023/nsys-3444260/trace-validation.json",
+      "sha256": "1e2317507257566d32d122fb5b9e32c642725d779957f8f12b66472a6acd6f85",
+      "bytes": 7872
+    },
+    "ncu-3444049/run.json": {
+      "path": "/tmp/igr-operator-residual-20261023/ncu-3444049/run.json",
+      "sha256": "4cc95fe8b2a741a71e1264a9a0d7462d5fec41c53a318b1ed454a2a2423781a5",
+      "bytes": 43721
+    },
+    "ncu-3444049/metrics.json": {
+      "path": "/tmp/igr-operator-residual-20261023/ncu-3444049/metrics.json",
+      "sha256": "d722e64f8f80bb09eae996247ea78271472e27e4398c35ac2c5802832e3b75f6",
+      "bytes": 20655
+    },
+    "ncu-candidate-3444300/run.json": {
+      "path": "/tmp/igr-operator-residual-20261023/ncu-candidate-3444300/run.json",
+      "sha256": "6d97ba2f5e2a162cd5fedcbdb1052e5fed69b426e12b68fae9e4e5bae4d81d6a",
+      "bytes": 48182
+    },
+    "ncu-candidate-3444300/metrics.json": {
+      "path": "/tmp/igr-operator-residual-20261023/ncu-candidate-3444300/metrics.json",
+      "sha256": "2ead70832e3bd17eed7b75cda92a27e116f6b5ab7fd78ae12bac736ce9bc5030",
+      "bytes": 20245
+    },
+    "ncu-candidate-3444300/counter-comparison.json": {
+      "path": "/tmp/igr-operator-residual-20261023/ncu-candidate-3444300/counter-comparison.json",
+      "sha256": "2803bd13457f3d577588289bcbb0c0f8aad81cec5a895373e231f9946a491058",
+      "bytes": 18346
+    },
+    "full-3444291/sampled-clocks-summary.json": {
+      "path": "/tmp/igr-operator-residual-20261023/full-3444291/sampled-clocks-summary.json",
+      "sha256": "97c6f3861ace9022bb0b4f287fa14c3834130279f71ff2808d9f8c721394ceb4",
+      "bytes": 586
+    },
+    "summarize_total.py": {
+      "path": "/tmp/igr-operator-residual-20261023/summarize_total.py",
+      "sha256": "6fba8d1c4cea5061b3bbb60f8e1c18a4cf21b47d27b9a42a59148d8088227b43",
+      "bytes": 35138
+    },
+    "analyze_optimized.py": {
+      "path": "/tmp/igr-operator-residual-20261023/analyze_optimized.py",
+      "sha256": "0f2ef4710069d0b98bef5edc26d8f3e3c9c3af63a4f0513d73209c2887045f8b",
+      "bytes": 15790
+    },
+    "candidate_ncu.py": {
+      "path": "/tmp/igr-operator-residual-20261023/candidate_ncu.py",
+      "sha256": "e0632182d9d5b0ab71a30cd6edc7b30b33be3ec07d6ba193929261c246475663",
+      "bytes": 18759
+    },
+    "pair.py": {
+      "path": "/tmp/igr-operator-residual-20261023/pair.py",
+      "sha256": "4f61642f55227df6474555e3ee5c7d131f1d9506e612626f8bbfc3fa452a916b",
+      "bytes": 27050
+    },
+    "plot_results.py": {
+      "path": "/tmp/igr-operator-residual-20261023/plot_results.py",
+      "sha256": "fbab2e34240eac80ebb32232e8ea8f5dc31f393fa8b18e978239eb89fe9a4f1c",
+      "bytes": 3519
+    },
+    "total-solver-cost.png": {
+      "path": "/tmp/igr-operator-residual-20261023/total-solver-cost.png",
+      "sha256": "9051ada675103ced2503273496f68a5cca7eb3fecf0c01a349f8b61df7baf63d",
+      "bytes": 285612
+    },
+    "total-solver-cost.pdf": {
+      "path": "/tmp/igr-operator-residual-20261023/total-solver-cost.pdf",
+      "sha256": "e8c470370ff8eed76354ddf2d0fd7d86bba8e3eb461f15c9973a65504a64f862",
+      "bytes": 37340
+    },
+    "total-solver-summary.json": {
+      "path": "/tmp/igr-operator-residual-20261023/total-solver-summary.json",
+      "sha256": "81d9f10086e561a15142458901a4a03118afe99cbe7c7903389e6c2c69680ab1",
+      "bytes": 50531
+    }
+  }
+}

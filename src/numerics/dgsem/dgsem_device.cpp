@@ -1258,6 +1258,98 @@ void ApplyCentralVolumeDevice(int dim,
                });
 }
 
+void ApplySharedCentralVolumeDevice(
+  int n1d, const Array<int>& lex_to_local, const DenseMatrix& split_matrix,
+  const Vector& weights, const DenseMatrix& contravariant_flux,
+  DenseMatrix& weak_volume, ::igrlab::shared_reference::Map& map,
+  Vector& row_sums, ::igrlab::shared_reference::Precision precision)
+{
+  MFEM_VERIFY(n1d >= 2 && n1d <= 16,
+              "Shared DGSEM central lines require 2 <= n1d <= 16.");
+  const int dof = n1d * n1d, rows = contravariant_flux.Height();
+  const int neq = contravariant_flux.Width() / 2;
+  MFEM_VERIFY(rows > 0 && rows % dof == 0 &&
+                neq == 4 && contravariant_flux.Width() == 2 * neq &&
+                lex_to_local.Size() == dof && weights.Size() == n1d &&
+                split_matrix.Height() == n1d && split_matrix.Width() == n1d &&
+                rows <= std::numeric_limits<int>::max() / (2 * neq),
+              "Shared DGSEM central lines require bounded uniform 2D Euler tensors.");
+  const int ne = rows / dof, columns = ne * neq * 2 * n1d;
+  if (!map.Ready())
+  {
+    DenseMatrix matrix(n1d);
+    matrix = 0.0;
+    const real_t* split = split_matrix.HostRead();
+    row_sums.SetSize(n1d); row_sums.UseDevice(true);
+    real_t* sums = row_sums.HostWrite();
+    const int* local = lex_to_local.HostRead();
+    for (int i = 0; i < dof; ++i)
+    {
+      MFEM_VERIFY(local[i] >= 0 && local[i] < dof,
+                  "Shared DGSEM invalid local map.");
+      for (int j = 0; j < i; ++j)
+      {
+        MFEM_VERIFY(local[i] != local[j], "Shared DGSEM local map is not a permutation.");
+      }
+    }
+    for (int i = 0; i < n1d; ++i)
+    {
+      // -sum_{j!=i} Dsplit(i,j)*(F_i+F_j)/2. No diagonal of
+      // Dsplit is used, matching the existing pairwise implementation.
+      for (int j = 0; j < n1d; ++j)
+      {
+        if (i != j)
+        {
+          const real_t value = -0.5 * split[i + n1d * j];
+          matrix(i, j) = value;
+          matrix(i, i) += value;
+        }
+      }
+      sums[i] = 0.0;
+      for (int j = 0; j < n1d; ++j) { sums[i] += matrix(i, j); }
+    }
+    map.Configure(matrix, columns, precision, "dgsem-central-lines");
+    weak_volume.SetSize(rows, neq); weak_volume.GetMemory().UseDevice(true);
+    weak_volume.Write(); row_sums.Read();
+  }
+  MFEM_VERIFY(map.GetPrecision() == precision && map.Input().Height() == n1d &&
+                map.Input().Width() == columns && row_sums.Size() == n1d &&
+                weak_volume.Height() == rows && weak_volume.Width() == neq,
+              "Shared DGSEM live map layout/precision changed without cache rebuild.");
+  const int* local = lex_to_local.Read();
+  const real_t* flux = contravariant_flux.Read();
+  real_t* input = map.Input().Write();
+  mfem::forall(n1d * columns, [=] MFEM_HOST_DEVICE(int entry)
+  {
+    const int position = entry % n1d, column = entry / n1d;
+    const int fixed = column % n1d, direction = (column / n1d) % 2;
+    const int equation = (column / (2 * n1d)) % neq;
+    const int element = column / (2 * n1d * neq);
+    const int lex = direction == 0 ? position + n1d * fixed : fixed + n1d * position;
+    const int anchor = direction == 0 ? n1d * fixed : fixed;
+    const int base = element * dof + rows * (equation + neq * direction);
+    input[entry] = flux[base + local[lex]] - flux[base + local[anchor]];
+  });
+  map.Apply();
+  const real_t* output = map.Output().Read();
+  const real_t* sums = row_sums.Read();
+  const real_t* weight = weights.Read();
+  real_t* volume = weak_volume.Write();
+  mfem::forall(rows * neq, [=] MFEM_HOST_DEVICE(int entry)
+  {
+    const int lex = entry % dof, element = (entry / dof) % ne;
+    const int equation = entry / rows;
+    const int i = lex % n1d, j = lex / n1d;
+    const int base_column = (element * neq + equation) * 2 * n1d;
+    const int base_flux = element * dof + rows * equation;
+    const real_t x = output[i + n1d * (base_column + j)] +
+      sums[i] * flux[base_flux + local[n1d * j]];
+    const real_t y = output[j + n1d * (base_column + n1d + i)] +
+      sums[j] * flux[base_flux + rows * neq + local[i]];
+    volume[element * dof + local[lex] + rows * equation] = weight[i] * weight[j] * (x + y);
+  });
+}
+
 int DGSEMVolumePairCount(int dim, int ne, int n1d)
 {
   MFEM_VERIFY(dim == 1 || dim == 2,
@@ -2248,9 +2340,13 @@ void ComponentSumsDevice(const DenseMatrix& values, Vector& sums)
                });
 }
 
-#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
 namespace
 {
+constexpr int kMaximumReductionSingleBlockLimit = 4096;
+constexpr int kMaximumReductionItemsPerBlock = 1024;
+constexpr int kMaximumReductionMaxBlocks = 1024;
+
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
 constexpr int kMaximumReductionThreads = 256;
 
 __global__ void DeterministicMaximumKernel(const real_t* value,
@@ -2292,8 +2388,86 @@ __global__ void DeterministicMaximumKernel(const real_t* value,
     result[0] = current;
   }
 }
-} // namespace
+
+__global__ void DeterministicMaximumPartialsKernel(const real_t* value,
+                                                   unsigned int size,
+                                                   real_t* result)
+{
+  __shared__ real_t partial[kMaximumReductionThreads];
+  real_t current = 0.0;
+  const unsigned int stride = blockDim.x * gridDim.x;
+  // The bounded grid and an int-sized vector keep the last unsigned stride
+  // below UINT_MAX, even for the largest supported Vector length.
+  for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < size; i += stride)
+  {
+    current = fmax(current, value[i]);
+  }
+  partial[threadIdx.x] = current;
+  __syncthreads();
+  for (int offset = kMaximumReductionThreads / 2; offset > 0; offset /= 2)
+  {
+    if (threadIdx.x < offset)
+    {
+      partial[threadIdx.x] =
+        fmax(partial[threadIdx.x], partial[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { result[blockIdx.x] = partial[0]; }
+}
+
+__global__ void DeterministicMaximumFinalizeKernel(const real_t* partials,
+                                                   unsigned int count,
+                                                   const real_t* value,
+                                                   unsigned int size,
+                                                   real_t* result)
+{
+  __shared__ real_t partial[kMaximumReductionThreads];
+  real_t current = 0.0;
+  for (unsigned int i = threadIdx.x; i < count; i += blockDim.x)
+  {
+    current = fmax(current, partials[i]);
+  }
+  partial[threadIdx.x] = current;
+  __syncthreads();
+  for (int offset = kMaximumReductionThreads / 2; offset > 0; offset /= 2)
+  {
+    if (threadIdx.x < offset)
+    {
+      partial[threadIdx.x] =
+        fmax(partial[threadIdx.x], partial[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+  {
+    current = partial[0];
+    // Positive maxima, including +Inf, are independent of partition/order.
+    // A zero result must retain the original full-array signed-zero order;
+    // replaying only the partial maxima would not preserve that contract.
+    if (current == 0.0)
+    {
+      current = 0.0;
+      for (unsigned int i = 0; i < size; ++i)
+      {
+        current = fmax(current, value[i]);
+      }
+    }
+    result[0] = current;
+  }
+}
 #endif
+} // namespace
+
+int DeterministicMaximumWorkspaceSize(int value_count)
+{
+  MFEM_VERIFY(value_count >= 0, "Maximum input length must be nonnegative.");
+  if (value_count <= kMaximumReductionSingleBlockLimit) { return 0; }
+  // Subtract before the ceiling division so INT_MAX cannot overflow.
+  const int blocks = 1 + (value_count - 1) / kMaximumReductionItemsPerBlock;
+  return blocks < kMaximumReductionMaxBlocks ? blocks : kMaximumReductionMaxBlocks;
+}
 
 void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
 {
@@ -2324,6 +2498,39 @@ void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
                  }
                  result[0] = current;
                });
+}
+
+void DeterministicMaximumDevice(const Vector& values,
+                                Vector& maximum,
+                                Vector& workspace)
+{
+  MFEM_VERIFY(&values != &maximum && &values != &workspace &&
+                &maximum != &workspace,
+              "Maximum input, output and workspace must be distinct vectors.");
+  const int blocks = DeterministicMaximumWorkspaceSize(values.Size());
+  MFEM_VERIFY(workspace.Size() >= blocks,
+              "Maximum workspace must be prepared for the input length.");
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  if (blocks > 0 && Device::Allows(Backend::CUDA) &&
+      !Device::Allows(Backend::RAJA_CUDA))
+  {
+    if (maximum.Size() != 1) { maximum.SetSize(1); }
+    maximum.UseDevice(true);
+    workspace.UseDevice(true);
+    const real_t* value = values.Read();
+    real_t* partials = workspace.Write();
+    real_t* result = maximum.Write();
+    DeterministicMaximumPartialsKernel<<<blocks, kMaximumReductionThreads>>>(
+      value, static_cast<unsigned int>(values.Size()), partials);
+    MFEM_GPU_CHECK(cudaGetLastError());
+    DeterministicMaximumFinalizeKernel<<<1, kMaximumReductionThreads>>>(
+      partials, static_cast<unsigned int>(blocks), value,
+      static_cast<unsigned int>(values.Size()), result);
+    MFEM_GPU_CHECK(cudaGetLastError());
+    return;
+  }
+#endif
+  DeterministicMaximumDevice(values, maximum);
 }
 
 } // namespace dgsem

@@ -46,7 +46,9 @@ enum class IGRIPKind
 enum class IGRSolveMode
 {
   SmootherSweeps,
-  Krylov
+  Krylov,
+  /// Explicit approximate closure: a fixed number of current element solves.
+  FixedElementJacobi
 };
 
 /// @brief Krylov solver selection for IGR solves.
@@ -109,6 +111,9 @@ struct IGRConfig
 {
   double alpha = mfem::igrlab::IGRDefaults::kAlpha;
   double rho_floor = mfem::igrlab::IGRDefaults::kRhoFloor;
+  // Optional routine state/RHS/quadrature finite diagnostics. Native solver
+  // residual acceptance and exceptional recovery guards remain independent.
+  bool nan_scan = false;
   IGRAlphaLengthScalePolicy alpha_length_scale_policy =
     IGRAlphaLengthScalePolicy::Average;
 
@@ -118,6 +123,10 @@ struct IGRConfig
 
   int regular_sweeps = mfem::igrlab::IGRDefaults::kRegularSweeps;
   int warm_start_sweeps = mfem::igrlab::IGRDefaults::kWarmStartSweeps;
+  // Used only by FixedElementJacobi; the legacy smoother defaults are intact.
+  double element_jacobi_omega = 0.7;
+  bool element_jacobi_reference_blocks = false;
+  bool element_jacobi_tensor_blocks = false;
 
   IGRSolveMode solve_mode = IGRSolveMode::Krylov;
   IGRLinearSolverType lin_solver_type = IGRLinearSolverType::Auto;

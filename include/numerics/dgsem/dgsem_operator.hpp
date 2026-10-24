@@ -75,16 +75,20 @@ public:
 
   /** Execute the accepted production kernels on an MFEM local L-vector.
    *
-   * State/sigma admissibility is checked before `y_local` is written. The
-   * caller is responsible for true-to-local `P x` before this call and local-
-   * to-true `P^T y` afterward. When requested, `physical_boundary_flux` is
+   * Structural/cache checks always precede output writes. Bulk state/sigma
+   * diagnostics are default-off and follow the owner's diagnostic scan
+   * option; the typed frozen-sigma spectral policy requires them for stage
+   * q_sigma admission independently. The caller supplies true-to-local `P x`
+   * before this call and local-to-true `P^T y` afterward. When requested,
+   * `physical_boundary_flux` is
    * overwritten with the rank-local outward flux used by the packed face
    * residual; communicator reduction remains the caller's responsibility.
    *
    * With `admission_only=true`, the same packed gather, exchange, and FP64
-   * owned/face scans run, but no flux, inverse mass, speed reduction,
-   * boundary-flux capture, or caller-output write occurs. The result then
-   * carries the fresh communicator-wide q_sigma aggregate for this call.
+   * owned/face scans always run, but no residual, inverse mass, boundary-flux
+   * capture, or caller-output write occurs. The result carries the fresh
+   * communicator-wide q_sigma aggregate and computes characteristic speeds
+   * only when that aggregate is admissible.
    * The default remains the complete residual operation.
    */
   DGSEMProductionResult AssembleProductionResidual(

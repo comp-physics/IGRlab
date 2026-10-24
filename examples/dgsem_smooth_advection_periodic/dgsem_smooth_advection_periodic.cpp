@@ -129,7 +129,9 @@ int main(int argc, char* argv[])
   spec.use_igr = false;
   spec.need_h1 = false;
   spec.dg_backend_default = dg_sim::DGBackend::DGSEM;
-  spec.glvis.precision = 8;
+  // Native state exports also use this precision; preserve round-trip values
+  // when comparing solver arithmetic on the smooth verification case.
+  spec.glvis.precision = std::numeric_limits<mfem::real_t>::max_digits10;
   spec.vtk.print_dataset_name = true;
 
   spec.configure_case = [](dg_sim::CaseConfig& cfg)

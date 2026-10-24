@@ -15,7 +15,8 @@ add_test(NAME dg_igr_cuda_build_policy
 )
 set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   LABELS "build;cuda;contract"
-  TIMEOUT 30
+  # Temporary source clones and policy subprocesses can exceed 30s on HPC storage.
+  TIMEOUT 120
 )
 
 foreach(build_check pace_submission pace_manifest pace_discovery delta_site dependency_bindings
@@ -191,7 +192,9 @@ add_executable(dg_igr_unit_tests
   test_diagnostics.cpp
 )
 
-add_executable(dg_igr_exact_face_test test_igr_exact_face.cpp)
+add_executable(dg_igr_exact_face_test
+  test_igr_exact_face.cpp
+  test_igr_exact_face_host_query.cpp)
 target_link_libraries(dg_igr_exact_face_test PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_exact_face_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 set(_igrlab_exact_face_command dg_igr_exact_face_test)
@@ -262,6 +265,92 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     COMMAND ${_igrlab_dg_device_faces_command} cuda)
   set_tests_properties(dg_igr_dg_device_faces_cuda PROPERTIES
     LABELS "dg;face;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_dg_mapped_dense_test test_dg_mapped_dense.cpp)
+target_link_libraries(dg_igr_dg_mapped_dense_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dg_mapped_dense_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(dg_igr_dg_mapped_dense_test PRIVATE cxx_std_17)
+# Retain the host MFEM assembly oracle in CUDA builds.
+set_source_files_properties(test_dg_mapped_dense.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_dg_mapped_dense_command dg_igr_dg_mapped_dense_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_dg_mapped_dense_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dg_mapped_dense_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dg_mapped_dense_cpu
+  COMMAND ${_igrlab_dg_mapped_dense_command} cpu)
+set_tests_properties(dg_igr_dg_mapped_dense_cpu PROPERTIES
+  LABELS "dg;mapped;dense;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dg_mapped_dense_cuda
+    COMMAND ${_igrlab_dg_mapped_dense_command} cuda)
+  set_tests_properties(dg_igr_dg_mapped_dense_cuda PROPERTIES
+    LABELS "dg;mapped;dense;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_vtk_field_cache_test test_vtk_field_cache.cpp)
+target_link_libraries(dg_igr_vtk_field_cache_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_vtk_field_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(dg_igr_vtk_field_cache_test PRIVATE cxx_std_17)
+set_source_files_properties(test_vtk_field_cache.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_vtk_field_cache_command dg_igr_vtk_field_cache_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_vtk_field_cache_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_vtk_field_cache_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_vtk_field_cache_cpu COMMAND ${_igrlab_vtk_field_cache_command})
+set_tests_properties(dg_igr_vtk_field_cache_cpu PROPERTIES
+  LABELS "io;vtk;parity;cpu" TIMEOUT 120 RUN_SERIAL TRUE)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_vtk_field_cache_cuda COMMAND ${_igrlab_vtk_field_cache_command} cuda)
+  set_tests_properties(dg_igr_vtk_field_cache_cuda PROPERTIES
+    LABELS "io;vtk;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
+add_executable(dg_igr_dg_mapped_weakdiv_tensor_test
+  test_dg_mapped_weakdiv_tensor.cpp)
+target_link_libraries(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(dg_igr_dg_mapped_weakdiv_tensor_test PRIVATE cxx_std_17)
+# The independent MFEM assembly oracle remains ordinary host C++.
+set_source_files_properties(test_dg_mapped_weakdiv_tensor.cpp PROPERTIES LANGUAGE CXX)
+set(_igrlab_mapped_weakdiv_tensor_command dg_igr_dg_mapped_weakdiv_tensor_test)
+if(MPIEXEC_EXECUTABLE)
+  set(_igrlab_mapped_weakdiv_tensor_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dg_mapped_weakdiv_tensor_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dg_mapped_weakdiv_tensor_cpu
+  COMMAND ${_igrlab_mapped_weakdiv_tensor_command} cpu)
+set_tests_properties(dg_igr_dg_mapped_weakdiv_tensor_cpu PROPERTIES
+  LABELS "dg;mapped;tensor;parity;cpu" TIMEOUT 180)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dg_mapped_weakdiv_tensor_cuda
+    COMMAND ${_igrlab_mapped_weakdiv_tensor_command} cuda)
+  set_tests_properties(dg_igr_dg_mapped_weakdiv_tensor_cuda PROPERTIES
+    LABELS "dg;mapped;tensor;parity;cuda" TIMEOUT 240 RUN_SERIAL TRUE)
+endif()
+
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_executable(dg_igr_stage_refresh_test test_igr_stage_refresh.cpp)
+  target_link_libraries(dg_igr_stage_refresh_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_stage_refresh_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_features(dg_igr_stage_refresh_test PRIVATE cxx_std_17)
+  set_source_files_properties(test_igr_stage_refresh.cpp PROPERTIES LANGUAGE CXX)
+  set(_igrlab_stage_refresh_command dg_igr_stage_refresh_test)
+  if(MPIEXEC_EXECUTABLE)
+    set(_igrlab_stage_refresh_command
+      ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_stage_refresh_test> ${MPIEXEC_POSTFLAGS})
+  endif()
+  add_test(NAME dg_igr_stage_refresh_cuda COMMAND ${_igrlab_stage_refresh_command} cuda)
+  set_tests_properties(dg_igr_stage_refresh_cuda PROPERTIES
+    LABELS "igr;mapped;coefficients;face;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 
 add_executable(dg_igr_face_density_host_cache_test
@@ -739,6 +828,23 @@ if (MFEM_USE_CUDA)
     RUN_SERIAL TRUE
   )
 
+  set_source_files_properties(test_zhang_shu_throughput.cpp PROPERTIES LANGUAGE CUDA)
+  add_executable(dg_igr_zhang_shu_throughput_test test_zhang_shu_throughput.cpp)
+  target_link_libraries(dg_igr_zhang_shu_throughput_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_zhang_shu_throughput_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(dg_igr_zhang_shu_throughput_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_zhang_shu_throughput_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  foreach(_limiter_device cpu cuda)
+    add_test(NAME dg_igr_zhang_shu_throughput_${_limiter_device}
+      COMMAND dg_igr_zhang_shu_throughput_test ${_limiter_device})
+    set_tests_properties(dg_igr_zhang_shu_throughput_${_limiter_device} PROPERTIES
+      LABELS "limiter;admissibility;conservation;${_limiter_device}"
+      TIMEOUT 180 RUN_SERIAL TRUE)
+  endforeach()
+
   add_executable(dg_igr_limiter_device_alias_test
     test_limiter_device_alias.cpp
   )
@@ -815,6 +921,18 @@ add_test(NAME dg_igr_dgsem_portability_refactor_tests
          COMMAND dg_igr_unit_tests --dgsem-operator --dgsem-igr)
 add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
+add_test(NAME dg_igr_igr_diagnostic_scans
+  COMMAND dg_igr_unit_tests --igr-diagnostic-scans)
+set_tests_properties(dg_igr_igr_diagnostic_scans PROPERTIES
+  ENVIRONMENT "IGRLAB_TEST_DEVICE=cpu"
+  LABELS "igr;diagnostics;residual" TIMEOUT 120 RUN_SERIAL TRUE)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_igr_diagnostic_scans_cuda
+    COMMAND dg_igr_unit_tests --igr-diagnostic-scans)
+  set_tests_properties(dg_igr_igr_diagnostic_scans_cuda PROPERTIES
+    ENVIRONMENT "IGRLAB_TEST_DEVICE=cuda"
+    LABELS "cuda;igr;diagnostics;residual" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
@@ -1916,3 +2034,151 @@ if(IGRLAB_BUILD_RESEARCH_TESTS AND TARGET dg_igr_hdg_generic_cpu AND MFEM_USE_MP
     LABELS "cpu-reference;igr;research;hdg" TIMEOUT 120)
 endif()
 add_subdirectory(regularization)
+
+# Private shared IGR Krylov algebra fixture, independent of the HDG runtime.
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MPI)
+  add_executable(dg_igr_element_block_jacobi_test test_igr_element_block_jacobi_cuda.cu)
+  target_link_libraries(dg_igr_element_block_jacobi_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_element_block_jacobi_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_element_block_jacobi_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_element_block_jacobi_cuda COMMAND dg_igr_element_block_jacobi_test)
+  set_tests_properties(dg_igr_element_block_jacobi_cuda PROPERTIES
+    LABELS "cuda;igr;element-block" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_dgsem_mapped_fixed_cuda
+    COMMAND dg_igr_element_block_jacobi_test --qualify-dgsem-mapped)
+  set_tests_properties(dg_igr_dgsem_mapped_fixed_cuda PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;element-block" TIMEOUT 180 RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
+  foreach(_fixed_limiter_backend dg dgsem)
+    add_test(NAME dg_igr_fixed_positivity_rollback_${_fixed_limiter_backend}_cuda
+      COMMAND dg_igr_element_block_jacobi_test --qualify-positivity-rollback-${_fixed_limiter_backend})
+    set_tests_properties(dg_igr_fixed_positivity_rollback_${_fixed_limiter_backend}_cuda PROPERTIES
+      LABELS "cuda;igr;limiter;mapped;rollback" TIMEOUT 240 RUN_SERIAL TRUE)
+  endforeach()
+
+  add_executable(dg_igr_local_tensor_jacobi_test test_igr_local_tensor_jacobi_cuda.cu)
+  target_link_libraries(dg_igr_local_tensor_jacobi_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_local_tensor_jacobi_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_local_tensor_jacobi_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda COMMAND dg_igr_local_tensor_jacobi_test)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda PROPERTIES
+    LABELS "cuda;igr;element-block;tensor" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_backends
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-backends)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_backends PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;precision" TIMEOUT 300 RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected --backend simt-fp64)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;projected;mapped" TIMEOUT 300 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_backends
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_backends PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;projected;mapped;precision" TIMEOUT 600 RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_gll_simt
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected-gll --backend simt-fp64)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_gll_simt PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;tensor" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_gll_wmma
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected-gll --backend wmma-factor-fp64)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_gll_wmma PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;tensor" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_reject_exact_gll
+    COMMAND dg_igr_local_tensor_jacobi_test --reject-exact-gll)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_reject_exact_gll PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;tensor;negative" TIMEOUT 120 RUN_SERIAL TRUE WILL_FAIL TRUE)
+
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_reject_dense
+    COMMAND dg_igr_local_tensor_jacobi_test --reject-projected-dense)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_reject_dense PROPERTIES
+    LABELS "cuda;igr;element-block;tensor;projected;admission" TIMEOUT 60 RUN_SERIAL TRUE WILL_FAIL TRUE)
+  foreach(_igrlab_tensor_rejection skew curved nonseparable)
+    add_test(NAME dg_igr_local_tensor_jacobi_cuda_reject_${_igrlab_tensor_rejection}
+      COMMAND dg_igr_local_tensor_jacobi_test --reject-${_igrlab_tensor_rejection})
+    set_tests_properties(dg_igr_local_tensor_jacobi_cuda_reject_${_igrlab_tensor_rejection}
+      PROPERTIES LABELS "cuda;igr;element-block;tensor;admission"
+      TIMEOUT 60 RUN_SERIAL TRUE WILL_FAIL TRUE)
+  endforeach()
+
+  add_executable(dg_igr_device_krylov_test test_igr_device_krylov_cuda.cu)
+  target_link_libraries(dg_igr_device_krylov_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_device_krylov_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_device_krylov_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_device_krylov_cuda COMMAND dg_igr_device_krylov_test)
+  set_tests_properties(dg_igr_device_krylov_cuda PROPERTIES
+    LABELS "cuda;igr;krylov" TIMEOUT 120 RUN_SERIAL TRUE)
+
+  add_executable(dg_igr_shared_reference_test test_shared_reference_cuda.cu)
+  target_link_libraries(dg_igr_shared_reference_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_shared_reference_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_shared_reference_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_shared_reference_cuda COMMAND dg_igr_shared_reference_test)
+  set_tests_properties(dg_igr_shared_reference_cuda PROPERTIES
+    LABELS "cuda;dg;dgsem;shared-reference" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_dg_volume_memory_cuda
+    COMMAND dg_igr_shared_reference_test --dg-volume-memory-only)
+  set_tests_properties(dg_igr_dg_volume_memory_cuda PROPERTIES
+    LABELS "cuda;dg;shared-reference;volume-memory" TIMEOUT 120 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_dg_tensor_face_cuda
+    COMMAND dg_igr_shared_reference_test --dg-tensor-face-only)
+  set_tests_properties(dg_igr_dg_tensor_face_cuda PROPERTIES
+    LABELS "cuda;dg;tensor-face" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
+# Shared-reference patch GEMM: actual patch columns and current-A acceptance.
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MPI)
+  add_executable(dg_igr_shared_patch_test test_igr_shared_patch_cuda.cu)
+  target_link_libraries(dg_igr_shared_patch_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+  target_compile_options(dg_igr_shared_patch_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_shared_patch_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  add_test(NAME dg_igr_shared_patch_cuda COMMAND dg_igr_shared_patch_test)
+  set_tests_properties(dg_igr_shared_patch_cuda PROPERTIES
+    LABELS "cuda;igr;krylov" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+endif()
+
+# Experimental tensor IGR pipeline: independent operator and solve oracles.
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MPI)
+  foreach(component IN ITEMS volume multigrid center_map nodal)
+    add_executable(dg_igr_tensor_${component}_test test_igr_tensor_${component}_cuda.cu)
+    target_link_libraries(dg_igr_tensor_${component}_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
+    target_compile_options(dg_igr_tensor_${component}_test PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+    set_target_properties(dg_igr_tensor_${component}_test PROPERTIES
+      CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME dg_igr_tensor_${component}_cuda COMMAND dg_igr_tensor_${component}_test)
+    set_tests_properties(dg_igr_tensor_${component}_cuda PROPERTIES
+      LABELS "cuda;igr;tensor-pipeline" TIMEOUT 300 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  endforeach()
+  set_tests_properties(dg_igr_tensor_multigrid_cuda PROPERTIES
+    ENVIRONMENT "IGRLAB_IGR_SPECTRAL_TENSOR_NODAL=0")
+  add_test(NAME dg_igr_tensor_multigrid_nodal_cuda COMMAND dg_igr_tensor_multigrid_test)
+  set_tests_properties(dg_igr_tensor_multigrid_nodal_cuda PROPERTIES
+    ENVIRONMENT "IGRLAB_IGR_SPECTRAL_TENSOR_NODAL=1"
+    LABELS "cuda;igr;tensor-pipeline" TIMEOUT 300 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  foreach(nodal_mode IN ITEMS 0 1)
+    add_test(NAME dg_igr_tensor_spectral_gll_nodal${nodal_mode}_cuda
+      COMMAND dg_igr_tensor_multigrid_test --spectral-gll-only)
+    set_tests_properties(dg_igr_tensor_spectral_gll_nodal${nodal_mode}_cuda PROPERTIES
+      ENVIRONMENT "IGRLAB_IGR_SPECTRAL_TENSOR_NODAL=${nodal_mode}"
+      LABELS "cuda;igr;tensor-pipeline;spectral;gll" TIMEOUT 300 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  endforeach()
+endif()

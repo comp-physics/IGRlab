@@ -5,14 +5,21 @@
 namespace mfem
 {
 
-/** Physical-time conservative modal relaxation on affine tensor DG cells.
+/** Physical-time conservative modal relaxation on tensor DG cells.
  *
  * In one dimension the M16 profile is q(k) = max((39*k-29*p)/(10*p),0)^4
  * with rate 80000. In multiple dimensions q is evaluated at max(k_1,...,k_d).
- * This tensor extension retains a maximum decay rate equal to rate, and
+ * The maximum decay rate equals rate. On affine cells the tensor extension
  * reduces to the original law for a field depending on one reference axis.
  * The source is added to every conservative component after mass inversion.
- * A zero constant-mode rate preserves physical cell integrals on affine cells.
+ * Affine cells retain the tensor Legendre transform. Curved 2D polynomial
+ * quadrilaterals (solution and geometry orders at most eight) use a cached
+ * physical-mass orthonormalization ordered by increasing q. This preserves
+ * physical cell integrals and the entire zero-q polynomial space, dissipates
+ * the physical mass norm, and retains decay eigenvalues between zero and rate.
+ * Curved operators require finite positive Jacobians, checked conditioning,
+ * and at most 256 MiB of local matrix storage. Geometry is fixed until the
+ * enclosing DG operator is updated.
  * No positivity, entropy, or gradient-monotonicity guarantee is implied.
  */
 class ConservativeModalDamping
@@ -40,6 +47,10 @@ private:
   DenseMatrix to_modal_;
   DenseMatrix to_nodal_;
   Vector weights_;
+  Array<int> curved_elements_;
+  Array<int> curved_operator_index_;
+  Vector curved_decay_;
+  mutable Vector curved_work_;
   mutable Vector work_a_;
   mutable Vector work_b_;
 };

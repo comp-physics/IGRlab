@@ -10,12 +10,69 @@ namespace
 
 using DeviceBoundaryType = detail::EulerBoundaryStateKind;
 
+// Keep the element algorithm available for matched execution checks. The
+// canonical IGRLAB_ spelling is resolved by GetEnv before its legacy alias.
+inline bool UsePackedDenseRows_(const FiniteElementSpace& fes, int dof, int neq)
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_DG_PACKED_DENSE_EXECUTION");
+  MFEM_VERIFY(!value || std::string(value) == "element" ||
+                std::string(value) == "rows",
+              "IGRLAB_DG_PACKED_DENSE_EXECUTION must be element or rows.");
+  const bool requested = !value || std::string(value) == "rows";
+#if defined(MFEM_USE_CUDA) && defined(DG_IGR_HAS_ACCEL_FORALL)
+  const unsigned long ordinary_backends =
+    static_cast<unsigned long>(Backend::CPU) |
+    static_cast<unsigned long>(Backend::CUDA);
+  return requested && Device::Allows(Backend::CUDA) &&
+    !Device::Allows(~ordinary_backends) &&
+    dynamic_cast<const L2_FECollection*>(fes.FEColl()) &&
+    dof > 0 && neq > 0 &&
+    static_cast<long long>(fes.GetNE()) * dof * neq == fes.GetVSize();
+#else
+  (void)fes; (void)dof; (void)neq; (void)requested;
+  return false;
+#endif
+}
+
+// Compare the pointers already required by the apply, including offset aliases.
+// Inspecting device pointers avoids host synchronization for this admission.
+inline bool PackedPointersOverlap_(const real_t* a, int a_size,
+                                   const real_t* b, int b_size)
+{
+  if (a_size == 0 || b_size == 0) { return false; }
+  const auto first = reinterpret_cast<std::uintptr_t>(a);
+  const auto second = reinterpret_cast<std::uintptr_t>(b);
+  return first <= second
+    ? second - first < std::size_t(a_size) * sizeof(real_t)
+    : first - second < std::size_t(b_size) * sizeof(real_t);
+}
+
 constexpr int kFrozenSigmaTelemetryWidth_ = 5;
 constexpr int kFrozenSigmaSampleCount_ = 0;
 constexpr int kFrozenSigmaNonpositiveCount_ = 1;
 constexpr int kFrozenSigmaNonfiniteCount_ = 2;
 constexpr int kFrozenSigmaMinimumRaw_ = 3;
 constexpr int kFrozenSigmaMinimumRatio_ = 4;
+
+// Host and device paths use the same exact-node/global-dof gather or the same
+// interpolation rows. A zero element stride selects one shared reference table.
+MFEM_HOST_DEVICE inline real_t EvalPackedWeakDivSigma_(
+  int e, int j, int sigma_ldof, int interpolation_stride, bool exact_nodes,
+  const int* sigma_map, const real_t* interpolation, const real_t* values)
+{
+  const int map_offset = e * sigma_ldof;
+  if (exact_nodes)
+  {
+    return values[sigma_map[map_offset + j]];
+  }
+  const int row_offset = e * interpolation_stride + j * sigma_ldof;
+  real_t value = 0.0;
+  for (int k = 0; k < sigma_ldof; ++k)
+  {
+    value += interpolation[row_offset + k] * values[sigma_map[map_offset + k]];
+  }
+  return value;
+}
 
 #ifdef DG_IGR_HAS_ACCEL_FORALL
 MFEM_HOST_DEVICE inline bool FiniteTelemetryValue_(const double value)
@@ -290,6 +347,31 @@ struct PackedInverseMassKernel
   }
 };
 
+// One output coefficient per thread. Adjacent rows read adjacent entries of
+// the original column-major physical inverse; each dot product keeps j order.
+struct PackedInverseMassRowsKernel
+{
+  int dof = 0;
+  int neq = 0;
+  const int* map = nullptr;
+  const real_t* minv = nullptr;
+  const real_t* zin = nullptr;
+  real_t* yout = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, column = entry / dof;
+    const int eq = column % neq, e = column / neq;
+    const int voff = e * dof * neq, moff = e * dof * dof;
+    real_t sum = 0.0;
+    for (int j = 0; j < dof; ++j)
+    {
+      sum += minv[moff + j * dof + i] * zin[map[voff + j * neq + eq]];
+    }
+    yout[map[voff + i * neq + eq]] = sum;
+  }
+};
+
 struct PackedWeakDivEulerKernel
 {
   int dof = 0;
@@ -297,12 +379,14 @@ struct PackedWeakDivEulerKernel
   int dim = 0;
   int ldof = 0;
   int sigma_ldof = 0;
+  int sigma_interp_stride = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
   real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
   bool invariant_domain_flux = false;
   bool track_volume_speed = false;
+  bool sigma_exact_nodes = false;
   const int* state_map = nullptr;
   const real_t* weakdiv = nullptr;
   const real_t* x = nullptr;
@@ -312,128 +396,358 @@ struct PackedWeakDivEulerKernel
   const int* sigma_map = nullptr;
   const real_t* sigma_interp = nullptr;
   const real_t* sigma_vals = nullptr;
+  // Optional FP64 pointwise-flux output. The shared fixed linear map is
+  // applied separately; all pressure/sigma/speed/telemetry algebra above it
+  // remains identical to the existing fused weak-divergence path.
+  real_t* packed_flux = nullptr;
 
-  MFEM_HOST_DEVICE void operator()(int e) const
+  // The fused scatter is still executed by one thread per element. Only the
+  // packed-flux branch may be called concurrently for different state nodes.
+  template <bool PackedOnly = false>
+  MFEM_HOST_DEVICE real_t EvalNode_(int e, int j) const
   {
     const int state_off = e * ldof;
-    const int weak_off = e * dof * dof * dim;
-    const int sigma_map_off = e * sigma_ldof;
-    const int sigma_interp_off = e * dof * sigma_ldof;
 
     const int energy_eq = 1 + dim;
     const real_t gm1 = gamma - 1.0;
-    real_t element_max_speed = 0.0;
+    real_t nodal_speed = 0.0;
 
-    for (int j = 0; j < dof; ++j)
+    const int xj0 = state_map[state_off + j * neq + 0];
+    const real_t rho = x[xj0];
+    const real_t inv_rho = 1.0 / rho;
+
+    real_t mom[3] = {0.0, 0.0, 0.0};
+    real_t mom2 = 0.0;
+    for (int d = 0; d < dim; ++d)
     {
-      const int xj0 = state_map[state_off + j * neq + 0];
-      const real_t rho = x[xj0];
-      const real_t inv_rho = 1.0 / rho;
+      const int xjd = state_map[state_off + j * neq + (1 + d)];
+      mom[d] = x[xjd];
+      mom2 += mom[d] * mom[d];
+    }
+    const real_t energy = x[state_map[state_off + j * neq + energy_eq]];
+    const real_t kinetic = 0.5 * mom2 * inv_rho;
+    const real_t pressure = gm1 * (energy - kinetic);
+    const real_t H = (energy + pressure) * inv_rho;
 
-      real_t mom[3] = {0.0, 0.0, 0.0};
-      real_t mom2 = 0.0;
+    real_t sigma_j = 0.0;
+    if (use_sigma)
+    {
+      sigma_j = EvalPackedWeakDivSigma_(
+        e, j, sigma_ldof, sigma_interp_stride, sigma_exact_nodes,
+        sigma_map, sigma_interp, sigma_vals);
+    }
+    if (use_sigma && invariant_domain_flux)
+    {
+      AccumulateFrozenSigmaTelemetry_(
+        pressure,
+        sigma_j,
+        gamma,
+        q_sigma_telemetry +
+          (e * dof + j) * kFrozenSigmaTelemetryWidth_);
+    }
+    const real_t inv_rho_sigma =
+      (use_sigma ? 1.0 / fmax(rho, sigma_rho_floor) : 0.0);
+    if (track_volume_speed)
+    {
+      const real_t transport_speed = sqrt(mom2) * inv_rho;
+      const real_t base_speed =
+        transport_speed + sqrt(gamma * pressure * inv_rho);
+      nodal_speed =
+        IGRFluxInvariantDomainSpeed(base_speed,
+                                    rho,
+                                    pressure,
+                                    transport_speed,
+                                    sigma_j,
+                                    gamma,
+                                    sigma_rho_floor,
+                                    invariant_domain_pressure_floor);
+    }
+
+    if (PackedOnly || packed_flux)
+    {
+      const int stride = dof * dim;
       for (int d = 0; d < dim; ++d)
       {
-        const int xjd = state_map[state_off + j * neq + (1 + d)];
-        mom[d] = x[xjd];
-        mom2 += mom[d] * mom[d];
-      }
-      const real_t energy = x[state_map[state_off + j * neq + energy_eq]];
-      const real_t kinetic = 0.5 * mom2 * inv_rho;
-      const real_t pressure = gm1 * (energy - kinetic);
-      const real_t H = (energy + pressure) * inv_rho;
-
-      real_t sigma_j = 0.0;
-      if (use_sigma)
-      {
-        const int interp_row_off = sigma_interp_off + j * sigma_ldof;
-        for (int k = 0; k < sigma_ldof; ++k)
-        {
-          const int sk = sigma_map[sigma_map_off + k];
-          sigma_j += sigma_interp[interp_row_off + k] * sigma_vals[sk];
-        }
-      }
-      if (use_sigma && invariant_domain_flux)
-      {
-        AccumulateFrozenSigmaTelemetry_(
-          pressure,
-          sigma_j,
-          gamma,
-          q_sigma_telemetry +
-            (e * dof + j) * kFrozenSigmaTelemetryWidth_);
-      }
-      const real_t inv_rho_sigma =
-        (use_sigma ? 1.0 / fmax(rho, sigma_rho_floor) : 0.0);
-      if (track_volume_speed)
-      {
-        const real_t transport_speed = sqrt(mom2) * inv_rho;
-        const real_t base_speed =
-          transport_speed + sqrt(gamma * pressure * inv_rho);
-        const real_t nodal_speed =
-          IGRFluxInvariantDomainSpeed(base_speed,
-                                      rho,
-                                      pressure,
-                                      transport_speed,
-                                      sigma_j,
-                                      gamma,
-                                      sigma_rho_floor,
-                                      invariant_domain_pressure_floor);
-        element_max_speed = fmax(element_max_speed, nodal_speed);
-      }
-
-      for (int i = 0; i < dof; ++i)
-      {
-        const int wbase = weak_off + i * (dof * dim) + j * dim;
-
-        // Continuity equation.
-        real_t sum_rho = 0.0;
-        for (int d = 0; d < dim; ++d)
-        {
-          sum_rho += weakdiv[wbase + d] * mom[d];
-        }
-        z[state_map[state_off + i * neq + 0]] += sum_rho;
-
-        // Momentum equations.
+        const int row = j * dim + d;
+        packed_flux[row + stride * (e * neq)] = mom[d];
         for (int m = 0; m < dim; ++m)
         {
-          real_t sum_m = 0.0;
-          for (int d = 0; d < dim; ++d)
+          real_t value = mom[m] * mom[d] * inv_rho;
+          if (m == d)
           {
-            real_t flux_md = mom[m] * mom[d] * inv_rho;
-            if (m == d)
+            value += pressure;
+            if (use_sigma)
             {
-              flux_md += pressure;
-              if (use_sigma)
-              {
-                flux_md += ::igrlab::frozen_scalar_igr_algebra::
-                  TensorSigmaMomentumDiagonalTerm(sigma_j);
-              }
+              value += ::igrlab::frozen_scalar_igr_algebra::
+                TensorSigmaMomentumDiagonalTerm(sigma_j);
             }
-            sum_m += weakdiv[wbase + d] * flux_md;
           }
-          z[state_map[state_off + i * neq + (1 + m)]] += sum_m;
+          packed_flux[row + stride * (e * neq + 1 + m)] = value;
         }
+        real_t value = mom[d] * H;
+        if (use_sigma)
+        {
+          value += ::igrlab::frozen_scalar_igr_algebra::
+            TensorSigmaEnergyTermFromInverseDensity(sigma_j, mom[d], inv_rho_sigma);
+        }
+        packed_flux[row + stride * (e * neq + energy_eq)] = value;
+      }
+      return nodal_speed;
+    }
 
-        // Energy equation.
-        real_t sum_e = 0.0;
+    const int weak_off = e * dof * dof * dim;
+    for (int i = 0; i < dof; ++i)
+    {
+      const int wbase = weak_off + i + dof * j * dim;
+
+      // Continuity equation.
+      real_t sum_rho = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        sum_rho += weakdiv[wbase + dof * d] * mom[d];
+      }
+      z[state_map[state_off + i * neq + 0]] += sum_rho;
+
+      // Momentum equations.
+      for (int m = 0; m < dim; ++m)
+      {
+        real_t sum_m = 0.0;
         for (int d = 0; d < dim; ++d)
         {
-          real_t flux_ed = mom[d] * H;
-          if (use_sigma)
+          real_t flux_md = mom[m] * mom[d] * inv_rho;
+          if (m == d)
           {
-            flux_ed += ::igrlab::frozen_scalar_igr_algebra::
-              TensorSigmaEnergyTermFromInverseDensity(
-                sigma_j, mom[d], inv_rho_sigma);
+            flux_md += pressure;
+            if (use_sigma)
+            {
+              flux_md += ::igrlab::frozen_scalar_igr_algebra::
+                TensorSigmaMomentumDiagonalTerm(sigma_j);
+            }
           }
-          sum_e += weakdiv[wbase + d] * flux_ed;
+          sum_m += weakdiv[wbase + dof * d] * flux_md;
         }
-        z[state_map[state_off + i * neq + energy_eq]] += sum_e;
+        z[state_map[state_off + i * neq + (1 + m)]] += sum_m;
+      }
+
+      // Energy equation.
+      real_t sum_e = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        real_t flux_ed = mom[d] * H;
+        if (use_sigma)
+        {
+          flux_ed += ::igrlab::frozen_scalar_igr_algebra::
+            TensorSigmaEnergyTermFromInverseDensity(
+              sigma_j, mom[d], inv_rho_sigma);
+        }
+        sum_e += weakdiv[wbase + dof * d] * flux_ed;
+      }
+      z[state_map[state_off + i * neq + energy_eq]] += sum_e;
+    }
+    return nodal_speed;
+  }
+
+  MFEM_HOST_DEVICE void operator()(int e) const
+  {
+    real_t element_max_speed = 0.0;
+    for (int j = 0; j < dof; ++j)
+    {
+      const real_t nodal_speed = EvalNode_(e, j);
+      if (track_volume_speed)
+      {
+        element_max_speed = fmax(element_max_speed, nodal_speed);
       }
     }
     if (track_volume_speed)
     {
       volume_speed[e] = element_max_speed;
     }
+  }
+};
+
+// Adjacent threads evaluate adjacent state nodes and gather adjacent exact
+// sigma map entries. Each thread owns all packed rows for one node, as well as
+// its telemetry slot. This functor is admitted only with packed_flux != null.
+struct PackedSharedWeakDivEulerPointKernel
+{
+  PackedWeakDivEulerKernel flux;
+  real_t* point_speed = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int point) const
+  {
+    const int e = point / flux.dof, j = point % flux.dof;
+    const real_t speed = flux.EvalNode_<true>(e, j);
+    if (flux.track_volume_speed)
+    {
+      point_speed[point] = speed;
+    }
+  }
+};
+
+struct PackedSharedWeakDivPointSpeedKernel
+{
+  int dof = 0;
+  const real_t* point_speed = nullptr;
+  real_t* element_speed = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int e) const
+  {
+    real_t speed = 0.0;
+    for (int j = 0; j < dof; ++j)
+    {
+      speed = fmax(speed, point_speed[e * dof + j]);
+    }
+    element_speed[e] = speed;
+  }
+};
+
+// Use the same pointwise FP64 flux as the shared map, with each physical
+// per-element matrix retained. Rows are contiguous in the packed matrix.
+// Preserve the element kernel's directional subtotal and per-node addition
+// order, starting from the existing face residual.
+struct PackedWeakDivRowsKernel
+{
+  int dof = 0;
+  int neq = 0;
+  int dim = 0;
+  const int* map = nullptr;
+  const real_t* weakdiv = nullptr;
+  const real_t* flux = nullptr;
+  real_t* z = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, column = entry / dof;
+    const int eq = column % neq, e = column / neq;
+    const int output = map[e * dof * neq + i * neq + eq];
+    const int matrix_offset = e * dof * dof * dim;
+    const int flux_offset = (e * neq + eq) * dof * dim;
+    real_t value = z[output];
+    for (int j = 0; j < dof; ++j)
+    {
+      real_t subtotal = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        const int col = j * dim + d;
+        subtotal += weakdiv[matrix_offset + col * dof + i] *
+                    flux[flux_offset + col];
+      }
+      value += subtotal;
+    }
+    z[output] = value;
+  }
+};
+
+// One row owns the four 2D Euler equations. Reuse the original physical
+// matrix entries without changing any equation's directional subtotal or
+// ascending node accumulation, including its existing face residual.
+struct PackedWeakDivRowReuseEulerKernel
+{
+  int dof = 0;
+  const int* map = nullptr;
+  const real_t* weakdiv = nullptr;
+  const real_t* flux = nullptr;
+  real_t* z = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, e = entry / dof;
+    const int map_offset = (e * dof + i) * 4;
+    const int output0 = map[map_offset];
+    const int output1 = map[map_offset + 1];
+    const int output2 = map[map_offset + 2];
+    const int output3 = map[map_offset + 3];
+    const int matrix_offset = e * dof * dof * 2;
+    const int flux_stride = dof * 2;
+    const int flux_offset = e * 4 * flux_stride;
+    real_t value0 = z[output0], value1 = z[output1];
+    real_t value2 = z[output2], value3 = z[output3];
+    for (int j = 0; j < dof; ++j)
+    {
+      real_t subtotal0 = 0.0, subtotal1 = 0.0;
+      real_t subtotal2 = 0.0, subtotal3 = 0.0;
+      for (int d = 0; d < 2; ++d)
+      {
+        const int col = j * 2 + d;
+        const real_t weight = weakdiv[matrix_offset + col * dof + i];
+        subtotal0 += weight * flux[flux_offset + col];
+        subtotal1 += weight * flux[flux_offset + flux_stride + col];
+        subtotal2 += weight * flux[flux_offset + 2 * flux_stride + col];
+        subtotal3 += weight * flux[flux_offset + 3 * flux_stride + col];
+      }
+      value0 += subtotal0;
+      value1 += subtotal1;
+      value2 += subtotal2;
+      value3 += subtotal3;
+    }
+    z[output0] = value0;
+    z[output1] = value1;
+    z[output2] = value2;
+    z[output3] = value3;
+  }
+};
+
+// Named functors keep NVCC extended lambdas out of private member functions.
+struct PackedSharedWeakDivCenterKernel
+{
+  int k = 0;
+  int dim = 0;
+  const real_t* flux = nullptr;
+  real_t* input = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int row = entry % k, column = entry / k;
+    input[entry] = flux[entry] - flux[row % dim + k * column];
+  }
+};
+
+struct PackedSharedWeakDivMomentKernel
+{
+  int dof = 0;
+  int k = 0;
+  const real_t* input = nullptr;
+  const real_t* output = nullptr;
+  const real_t* column_sums = nullptr;
+  real_t* correction = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int column) const
+  {
+    real_t observed = 0.0, expected = 0.0;
+    for (int i = 0; i < dof; ++i) { observed += output[i + dof * column]; }
+    for (int j = 0; j < k; ++j)
+    {
+      expected += column_sums[j] * input[j + k * column];
+    }
+    correction[column] = expected - observed;
+  }
+};
+
+struct PackedSharedWeakDivRestoreKernel
+{
+  int dof = 0;
+  int dim = 0;
+  int neq = 0;
+  const real_t* flux = nullptr;
+  const real_t* output = nullptr;
+  const real_t* row_sums = nullptr;
+  const real_t* mass_fractions = nullptr;
+  const real_t* correction = nullptr;
+  const int* map = nullptr;
+  real_t* z = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int i = entry % dof, column = entry / dof;
+    const int e = column / neq, equation = column % neq;
+    // Enforce 1^T y = (1^T W) b on the centered product. The original FP64
+    // anchor is restored only afterwards, preserving the constant-input path.
+    real_t value = output[entry] + mass_fractions[e * dof + i] * correction[column];
+    for (int d = 0; d < dim; ++d)
+    {
+      value += row_sums[i + dof * d] * flux[d + dof * dim * column];
+    }
+    z[map[e * dof * neq + i * neq + equation]] += value;
   }
 };
 

@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include "mfem.hpp"
 #include "numerics/limiters/zhang_shu.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
+#include "utils/config/env_flags.hpp"
 #include "utils/diagnostics/non_finite.hpp"
 #include "utils/profiling/nvtx.hpp"
 
@@ -125,10 +127,33 @@ struct TimeLoopResult
   std::string termination_reason = "not-started";
   double non_finite_min = std::numeric_limits<double>::infinity();
   double non_finite_max = -std::numeric_limits<double>::infinity();
+  // Opt-in host wall time in disjoint hooks, including their existing waits.
+  // These are not GPU execution times; no device synchronization is added.
+  double scheduled_output_wall_seconds = 0.0;
+  double final_output_wall_seconds = 0.0;
+  // Configured visualize (alive/GLVis) and analysis hooks only. Existing
+  // accepted-state scans and other loop checks stay in the loop complement.
+  double diagnostics_wall_seconds = 0.0;
 };
 
 namespace time_loop_detail
 {
+
+// Clock comparisons use only floating-point time roundoff, not an absolute
+// physical-time tolerance. The accumulated bound accounts for the accepted
+// t += dt additions since the last exact output/final boundary. The local
+// allowance covers the accepted endpoint and checkpoint arithmetic; in
+// particular, a physically small time interval near zero is not discarded.
+inline bool ClockTimesMatch(mfem::real_t lhs,
+                            mfem::real_t rhs,
+                            mfem::real_t accumulated_roundoff = 0.0)
+{
+  const mfem::real_t scale = std::max(std::abs(lhs), std::abs(rhs));
+  return std::isfinite(lhs) && std::isfinite(rhs) &&
+         std::abs(lhs - rhs) <=
+           accumulated_roundoff +
+             8.0 * std::numeric_limits<mfem::real_t>::epsilon() * scale;
+}
 
 template <typename OperatorType, typename = void>
 struct InvariantDomainVolumeSpeedTracking
@@ -570,6 +595,9 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                            const TimeLoopHooks& hooks = {})
 {
   ::igrlab::NVTXRange range("Time/RunTimeLoop");
+  using WallClock = std::chrono::steady_clock;
+  const bool wall_timing_enabled =
+    ::igrlab::EnvFlagEnabled("DG_IGR_SOLVER_WALL_TIMING");
   TimeLoopResult result;
   result.termination_reason = "running";
   PopulateExplicitCFLDiagnostics(result, cfg, stepper);
@@ -634,12 +662,6 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   int save_idx = cfg.save_index_offset;
   bool has_last_save_time = cfg.initial_state_saved;
   mfem::real_t last_save_time = cfg.initial_time;
-  const auto SaveTimeMatches = [](mfem::real_t lhs, mfem::real_t rhs)
-  {
-    return std::abs(lhs - rhs) <=
-           32.0 * std::numeric_limits<mfem::real_t>::epsilon() *
-             std::max({mfem::real_t{1.0}, std::abs(lhs), std::abs(rhs)});
-  };
   auto EmitSave = [&](int step,
                       mfem::real_t time,
                       int cycle,
@@ -648,11 +670,20 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   {
     if (!cfg.vtk_save || !hooks.on_save ||
         (suppress_duplicate_time && has_last_save_time &&
-         SaveTimeMatches(time, last_save_time)))
+         time_loop_detail::ClockTimesMatch(time, last_save_time)))
     {
       return false;
     }
+    const auto save_start =
+      wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
     hooks.on_save(step, time, cycle, is_final);
+    if (wall_timing_enabled)
+    {
+      const double elapsed =
+        std::chrono::duration<double>(WallClock::now() - save_start).count();
+      (is_final ? result.final_output_wall_seconds
+                : result.scheduled_output_wall_seconds) += elapsed;
+    }
     has_last_save_time = true;
     last_save_time = time;
     return true;
@@ -729,20 +760,23 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     {
       std::cout << "[dt-check] Non-finite dt before time loop: " << dt << "\n";
     }
-    const mfem::igrlab::NonFiniteSummary summary =
-      mfem::igrlab::ScanNonFinite(sol);
-    result.non_finite_count =
-      summary.global_non_finite > 0 ? summary.global_non_finite : 1;
-    result.non_finite_min = summary.global_min;
-    result.non_finite_max = summary.global_max;
     result.termination_reason = "nonfinite-initial-dt";
-    if (summary.global_non_finite == 0)
+    if (cfg.nan_scan)
     {
-      EmitSave(result.steps,
-               t,
-               save_idx,
-               /*is_final=*/true,
-               /*suppress_duplicate_time=*/true);
+      const mfem::igrlab::NonFiniteSummary summary =
+        mfem::igrlab::ScanNonFinite(sol);
+      result.non_finite_count =
+        summary.global_non_finite > 0 ? summary.global_non_finite : 1;
+      result.non_finite_min = summary.global_min;
+      result.non_finite_max = summary.global_max;
+      if (summary.global_non_finite == 0)
+      {
+        EmitSave(result.steps,
+                 t,
+                 save_idx,
+                 /*is_final=*/true,
+                 /*suppress_duplicate_time=*/true);
+      }
     }
     if (communicator_root)
     {
@@ -769,6 +803,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       ? ((cfg.next_save_time > cfg.initial_time) ? cfg.next_save_time
                                                  : cfg.initial_time + cfg.dt_save)
       : 0.0;
+  const mfem::real_t first_save_time = t_next_save;
+  std::uint64_t completed_save_intervals = 0;
   const bool requires_step_transaction =
     time_loop_detail::StepTransactionRequirement<StepperType>::Required(
       stepper);
@@ -782,6 +818,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   }
 
   bool done = false;
+  mfem::real_t accumulated_time_roundoff = 0.0;
   mfem::real_t previous_accepted_dt =
     std::numeric_limits<mfem::real_t>::quiet_NaN();
   for (int segment_step = 0; !done; ++segment_step)
@@ -807,14 +844,12 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     mfem::real_t dt_real_base = std::min(dt, cfg.t_final - t);
     mfem::real_t dt_real = dt_real_base;
 
-    bool hit_save_boundary = false;
     if (cfg.vtk_save && cfg.dt_save > 0.0)
     {
       const mfem::real_t gap = t_next_save - t;
       if (gap >= 0.0 && gap <= dt_real_base)
       {
         dt_real = gap;
-        hit_save_boundary = true;
       }
     }
 
@@ -825,20 +860,23 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
         std::cout << "[dt-check] Non-finite dt during time loop: " << dt_real
                   << " at t=" << t << "\n";
       }
-      const mfem::igrlab::NonFiniteSummary summary =
-        mfem::igrlab::ScanNonFinite(sol);
-      result.non_finite_count =
-        summary.global_non_finite > 0 ? summary.global_non_finite : 1;
-      result.non_finite_min = summary.global_min;
-      result.non_finite_max = summary.global_max;
       result.termination_reason = "nonfinite-attempt-dt";
-      if (summary.global_non_finite == 0)
+      if (cfg.nan_scan)
       {
-        EmitSave(result.steps,
-                 t,
-                 save_idx,
-                 /*is_final=*/true,
-                 /*suppress_duplicate_time=*/true);
+        const mfem::igrlab::NonFiniteSummary summary =
+          mfem::igrlab::ScanNonFinite(sol);
+        result.non_finite_count =
+          summary.global_non_finite > 0 ? summary.global_non_finite : 1;
+        result.non_finite_min = summary.global_min;
+        result.non_finite_max = summary.global_max;
+        if (summary.global_non_finite == 0)
+        {
+          EmitSave(result.steps,
+                   t,
+                   save_idx,
+                   /*is_final=*/true,
+                   /*suppress_duplicate_time=*/true);
+        }
       }
       break;
     }
@@ -851,9 +889,9 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       }
       result.final_time = t;
       done = true;
-      const mfem::real_t completion_tolerance =
-        1.0e-12 * std::max<mfem::real_t>(1.0, std::abs(cfg.t_final));
-      if (t >= cfg.t_final - completion_tolerance)
+      if (t >= cfg.t_final ||
+          time_loop_detail::ClockTimesMatch(
+            t, cfg.t_final, accumulated_time_roundoff))
       {
         result.success = true;
         result.termination_reason = "target-reached";
@@ -967,7 +1005,6 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 
         dt = retry_dt;
         dt_real = retry_dt;
-        hit_save_boundary = false;
       }
       catch (const mfem::RecoverableRKStageAdmissionFailure& failure)
       {
@@ -1042,7 +1079,6 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 
         dt = retry_dt;
         dt_real = retry_dt;
-        hit_save_boundary = false;
       }
     }
 
@@ -1056,15 +1092,26 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                /*suppress_duplicate_time=*/true);
       break;
     }
-    if (hit_save_boundary)
+    accumulated_time_roundoff +=
+      std::numeric_limits<mfem::real_t>::epsilon() *
+      std::max({std::abs(pre_attempt_time), std::abs(t),
+                std::abs(previous_accepted_dt)});
+    // Inspect the actual accepted endpoint, including after a shortened
+    // retry. A rejected boundary attempt must never snap the retry forward.
+    // A roundoff-short endpoint keeps its physical dt and reaches the exact
+    // scheduled clock here, without an artificial tiny RHS step next time.
+    const bool hit_save_boundary =
+      cfg.vtk_save && cfg.dt_save > 0.0 &&
+      time_loop_detail::ClockTimesMatch(
+        t, t_next_save, accumulated_time_roundoff);
+    const bool hit_final_boundary = time_loop_detail::ClockTimesMatch(
+      t, cfg.t_final, accumulated_time_roundoff);
+    if (hit_final_boundary || hit_save_boundary)
     {
-      t = t_next_save;
+      t = hit_final_boundary ? cfg.t_final : t_next_save;
+      accumulated_time_roundoff = 0.0;
     }
-
-    const mfem::real_t completion_tolerance =
-      1.0e-12 * std::max<mfem::real_t>(1.0, std::abs(cfg.t_final));
-    const bool accepted_reached_target =
-      t >= cfg.t_final - completion_tolerance;
+    const bool accepted_reached_target = t >= cfg.t_final;
     if (uses_cfl)
     {
       mfem::real_t max_char_speed =
@@ -1101,23 +1148,26 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
             std::cout << "[dt-check] Non-finite dt after CFL update: " << dt
                       << " at t=" << t << "\n";
           }
-          const mfem::igrlab::NonFiniteSummary summary =
-            mfem::igrlab::ScanNonFinite(sol);
-          result.non_finite_count =
-            summary.global_non_finite > 0 ? summary.global_non_finite : 1;
-          result.non_finite_min = summary.global_min;
-          result.non_finite_max = summary.global_max;
           result.segment_steps = segment_step + 1;
           result.steps = cfg.initial_step + result.segment_steps;
           result.final_time = t;
           result.termination_reason = "nonfinite-cfl-dt";
-          if (summary.global_non_finite == 0)
+          if (cfg.nan_scan)
           {
-            EmitSave(result.steps,
-                     t,
-                     save_idx,
-                     /*is_final=*/true,
-                     /*suppress_duplicate_time=*/true);
+            const mfem::igrlab::NonFiniteSummary summary =
+              mfem::igrlab::ScanNonFinite(sol);
+            result.non_finite_count =
+              summary.global_non_finite > 0 ? summary.global_non_finite : 1;
+            result.non_finite_min = summary.global_min;
+            result.non_finite_max = summary.global_max;
+            if (summary.global_non_finite == 0)
+            {
+              EmitSave(result.steps,
+                       t,
+                       save_idx,
+                       /*is_final=*/true,
+                       /*suppress_duplicate_time=*/true);
+            }
           }
           break;
         }
@@ -1169,7 +1219,14 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       (cfg.vis_steps > 0) && (done || (result.steps % cfg.vis_steps == 0));
     if (should_visualize && hooks.on_visualize)
     {
+      const auto hook_start =
+        wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
       hooks.on_visualize(result.steps, t, dt_real, done);
+      if (wall_timing_enabled)
+      {
+        result.diagnostics_wall_seconds +=
+          std::chrono::duration<double>(WallClock::now() - hook_start).count();
+      }
     }
 
     const bool should_analyze =
@@ -1177,7 +1234,14 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       (done || (result.steps % cfg.analysis_steps == 0));
     if (should_analyze && hooks.on_analysis)
     {
+      const auto hook_start =
+        wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
       hooks.on_analysis(result.steps, t, dt_real, done);
+      if (wall_timing_enabled)
+      {
+        result.diagnostics_wall_seconds +=
+          std::chrono::duration<double>(WallClock::now() - hook_start).count();
+      }
     }
 
     bool saved_this_step = false;
@@ -1188,7 +1252,13 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                                  save_idx,
                                  /*is_final=*/done);
       ++save_idx;
-      t_next_save += cfg.dt_save;
+      // Anchor the schedule instead of accumulating dt_save roundoff, which
+      // can otherwise reintroduce a tiny final step after frequent saves.
+      ++completed_save_intervals;
+      t_next_save = std::fma(
+        static_cast<mfem::real_t>(completed_save_intervals),
+        cfg.dt_save,
+        first_save_time);
     }
 
     if (done && !saved_this_step)
@@ -1207,9 +1277,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     initial_rhs_evaluations;
   if (result.termination_reason == "running")
   {
-    const mfem::real_t completion_tolerance =
-      1.0e-12 * std::max<mfem::real_t>(1.0, std::abs(cfg.t_final));
-    result.success = result.final_time >= cfg.t_final - completion_tolerance;
+    result.success = result.final_time >= cfg.t_final;
     result.termination_reason = result.success ? "target-reached"
                                                : "incomplete";
   }

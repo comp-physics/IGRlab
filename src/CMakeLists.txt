@@ -71,12 +71,22 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
                                   physics/igr/IGR_two_level_inverse_cuda.cu
                                   physics/igr/IGR_screened_patch_inverse_cuda.cu
                                   physics/igr/IGR_face_density_cuda.cu
-                                  physics/igr/IGR_stationary_correction_cuda.cu)
+                                  physics/igr/IGR_stage_coefficients_cuda.cu
+                                  physics/igr/IGR_stationary_correction_cuda.cu
+                                  physics/igr/IGR_element_block_jacobi.cu
+                                  physics/igr/IGR_local_tensor_jacobi.cu
+                                  physics/igr/IGR_device_krylov_cuda.cu
+                                  physics/igr/IGR_tensor_multigrid.cu
+                                  physics/igr/IGR_tensor_volume.cu)
     target_compile_definitions(igr_mfem PRIVATE DG_IGR_HAS_DENSE_INVERSE_CUDA=1
                                               DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA=1
                                               DG_IGR_HAS_SCREENED_PATCH_CUDA=1
                                               DG_IGR_HAS_FACE_DENSITY_CUDA=1
-                                              DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1)
+                                              DG_IGR_HAS_STAGE_COEFFICIENTS_CUDA=1
+                                              DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1
+                                              DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA=1
+                                              DG_IGR_HAS_DEVICE_KRYLOV_CUDA=1
+                                              DG_IGR_HAS_TENSOR_PIPELINE_CUDA=1)
 endif()
 
 set(_dg_igr_default_accel_sources "")
@@ -90,6 +100,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
          "src/numerics/dg/EulerAdmissibilityKernels.cpp"
          "src/numerics/dgsem/dgsem_device.cpp"
+         "src/numerics/shared_reference_map.cpp"
          "src/numerics/hdg/device/device_core.cpp"
          "src/numerics/hdg/scalar_hdg_oracle.cpp"
          "src/numerics/limiters/zhang_shu.cpp"

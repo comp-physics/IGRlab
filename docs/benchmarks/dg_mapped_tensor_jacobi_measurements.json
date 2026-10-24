@@ -1,0 +1,929 @@
+{
+  "schema": "igr-dg-mapped-tensor-measurements-v1",
+  "source_commit": "edba7971aacfa33b8886c94d67f38c6cbd9d6c23",
+  "source_manifest_sha256": "4c3b9167ddc37321a143b19093b2f1a2a787d77d96ec6a29aaf3b1801dd9f108",
+  "binary_sha256": "38e112c45baf6bfe1715b3710a3ecbc6109a11f4997a5f4c0a903be978f50a28",
+  "fixture_sha256": "868733ff4ccdabb2d67e33bd34bb5246123de845425166dda7138da04eb506de",
+  "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+  "native": {
+    "job": "3439089",
+    "node": "gh032",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-861b9c50-f55a-64ea-d1f4-954c107be637",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "passed_checks": [
+      "dg_igr_time_defaults_tests",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_local_tensor_jacobi_cuda",
+      "dg_igr_local_tensor_jacobi_cuda_backends",
+      "dg_igr_local_tensor_jacobi_cuda_projected",
+      "dg_igr_local_tensor_jacobi_cuda_projected_backends",
+      "dg_igr_local_tensor_jacobi_cuda_projected_reject_dense",
+      "dg_igr_local_tensor_jacobi_cuda_reject_skew",
+      "dg_igr_local_tensor_jacobi_cuda_reject_curved",
+      "dg_igr_local_tensor_jacobi_cuda_reject_nonseparable",
+      "dg_igr_device_krylov_cuda"
+    ],
+    "checks": [
+      "dg_igr_local_tensor_jacobi_cuda",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_time_defaults_tests",
+      "dg_igr_device_krylov_cuda",
+      "dg_igr_local_tensor_jacobi_cuda_reject_skew",
+      "dg_igr_local_tensor_jacobi_cuda_reject_curved",
+      "dg_igr_local_tensor_jacobi_cuda_reject_nonseparable",
+      "dg_igr_local_tensor_jacobi_cuda_backends",
+      "dg_igr_local_tensor_jacobi_cuda_projected",
+      "dg_igr_local_tensor_jacobi_cuda_projected_backends",
+      "dg_igr_local_tensor_jacobi_cuda_projected_reject_dense"
+    ],
+    "receipt_sha256": "4e4b6d831da5c01b83fb94508cd46dda05aec671217601ca83fb88edbf3ac239"
+  },
+  "kernel_benchmark": {
+    "scope": "Unprofiled CUDA events around production Mult, including its packing/unpacking",
+    "evolved_fields": false,
+    "summaries": [
+      {
+        "event": "summary",
+        "backend": "simt-fp64",
+        "mesh_n": "512",
+        "p": "5",
+        "sigma_dofs": "9437184",
+        "apply_ms_median": "0.31176000833511353",
+        "refresh_ms_median": "0.19627200067043304",
+        "apply_ms_min": "0.3099680095911026",
+        "apply_ms_max": "0.3131520003080368",
+        "refresh_ms_min": "0.19582399725914001",
+        "refresh_ms_max": "0.19707199931144714",
+        "correction_relative_l2": "0",
+        "correction_relative_max": "0",
+        "statistic": "per-round-medians",
+        "whole_application_speed_claim": "false"
+      },
+      {
+        "event": "summary",
+        "backend": "wmma-factor-fp64",
+        "mesh_n": "512",
+        "p": "5",
+        "sigma_dofs": "9437184",
+        "apply_ms_median": "0.20582399517297745",
+        "refresh_ms_median": "0.19609600305557251",
+        "apply_ms_min": "0.20500800013542175",
+        "apply_ms_max": "0.20622400194406509",
+        "refresh_ms_min": "0.19599999487400055",
+        "refresh_ms_max": "0.19684799760580063",
+        "correction_relative_l2": "0",
+        "correction_relative_max": "0",
+        "statistic": "per-round-medians",
+        "whole_application_speed_claim": "false"
+      },
+      {
+        "event": "summary",
+        "backend": "wmma-factor-tf32",
+        "mesh_n": "512",
+        "p": "5",
+        "sigma_dofs": "9437184",
+        "apply_ms_median": "0.19575999677181244",
+        "refresh_ms_median": "0.19601599872112274",
+        "apply_ms_min": "0.19489599764347076",
+        "apply_ms_max": "0.19575999677181244",
+        "refresh_ms_min": "0.19582399725914001",
+        "refresh_ms_max": "0.19628799706697464",
+        "correction_relative_l2": "0.00044222509012653468",
+        "correction_relative_max": "0.0007472601903576278",
+        "statistic": "per-round-medians",
+        "whole_application_speed_claim": "false"
+      }
+    ]
+  },
+  "hardware": {
+    "job": "3439260",
+    "node": "gh010",
+    "gpu": {
+      "index": 0,
+      "uuid": "GPU-68c936db-7ee6-cb65-ab25-aecc4c8fde9d",
+      "name": "NVIDIA GH200 120GB",
+      "memory_mib": 97871,
+      "cuda_visible_devices": "0",
+      "logical_cuda_device": 0
+    },
+    "kernel": "ApplyTensorFactorFP64",
+    "status": "verified",
+    "metrics": {
+      "dram__bytes.sum": {
+        "value": "333429248",
+        "unit": "byte"
+      },
+      "gpu__time_duration.sum": {
+        "value": "216992",
+        "unit": "ns"
+      },
+      "sm__inst_executed_pipe_tensor_op_dmma.sum": {
+        "value": "1573344",
+        "unit": "inst"
+      },
+      "sm__inst_executed_pipe_tensor_op_hmma.sum": {
+        "value": "0",
+        "unit": "inst"
+      },
+      "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": {
+        "value": "12.11",
+        "unit": "%"
+      },
+      "sm__warps_active.avg.pct_of_peak_sustained_active": {
+        "value": "90.44",
+        "unit": "%"
+      }
+    },
+    "report_sha256": "08c2c5318b3120d7459637ae26a4b46189b0b569278dfde92ce00afaf1d9ad61",
+    "sass_sha256": "53796ff873cdb0e01bf9c34f12695ea1aa2c80f89ca93b9797ed1fc9a2f98240",
+    "receipt_sha256": "c6d0cf86a8e5b172bf5c1e42825491684b29c9cfcf6f7cad449d064384a27b0e",
+    "profiled_diagnostic_not_benchmark": true
+  },
+  "physical": {
+    "scope": "Short mapped-mesh prototype only; t=0.0025. Separate allocations after audit-only recovery; no matched speedup claim.",
+    "case_spec_sha256": "d0712e25c218b73f9f7674c04d66c0e55f7d02f69d763cf63497744b6c4747ce",
+    "source_job_control": "3439162",
+    "source_job_candidate": "3439241",
+    "original_continuation_receipt_sha256": "dacac2260728f8bd470d5958b3330a308dcfdde30b11360e97d1efd8dc5c6fa6",
+    "original_receipt_status": "applications-completed-fields-pending",
+    "same_gpu": false,
+    "speedup": null,
+    "arms": {
+      "control": {
+        "application_wall_seconds": 432.54086591489613,
+        "native_done_seconds": 315.024076166,
+        "accepted_steps": 162,
+        "linear_calls": 487,
+        "linear_summary": {
+          "event": "run-summary",
+          "calls": "487",
+          "converged_calls": "487",
+          "production_calls": "486",
+          "production_converged_calls": "486",
+          "output_only_calls": "1",
+          "output_only_converged_calls": "1",
+          "output_only_iters": "42",
+          "output_only_solve_s": "0.18992866599998592",
+          "output_only_igr_s": "0.1944700619999824",
+          "total_iters": "32665",
+          "avg_iters": "67.073921971252574",
+          "max_iters": "100",
+          "avg_solve_iter_s": "0.0045441933711617942",
+          "avg_krylov_operator_apply_count": "70.063655030800817",
+          "avg_krylov_preconditioner_apply_count": "67.073921971252574",
+          "avg_krylov_preconditioner_operator_apply_count": "0",
+          "krylov_operator_apply_count_per_iter": "1.0445737027399358",
+          "krylov_preconditioner_apply_count_per_iter": "1",
+          "krylov_preconditioner_operator_apply_count_per_iter": "0",
+          "avg_assemble_s": "0.22290545680492824",
+          "avg_form_s": "0.030716692028747401",
+          "avg_pc_setup_s": "0.0067931360533880873",
+          "avg_solve_s": "0.30479687159958935",
+          "total_assemble_s": "108.55495746400005",
+          "total_form_s": "14.959029017999985",
+          "total_pc_setup_s": "3.3082572579999985",
+          "total_cheb_diag_s": "0",
+          "total_cheb_setup_s": "0",
+          "total_cheb_eigen_reuses": "0",
+          "total_cheb_smoother_reuses": "0",
+          "total_cheb_smoother_builds": "0",
+          "total_krylov_operator_apply_s": "0",
+          "total_krylov_preconditioner_apply_s": "0",
+          "total_krylov_preconditioner_operator_apply_s": "0",
+          "total_krylov_operator_apply_count": "34121",
+          "total_krylov_preconditioner_apply_count": "32665",
+          "total_krylov_preconditioner_operator_apply_count": "0",
+          "total_solve_s": "148.436076469",
+          "total_igr_s": "275.25832020900003",
+          "total_update_s": "275.4977700940002",
+          "solve_pct": "47.11896254900293",
+          "total_igr_pct": "87.376915300897309",
+          "solve_pct_stage": "53.87922973690619",
+          "total_igr_pct_stage": "99.913084637701985",
+          "last_solver": "fgmres-cuda-fp64",
+          "last_precond": "tensor-element-projected-wmma-factor-fp64",
+          "last_cheb_diag_s": "0",
+          "last_cheb_setup_s": "0",
+          "last_cheb_eigen_reused": "0",
+          "last_cheb_smoother_reused": "0",
+          "last_cheb_eigen_estimate": "0",
+          "last_krylov_operator_apply_s": "0",
+          "last_krylov_preconditioner_apply_s": "0",
+          "last_krylov_preconditioner_operator_apply_s": "0",
+          "last_krylov_operator_apply_count": "44",
+          "last_krylov_preconditioner_apply_count": "42",
+          "last_krylov_preconditioner_operator_apply_count": "0",
+          "direct_identity_system": "1",
+          "direct_identity_reason": "active",
+          "direct_identity_uses": "487",
+          "exact_face_requested": "1",
+          "exact_face_effective": "1",
+          "exact_face_reason": "active",
+          "exact_face_local_nf": "523264",
+          "exact_face_shared_nf": "0",
+          "exact_face_operator_uses": "487",
+          "exact_face_last_mult_calls": "1"
+        },
+        "convergence": {
+          "kind": "independent-current-FP64-A",
+          "factor": 1,
+          "relative_limit": 1e-06,
+          "logged_certificates": 487,
+          "maximum_logged_residual_rel_rhs": 9.9990288e-07,
+          "residual_replacement_retries": 0,
+          "logging_note": "Successful non-output production anchors at rk_stage=-1 omit certificate lines; authoritative converged-call totals and final certificate are also checked"
+        },
+        "resolved_regularization": {
+          "event": "resolved",
+          "c_alpha": "0.16666667",
+          "h_eff_policy": "max",
+          "h_min": "0.0014478828",
+          "h_average": "0.0017532947",
+          "h_max": "0.001953125",
+          "h_eff_reference": "0.001953125",
+          "alpha_effective_min": "6.3578288e-07",
+          "alpha_effective_max": "6.3578288e-07"
+        },
+        "euler_faces": {
+          "requested": "fp64-tensor",
+          "actual": "packed-mfem-forall-euler-rusanov",
+          "representation_rejection": "geometry",
+          "physical_operator": "unchanged-generic-fp64",
+          "fallback": {
+            "event": "fallback",
+            "reason": "geometry"
+          },
+          "device_domain": {
+            "event": "face-domain-path",
+            "selected": "packed-mfem-forall-euler-rusanov",
+            "backend": "device",
+            "lvec_mode": "P-x-PT",
+            "x_size": "37748736",
+            "local_vsize": "37748736",
+            "true_vsize": "37748736"
+          },
+          "inverse_mass": {
+            "event": "invmass-path",
+            "selected": "packed-mfem-forall",
+            "backend": "device"
+          }
+        },
+        "gpu_samples": {
+          "enabled": true,
+          "interval_seconds": 1,
+          "samples": 413,
+          "errors": [],
+          "sampled_memory_used_mib_max": 35151.0,
+          "note": "One-second total-device snapshots can miss peaks and do not isolate backend memory",
+          "file": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/physical-3439162/control/gpu-samples.jsonl",
+            "sha256": "b6b29283bffec7b8f252f116c05c5f1735666cdfbaa14144deda7eb6117fcc69",
+            "bytes": 60494
+          }
+        },
+        "gpu": {
+          "index": 0,
+          "uuid": "GPU-bf6ea382-b408-d7a7-47bd-f02652fad714",
+          "name": "NVIDIA GH200 120GB",
+          "memory_mib": 97871,
+          "cuda_visible_devices": "0",
+          "logical_cuda_device": 0
+        }
+      },
+      "candidate": {
+        "application_wall_seconds": 278.4152801842429,
+        "native_done_seconds": 166.81400041,
+        "accepted_steps": 162,
+        "linear_calls": 487,
+        "linear_summary": {
+          "event": "run-summary",
+          "calls": "487",
+          "converged_calls": "0",
+          "production_calls": "486",
+          "production_converged_calls": "0",
+          "output_only_calls": "1",
+          "output_only_converged_calls": "0",
+          "output_only_iters": "2",
+          "output_only_solve_s": "0.0067356420000002082",
+          "output_only_igr_s": "0.011313905999996265",
+          "total_iters": "1022",
+          "avg_iters": "2.0985626283367558",
+          "max_iters": "50",
+          "avg_solve_iter_s": "0.0032097297446183927",
+          "avg_krylov_operator_apply_count": "2.0985626283367558",
+          "avg_krylov_preconditioner_apply_count": "2.0985626283367558",
+          "avg_krylov_preconditioner_operator_apply_count": "0",
+          "krylov_operator_apply_count_per_iter": "1",
+          "krylov_preconditioner_apply_count_per_iter": "1",
+          "krylov_preconditioner_operator_apply_count_per_iter": "0",
+          "avg_assemble_s": "0.22335011544763866",
+          "avg_form_s": "0.031042045722792594",
+          "avg_pc_setup_s": "0.0068086989774127308",
+          "avg_solve_s": "0.006735818889117038",
+          "total_assemble_s": "108.77150622300003",
+          "total_form_s": "15.117476266999994",
+          "total_pc_setup_s": "3.315836402",
+          "total_cheb_diag_s": "0",
+          "total_cheb_setup_s": "0",
+          "total_cheb_eigen_reuses": "0",
+          "total_cheb_smoother_reuses": "0",
+          "total_cheb_smoother_builds": "0",
+          "total_krylov_operator_apply_s": "0",
+          "total_krylov_preconditioner_apply_s": "0",
+          "total_krylov_preconditioner_operator_apply_s": "0",
+          "total_krylov_operator_apply_count": "1022",
+          "total_krylov_preconditioner_apply_count": "1022",
+          "total_krylov_preconditioner_operator_apply_count": "0",
+          "total_solve_s": "3.2803437989999975",
+          "total_igr_s": "130.48516269100003",
+          "total_update_s": "130.50190885599994",
+          "solve_pct": "1.9664679169239265",
+          "total_igr_pct": "78.221949219064356",
+          "solve_pct_stage": "2.5136366416062432",
+          "total_igr_pct_stage": "99.987167877353883",
+          "last_solver": "fixed-element-jacobi",
+          "last_precond": "tensor-element-projected-wmma-factor-fp64",
+          "last_cheb_diag_s": "0",
+          "last_cheb_setup_s": "0",
+          "last_cheb_eigen_reused": "0",
+          "last_cheb_smoother_reused": "0",
+          "last_cheb_eigen_estimate": "0",
+          "last_krylov_operator_apply_s": "0",
+          "last_krylov_preconditioner_apply_s": "0",
+          "last_krylov_preconditioner_operator_apply_s": "0",
+          "last_krylov_operator_apply_count": "2",
+          "last_krylov_preconditioner_apply_count": "2",
+          "last_krylov_preconditioner_operator_apply_count": "0",
+          "direct_identity_system": "1",
+          "direct_identity_reason": "active",
+          "direct_identity_uses": "487",
+          "exact_face_requested": "1",
+          "exact_face_effective": "1",
+          "exact_face_reason": "active",
+          "exact_face_local_nf": "523264",
+          "exact_face_shared_nf": "0",
+          "exact_face_operator_uses": "487",
+          "exact_face_last_mult_calls": "2",
+          "jacobi_blocks": "tensor",
+          "solve_mode": "element-block-jacobi",
+          "approximate": "1",
+          "acceptance": "fixed-sweeps"
+        },
+        "convergence": {
+          "kind": "fixed-sweeps-approximate",
+          "initial_sweeps": 50,
+          "regular_sweeps": 2,
+          "omega": 0.7,
+          "total_sweeps": 1022,
+          "convergence_certificate": false
+        },
+        "resolved_regularization": {
+          "event": "resolved",
+          "c_alpha": "0.16666667",
+          "h_eff_policy": "max",
+          "h_min": "0.0014478828",
+          "h_average": "0.0017532947",
+          "h_max": "0.001953125",
+          "h_eff_reference": "0.001953125",
+          "alpha_effective_min": "6.3578288e-07",
+          "alpha_effective_max": "6.3578288e-07"
+        },
+        "euler_faces": {
+          "requested": "fp64-tensor",
+          "actual": "packed-mfem-forall-euler-rusanov",
+          "representation_rejection": "geometry",
+          "physical_operator": "unchanged-generic-fp64",
+          "fallback": {
+            "event": "fallback",
+            "reason": "geometry"
+          },
+          "device_domain": {
+            "event": "face-domain-path",
+            "selected": "packed-mfem-forall-euler-rusanov",
+            "backend": "device",
+            "lvec_mode": "P-x-PT",
+            "x_size": "37748736",
+            "local_vsize": "37748736",
+            "true_vsize": "37748736"
+          },
+          "inverse_mass": {
+            "event": "invmass-path",
+            "selected": "packed-mfem-forall",
+            "backend": "device"
+          }
+        },
+        "gpu_samples": {
+          "enabled": true,
+          "interval_seconds": 1,
+          "samples": 263,
+          "errors": [],
+          "sampled_memory_used_mib_max": 29099.0,
+          "note": "One-second total-device snapshots can miss peaks and do not isolate backend memory",
+          "file": {
+            "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/physical-3439241/candidate/gpu-samples.jsonl",
+            "sha256": "98afadb4a5626b7b104cfe3b8e70dc6ea9b95a6a79190e6116e2bfa01d709301",
+            "bytes": 38411
+          }
+        },
+        "gpu": {
+          "index": 0,
+          "uuid": "GPU-02b74a81-8086-423b-9ee2-e4baa540a5c3",
+          "name": "NVIDIA GH200 120GB",
+          "memory_mib": 97871,
+          "cuda_visible_devices": "0",
+          "logical_cuda_device": 0
+        }
+      }
+    },
+    "field_selection_recovery_sha256": "129f1b88e98b803117fd89a57c3fb3faa37fa6f7ee17a89eebbb4eb8002b6aa2",
+    "metadata_encoding_limitation": {
+      "control": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/physical-3439162/control/vtk/sedov_taylor_blast_p_5_ref_0_is_L2_ig_BrokenL2_ca_0.166667_iexface/run_metadata.json",
+        "raw_tokens": [],
+        "normalization": "in-memory null for unavailable uncertified fixed-sweep norm diagnostics only",
+        "raw_file_modified": false,
+        "raw_sha256": "ec411dfd48906628c8c35da57931696d4c214e64c336d3531554bee837b35e89",
+        "raw_bytes": 7523
+      },
+      "candidate": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/physical-3439241/candidate/vtk/sedov_taylor_blast_p_5_ref_0_is_L2_ig_BrokenL2_ca_0.166667_iexface/run_metadata.json",
+        "raw_tokens": [
+          {
+            "raw_token": "nan",
+            "character_offset": 5913,
+            "line": 161,
+            "column": 26,
+            "json_path": "$.igr_linear.last_initial_norm",
+            "derived_value": null
+          },
+          {
+            "raw_token": "nan",
+            "character_offset": 5941,
+            "line": 162,
+            "column": 24,
+            "json_path": "$.igr_linear.last_final_norm",
+            "derived_value": null
+          }
+        ],
+        "normalization": "in-memory null for unavailable uncertified fixed-sweep norm diagnostics only",
+        "raw_file_modified": false,
+        "raw_sha256": "f57e6233797239c8032ea91100a0532b8e18ea2647614db11a7554c3f3e3e067",
+        "raw_bytes": 7554
+      }
+    },
+    "final_fields": {
+      "control": {
+        "target_time": 0.0025,
+        "complete_native_vtu_sha256": "d7ad8a74a98abb426923a19fed05d77463e3619c67c8b68001fb04605cbad26f",
+        "full_polynomial_comparison_source": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/physical-3439162/control/vtk/sedov_taylor_blast_p_5_ref_0_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000001/proc000000.vtu"
+      },
+      "candidate": {
+        "target_time": 0.0025,
+        "complete_native_vtu_sha256": "8111e2f5a10873effe1be0ab59d6c08f67917e32346812fba251417c5a8fa0b9",
+        "full_polynomial_comparison_source": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/physical-3439241/candidate/vtk/sedov_taylor_blast_p_5_ref_0_is_L2_ig_BrokenL2_ca_0.166667_iexface/Cycle000001/proc000000.vtu"
+      }
+    }
+  },
+  "fields": {
+    "status": "ok",
+    "time": 0.0025,
+    "gamma": 1.4,
+    "helper_sha256": "f3cb6b0baaf8c0e54c1fa99e1fe63868b93f0064e013002edbfc0fa5ca2da615",
+    "reference": {
+      "path": "/tmp/igr-dg-mapped-tensor-20261022/fields/control-t0025.vtu",
+      "sha256": "d7ad8a74a98abb426923a19fed05d77463e3619c67c8b68001fb04605cbad26f",
+      "bytes": 1160775042,
+      "mtime_ns": 1792712010795335204,
+      "hash_verified": true
+    },
+    "candidate": {
+      "path": "/tmp/igr-dg-mapped-tensor-20261022/fields/candidate-t0025.vtu",
+      "sha256": "8111e2f5a10873effe1be0ab59d6c08f67917e32346812fba251417c5a8fa0b9",
+      "bytes": 1160775042,
+      "mtime_ns": 1792712478551774744,
+      "hash_verified": true
+    },
+    "grid": {
+      "cells": 262144,
+      "points": 9437184,
+      "matching_ordered_connectivity": true,
+      "cell_rematching": false,
+      "coordinate_pair_absolute_difference_max": 0.0,
+      "coordinate_pair_absolute_tolerance": 1e-12,
+      "q2_fit_absolute_residual_max_reference": 2.7755575615628914e-15,
+      "q2_fit_absolute_residual_max_candidate": 2.7755575615628914e-15,
+      "sampled_signed_detj_range_reference": [
+        2.975792223659254e-06,
+        4.653602307607573e-06
+      ],
+      "sampled_signed_detj_range_candidate": [
+        2.975792223659254e-06,
+        4.653602307607573e-06
+      ],
+      "sampled_signed_detj_pair_absolute_difference_max": 0.0,
+      "area_reference": 1.0000000000002616,
+      "area_candidate": 1.0000000000002616,
+      "integration_measure": "GL8 weights times fitted reference Q2 signed detJ at each point",
+      "source_geometry_requirement": "caller binds Q2 source mesh; saved coordinates independently verified Q2"
+    },
+    "components": {
+      "density": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 1.0000000228950463,
+        "l2_candidate": 1.000000022895046,
+        "l2_difference": 6.960334645725322e-10,
+        "normalized_l2": 6.960334486368142e-10,
+        "normalized_linf_at_gl_points": 1.3905768850308092e-08,
+        "linf_reference_at_gl_points": 1.0001816671135355,
+        "linf_candidate_at_gl_points": 1.00018166705124,
+        "linf_difference_at_gl_points": 1.3908295071196619e-08,
+        "reference_range_at_gl_points": [
+          0.9987143708930941,
+          1.0001816671135355
+        ],
+        "candidate_range_at_gl_points": [
+          0.998714383415714,
+          1.00018166705124
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 131328,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.5019194090220233,
+            0.5019194090220233
+          ],
+          "reference": 0.9987149074865055,
+          "candidate": 0.9987149213948006
+        },
+        "integral_reference": 1.000000000000255,
+        "integral_candidate": 1.0000000000002531,
+        "integral_candidate_minus_reference": -1.5220617541422412e-18,
+        "difference_of_separately_accumulated_integrals": -1.7763568394002505e-15,
+        "reference_gl_l1": 1.000000000000255,
+        "integral_abs_difference_over_abs_reference_integral": 1.5220617541418531e-18,
+        "integral_abs_difference_over_reference_gl_l1": 1.5220617541418531e-18,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "momentum_x": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 0.011344304116898827,
+        "l2_candidate": 0.01134430392701204,
+        "l2_difference": 3.261805479136343e-10,
+        "normalized_l2": 2.8752803570185118e-08,
+        "normalized_linf_at_gl_points": 6.718016753666985e-08,
+        "linf_reference_at_gl_points": 0.041382163466703925,
+        "linf_candidate_at_gl_points": 0.04138216248681828,
+        "linf_difference_at_gl_points": 2.7800606747230283e-09,
+        "reference_range_at_gl_points": [
+          -0.041382163466703925,
+          0.04138216231736236
+        ],
+        "candidate_range_at_gl_points": [
+          -0.04138216248681828,
+          0.04138216152837966
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 131292,
+          "gauss_ij": [
+            5,
+            3
+          ],
+          "physical_xy": [
+            0.431103787602185,
+            0.5007239369650639
+          ],
+          "reference": -0.030923397170200956,
+          "candidate": -0.03092339439014028
+        },
+        "integral_reference": 2.6753013522624433e-16,
+        "integral_candidate": -4.1271586718120443e-16,
+        "integral_candidate_minus_reference": -6.831743174376926e-16,
+        "difference_of_separately_accumulated_integrals": -6.802460024074488e-16,
+        "reference_gl_l1": 0.006011849435279683,
+        "integral_abs_difference_over_abs_reference_integral": 2.553635002127694,
+        "integral_abs_difference_over_reference_gl_l1": 1.1363796196035473e-13,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "momentum_y": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 0.011344304116898817,
+        "l2_candidate": 0.011344303927012031,
+        "l2_difference": 3.261805480012811e-10,
+        "normalized_l2": 2.8752803577911204e-08,
+        "normalized_linf_at_gl_points": 6.718015755436668e-08,
+        "linf_reference_at_gl_points": 0.041382163470054835,
+        "linf_candidate_at_gl_points": 0.04138216249017197,
+        "linf_difference_at_gl_points": 2.780060261858841e-09,
+        "reference_range_at_gl_points": [
+          -0.041382163470054835,
+          0.04138216231657059
+        ],
+        "candidate_range_at_gl_points": [
+          -0.04138216249017197,
+          0.04138216152758962
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 112896,
+          "gauss_ij": [
+            3,
+            5
+          ],
+          "physical_xy": [
+            0.5007239369650638,
+            0.431103787602185
+          ],
+          "reference": -0.03092339716914676,
+          "candidate": -0.0309233943890865
+        },
+        "integral_reference": 2.427787009243957e-16,
+        "integral_candidate": -4.444055766558621e-16,
+        "integral_candidate_minus_reference": -6.833315180260023e-16,
+        "difference_of_separately_accumulated_integrals": -6.871842775802578e-16,
+        "reference_gl_l1": 0.006011849435279658,
+        "integral_abs_difference_over_abs_reference_integral": 2.8146271292505194,
+        "integral_abs_difference_over_reference_gl_l1": 1.1366411041766471e-13,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "energy": {
+        "saved_polynomial_component": true,
+        "conservative_component": true,
+        "l2_reference": 3.9716472855306835,
+        "l2_candidate": 3.9716472855419998,
+        "l2_difference": 9.448911859560186e-09,
+        "normalized_l2": 2.3790913896065272e-09,
+        "normalized_linf_at_gl_points": 1.951528236600723e-08,
+        "linf_reference_at_gl_points": 11.536192377102857,
+        "linf_candidate_at_gl_points": 11.536192602223466,
+        "linf_difference_at_gl_points": 2.2513205166774242e-07,
+        "reference_range_at_gl_points": [
+          2.5000071148385814,
+          11.536192377102857
+        ],
+        "candidate_range_at_gl_points": [
+          2.5000071148385805,
+          11.536192602223466
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 131328,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.5019194090220233,
+            0.5019194090220233
+          ],
+          "reference": 11.53431062659866,
+          "candidate": 11.534310851730712
+        },
+        "integral_reference": 3.4999888357544675,
+        "integral_candidate": 3.499988835754468,
+        "integral_candidate_minus_reference": -2.5157007431341388e-18,
+        "difference_of_separately_accumulated_integrals": 4.440892098500626e-16,
+        "reference_gl_l1": 3.4999888357544675,
+        "integral_abs_difference_over_abs_reference_integral": 7.187739336293761e-19,
+        "integral_abs_difference_over_reference_gl_l1": 7.187739336293761e-19,
+        "engineering_budget_pass": true,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "sigma": {
+        "saved_polynomial_component": true,
+        "conservative_component": false,
+        "l2_reference": 1.1848247470803336e-07,
+        "l2_candidate": 9.16373970647204e-08,
+        "l2_difference": 2.727571663650137e-08,
+        "normalized_l2": 0.23020887016172376,
+        "normalized_linf_at_gl_points": 0.31343091196022554,
+        "linf_reference_at_gl_points": 1.0059459953328275e-06,
+        "linf_candidate_at_gl_points": 8.243123243449815e-07,
+        "linf_difference_at_gl_points": 3.152945706999049e-07,
+        "reference_range_at_gl_points": [
+          2.6479246657472075e-16,
+          1.0059459953328275e-06
+        ],
+        "candidate_range_at_gl_points": [
+          1.6949768521281154e-16,
+          8.243123243449815e-07
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 129789,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.4960764706110623,
+            0.4960764706110624
+          ],
+          "reference": 1.0024483567674207e-06,
+          "candidate": 6.871537860675159e-07
+        },
+        "integral_reference": 3.721942121229433e-08,
+        "integral_candidate": 2.8695886578547237e-08,
+        "integral_candidate_minus_reference": -8.523534633747127e-09,
+        "difference_of_separately_accumulated_integrals": -8.523534633747094e-09,
+        "reference_gl_l1": 3.721942121229433e-08,
+        "integral_abs_difference_over_abs_reference_integral": 0.22900771576027706,
+        "integral_abs_difference_over_reference_gl_l1": 0.22900771576027706,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": true
+      },
+      "pressure": {
+        "saved_polynomial_component": false,
+        "conservative_component": false,
+        "l2_reference": 1.5885743781083312,
+        "l2_candidate": 1.588574378116694,
+        "l2_difference": 3.779618161156838e-09,
+        "normalized_l2": 2.3792516190885526e-09,
+        "normalized_linf_at_gl_points": 1.9515325404425884e-08,
+        "linf_reference_at_gl_points": 4.614476950682486,
+        "linf_candidate_at_gl_points": 4.614477040730727,
+        "linf_difference_at_gl_points": 9.005301926379161e-08,
+        "reference_range_at_gl_points": [
+          1.0000028459354324,
+          4.614476950682486
+        ],
+        "candidate_range_at_gl_points": [
+          1.000002845935432,
+          4.614477040730727
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 131328,
+          "gauss_ij": [
+            7,
+            7
+          ],
+          "physical_xy": [
+            0.5019194090220233,
+            0.5019194090220233
+          ],
+          "reference": 4.613723862083428,
+          "candidate": 4.613723952136447
+        },
+        "integral_reference": 1.3999440472053104,
+        "integral_candidate": 1.3999440472070364,
+        "integral_candidate_minus_reference": 1.7242061258371302e-12,
+        "difference_of_separately_accumulated_integrals": 1.7259527140822684e-12,
+        "reference_gl_l1": 1.3999440472053104,
+        "integral_abs_difference_over_abs_reference_integral": 1.2316250276424545e-12,
+        "integral_abs_difference_over_reference_gl_l1": 1.2316250276424545e-12,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": false
+      },
+      "speed": {
+        "saved_polynomial_component": false,
+        "conservative_component": false,
+        "l2_reference": 0.016046324591639242,
+        "l2_candidate": 0.016046324322869236,
+        "l2_difference": 4.5520386295164706e-10,
+        "normalized_l2": 2.8368107621905265e-08,
+        "normalized_linf_at_gl_points": 7.236454887928287e-08,
+        "linf_reference_at_gl_points": 0.041398287231647214,
+        "linf_candidate_at_gl_points": 0.04139828654127261,
+        "linf_difference_at_gl_points": 2.9957683798931267e-09,
+        "reference_range_at_gl_points": [
+          3.626423567944201e-09,
+          0.041398287231647214
+        ],
+        "candidate_range_at_gl_points": [
+          3.6264232606388606e-09,
+          0.04139828654127261
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 144105,
+          "gauss_ij": [
+            5,
+            1
+          ],
+          "physical_xy": [
+            0.45370782945823535,
+            0.546166619607327
+          ],
+          "reference": 0.02976913537664243,
+          "candidate": 0.02976913238087405
+        },
+        "integral_reference": 0.009443544467487715,
+        "integral_candidate": 0.009443544327065845,
+        "integral_candidate_minus_reference": -1.4042185847149493e-10,
+        "difference_of_separately_accumulated_integrals": -1.4042187031215736e-10,
+        "reference_gl_l1": 0.009443544467487715,
+        "integral_abs_difference_over_abs_reference_integral": 1.486961372977488e-08,
+        "integral_abs_difference_over_reference_gl_l1": 1.486961372977488e-08,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": false
+      },
+      "q_sigma": {
+        "saved_polynomial_component": false,
+        "conservative_component": false,
+        "l2_reference": 2.224004160038773,
+        "l2_candidate": 2.2240041530304717,
+        "l2_difference": 1.142039880387871e-08,
+        "normalized_l2": 5.13506179938063e-09,
+        "normalized_linf_at_gl_points": 2.0982224646983274e-08,
+        "linf_reference_at_gl_points": 6.460268133333878,
+        "linf_candidate_at_gl_points": 6.460268133678334,
+        "linf_difference_at_gl_points": 1.3555079725335872e-07,
+        "reference_range_at_gl_points": [
+          1.4000039843096117,
+          6.460268133333878
+        ],
+        "candidate_range_at_gl_points": [
+          1.4000039843096108,
+          6.460268133678334
+        ],
+        "maximum_difference_location": {
+          "cell_ordinal": 130302,
+          "gauss_ij": [
+            3,
+            3
+          ],
+          "physical_xy": [
+            0.49690452965668197,
+            0.49690452965668186
+          ],
+          "reference": 6.4575257400909605,
+          "candidate": 6.457525604540163
+        },
+        "integral_reference": 1.9599216809752045,
+        "integral_candidate": 1.9599216775682011,
+        "integral_candidate_minus_reference": -3.4069999649563775e-09,
+        "difference_of_separately_accumulated_integrals": -3.407003346111992e-09,
+        "reference_gl_l1": 1.9599216809752045,
+        "integral_abs_difference_over_abs_reference_integral": 1.7383347498156895e-09,
+        "integral_abs_difference_over_reference_gl_l1": 1.7383347498156895e-09,
+        "engineering_budget_pass": null,
+        "polynomial_integrals_and_squared_norms_exact_on_fitted_q2_up_to_roundoff": false
+      }
+    },
+    "sampled_admissibility": {
+      "reference": {
+        "density_min": 0.9987143708930941,
+        "pressure_min": 1.0000028459354324,
+        "q_sigma_min": 1.4000039843096117
+      },
+      "candidate": {
+        "density_min": 0.998714383415714,
+        "pressure_min": 1.000002845935432,
+        "q_sigma_min": 1.4000039843096108
+      }
+    },
+    "qualification_passed": true,
+    "engineering_budgets": {
+      "normalized_l2": 0.001,
+      "normalized_linf_at_gl_points": 0.01,
+      "components": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "all_conservative_components_pass": true,
+      "sigma_budget": null,
+      "meaning": "engineering comparison thresholds, not discretization error bounds"
+    },
+    "scope": "Complete saved Q5 conserved and sigma polynomials on matching ordered cells with verified Q2 geometry. GL8 integrates polynomial integrals and squared differences on the fitted Q2 map to FP64/geometry-fit roundoff. Pressure, speed and q_sigma metrics are quadrature estimates. Linf and positivity are sampled at GL8 points, with no continuous or between-frame claim.",
+    "normalization": "Per component L2=norm(candidate-reference)/norm(reference); sampled Linf=max_GL(abs(candidate-reference))/max_GL(abs(reference)). A zero reference denominator gives zero for zero difference, otherwise JSON null. Signed integral differences integrate candidate-reference directly; reference GL L1 avoids near-zero signed momentum normalization. q_sigma=gamma*pressure+(gamma-1)*sigma."
+  },
+  "field_report_sha256": "760bb5efe2c9a5a24c6151cbaa7a9986723329417947701596ce0065c6f13abc",
+  "limitations": [
+    "Full t=0.1 evolved-flow comparison has not run.",
+    "Initial sigma is tiny at this early endpoint; field agreement does not establish late-time accuracy.",
+    "Fixed omega=.7 is not guaranteed stable on arbitrary admitted mapped meshes; coarse curved native fixture local lambda_max=3.02660929.",
+    "No TF32 physical evolution comparison; TF32 numbers are local inverse benchmark only.",
+    "Host phase counters overlap asynchronous GPU work and are not exclusive kernel timings.",
+    "Generic packed FP64 Euler faces are selected after tensor-face geometry rejection.",
+    "Original candidate JSON metadata contains lowercase nan for two unavailable residual diagnostics; strict separate postprocessing normalized only those fields in memory, preserving original bytes. Final-PVD/VTU identities and fields are fully bound by the recovered receipt."
+  ],
+  "field_qualification": {
+    "status": "passed",
+    "scope": "t=.0025 only; sampled positivity and conserved field engineering budgets; not a general stability or late-time validation",
+    "physical_run_sha256": "dacac2260728f8bd470d5958b3330a308dcfdde30b11360e97d1efd8dc5c6fa6",
+    "field_selection_recovery_sha256": "129f1b88e98b803117fd89a57c3fb3faa37fa6f7ee17a89eebbb4eb8002b6aa2",
+    "comparison_report_sha256": "760bb5efe2c9a5a24c6151cbaa7a9986723329417947701596ce0065c6f13abc",
+    "source_commit": "edba7971aacfa33b8886c94d67f38c6cbd9d6c23",
+    "binary_sha256": "38e112c45baf6bfe1715b3710a3ecbc6109a11f4997a5f4c0a903be978f50a28",
+    "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "time": 0.0025,
+    "same_gpu": false,
+    "matched_performance_claim": false,
+    "maximum_conserved_relative_l2": 2.8752803577911204e-08,
+    "sigma_relative_l2": 0.23020887016172376,
+    "sampled_admissibility_all_positive": true,
+    "original_receipts_preserved": true
+  }
+}
