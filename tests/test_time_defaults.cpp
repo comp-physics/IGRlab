@@ -202,7 +202,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
     unsupported.discretization = dg_sim::Discretization::DGSEM;
     unsupported.dg_backend = dg_sim::DGBackend::DGSEM;
     ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
-              "fixed element Jacobi: DGSEM is not silently selected");
+              "fixed element Jacobi: DGSEM requires explicit tensor blocks");
+    unsupported.igr_opts.element_jacobi_blocks = "tensor";
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: DGSEM tensor closure is explicitly admitted");
+    unsupported.case_config.limiter_pipeline.zhang_shu = true;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: DGSEM tensor closure retains retry exclusion");
     unsupported = candidate;
     unsupported.device_backend = dg_sim::DeviceBackend::CPU;
     ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),

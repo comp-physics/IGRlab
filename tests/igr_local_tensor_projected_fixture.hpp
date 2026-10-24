@@ -125,9 +125,10 @@ struct MappedTensorFixture
   Vector side;
   const double kappa = 144.0;
 
-  MappedTensorFixture(int nx, int ny, const std::string& geometry, double alpha_, bool reorder)
+  MappedTensorFixture(int nx, int ny, const std::string& geometry, double alpha_, bool reorder,
+                      int basis = BasisType::GaussLegendre)
     : serial(MappedMesh(nx, ny, geometry, reorder)), mesh(MPI_COMM_WORLD, serial),
-      collection(5, 2, BasisType::GaussLegendre), space(&mesh, &collection),
+      collection(5, 2, basis), space(&mesh, &collection),
       mass_rule(MassIntegrator::GetRule(*space.GetFE(0), *space.GetFE(0),
                                        *mesh.GetTypicalElementTransformation())),
       diffusion_rule(DiffusionIntegrator::GetRule(*space.GetFE(0), *space.GetFE(0))),
@@ -436,7 +437,7 @@ private:
   DenseMatrix basis_[16];
 };
 
-void CheckProjectedMassDiagonal(MappedTensorFixture& fixture)
+double CheckProjectedMassDiagonal(MappedTensorFixture& fixture)
 {
   const Vector oracle = PhysicalMassDiagonal(fixture.space, fixture.invrho);
   BilinearForm mass(&fixture.space);
@@ -452,20 +453,38 @@ void CheckProjectedMassDiagonal(MappedTensorFixture& fixture)
   }
   MFEM_VERIFY(RelativeDifference(assembled, expected) < 1.0e-12,
               "Integrated phi_i^2 physical mass differs from assembled MFEM mass diagonal.");
+  const auto& matrix = mass.SpMat();
+  const int* rows = matrix.GetI();
+  const int* columns = matrix.GetJ();
+  const double* entries = matrix.GetData();
+  long double total2 = 0.0L, offdiagonal2 = 0.0L;
+  for (int row = 0; row < matrix.Height(); ++row)
+    for (int entry = rows[row]; entry < rows[row + 1]; ++entry)
+    {
+      const long double value2 = static_cast<long double>(entries[entry]) * entries[entry];
+      total2 += value2;
+      if (row != columns[entry]) { offdiagonal2 += value2; }
+    }
+  MFEM_VERIFY(total2 > 0.0L, "Independent physical mass matrix is zero.");
+  return std::sqrt(double(offdiagonal2 / total2));
 }
 
-void QualifyProjected(const std::vector<std::string>& modes)
+void QualifyProjected(const std::vector<std::string>& modes,
+                      int basis = BasisType::GaussLegendre)
 {
   ReferenceSelection reference_policy("projected");
+  MFEM_VERIFY(basis == BasisType::GaussLegendre || basis == BasisType::GaussLobatto,
+              "Projected qualification requires GL or GLL nodes.");
+  const char* basis_name = basis == BasisType::GaussLegendre ? "gl" : "gll";
   for (const std::string geometry : {"cartesian", "rotated-stretch", "shear", "curved-q2"})
   {
-    MappedTensorFixture fixture(5, 4, geometry, 0.017, true);
+    MappedTensorFixture fixture(5, 4, geometry, 0.017, true, basis);
     const Vector initial = AssembledDiagonal(fixture.space, fixture.mass, fixture.diffusion,
       fixture.mass_rule, fixture.diffusion_rule, fixture.face_rule, fixture.kappa);
     ProjectedDenseReference reference(fixture, initial);
     if (geometry == "rotated-stretch")
     {
-      MappedTensorFixture stretched(5, 4, "orthogonal-stretch", 0.017, true);
+      MappedTensorFixture stretched(5, 4, "orthogonal-stretch", 0.017, true, basis);
       const Vector unrotated = AssembledDiagonal(stretched.space, stretched.mass, stretched.diffusion,
         stretched.mass_rule, stretched.diffusion_rule, stretched.face_rule, stretched.kappa);
       MFEM_VERIFY(RelativeDifference(initial, unrotated) < 5.0e-11,
@@ -480,10 +499,17 @@ void QualifyProjected(const std::vector<std::string>& modes)
     FillSignedResidual(rhs, 0); FillSignedResidual(second, 0, true); first_action = 0.0;
     std::vector<Vector> physical(3), exact(3);
     ProjectedQuality quality[3];
+    double mass_offdiagonal[3] = {};
     double noncollocated_mass_difference = 0.0;
     for (int phase = 0; phase < 3; ++phase)
     {
-      fixture.SetPhase(phase); CheckProjectedMassDiagonal(fixture);
+      fixture.SetPhase(phase);
+      mass_offdiagonal[phase] = CheckProjectedMassDiagonal(fixture);
+      if (basis == BasisType::GaussLobatto)
+      {
+        MFEM_VERIFY(mass_offdiagonal[phase] > 1.0e-4,
+                    "GLL fixture must retain the off-diagonal consistent GL-quadrature mass.");
+      }
       physical[phase] = AssembledDiagonal(fixture.space, fixture.mass, fixture.diffusion,
         fixture.mass_rule, fixture.diffusion_rule, fixture.face_rule, fixture.kappa);
       exact[phase] = SolveBlocks(fixture.space, physical[phase], rhs);
@@ -495,7 +521,7 @@ void QualifyProjected(const std::vector<std::string>& modes)
         noncollocated_mass_difference = RelativeDifference(
           PhysicalMassDiagonal(fixture.space, collocated), PhysicalMassDiagonal(fixture.space, fixture.invrho));
         MFEM_VERIFY(noncollocated_mass_difference > 1.0e-8,
-                    "Q2 heterogeneous fixture does not distinguish GL7 mass from nodal GL6 scaling.");
+                    "Q2 heterogeneous fixture does not distinguish actual GL7 mass from GL6 mass scaling.");
       }
     }
     for (const auto& mode : modes)
@@ -528,8 +554,20 @@ void QualifyProjected(const std::vector<std::string>& modes)
                   budget2.absolute_l2 * std::sqrt(Dot(rhs, rhs))) / scale) + 5.0e-10;
         MFEM_VERIFY(symmetry <= symmetry_limit, "Projected action exceeded arithmetic symmetry envelope.");
         const double physical_error = RelativeDifference(actual, exact[phase]);
-        if ((geometry == "cartesian" || geometry == "rotated-stretch") && phase < 2)
+        // Only GL's collocated affine mass gives the original separable
+        // exact-inverse special case. GLL retains a consistent mass matrix;
+        // its projected action is checked against the independent surrogate.
+        if (basis == BasisType::GaussLegendre &&
+            (geometry == "cartesian" || geometry == "rotated-stretch") && phase < 2)
         { CheckCorrection(MeasureError(actual, exact[phase]), budget, mode); }
+        if (phase == 1)
+        {
+          Vector scaled_initial(first_action); scaled_initial *= 0.45;
+          // Compare two rounded actions; each contributes its forward bound.
+          const OracleBudget scaling_budget{2.0L * budget.absolute_l2,
+                                             2.0L * budget.absolute_max};
+          CheckCorrection(MeasureError(actual, scaled_initial), scaling_budget, mode);
+        }
         if (phase == 0)
         {
           if (first_action.Size() == n && first_action.Norml2() > 0.0)
@@ -538,11 +576,13 @@ void QualifyProjected(const std::vector<std::string>& modes)
           first_action = actual;
         }
         std::cout << std::setprecision(17)
-                  << "local_tensor_projected_qualification geometry=" << geometry << " backend=" << mode
+                  << "local_tensor_projected_qualification basis=" << basis_name
+                  << " geometry=" << geometry << " backend=" << mode
                   << " p=5 phase=" << phase << " mass_q1d=" << int(std::sqrt(fixture.mass_rule.GetNPoints()))
                   << " diffusion_q1d=6 boundary_classes=" << reference.ClassCount()
                   << " shared_class_diagonal_variation=" << reference.DiagonalVariation()
                   << " gl6_vs_actual_mass_relative=" << noncollocated_mass_difference
+                  << " consistent_mass_offdiagonal_relative=" << mass_offdiagonal[phase]
                   << " physical_block_relative=" << assembly_error
                   << " surrogate_relative_l2=" << error.relative_l2
                   << " surrogate_relative_max=" << error.relative_max
@@ -560,9 +600,11 @@ void QualifyProjected(const std::vector<std::string>& modes)
       first_action = 0.0;
     }
   }
-  std::cout << "local_tensor_projected_test passed modes=" << modes.size()
+  std::cout << "local_tensor_projected_test passed basis=" << basis_name << " modes=" << modes.size()
             << " initial_physical_blocks_unchanged=true surrogate_spd=true"
-            << " gl7_mass_diagonal=true class_basis_shared=true per_element_diagonal=true\n";
+            << " gl7_mass_diagonal=true class_basis_shared=true per_element_diagonal=true"
+            << " current_mass_uniform_scaling=true"
+            << " gll_consistent_mass_not_diagonal=" << int(basis == BasisType::GaussLobatto) << '\n';
 }
 
 void BenchmarkProjected(const Options& options, const std::vector<std::string>& modes)

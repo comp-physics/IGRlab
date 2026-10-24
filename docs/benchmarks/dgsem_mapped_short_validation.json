@@ -1,0 +1,98 @@
+{
+  "status": "compact-metadata-verified",
+  "run_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-mapped-throughput-20261023/short-r1/payload/case",
+  "raw_sha256": "72131c0833d27d59a5d83ac567b717ba2c74cc220305f410b5fc285d7269ce7b",
+  "qualification_sha256": "b4ebfd2d7ebe55c211749d8d46b5db505676a08bc2c73f55026020b72e71cee7",
+  "source_commit": "96c7ea05a6cd8a99c69008e85e242f66fba31876",
+  "gpu": {
+    "index": 0,
+    "uuid": "GPU-bd5ab5e3-579f-fd2f-8b37-d8de3cb90b9d",
+    "name": "NVIDIA GH200 120GB",
+    "cuda_visible_devices": "0"
+  },
+  "arms": {
+    "reference": {
+      "application_s": 190.89754529856145,
+      "external_to_RunEulerCase_s": 25.746405395561453,
+      "setup_initial_output_s": 62.726983324,
+      "advancing_cfl_s": 64.394366303,
+      "scheduled_output_s": 0.0,
+      "diagnostics_s": 0.033069105,
+      "final_output_postloop_s": 37.996721171000004
+    },
+    "fixed-baseline": {
+      "application_s": 128.3206553272903,
+      "external_to_RunEulerCase_s": 23.910428729290302,
+      "setup_initial_output_s": 54.685450942,
+      "advancing_cfl_s": 12.916855134,
+      "scheduled_output_s": 0.0,
+      "diagnostics_s": 0.033851985,
+      "final_output_postloop_s": 36.774068537
+    },
+    "fixed-improved": {
+      "application_s": 88.17171369772404,
+      "external_to_RunEulerCase_s": 24.591859417724045,
+      "setup_initial_output_s": 35.967152964,
+      "advancing_cfl_s": 10.310682628999999,
+      "scheduled_output_s": 0.0,
+      "diagnostics_s": 0.033593740999999996,
+      "final_output_postloop_s": 17.268424946
+    }
+  },
+  "fields": {
+    "method_accuracy": {
+      "status": "passed",
+      "errors": {
+        "density": {
+          "normalized_l2": 6.96048408826353e-10,
+          "normalized_linf_at_gl_points": 1.3904828178785647e-08
+        },
+        "momentum_x": {
+          "normalized_l2": 2.875811589055368e-08,
+          "normalized_linf_at_gl_points": 6.735352148668649e-08
+        },
+        "momentum_y": {
+          "normalized_l2": 2.875811586440459e-08,
+          "normalized_linf_at_gl_points": 6.735351091858636e-08
+        },
+        "energy": {
+          "normalized_l2": 2.3792565209292507e-09,
+          "normalized_linf_at_gl_points": 1.9514041431455527e-08
+        }
+      },
+      "sigma": 0.23021458219661
+    },
+    "execution_equivalence": {
+      "status": "passed",
+      "errors": {
+        "density": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "energy": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        }
+      },
+      "sigma": 0.0
+    }
+  },
+  "retained_VTU_count": 0,
+  "job": "3446717",
+  "scope": "Fixed-large mesh short t=.0025 correctness only; these wall timings are not a full-run speedup claim.",
+  "all_analysis_on_DeltaAI": true,
+  "large_data_downloaded": false,
+  "all_short_snapshots_deleted_after_gates": true
+}

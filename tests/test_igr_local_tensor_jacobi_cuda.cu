@@ -828,6 +828,7 @@ void QualifyBackends(const std::vector<std::string>& modes)
 struct Options
 {
   bool benchmark = false, profile = false, qualify = false, qualify_projected = false, help = false;
+  int projected_basis = BasisType::GaussLegendre;
   int mesh_n = 512, repetitions = 64, warmup = 8, rounds = 3;
   std::string backend = "all", reference = "exact", write_mapped_mesh;
 };
@@ -844,7 +845,12 @@ Options ParseOptions(int argc, char** argv)
     if (arg == "--benchmark") { options.benchmark = true; }
     else if (arg == "--profile") { options.benchmark = true; options.profile = true; }
     else if (arg == "--qualify-backends") { options.qualify = true; }
-    else if (arg == "--qualify-projected") { options.qualify_projected = true; options.reference = "projected"; }
+    else if (arg == "--qualify-projected" || arg == "--qualify-projected-gll")
+    {
+      options.qualify_projected = true; options.reference = "projected";
+      options.projected_basis = arg == "--qualify-projected-gll"
+        ? BasisType::GaussLobatto : BasisType::GaussLegendre;
+    }
     else if (arg == "--reference") { options.reference = value(); }
     else if (arg == "--write-mapped-mesh") { options.write_mapped_mesh = value(); }
     else if (arg == "--backend") { options.backend = value(); }
@@ -864,9 +870,10 @@ Options ParseOptions(int argc, char** argv)
                       int(options.benchmark) + int(!options.write_mapped_mesh.empty());
   MFEM_VERIFY(actions <= 1, "Select one qualification, benchmark or mesh-generation action.");
   MFEM_VERIFY(!options.qualify || options.reference == "exact", "--qualify-backends checks the exact reference.");
-  MFEM_VERIFY(!options.qualify_projected || options.reference == "projected", "--qualify-projected requires projected reference.");
+  MFEM_VERIFY(!options.qualify_projected || options.reference == "projected",
+              "Projected GL/GLL qualification requires projected reference.");
   MFEM_VERIFY(argc == 1 || options.help || actions == 1,
-              "Select --qualify-backends, --qualify-projected, --benchmark, --profile or --write-mapped-mesh.");
+              "Select --qualify-backends, --qualify-projected, --qualify-projected-gll, --benchmark, --profile or --write-mapped-mesh.");
   if (options.profile)
   {
     MFEM_VERIFY(options.backend != "all", "--profile requires one explicit --backend.");
@@ -1117,7 +1124,8 @@ void ExpectedRejection(const std::string& kind)
     { y.SetSize(2); y[0] = x[0] + 0.1 * x[0] * x[1]; y[1] = x[1]; });
   }
   ParMesh mesh(MPI_COMM_WORLD, serial);
-  DG_FECollection collection(5, 2, BasisType::GaussLegendre);
+  DG_FECollection collection(5, 2, kind == "exact-gll"
+    ? BasisType::GaussLobatto : BasisType::GaussLegendre);
   ParFiniteElementSpace space(&mesh, &collection);
   const auto& rule = IntRules.Get(Geometry::SQUARE, 11);
   QuadratureSpace qs(mesh, rule); QuadratureFunction invrho(qs);
@@ -1162,7 +1170,8 @@ int main(int argc, char** argv)
       std::cout << "local_tensor_projected_unexpected_dense_admission\n";
       return 0;
     }
-    MFEM_VERIFY(kind == "skew" || kind == "curved" || kind == "nonseparable", "Unknown rejection fixture.");
+    MFEM_VERIFY(kind == "skew" || kind == "curved" || kind == "nonseparable" ||
+                  kind == "exact-gll", "Unknown rejection fixture.");
     ExpectedRejection(kind);
     return 0;
   }
@@ -1171,6 +1180,7 @@ int main(int argc, char** argv)
   {
     std::cout << "Usage: dg_igr_local_tensor_jacobi_test [--qualify-backends [--backend MODE] | "
                  "--qualify-projected [--backend all|MODE] | "
+                 "--qualify-projected-gll [--backend all|MODE] | "
                  "--benchmark [--mesh-n 512] [--backend all|MODE] [--repetitions 64] "
                  "[--warmup 8] [--rounds 3] [--reference exact|projected] | --profile --backend MODE "
                  "[--reference exact|projected] [--mesh-n 512] [--repetitions 1] [--warmup 0] | "
@@ -1196,7 +1206,7 @@ int main(int argc, char** argv)
       return 77;
     }
     if (options.qualify) { QualifyBackends(modes); }
-    else if (options.qualify_projected) { QualifyProjected(modes); }
+    else if (options.qualify_projected) { QualifyProjected(modes, options.projected_basis); }
     else if (options.reference == "projected") { BenchmarkProjected(options, modes); }
     else { Benchmark(options, modes); }
     return 0;

@@ -2030,6 +2030,11 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   add_test(NAME dg_igr_element_block_jacobi_cuda COMMAND dg_igr_element_block_jacobi_test)
   set_tests_properties(dg_igr_element_block_jacobi_cuda PROPERTIES
     LABELS "cuda;igr;element-block" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_dgsem_mapped_fixed_cuda
+    COMMAND dg_igr_element_block_jacobi_test --qualify-dgsem-mapped)
+  set_tests_properties(dg_igr_dgsem_mapped_fixed_cuda PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;element-block" TIMEOUT 180 RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
 
   add_executable(dg_igr_local_tensor_jacobi_test test_igr_local_tensor_jacobi_cuda.cu)
   target_link_libraries(dg_igr_local_tensor_jacobi_test PRIVATE igr_mfem mfem MPI::MPI_CXX)
@@ -2055,6 +2060,19 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_backends PROPERTIES
     LABELS "cuda;igr;element-block;tensor;projected;mapped;precision" TIMEOUT 600 RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_gll_simt
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected-gll --backend simt-fp64)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_gll_simt PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;tensor" TIMEOUT 180 RUN_SERIAL TRUE)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_gll_wmma
+    COMMAND dg_igr_local_tensor_jacobi_test --qualify-projected-gll --backend wmma-factor-fp64)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_gll_wmma PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;tensor" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  add_test(NAME dg_igr_local_tensor_jacobi_cuda_reject_exact_gll
+    COMMAND dg_igr_local_tensor_jacobi_test --reject-exact-gll)
+  set_tests_properties(dg_igr_local_tensor_jacobi_cuda_reject_exact_gll PROPERTIES
+    LABELS "cuda;igr;dgsem;mapped;tensor;negative" TIMEOUT 120 RUN_SERIAL TRUE WILL_FAIL TRUE)
+
   add_test(NAME dg_igr_local_tensor_jacobi_cuda_projected_reject_dense
     COMMAND dg_igr_local_tensor_jacobi_test --reject-projected-dense)
   set_tests_properties(dg_igr_local_tensor_jacobi_cuda_projected_reject_dense PROPERTIES

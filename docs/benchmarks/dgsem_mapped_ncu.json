@@ -1,0 +1,283 @@
+{
+  "schema": "dgsem-ncu-compact-v1",
+  "source_commit": "96c7ea05a6cd8a99c69008e85e242f66fba31876",
+  "binary_sha256": "6338e9b0a1502c26af26706b80a726707da0e2dfe3c4623b667913524658694b",
+  "captured_launches": 10,
+  "summarized_launches": 6,
+  "summary_predeclared": true,
+  "families": {
+    "IGRCompactTensorVolumeKernel": {
+      "captured_records": 4,
+      "summarized_launch_indices": [
+        0,
+        2
+      ],
+      "native_ids": [
+        "0",
+        "2"
+      ],
+      "configuration": {
+        "family": "IGRCompactTensorVolumeKernel",
+        "name": "igrlab::igr_internal::<unnamed>::IGRCompactTensorVolumeKernel(int, const int *, const double *, const double *, const double *, const double *, double *)",
+        "grid": [
+          65536,
+          1,
+          1
+        ],
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "static_shared": 9040,
+        "dynamic_shared": 0,
+        "nsys_registers_per_thread": 40,
+        "nsys_local_memory_per_thread": 0
+      },
+      "mean_metrics": {
+        "gpu__time_duration.sum": 778672.0,
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed": 66.1,
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 19.335,
+        "dram__bytes_read.sum": 532753024.0,
+        "dram__bytes_write.sum": 72901120.0,
+        "lts__t_bytes.sum": 931612304.0,
+        "l1tex__t_bytes.sum": 784273360.0,
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 11.33,
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 18.36,
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.59,
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 30.15,
+        "sm__warps_active.avg.pct_of_peak_sustained_active": 72.745,
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+        "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+        "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+        "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 758120448.0,
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 16.625,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 522733.0,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 21687.0,
+        "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 8.95,
+        "launch__registers_per_thread": 40.0,
+        "launch__stack_size": 1568.0,
+        "launch__occupancy_limit_registers": 12.0,
+        "launch__occupancy_limit_shared_mem": 13.0,
+        "launch__occupancy_limit_blocks": 32.0,
+        "launch__occupancy_limit_warps": 16.0
+      }
+    },
+    "InteriorFaceDGDiffusionTensorLiftRecord2DWarp": {
+      "captured_records": 4,
+      "summarized_launch_indices": [
+        1,
+        3
+      ],
+      "native_ids": [
+        "1",
+        "3"
+      ],
+      "configuration": {
+        "family": "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+        "name": "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp>(int, T1)",
+        "grid": [
+          130816,
+          1,
+          1
+        ],
+        "block": [
+          32,
+          1,
+          4
+        ],
+        "static_shared": 0,
+        "dynamic_shared": 0,
+        "nsys_registers_per_thread": 38,
+        "nsys_local_memory_per_thread": 0
+      },
+      "mean_metrics": {
+        "gpu__time_duration.sum": 488512.0,
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed": 57.185,
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 19.785,
+        "dram__bytes_read.sum": 295377792.0,
+        "dram__bytes_write.sum": 93443968.0,
+        "lts__t_bytes.sum": 873137648.0,
+        "l1tex__t_bytes.sum": 6563861008.0,
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 61.065,
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 5.515,
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 1.45,
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.94,
+        "sm__warps_active.avg.pct_of_peak_sustained_active": 68.215,
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+        "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+        "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+        "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 282562560.0,
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 14.295,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 0.0,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 0.0,
+        "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.0,
+        "launch__registers_per_thread": 38.0,
+        "launch__stack_size": 1568.0,
+        "launch__occupancy_limit_registers": 12.0,
+        "launch__occupancy_limit_shared_mem": 32.0,
+        "launch__occupancy_limit_blocks": 32.0,
+        "launch__occupancy_limit_warps": 16.0
+      }
+    },
+    "FusedEulerResidualKernel": {
+      "captured_records": 2,
+      "summarized_launch_indices": [
+        4,
+        9
+      ],
+      "native_ids": [
+        "4",
+        "9"
+      ],
+      "configuration": {
+        "family": "FusedEulerResidualKernel",
+        "name": "void mfem::dgsem::<unnamed>::FusedEulerResidualKernel<(int)6, (bool)0, (bool)0>(mfem::dgsem::<unnamed>::FusedResidualData)",
+        "grid": [
+          262144,
+          1,
+          1
+        ],
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "static_shared": 5760,
+        "dynamic_shared": 0,
+        "nsys_registers_per_thread": 60,
+        "nsys_local_memory_per_thread": 0
+      },
+      "mean_metrics": {
+        "gpu__time_duration.sum": 1352048.0,
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed": 32.265,
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 24.605,
+        "dram__bytes_read.sum": 969245184.0,
+        "dram__bytes_write.sum": 369041536.0,
+        "lts__t_bytes.sum": 2435801696.0,
+        "l1tex__t_bytes.sum": 3917529312.0,
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 47.1,
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 3.75,
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.35,
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": 0.41,
+        "sm__warps_active.avg.pct_of_peak_sustained_active": 44.46,
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": 0.0,
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": 0.0,
+        "smsp__sass_inst_executed_op_local_ld.sum": 0.0,
+        "smsp__sass_inst_executed_op_local_st.sum": 0.0,
+        "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": 1310195712.0,
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": 16.17,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": 4919221.5,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": 70346.0,
+        "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 25.055,
+        "launch__registers_per_thread": 60.0,
+        "launch__stack_size": 1568.0,
+        "launch__occupancy_limit_registers": 8.0,
+        "launch__occupancy_limit_shared_mem": 19.0,
+        "launch__occupancy_limit_blocks": 32.0,
+        "launch__occupancy_limit_warps": 16.0
+      }
+    }
+  },
+  "coverage": {
+    "complete": true,
+    "launches_complete": true,
+    "supported_counters_complete": true,
+    "native_launch_count": 10,
+    "counts": {
+      "IGRCompactTensorVolumeKernel": 4,
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp": 4,
+      "FusedEulerResidualKernel": 2
+    },
+    "native_order": [
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "FusedEulerResidualKernel",
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "FusedEulerResidualKernel"
+    ],
+    "expected_order": [
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "FusedEulerResidualKernel",
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "IGRCompactTensorVolumeKernel",
+      "InteriorFaceDGDiffusionTensorLiftRecord2DWarp",
+      "FusedEulerResidualKernel"
+    ],
+    "missing_metrics": [],
+    "unsupported_metrics": [],
+    "mismatched_native_launches": [],
+    "expected_launch_count": 10,
+    "historical_fixed_six_launch_test": false,
+    "native_NVTX_RK_and_functional_ancestry": true,
+    "selected_NVTX_ordinal_guard": "Bound command --nvtx-include RK\\/Step/ --range-filter no::1200; native RK/Step ancestry required"
+  },
+  "metric_units": {
+    "gpu__time_duration.sum": "ns",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": "%",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": "%",
+    "dram__bytes_read.sum": "byte",
+    "dram__bytes_write.sum": "byte",
+    "lts__t_bytes.sum": "byte",
+    "l1tex__t_bytes.sum": "byte",
+    "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": "%",
+    "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": "%",
+    "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": "%",
+    "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct": "%",
+    "sm__warps_active.avg.pct_of_peak_sustained_active": "%",
+    "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": "sector",
+    "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum": "sector",
+    "smsp__sass_inst_executed_op_local_ld.sum": "inst",
+    "smsp__sass_inst_executed_op_local_st.sum": "inst",
+    "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum": "inst",
+    "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed": "%",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": "",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": "",
+    "smsp__warp_issue_stalled_barrier_per_warp_active.pct": "%",
+    "launch__registers_per_thread": "register/thread",
+    "launch__stack_size": "",
+    "launch__occupancy_limit_registers": "block",
+    "launch__occupancy_limit_shared_mem": "block",
+    "launch__occupancy_limit_blocks": "block",
+    "launch__occupancy_limit_warps": "block"
+  },
+  "interpretation_limits": [
+    "One fresh continuously evolved improved application; no restart or replayed saved state.",
+    "The proven NVTX CLI occurrence filter no::1200 selects RK/Step occurrence1200. Native CSV must contain RK/Step ancestry; no new absolute-step payload is available.",
+    "Ten launches are captured in order V,F,V,F,E,V,F,V,F,E: four volume/four face/two Euler. All ten records and all counters are preserved.",
+    "The summary uses only predeclared first-two-per-family launch indices V[0,2], F[1,3], E[4,9]. Euler samples span stages0/1; volume/face summary samples are stage0.",
+    "Standard kernel replay, all-cache flush, dynamic boost and unlocked clocks perturb runtime. NCU durations are not application timing or speedup evidence.",
+    "No unique bottleneck follows from stall percentages. Local-memory counters do not establish compiler spills or zero allocated stack.",
+    "All21 requested counters and LaunchStats fields must be present for all10 launches. Unsupported/missing measurements are null, never measured zero.",
+    "Diagnostic save interval.1 and native VTK match the qualified Nsight GPU configuration; full physical qualification uses its original.02 cadence and writer policy.",
+    "Profiler termination after ten launches is intentional partial diagnosis, not a completed physical trajectory or inferred physical failure."
+  ],
+  "gpu": {
+    "index": 0,
+    "uuid": "GPU-961a75de-5e0f-dfa6-dbf1-36bcd07b960c",
+    "name": "NVIDIA GH200 120GB",
+    "cuda_visible_devices": "0"
+  },
+  "metrics": {
+    "path": "/tmp/igrlab-3446848-oqw17xf9/run/ncu/metrics.json",
+    "bytes": 33998,
+    "sha256": "c469bdfaef5f2065d48663b8e247235b8793e2818d559e2b32819a2e5caed5d4"
+  },
+  "job": "3446848",
+  "status": "counter-qualified",
+  "native_report_sha256": "d5fb4ee83c8c5e38f8d1bf813f3ef44dec0580d872bae2550e0970167c08dc04",
+  "compact_metrics_sha256": "8c26464b6aaa9e554ab848ab4b259b0affb7030b2689c65a1822b2cc3a9c8ffb",
+  "full_run_sha256": "72f0d2b766bed7c565c006836defeeedde7f34f150dac7a55d05fc2f1e35b6dd",
+  "full_qualification_sha256": "7990a8c7edf10216da0d864960510d3f8315ce3d4e647d6cc3d1fb37aa10d437"
+}

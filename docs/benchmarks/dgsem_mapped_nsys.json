@@ -1,0 +1,871 @@
+{
+  "schema": "dgsem-mapped-profile-compact-v1",
+  "status": "capture-pair-qualified",
+  "source_commit": "96c7ea05a6cd8a99c69008e85e242f66fba31876",
+  "case_sha256": "7e089496ac67b7254631e140d3a6f1b9c44605b05fe3a49a5652cb562a6c5d92",
+  "binary_sha256": "6338e9b0a1502c26af26706b80a726707da0e2dfe3c4623b667913524658694b",
+  "short_qualification_sha256": "b4ebfd2d7ebe55c211749d8d46b5db505676a08bc2c73f55026020b72e71cee7",
+  "gpu": {
+    "index": 0,
+    "uuid": "GPU-bd5ab5e3-579f-fd2f-8b37-d8de3cb90b9d",
+    "name": "NVIDIA GH200 120GB",
+    "cuda_visible_devices": "0"
+  },
+  "delay_seconds": 120.0,
+  "duration_seconds": 15,
+  "comparison": {
+    "same_GPU": true,
+    "rows": [
+      {
+        "label": "GLL coefficients/RHS and A/P refresh",
+        "baseline_gpu_union_ms_per_stage": 6.196818721014493,
+        "improved_gpu_union_ms_per_stage": 1.9391637343265054
+      },
+      {
+        "label": "Current A + residual",
+        "baseline_gpu_union_ms_per_stage": 2.8640799411231885,
+        "improved_gpu_union_ms_per_stage": 2.887989538175047
+      },
+      {
+        "label": "P + solution update",
+        "baseline_gpu_union_ms_per_stage": 0.43469660869565224,
+        "improved_gpu_union_ms_per_stage": 0.4379780415890751
+      },
+      {
+        "label": "DGSEM Euler residual and faces",
+        "baseline_gpu_union_ms_per_stage": 2.8942199411231884,
+        "improved_gpu_union_ms_per_stage": 2.8922199950341403
+      },
+      {
+        "label": "DGSEM CFL reductions",
+        "baseline_gpu_union_ms_per_stage": 0.043344550724637686,
+        "improved_gpu_union_ms_per_stage": 0.04388785040347611
+      },
+      {
+        "label": "RK common work",
+        "baseline_gpu_union_ms_per_stage": 0.4170063496376812,
+        "improved_gpu_union_ms_per_stage": 0.4160982656734947
+      },
+      {
+        "label": "Other recorded work",
+        "baseline_gpu_union_ms_per_stage": 0.5290654791666667,
+        "improved_gpu_union_ms_per_stage": 0.5289789484792055
+      }
+    ],
+    "baseline_whole_RK": {
+      "selected_complete_steps": 368,
+      "gpu_union": {
+        "samples": 368,
+        "mean_ms": 40.13769477445652,
+        "median_ms": 40.1363035,
+        "minimum_ms": 39.939008,
+        "p95_ms": 40.277007999999995,
+        "maximum_ms": 40.379647
+      },
+      "kernel_sum_ms_per_RK": 37.42861398913044,
+      "host_elapsed": {
+        "samples": 368,
+        "mean_ms": 40.498360086956524,
+        "median_ms": 40.484511999999995,
+        "minimum_ms": 39.685792,
+        "p95_ms": 40.6542672,
+        "maximum_ms": 42.2872
+      }
+    },
+    "improved_whole_RK": {
+      "selected_complete_steps": 537,
+      "gpu_union": {
+        "samples": 537,
+        "mean_ms": 27.43894912104283,
+        "median_ms": 27.462304,
+        "minimum_ms": 27.23648,
+        "p95_ms": 27.536102399999997,
+        "maximum_ms": 27.624416
+      },
+      "kernel_sum_ms_per_RK": 24.72540382309125,
+      "host_elapsed": {
+        "samples": 537,
+        "mean_ms": 27.744536968342643,
+        "median_ms": 27.761312,
+        "minimum_ms": 27.005727999999998,
+        "p95_ms": 27.8496896,
+        "maximum_ms": 28.266816
+      }
+    },
+    "interpretation": "Descriptive recorded-GPU comparison at separate evolved states; no application speedup or lossless-acquisition claim."
+  },
+  "physical_completion_claim": false,
+  "application_speedup_claim": false,
+  "acquisition_losslessness_claim": false,
+  "job": "3446741",
+  "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-mapped-throughput-20261023/profile-r1",
+  "arms": {
+    "fixed-baseline": {
+      "selected_counts": {
+        "selected_rk_steps": 368,
+        "selected_stages": 1104,
+        "current_A_scopes": 2208,
+        "local_inverse_P_scopes": 2208,
+        "sweep_scopes": 2208,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 2208
+      },
+      "whole_RK": {
+        "selected_complete_steps": 368,
+        "gpu_union": {
+          "samples": 368,
+          "mean_ms": 40.13769477445652,
+          "median_ms": 40.1363035,
+          "minimum_ms": 39.939008,
+          "p95_ms": 40.277007999999995,
+          "maximum_ms": 40.379647
+        },
+        "kernel_sum_ms_per_RK": 37.42861398913044,
+        "host_elapsed": {
+          "samples": 368,
+          "mean_ms": 40.498360086956524,
+          "median_ms": 40.484511999999995,
+          "minimum_ms": 39.685792,
+          "p95_ms": 40.6542672,
+          "maximum_ms": 42.2872
+        }
+      },
+      "phases": [
+        {
+          "label": "GLL coefficients/RHS and A/P refresh",
+          "phases": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_union_ms_per_stage": 6.196818721014493,
+          "kernel_sum_ms_per_stage": 6.162296807971015,
+          "activity_records": 20976,
+          "kernel_records": 18768
+        },
+        {
+          "label": "Current A + residual",
+          "phases": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_union_ms_per_stage": 2.8640799411231885,
+          "kernel_sum_ms_per_stage": 2.8640799411231885,
+          "activity_records": 6624,
+          "kernel_records": 6624
+        },
+        {
+          "label": "P + solution update",
+          "phases": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_union_ms_per_stage": 0.43469660869565224,
+          "kernel_sum_ms_per_stage": 0.43469660869565224,
+          "activity_records": 2208,
+          "kernel_records": 2208
+        },
+        {
+          "label": "DGSEM Euler residual and faces",
+          "phases": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_union_ms_per_stage": 2.8942199411231884,
+          "kernel_sum_ms_per_stage": 2.5547804048913045,
+          "activity_records": 12144,
+          "kernel_records": 7728
+        },
+        {
+          "label": "DGSEM CFL reductions",
+          "phases": [
+            "Euler_CFL_reductions"
+          ],
+          "gpu_union_ms_per_stage": 0.043344550724637686,
+          "kernel_sum_ms_per_stage": 0.043344550724637686,
+          "activity_records": 4416,
+          "kernel_records": 4416
+        },
+        {
+          "label": "RK common work",
+          "phases": [
+            "RK_common_other"
+          ],
+          "gpu_union_ms_per_stage": 0.4170063496376812,
+          "kernel_sum_ms_per_stage": 0.4170063496376812,
+          "activity_records": 1840,
+          "kernel_records": 1840
+        },
+        {
+          "label": "Other recorded work",
+          "phases": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_union_ms_per_stage": 0.5290654791666667,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 3312,
+          "kernel_records": 0
+        }
+      ],
+      "rejected_RK_steps": 1,
+      "rejected_for_missing_recorded_GPU_activity": 1,
+      "profiler_diagnostics": [
+        {
+          "timestamp": -119172198080,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+          "globalPid": 319333351817216
+        },
+        {
+          "timestamp": 981509746,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 981558672,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 319333452480512
+        },
+        {
+          "timestamp": 981560848,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 319333452480512
+        },
+        {
+          "timestamp": 981562128,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 319333351817216
+        },
+        {
+          "timestamp": 981565648,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "CUDA profiling might have not been started correctly.",
+          "globalPid": 319333452480512
+        },
+        {
+          "timestamp": 981566448,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No CUDA events collected. Does the process use CUDA?",
+          "globalPid": 319333452480512
+        },
+        {
+          "timestamp": 981567312,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected.",
+          "globalPid": 319333351817216
+        },
+        {
+          "timestamp": 981569392,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 319333452480512
+        },
+        {
+          "timestamp": 981571344,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 319333351817216
+        }
+      ],
+      "work_counts_match_expected": true,
+      "audit_sha256": "5e29e954ac08e6a45d123383032f72cf54185527deb71b63be3cd7bc616acb56",
+      "native_report_sha256": "1bc4adea3476c7311305814fa7dccba2df4502ae152ed2cd61d3d2ad7f77b841",
+      "top_recorded_kernels": [
+        {
+          "phase": "sigma_current_A_plus_residual",
+          "kernel_name": "igrlab::igr_internal::<unnamed>::IGRCompactTensorVolumeKernel(int, const int *, const double *, const double *, const double *, const double *, double *)",
+          "calls": 2208,
+          "calls_per_stage": 2.0,
+          "kernel_sum_ms_per_stage": 1.522911971014493,
+          "gpu_union_ms_per_stage": 1.522911971014493,
+          "duration": {
+            "samples": 2208,
+            "mean_ms": 0.7614559855072464,
+            "median_ms": 0.7612,
+            "minimum_ms": 0.7510399999999999,
+            "p95_ms": 0.769952,
+            "maximum_ms": 0.787808
+          },
+          "configurations": [
+            {
+              "block": [
+                128,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                65536,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 40,
+              "static_shared_bytes": 9040,
+              "launches": 2208
+            }
+          ]
+        },
+        {
+          "phase": "sigma_coefficient_source_interpolation",
+          "kernel_name": "void mfem::CuKernel2D<void mfem::internal::quadrature_interpolator::Derivatives2D<(mfem::QVectorLayout)1, (bool)1, (int)0, (int)0, (int)0, (int)1>(int, const double *, const double *, const double *, const double *, double *, int, int, int, int)::[lambda(int) (instance 1)]>(int, T1)",
+          "calls": 1104,
+          "calls_per_stage": 1.0,
+          "kernel_sum_ms_per_stage": 1.4313755652173914,
+          "gpu_union_ms_per_stage": 1.4313755652173914,
+          "duration": {
+            "samples": 1104,
+            "mean_ms": 1.4313755652173914,
+            "median_ms": 1.430544,
+            "minimum_ms": 1.4152959999999999,
+            "p95_ms": 1.4435056,
+            "maximum_ms": 1.4547839999999999
+          },
+          "configurations": [
+            {
+              "block": [
+                6,
+                6,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                262144,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 56,
+              "static_shared_bytes": 7840,
+              "launches": 1104
+            }
+          ]
+        },
+        {
+          "phase": "Euler_spatial_RHS",
+          "kernel_name": "void mfem::dgsem::<unnamed>::FusedEulerResidualKernel<(int)6, (bool)0, (bool)0>(mfem::dgsem::<unnamed>::FusedResidualData)",
+          "calls": 1104,
+          "calls_per_stage": 1.0,
+          "kernel_sum_ms_per_stage": 1.3729429583333332,
+          "gpu_union_ms_per_stage": 1.3729429583333332,
+          "duration": {
+            "samples": 1104,
+            "mean_ms": 1.3729429583333332,
+            "median_ms": 1.3739839999999999,
+            "minimum_ms": 1.36272,
+            "p95_ms": 1.3796111999999998,
+            "maximum_ms": 1.388992
+          },
+          "configurations": [
+            {
+              "block": [
+                128,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                262144,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 60,
+              "static_shared_bytes": 5760,
+              "launches": 1104
+            }
+          ]
+        },
+        {
+          "phase": "sigma_exact_face_coefficient_setup",
+          "kernel_name": "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceSideDensityProjection2D>(int, T1)",
+          "calls": 1104,
+          "calls_per_stage": 1.0,
+          "kernel_sum_ms_per_stage": 1.3557891005434783,
+          "gpu_union_ms_per_stage": 1.3557891005434783,
+          "duration": {
+            "samples": 1104,
+            "mean_ms": 1.3557891005434781,
+            "median_ms": 1.3493439999999999,
+            "minimum_ms": 1.346304,
+            "p95_ms": 1.3723151999999998,
+            "maximum_ms": 1.3768639999999999
+          },
+          "configurations": [
+            {
+              "block": [
+                12,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                523264,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 40,
+              "static_shared_bytes": 0,
+              "launches": 1104
+            }
+          ]
+        },
+        {
+          "phase": "sigma_coefficient_source_interpolation",
+          "kernel_name": "void mfem::CuKernel2D<void mfem::internal::quadrature_interpolator::Values2D<(mfem::QVectorLayout)1, (int)0, (int)0, (int)0, (int)1>(int, const double *, const double *, double *, int, int, int)::[lambda(int) (instance 1)]>(int, T1)",
+          "calls": 2208,
+          "calls_per_stage": 2.0,
+          "kernel_sum_ms_per_stage": 1.3438348985507247,
+          "gpu_union_ms_per_stage": 1.3438348985507247,
+          "duration": {
+            "samples": 2208,
+            "mean_ms": 0.6719174492753622,
+            "median_ms": 0.67264,
+            "minimum_ms": 0.629344,
+            "p95_ms": 0.7078399999999999,
+            "maximum_ms": 0.7188479999999999
+          },
+          "configurations": [
+            {
+              "block": [
+                7,
+                7,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                262144,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 32,
+              "static_shared_bytes": 4704,
+              "launches": 1104
+            },
+            {
+              "block": [
+                6,
+                6,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                262144,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 32,
+              "static_shared_bytes": 4704,
+              "launches": 1104
+            }
+          ]
+        }
+      ]
+    },
+    "fixed-improved": {
+      "selected_counts": {
+        "selected_rk_steps": 537,
+        "selected_stages": 1611,
+        "current_A_scopes": 3222,
+        "local_inverse_P_scopes": 3222,
+        "sweep_scopes": 3222,
+        "current_A_scopes_per_stage": 2.0,
+        "local_inverse_P_scopes_per_stage": 2.0,
+        "sweep_scopes_per_stage": 2.0,
+        "residual_scopes": 3222
+      },
+      "whole_RK": {
+        "selected_complete_steps": 537,
+        "gpu_union": {
+          "samples": 537,
+          "mean_ms": 27.43894912104283,
+          "median_ms": 27.462304,
+          "minimum_ms": 27.23648,
+          "p95_ms": 27.536102399999997,
+          "maximum_ms": 27.624416
+        },
+        "kernel_sum_ms_per_RK": 24.72540382309125,
+        "host_elapsed": {
+          "samples": 537,
+          "mean_ms": 27.744536968342643,
+          "median_ms": 27.761312,
+          "minimum_ms": 27.005727999999998,
+          "p95_ms": 27.8496896,
+          "maximum_ms": 28.266816
+        }
+      },
+      "phases": [
+        {
+          "label": "GLL coefficients/RHS and A/P refresh",
+          "phases": [
+            "sigma_coefficient_source_interpolation",
+            "sigma_exact_face_coefficient_setup",
+            "sigma_public_form_RHS_assembly",
+            "sigma_preconditioner_refresh",
+            "sigma_volume_operator_coefficient_refresh",
+            "sigma_assembly_other"
+          ],
+          "gpu_union_ms_per_stage": 1.9391637343265054,
+          "kernel_sum_ms_per_stage": 1.902952367473619,
+          "activity_records": 24165,
+          "kernel_records": 20943
+        },
+        {
+          "label": "Current A + residual",
+          "phases": [
+            "sigma_current_A_plus_residual"
+          ],
+          "gpu_union_ms_per_stage": 2.887989538175047,
+          "kernel_sum_ms_per_stage": 2.887989538175047,
+          "activity_records": 9666,
+          "kernel_records": 9666
+        },
+        {
+          "label": "P + solution update",
+          "phases": [
+            "sigma_P_plus_solution_update"
+          ],
+          "gpu_union_ms_per_stage": 0.4379780415890751,
+          "kernel_sum_ms_per_stage": 0.4379780415890751,
+          "activity_records": 3222,
+          "kernel_records": 3222
+        },
+        {
+          "label": "DGSEM Euler residual and faces",
+          "phases": [
+            "Euler_spatial_RHS"
+          ],
+          "gpu_union_ms_per_stage": 2.8922199950341403,
+          "kernel_sum_ms_per_stage": 2.552895211049038,
+          "activity_records": 17721,
+          "kernel_records": 11277
+        },
+        {
+          "label": "DGSEM CFL reductions",
+          "phases": [
+            "Euler_CFL_reductions"
+          ],
+          "gpu_union_ms_per_stage": 0.04388785040347611,
+          "kernel_sum_ms_per_stage": 0.04388785040347611,
+          "activity_records": 6444,
+          "kernel_records": 6444
+        },
+        {
+          "label": "RK common work",
+          "phases": [
+            "RK_common_other"
+          ],
+          "gpu_union_ms_per_stage": 0.4160982656734947,
+          "kernel_sum_ms_per_stage": 0.4160982656734947,
+          "activity_records": 2685,
+          "kernel_records": 2685
+        },
+        {
+          "label": "Other recorded work",
+          "phases": [
+            "sigma_solve_updates_copies_reductions",
+            "sigma_update_other"
+          ],
+          "gpu_union_ms_per_stage": 0.5289789484792055,
+          "kernel_sum_ms_per_stage": 0.0,
+          "activity_records": 4833,
+          "kernel_records": 0
+        }
+      ],
+      "rejected_RK_steps": 1,
+      "rejected_for_missing_recorded_GPU_activity": 1,
+      "profiler_diagnostics": [
+        {
+          "timestamp": -119928323264,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9",
+          "globalPid": 319396937465856
+        },
+        {
+          "timestamp": 841946694,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Scheduling information is absent. The thread activity is deduced based on OS runtime libraries traces. This is inaccurate and does not take into account asynchronous interrupts and exception faults.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 841986469,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 319397038129152
+        },
+        {
+          "timestamp": 841988069,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 319397038129152
+        },
+        {
+          "timestamp": 841988805,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 319396937465856
+        },
+        {
+          "timestamp": 841992101,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "CUDA profiling might have not been started correctly.",
+          "globalPid": 319397038129152
+        },
+        {
+          "timestamp": 841992549,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No CUDA events collected. Does the process use CUDA?",
+          "globalPid": 319397038129152
+        },
+        {
+          "timestamp": 841993029,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected.",
+          "globalPid": 319396937465856
+        },
+        {
+          "timestamp": 841994597,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 319397038129152
+        },
+        {
+          "timestamp": 841995781,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all OS runtime libraries events might have been collected.",
+          "globalPid": 319396937465856
+        }
+      ],
+      "work_counts_match_expected": true,
+      "audit_sha256": "4f03c00c3cf5b53261997da8a371d611f4c81b921eb85914d6a3a67bed1372e6",
+      "native_report_sha256": "1ceb1410d3a3a95e04cf210c604b83a6152733ae4a272a990472140a81cc05f2",
+      "top_recorded_kernels": [
+        {
+          "phase": "sigma_current_A_plus_residual",
+          "kernel_name": "igrlab::igr_internal::<unnamed>::IGRCompactTensorVolumeKernel(int, const int *, const double *, const double *, const double *, const double *, double *)",
+          "calls": 3222,
+          "calls_per_stage": 2.0,
+          "kernel_sum_ms_per_stage": 1.539000769708256,
+          "gpu_union_ms_per_stage": 1.539000769708256,
+          "duration": {
+            "samples": 3222,
+            "mean_ms": 0.7695003848541279,
+            "median_ms": 0.7705599999999999,
+            "minimum_ms": 0.752512,
+            "p95_ms": 0.776704,
+            "maximum_ms": 0.790272
+          },
+          "configurations": [
+            {
+              "block": [
+                128,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                65536,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 40,
+              "static_shared_bytes": 9040,
+              "launches": 3222
+            }
+          ]
+        },
+        {
+          "phase": "Euler_spatial_RHS",
+          "kernel_name": "void mfem::dgsem::<unnamed>::FusedEulerResidualKernel<(int)6, (bool)0, (bool)0>(mfem::dgsem::<unnamed>::FusedResidualData)",
+          "calls": 1611,
+          "calls_per_stage": 1.0,
+          "kernel_sum_ms_per_stage": 1.3724796076970827,
+          "gpu_union_ms_per_stage": 1.3724796076970827,
+          "duration": {
+            "samples": 1611,
+            "mean_ms": 1.3724796076970824,
+            "median_ms": 1.372672,
+            "minimum_ms": 1.358752,
+            "p95_ms": 1.380112,
+            "maximum_ms": 1.38544
+          },
+          "configurations": [
+            {
+              "block": [
+                128,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                262144,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 60,
+              "static_shared_bytes": 5760,
+              "launches": 1611
+            }
+          ]
+        },
+        {
+          "phase": "sigma_current_A_plus_residual",
+          "kernel_name": "void mfem::CuKernel2D<igrlab::dg_face::InteriorFaceDGDiffusionTensorLiftRecord2DWarp>(int, T1)",
+          "calls": 3222,
+          "calls_per_stage": 2.0,
+          "kernel_sum_ms_per_stage": 0.9735519553072627,
+          "gpu_union_ms_per_stage": 0.9735519553072627,
+          "duration": {
+            "samples": 3222,
+            "mean_ms": 0.4867759776536313,
+            "median_ms": 0.48729599999999995,
+            "minimum_ms": 0.479776,
+            "p95_ms": 0.49001599999999995,
+            "maximum_ms": 0.49513599999999997
+          },
+          "configurations": [
+            {
+              "block": [
+                32,
+                1,
+                4
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                130816,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 38,
+              "static_shared_bytes": 0,
+              "launches": 3222
+            }
+          ]
+        },
+        {
+          "phase": "sigma_P_plus_solution_update",
+          "kernel_name": "void igrlab::igr_internal::<unnamed>::ApplyTensorFactorFP64<(bool)1>(const int *, const int *, const int *, const double *, const double *, const double *, const double *, double *, double)",
+          "calls": 3222,
+          "calls_per_stage": 2.0,
+          "kernel_sum_ms_per_stage": 0.4379780415890751,
+          "gpu_union_ms_per_stage": 0.4379780415890751,
+          "duration": {
+            "samples": 3222,
+            "mean_ms": 0.21898902079453755,
+            "median_ms": 0.219136,
+            "minimum_ms": 0.214944,
+            "p95_ms": 0.2206704,
+            "maximum_ms": 0.223104
+          },
+          "configurations": [
+            {
+              "block": [
+                192,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                16389,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 32,
+              "static_shared_bytes": 14336,
+              "launches": 3222
+            }
+          ]
+        },
+        {
+          "phase": "sigma_coefficient_source_interpolation",
+          "kernel_name": "void igrlab::igr_internal::<unnamed>::SourceAndDiffusionKernel<(bool)0, (bool)1>(int, const double *, const double *, const double *, double, double, const double *, double *, double *, int, int)",
+          "calls": 1611,
+          "calls_per_stage": 1.0,
+          "kernel_sum_ms_per_stage": 0.4277212588454376,
+          "gpu_union_ms_per_stage": 0.4277212588454376,
+          "duration": {
+            "samples": 1611,
+            "mean_ms": 0.4277212588454376,
+            "median_ms": 0.427872,
+            "minimum_ms": 0.421504,
+            "p95_ms": 0.430944,
+            "maximum_ms": 0.44889599999999996
+          },
+          "configurations": [
+            {
+              "block": [
+                128,
+                1,
+                1
+              ],
+              "dynamic_shared_bytes": 0,
+              "grid": [
+                65536,
+                1,
+                1
+              ],
+              "local_bytes_per_thread": 0,
+              "registers_per_thread": 56,
+              "static_shared_bytes": 10944,
+              "launches": 1611
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

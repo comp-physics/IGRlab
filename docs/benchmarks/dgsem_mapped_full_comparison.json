@@ -1,0 +1,460 @@
+{
+  "status": "compact-metadata-verified",
+  "run_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-mapped-throughput-20261023/full-r1/payload/case",
+  "raw_sha256": "72f0d2b766bed7c565c006836defeeedde7f34f150dac7a55d05fc2f1e35b6dd",
+  "qualification_sha256": "7990a8c7edf10216da0d864960510d3f8315ce3d4e647d6cc3d1fb37aa10d437",
+  "source_commit": "96c7ea05a6cd8a99c69008e85e242f66fba31876",
+  "gpu": {
+    "index": 0,
+    "uuid": "GPU-961a75de-5e0f-dfa6-dbf1-36bcd07b960c",
+    "name": "NVIDIA GH200 120GB",
+    "cuda_visible_devices": "0"
+  },
+  "arms": {
+    "reference": {
+      "application_s": 1600.0250255559804,
+      "external_to_RunEulerCase_s": 25.27419958698033,
+      "setup_initial_output_s": 61.582681823,
+      "advancing_cfl_s": 1325.2683633420002,
+      "scheduled_output_s": 149.665024308,
+      "diagnostics_s": 0.411295509,
+      "final_output_postloop_s": 37.823460987000004
+    },
+    "fixed-baseline": {
+      "application_s": 536.7340920319548,
+      "external_to_RunEulerCase_s": 24.35218813295478,
+      "setup_initial_output_s": 54.894864804,
+      "advancing_cfl_s": 273.47888713400005,
+      "scheduled_output_s": 146.958075157,
+      "diagnostics_s": 0.42102049599999986,
+      "final_output_postloop_s": 36.629056308
+    },
+    "fixed-improved": {
+      "application_s": 329.094275200041,
+      "external_to_RunEulerCase_s": 23.709074371041027,
+      "setup_initial_output_s": 35.308350345,
+      "advancing_cfl_s": 188.40409983299998,
+      "scheduled_output_s": 65.074638884,
+      "diagnostics_s": 0.4210269240000002,
+      "final_output_postloop_s": 16.177084843
+    }
+  },
+  "fields": {
+    "method_accuracy": {
+      "status": "passed",
+      "errors": {
+        "density": {
+          "normalized_l2": 1.733572810527436e-07,
+          "normalized_linf_at_gl_points": 7.337788045695987e-07
+        },
+        "momentum_x": {
+          "normalized_l2": 8.20829087008141e-07,
+          "normalized_linf_at_gl_points": 1.9610212015945825e-06
+        },
+        "momentum_y": {
+          "normalized_l2": 8.208290869617632e-07,
+          "normalized_linf_at_gl_points": 1.9610212036529505e-06
+        },
+        "energy": {
+          "normalized_l2": 2.6161867113309104e-07,
+          "normalized_linf_at_gl_points": 8.995994786576177e-07
+        }
+      },
+      "sigma": 0.015291111761843073
+    },
+    "execution_equivalence": {
+      "status": "passed",
+      "errors": {
+        "density": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "energy": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        },
+        "sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0
+        }
+      },
+      "sigma": 0.0
+    }
+  },
+  "retained_VTU_count": 2,
+  "schema": "dgsem-mapped-full-comparison-v1",
+  "job": "3446752",
+  "binary_sha256": "6338e9b0a1502c26af26706b80a726707da0e2dfe3c4623b667913524658694b",
+  "case": {
+    "schema": "dgsem-mapped-case-v1",
+    "mesh_sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836",
+    "elements": 262144,
+    "conserved_dofs": 37748736,
+    "scalar_dofs": 9437184,
+    "geometry_order": 2,
+    "state_basis": "GLL",
+    "sigma_basis": "GLL",
+    "order": 5,
+    "short_target": 0.0025,
+    "full_target": 0.1,
+    "save_interval": 0.02,
+    "gamma": 1.4,
+    "argv": [
+      "-m",
+      "{mesh}",
+      "--device",
+      "cuda",
+      "--discretization",
+      "dgsem",
+      "--regularization",
+      "igr",
+      "--time-integrator",
+      "rk3ssp",
+      "-o",
+      "5",
+      "-rs",
+      "0",
+      "-rp",
+      "0",
+      "-tf",
+      "{target}",
+      "-c",
+      "0.3",
+      "--element-assembly-divergence",
+      "--igr-space",
+      "L2",
+      "--igr-grad",
+      "BrokenL2",
+      "--c-alpha",
+      "0.16666666666666666",
+      "--igr-alpha-length",
+      "max",
+      "--igr-ip-kind",
+      "sipg",
+      "--igr-exact-dg-face",
+      "--igr-sigma-cadence",
+      "every-stage",
+      "--igr-stage-rtol-scale",
+      "1",
+      "--igr-linear-solver",
+      "fgmres",
+      "--igr-preconditioner",
+      "none",
+      "--igr-lin-rtol",
+      "1e-6",
+      "--igr-lin-atol",
+      "0",
+      "--igr-lin-maxit",
+      "1000",
+      "--igr-nonconvergence-policy",
+      "error",
+      "--igr-lin-print",
+      "0",
+      "--positivity-limiter",
+      "none",
+      "--modal-damping-rate",
+      "0",
+      "--dgsem-surface-flux",
+      "rusanov",
+      "--no-igr-sigma-cfl",
+      "--no-igr-sigma-rusanov",
+      "--no-igr-invariant-domain-flux",
+      "--no-admissibility-scan",
+      "--no-conservation-balance",
+      "--no-nan-scan",
+      "-no-glvis",
+      "-vtk",
+      "--time-step-save",
+      "0.02",
+      "--no-vtk-h1-diagnostics",
+      "--no-vtk-l2-diagnostics",
+      "--no-save-state",
+      "-vs",
+      "100",
+      "-as",
+      "500",
+      "--igr-solve-mode",
+      "element-block-jacobi",
+      "--igr-jacobi-blocks",
+      "tensor",
+      "--igr-sweeps",
+      "2",
+      "--igr-initial-sweeps",
+      "50",
+      "--igr-jacobi-omega",
+      "0.7",
+      "--dgsem-stab",
+      "none",
+      "--dgsem-volume-flux",
+      "central",
+      "--dgsem-volume-dissipation",
+      "none"
+    ],
+    "common_environment": {
+      "PROFILE_NVTX": "0",
+      "IGR_PARTIAL_ASSEMBLY": "1",
+      "IGR_DEVICE_QF": "1",
+      "IGR_FACE_DENSITY_CUDA": "1",
+      "IGR_FACE_DENSITY_CACHE": "1",
+      "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+      "IGR_IPDG_PENALTY_SCALE": "1",
+      "IGR_KRYLOV_BACKEND": "cuda-fp64",
+      "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+      "IGR_TENSOR_VOLUME": "simt",
+      "IGR_TENSOR_VOLUME_STORAGE": "cached",
+      "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+      "IGR_TENSOR_MG": "off",
+      "IGR_TENSOR_MG_OPERATOR": "sampled",
+      "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+      "IGR_TRUE_RESIDUAL": "0",
+      "IGR_EVENT_LOG_MIN_ITERS": "0",
+      "IGR_OPERATOR_PROBE_EVERY": "0",
+      "IGR_PRECONDITIONER_PROBE": "0",
+      "SHARED_OPERATOR_PRECISION": "off",
+      "SHARED_EULER_LAYOUT": "dense",
+      "SHARED_EULER_FLUX_EXECUTION": "element",
+      "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+      "DG_FORCE_MATRIX_FREE": "0",
+      "DG_FORCE_NLFORM_FACE": "0",
+      "DG_NATIVE_MASS_INV": "0",
+      "DG_PACKED_INVMASS_DEVICE": "1",
+      "DG_TENSOR_FACE": "off",
+      "WEAKDIV_SIGMA_STORAGE": "auto",
+      "IGR_SHARE_STATE_INTERPOLATION": "1",
+      "IGR_FACTORIZED_FACE_NORMALS": "1",
+      "IGR_COMPACT_FACE_QDATA": "1",
+      "IGR_COMPACT_FACE_LIFT": "1",
+      "VTK_PRESSURE_COEFFICIENT": "1",
+      "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+      "IGR_EXTENDED_CERTIFICATE": "0",
+      "IGR_EXTENDED_CERTIFICATE_START": "1",
+      "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+      "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+      "DG_PACKED_DENSE_EXECUTION": "rows",
+      "SOLVER_WALL_TIMING": "1",
+      "IGR_TENSOR_VOLUME_COMPACT": "1",
+      "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+      "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+      "DG_WEAKDIV_ROW_REUSE": "0",
+      "DG_INVMASS_ROW_REUSE": "0",
+      "DG_TENSOR_FACE_ROW_REUSE": "0",
+      "IGR_FACE_COALESCED_TRACE": "0",
+      "DG_MAPPED_WEAKDIV_TENSOR": "0",
+      "VTK_OUTPUT_TIMING": "1",
+      "IGR_SIGMA_BASIS": "lgl",
+      "DGSEM_PRODUCTION_STRICT": "1",
+      "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+      "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+      "DGSEM_FUSED_RESIDUAL": "1",
+      "DGSEM_FUSED_DMMA": "0",
+      "DGSEM_SUBCELL_BLEND": "0",
+      "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0"
+    },
+    "arm_environment": {
+      "reference": {
+        "IGR_COEFFICIENT_EXECUTION": "baseline",
+        "IGR_FACE_DENSITY_EXECUTION": "dense",
+        "IGR_STAGE_STATE_DIRECT": "0",
+        "VTK_CACHED_EVALUATION": "0",
+        "IGR_EXTENDED_CERTIFICATE": "1",
+        "IGR_TWO_LEVEL_INVERSE": "fp64",
+        "IGR_TWO_LEVEL_LOCAL": "element",
+        "IGR_TWO_LEVEL_PATCH_COMPOSITION": "additive",
+        "IGR_TWO_LEVEL_BLOCK_PRECISION": "fp64",
+        "IGR_TWO_LEVEL_COARSE": "cg",
+        "IGR_TWO_LEVEL_ORDER": "1",
+        "IGR_COARSE_CG_BACKEND": "cuda-fp64",
+        "IGR_COARSE_CG_EXECUTION": "cooperative"
+      },
+      "fixed-baseline": {
+        "IGR_COEFFICIENT_EXECUTION": "baseline",
+        "IGR_FACE_DENSITY_EXECUTION": "dense",
+        "IGR_STAGE_STATE_DIRECT": "0",
+        "VTK_CACHED_EVALUATION": "0"
+      },
+      "fixed-improved": {
+        "IGR_COEFFICIENT_EXECUTION": "fused",
+        "IGR_FACE_DENSITY_EXECUTION": "tensor",
+        "IGR_STAGE_STATE_DIRECT": "1",
+        "VTK_CACHED_EVALUATION": "1"
+      }
+    },
+    "arm_order": [
+      "reference",
+      "fixed-baseline",
+      "fixed-improved"
+    ],
+    "method_accuracy_limits": {
+      "conserved_normalized_l2": 0.001,
+      "conserved_normalized_linf_at_gl_points": 0.01,
+      "sigma": "report-only; no approved method-accuracy budget"
+    },
+    "execution_equivalence_limits": {
+      "conserved_and_sigma_normalized_l2": 1e-10,
+      "conserved_and_sigma_normalized_linf_at_gl_points": 1e-09
+    },
+    "comparator": {
+      "filename": "compare-curved-q5-fields.py",
+      "sha256": "f3cb6b0baaf8c0e54c1fa99e1fe63868b93f0064e013002edbfc0fa5ca2da615",
+      "origin": "/home/jarias9/.cache/igrlab-experiments/igr-dg-mapped-tensor-20261022/fields/compare-curved-q5-fields.py"
+    },
+    "source_templates": [
+      {
+        "path": "/tmp/dg-mapped-throughput-20261023/full-3446347/payload/case/recommended/application.command.json",
+        "sha256": "85201370b17932741d437ec6fbd3f6102501a70a8d93346fe2514ed214d7f78e",
+        "role": "fixed policy and latest recommended settings"
+      },
+      {
+        "path": "/home/jarias9/.cache/igrlab-experiments/igr-dg-mapped-pipeline-20261022/full-3440138/control/application.command.json",
+        "sha256": "099a8a870aeabbc739597e2bee8e43c390bf5e3eb254bfeba00fc2586a0612a5",
+        "role": "converged FP64 FGMRES element/Q1 cooperative-CG reference"
+      }
+    ],
+    "timing_note": "Short is correctness-only. Full reference/fixed compares different numerical methods; only fixed-baseline/fixed-improved measures execution equivalence. No profiler is launched."
+  },
+  "timing_scope": "Whole-process wall, six additive host bins; GPU activity may cross host timer boundaries. One run per arm in reference/fixed-baseline/fixed-improved order on the same GPU; no repeatability confidence interval.",
+  "counts": {
+    "reference": {
+      "steps": "6663",
+      "rhs_evaluations": "19990",
+      "accepted_attempts": "6663",
+      "rejected_attempts": "0",
+      "success": "1",
+      "termination_reason": "target-reached",
+      "linear": {
+        "calls": "19990",
+        "production_calls": "19989",
+        "output_only_calls": "1",
+        "output_only_iters": "18",
+        "total_iters": "261550",
+        "avg_iters": "13.084042021010506",
+        "total_krylov_operator_apply_count": "301529",
+        "total_krylov_preconditioner_apply_count": "261550",
+        "last_solver": "fgmres-cuda-fp64",
+        "last_precond": "two-level-inverse-fp64"
+      },
+      "final_certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "1",
+        "certified": "1",
+        "residual_rel_rhs": "9.292851835945018e-07",
+        "run_success": "1",
+        "residual_abs": "8.7371210823376742e-15",
+        "relative_limit": "9.9999999999999995e-07",
+        "absolute_limit": "0",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0"
+      }
+    },
+    "fixed-baseline": {
+      "steps": "6663",
+      "rhs_evaluations": "19990",
+      "accepted_attempts": "6663",
+      "rejected_attempts": "0",
+      "success": "1",
+      "termination_reason": "target-reached",
+      "linear": {
+        "calls": "19990",
+        "production_calls": "19989",
+        "output_only_calls": "1",
+        "output_only_iters": "2",
+        "total_iters": "40028",
+        "avg_iters": "2.0024012006003002",
+        "total_krylov_operator_apply_count": "40028",
+        "total_krylov_preconditioner_apply_count": "40028",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64"
+      },
+      "final_certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      }
+    },
+    "fixed-improved": {
+      "steps": "6663",
+      "rhs_evaluations": "19990",
+      "accepted_attempts": "6663",
+      "rejected_attempts": "0",
+      "success": "1",
+      "termination_reason": "target-reached",
+      "linear": {
+        "calls": "19990",
+        "production_calls": "19989",
+        "output_only_calls": "1",
+        "output_only_iters": "2",
+        "total_iters": "40028",
+        "avg_iters": "2.0024012006003002",
+        "total_krylov_operator_apply_count": "40028",
+        "total_krylov_preconditioner_apply_count": "40028",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64"
+      },
+      "final_certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      }
+    }
+  },
+  "solver_count_limit": "Reported solver A/P counters exclude setup, original-current-A independent certification and additional instrumentation outside the solver telemetry.",
+  "derived_speedups": {
+    "method_total": 2.9810385613826855,
+    "execution_total": 1.6309432660464824,
+    "combined_total": 4.861904767511985,
+    "method_evolution": 4.845962250433764,
+    "execution_evolution": 1.4515548620035856,
+    "combined_evolution": 7.034180065702968
+  }
+}
