@@ -236,6 +236,10 @@ public:
                 "step is accepted or aborted.");
     RestoreTemporaryOutputState();
     CaptureRKStepSnapshot(step);
+    if (igr_.GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi)
+    {
+      igr_.BeginFixedElementJacobiRKStep_();
+    }
     rk_step_ = step;
     rk_stage_ = -1;
     rk_stage_count_ = stage_count;
@@ -301,6 +305,10 @@ public:
     {
       FinishExtrapolatedRKStep(state, t, state_generation);
     }
+    if (igr_.GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi)
+    {
+      igr_.AcceptFixedElementJacobiRKStep_();
+    }
     accepted_state_generation_ = state_generation;
     rk_stage_ = -1;
     rk_stage_count_ = -1;
@@ -315,9 +323,6 @@ public:
                    std::uint64_t restored_state_generation,
                    real_t retry_dt) override
   {
-    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi,
-                "Fixed element-block Jacobi does not support RK abort/retry: "
-                "its production sigma history is not transactional.");
     MFEM_VERIFY(rk_step_snapshot_.active,
                 "EulerWithIGR received an abort without an active RK step.");
     MFEM_VERIFY(restored_state.Size() == state_.Size(),
@@ -327,6 +332,35 @@ public:
     const bool update_was_due = rk_step_snapshot_.sigma_update_due;
     const bool will_retry = retry_dt > 0.0;
     extrapolated_q_sigma_rhs_baseline_valid_ = false;
+    if (igr_.GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi)
+    {
+      RestoreTemporaryOutputState();
+      if (igr_.AbortFixedElementJacobiRKStep_())
+      {
+        --sigma_prefetch_invalidation_count_;
+        --sigma_output_only_solve_count_;
+      }
+      RestoreRKStepSnapshot();
+      accepted_state_generation_ = restored_state_generation;
+      base_.SetTime(restored_time);
+      if (HasMultipleOwningRanks())
+      {
+        igr_.GetSigma().ExchangeFaceNbrData();
+      }
+      if (!will_retry && igr_.HasPendingStage0PrefetchAccounting())
+      {
+        AbandonPendingStage0Prefetch(/*restore_warm_start=*/false);
+      }
+      // The next attempt must apply stage zero to the accepted history again.
+      // Solving during abort would advance this approximate closure twice.
+      igr_.SetRKStepIndex(aborted_step);
+      igr_.SetRKStageIndex(will_retry ? 0 : -1);
+      igr_.SetCurrentTime(restored_time);
+      igr_.SetCurrentTimeStep(will_retry ? retry_dt :
+        std::numeric_limits<double>::quiet_NaN());
+      rk_step_snapshot_.active = false;
+      return;
+    }
     if (IsExtrapolatedEveryStep())
     {
       AbortExtrapolatedRKStep(restored_state,
@@ -562,8 +596,16 @@ public:
         /*restore_warm_start=*/reusable_for_transport);
     }
 
+    // A diagnostic fixed-sweep field may match this generation without owning
+    // production history or retained initialization factors. Prepare an actual
+    // production prefetch before allowing stage zero to consume that field.
+    const bool fixed_prefetch_required =
+      igr_.GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi &&
+      reusable_for_transport && !igr_.HasPendingStage0PrefetchAccounting() &&
+      (prefetched_stage0_generation_ != state_generation ||
+       prefetched_stage0_step_ != next_rk_step);
     if (!sigma_initialized_ || sigma_state_generation_ != state_generation ||
-        certify_residual)
+        certify_residual || fixed_prefetch_required)
     {
       igr_.SetRKStepIndex(next_rk_step);
       // A reusable solve is the next production stage-0 solve and must honor
@@ -609,6 +651,17 @@ public:
     {
       prefetched_stage0_generation_ = state_generation;
       prefetched_stage0_step_ = next_rk_step;
+      if (igr_.GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi &&
+          rk_step_snapshot_.active &&
+          rk_step_snapshot_.prefetched_stage0_generation != kInvalidGeneration &&
+          !rk_step_snapshot_.prefetched_state_saved)
+      {
+        // Only a new preparation inside an attempt can overwrite these bytes.
+        // Preserve them lazily, without copying the conservative state on the
+        // normal begin/consume/accept path.
+        prefetched_stage0_state_.Swap(rk_step_snapshot_.prefetched_stage0_state);
+        rk_step_snapshot_.prefetched_state_saved = true;
+      }
       prefetched_stage0_state_ = state;
     }
     else
@@ -876,13 +929,17 @@ public:
         break;
       }
 
+      // Fixed closure uses the mutation-aware generation as its authority.
+      // An entry limiter that changes it invalidates the prefetch immediately,
+      // without transferring the conservative field to the host for a compare.
       const bool stage0_candidate =
         update_sigma && sigma_initialized_ &&
         prefetched_stage0_generation_ != kInvalidGeneration &&
         sigma_state_generation_ == prefetched_stage0_generation_ &&
         ((rk_stage_ == 0 && rk_step_ == prefetched_stage0_step_ &&
           (rk_state_generation_ == prefetched_stage0_generation_ ||
-           PrefetchedStateMatches(U))) ||
+           (igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi &&
+            PrefetchedStateMatches(U)))) ||
          (rk_stage_ < 0 && rk_step_ < 0 && &U == &state_));
       const bool reusable_stage0 = stage0_candidate;
 
@@ -1726,6 +1783,8 @@ private:
     std::uint64_t sigma_state_generation = kInvalidGeneration;
     std::uint64_t prefetched_stage0_generation = kInvalidGeneration;
     int prefetched_stage0_step = -1;
+    bool prefetched_state_saved = false;
+    Vector prefetched_stage0_state;
   };
 
   struct TemporaryOutputSnapshot
@@ -1833,6 +1892,7 @@ private:
     rk_step_snapshot_.prefetched_stage0_generation =
       prefetched_stage0_generation_;
     rk_step_snapshot_.prefetched_stage0_step = prefetched_stage0_step_;
+    rk_step_snapshot_.prefetched_state_saved = false;
   }
 
   void RestoreRKStepSnapshot()
@@ -1852,6 +1912,11 @@ private:
     prefetched_stage0_generation_ =
       rk_step_snapshot_.prefetched_stage0_generation;
     prefetched_stage0_step_ = rk_step_snapshot_.prefetched_stage0_step;
+    if (rk_step_snapshot_.prefetched_state_saved)
+    {
+      prefetched_stage0_state_.Swap(rk_step_snapshot_.prefetched_stage0_state);
+      rk_step_snapshot_.prefetched_state_saved = false;
+    }
   }
 
   void AbandonPendingStage0Prefetch(bool restore_warm_start = true) const

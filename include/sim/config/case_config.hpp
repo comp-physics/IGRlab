@@ -2188,20 +2188,11 @@ inline std::string ValidateFixedElementJacobiIGRSelection(
   const auto cadence = run_cfg.igr_opts.sigma_cadence.empty()
     ? run_cfg.case_config.igr_config.sigma_cadence
     : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
-  // Extrapolated cadence owns recoverable q_sigma admission. Fixed-sweep
-  // history has no RK rollback transaction, so that route remains excluded.
+  // Fixed-sweep rollback is qualified with current-state updates at every
+  // stage. Extrapolated q_sigma admission selects a different closure method.
   if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
   {
     return prefix + "--igr-sigma-cadence every-stage.";
-  }
-  // MakeRunConfig resolves both the case default and positivity CLI override
-  // into this flag. Zhang-Shu can reject a CUDA RK attempt after fixed-sweep
-  // history has already advanced to a later stage of that rejected attempt.
-  if (run_cfg.case_config.limiter_pipeline.zhang_shu)
-  {
-    return prefix + "an inactive Zhang-Shu positivity limiter "
-           "(--positivity-limiter none); fixed-sweep sigma history cannot "
-           "be rolled back after RK rejection.";
   }
   if (!run_cfg.opts.restart_vtk.empty())
   {

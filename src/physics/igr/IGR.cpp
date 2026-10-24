@@ -329,6 +329,124 @@ void IGRSolver::AddOutputOnlyAccounting_(const SolveAccountingDelta& delta)
   output_only_pc_setup_seconds_ += delta.pc_setup_seconds;
 }
 
+void IGRSolver::BeginFixedElementJacobiRKStep_()
+{
+  auto& saved = fixed_element_jacobi_rk_snapshot_;
+  MFEM_VERIFY(solve_mode_ == SolveMode::FixedElementJacobi && !saved.active,
+              "Invalid fixed element-Jacobi RK transaction begin.");
+  saved.active = true;
+  saved.history_saved = false;
+  saved.history_valid = element_jacobi_history_valid_;
+  saved.first_call = first_call_;
+  saved.last_converged = last_linear_converged_;
+  saved.last_final_norm = last_linear_final_norm_;
+  saved.sigma.UseDevice(true);
+  saved.sigma = sigma_;
+  saved.blocks_present = bool(element_jacobi_blocks_);
+  saved.tensor_key = element_jacobi_tensor_key_;
+  saved.prefetch_accounting = pending_stage0_prefetch_accounting_;
+  saved.original_prefetch_pending = saved.prefetch_accounting.valid;
+  saved.original_prefetch_reclassified = false;
+  if (saved.prefetch_accounting.valid)
+  {
+    saved.prefetch_sigma_checkpoint.UseDevice(true);
+    saved.prefetch_sigma_checkpoint = pending_stage0_prefetch_sigma_checkpoint_;
+    saved.prefetch_first_call = pending_stage0_prefetch_first_call_;
+    saved.prefetch_last_converged = pending_stage0_prefetch_last_converged_;
+    saved.prefetch_last_final_norm = pending_stage0_prefetch_last_final_norm_;
+  }
+}
+
+void IGRSolver::AcceptFixedElementJacobiRKStep_()
+{
+  auto& saved = fixed_element_jacobi_rk_snapshot_;
+  MFEM_VERIFY(saved.active, "Fixed element-Jacobi RK accept has no snapshot.");
+  saved.abandoned_blocks.reset();
+  saved.active = false;
+}
+
+bool IGRSolver::AbortFixedElementJacobiRKStep_()
+{
+  auto& saved = fixed_element_jacobi_rk_snapshot_;
+  MFEM_VERIFY(saved.active, "Fixed element-Jacobi RK abort has no snapshot.");
+  if (saved.history_saved)
+  {
+    element_jacobi_history_.Swap(saved.history);
+  }
+  element_jacobi_history_valid_ = saved.history_valid;
+  first_call_ = saved.first_call;
+  sigma_ = saved.sigma;
+  last_linear_converged_ = saved.last_converged;
+  last_linear_final_norm_ = saved.last_final_norm;
+  if (element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_)
+  {
+    if (!saved.blocks_present)
+    {
+      // A failed first initialization must not choose the reference operator
+      // for a later accepted state, even if its fifty sweeps finished.
+      element_jacobi_blocks_.reset();
+    }
+    else if (saved.abandoned_blocks)
+    {
+      element_jacobi_blocks_ = std::move(saved.abandoned_blocks);
+    }
+    element_jacobi_tensor_key_ = saved.tensor_key;
+  }
+  if (saved.original_prefetch_reclassified)
+  {
+    // This solve will again be available to stage zero. Undo only its
+    // temporary classification; all work done by the rejected attempt stays
+    // in the measured totals and retains its own classification.
+    auto undo = saved.prefetch_accounting;
+    undo.calls = -undo.calls;
+    undo.iterations = -undo.iterations;
+    undo.converged_calls = -undo.converged_calls;
+    undo.solve_seconds = -undo.solve_seconds;
+    undo.assemble_seconds = -undo.assemble_seconds;
+    undo.form_system_seconds = -undo.form_system_seconds;
+    undo.pc_setup_seconds = -undo.pc_setup_seconds;
+    AddOutputOnlyAccounting_(undo);
+  }
+  pending_stage0_prefetch_accounting_ = saved.prefetch_accounting;
+  if (saved.prefetch_accounting.valid)
+  {
+    pending_stage0_prefetch_sigma_checkpoint_ = saved.prefetch_sigma_checkpoint;
+    pending_stage0_prefetch_first_call_ = saved.prefetch_first_call;
+    pending_stage0_prefetch_last_converged_ = saved.prefetch_last_converged;
+    pending_stage0_prefetch_last_final_norm_ = saved.prefetch_last_final_norm;
+  }
+  saved.active = false;
+  return saved.original_prefetch_reclassified;
+}
+
+void IGRSolver::CommitElementJacobiHistory_()
+{
+  auto& saved = fixed_element_jacobi_rk_snapshot_;
+  if (saved.active && !saved.history_saved)
+  {
+    element_jacobi_history_.Swap(saved.history);
+    saved.history_saved = true;
+  }
+  element_jacobi_history_.UseDevice(true);
+  element_jacobi_history_ = sigma_;
+  element_jacobi_history_valid_ = true;
+}
+
+void IGRSolver::DiscardUncommittedElementJacobiBlocks_()
+{
+  auto& saved = fixed_element_jacobi_rk_snapshot_;
+  if (saved.active && saved.blocks_present && !saved.abandoned_blocks)
+  {
+    // Entry limiting can invalidate a prefetched first initialization. Keep
+    // its factors alive until the attempt is accepted or rolled back.
+    saved.abandoned_blocks = std::move(element_jacobi_blocks_);
+  }
+  else
+  {
+    element_jacobi_blocks_.reset();
+  }
+}
+
 void IGRSolver::ConsumePendingStage0PrefetchAccounting()
 {
   if (pending_stage0_prefetch_accounting_.valid && local_tensor_preconditioner_)
@@ -338,10 +456,9 @@ void IGRSolver::ConsumePendingStage0PrefetchAccounting()
   if (pending_stage0_prefetch_accounting_.valid &&
       solve_mode_ == SolveMode::FixedElementJacobi)
   {
-    element_jacobi_history_.UseDevice(true);
-    element_jacobi_history_ = sigma_;
-    element_jacobi_history_valid_ = true;
+    CommitElementJacobiHistory_();
   }
+  fixed_element_jacobi_rk_snapshot_.original_prefetch_pending = false;
   pending_stage0_prefetch_accounting_ = {};
 }
 
@@ -363,13 +480,19 @@ bool IGRSolver::ReclassifyPendingStage0PrefetchAsOutputOnly(
     last_linear_final_norm_ = pending_stage0_prefetch_last_final_norm_;
   }
   AddOutputOnlyAccounting_(pending_stage0_prefetch_accounting_);
+  auto& saved = fixed_element_jacobi_rk_snapshot_;
+  if (saved.active && saved.original_prefetch_pending)
+  {
+    saved.original_prefetch_reclassified = true;
+    saved.original_prefetch_pending = false;
+  }
   if (solve_mode_ == SolveMode::FixedElementJacobi &&
       (element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) &&
       !element_jacobi_history_valid_)
   {
     // An abandoned initialization must not choose the frozen inverse or
     // normalized tensor structure for the first production solve.
-    element_jacobi_blocks_.reset();
+    DiscardUncommittedElementJacobiBlocks_();
   }
   if (!local_tensor_preconditioner_committed_)
   {
@@ -478,9 +601,7 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   if (solve_mode_ == SolveMode::FixedElementJacobi &&
       purpose == IGRSolvePurpose::ProductionStage)
   {
-    element_jacobi_history_.UseDevice(true);
-    element_jacobi_history_ = sigma_;
-    element_jacobi_history_valid_ = true;
+    CommitElementJacobiHistory_();
   }
   first_call_ = false;
   diagnostic_state_ = nullptr;
@@ -507,7 +628,7 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
         (element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) &&
         !element_jacobi_history_valid_)
     {
-      element_jacobi_blocks_.reset();
+      DiscardUncommittedElementJacobiBlocks_();
     }
     if (!local_tensor_preconditioner_committed_)
     {
