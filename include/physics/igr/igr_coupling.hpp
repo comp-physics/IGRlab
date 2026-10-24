@@ -314,6 +314,9 @@ public:
                    std::uint64_t restored_state_generation,
                    real_t retry_dt) override
   {
+    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi,
+                "Fixed element-block Jacobi does not support RK abort/retry: "
+                "its production sigma history is not transactional.");
     MFEM_VERIFY(rk_step_snapshot_.active,
                 "EulerWithIGR received an abort without an active RK step.");
     MFEM_VERIFY(restored_state.Size() == state_.Size(),

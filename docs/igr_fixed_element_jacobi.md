@@ -73,6 +73,13 @@ require Cartesian or affine cells; other retained optimizations can have their
 own geometry restrictions. DGSEM, HDG, restart, constrained scalar spaces and
 other sigma update cadences are outside this trial.
 
+Zhang-Shu positivity limiting and RK abort/retry are also unsupported: fixed-sweep
+production sigma history has no rollback transaction. Admission checks the
+effective case/CLI limiter policy; use `--positivity-limiter none` to disable an
+enabled case default. Recoverable q_sigma admission remains excluded with the
+extrapolated cadence. Direct library calls to abort a fixed-sweep RK step fail
+before any sigma recovery.
+
 Initialization is a reusable stage-zero closure even when VTK is disabled.
 Output-only solves do not commit production warm-start history, and a prefetched
 stage-zero solution commits history only when that stage consumes it. Final
