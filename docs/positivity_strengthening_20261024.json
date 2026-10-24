@@ -1,0 +1,157 @@
+{
+  "schema": "igr-positivity-strengthening-results-v1",
+  "date": "2026-10-24",
+  "status": "completed-numerical-and-capture-gates-passed-with-stated-limits",
+  "source": {
+    "numerical_commit": "30a472fdf7ee761724c56a72bacb005e782928dc",
+    "native_job": "3448740",
+    "native_tests_passed": 18,
+    "native_receipt": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/run.json", "bytes": 121189, "sha256": "12460aa210db4d00fe5f40d74eddbbf07e1b632f6d2271b0edd9d4bed9ee2dc9"},
+    "source_manifest": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/source-manifest.json", "bytes": 103555, "sha256": "50e9184f6076830358e2cdebd3190b69580cb682563e87d11fb8d6747d748fab"},
+    "application_changes_in_followup": false,
+    "application_builds_in_followup": false,
+    "hardware_allocation": {"gpu_count": 1, "GPU": "NVIDIA GH200 120GB", "account": "bdiy-dtai-gh", "partition": "ghx4", "constraint": "projects", "OMP_NUM_THREADS": 1},
+    "allocation_runtime": {"authority": "Completed Slurm sacct durations, recorded in cylinder-status.txt", "cylinder_elapsed_seconds": 678, "profile_elapsed_seconds": 138, "combined_allocated_GPU_minutes": 13.6, "meaning": "One allocated GPU per job; not billed credits or GPU-active time."}
+  },
+  "evidence": {
+    "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/positivity-strengthening-20261024",
+    "cylinder_receipt": {"job": "3449176", "remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/positivity-strengthening-20261024/cylinder-r1/selected/cylinder/run.json", "file": "cylinder-result.json", "bytes": 39261, "sha256": "81339d4c77f5ce48738236825cbf61af275d78db45d9fed4b69acdfdc9feb640"},
+    "profile_summary": {"job": "3449190", "remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/positivity-strengthening-20261024/application-profile-r1/selected/profile/compact-summary.json", "file": "profile-result.json", "bytes": 26699, "sha256": "101d3d60d62b5f884aa846a4e449a9ef8d7279078bf1a00e715d51f189ef3955"},
+    "profile_run_remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/positivity-strengthening-20261024/application-profile-r1/selected/profile/run.json",
+    "profile_archive_remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/positivity-strengthening-20261024/application-profile-r1/selected/profile/selected-results.tar.gz",
+    "profile_archive_members": {"report": "profile/capture.nsys-rep", "report_sha256": "2ebdf47ee98f7226823b0036d3c0a1e0dabaf6947b7628f938b9ed70c37eea9d", "audit": "profile/gpu-audit.json", "audit_sha256": "b099ac519727d6a38e017f2788c8ecb9670f6835ea99d06ee828b01104bf8052"},
+    "figure_inputs": [
+      {"file": "figure/recorded/figure-delivery.json", "bytes": 2741, "sha256": "54eb0ba374c9e7f1b43dc729649940dd86e17e4b2e650bf63c5045abbb7828b5"},
+      {"file": "figure/recorded/diagnostic-attribution.json", "bytes": 1313, "sha256": "53c87ee5c8325052586aa0ff754354b39dc1acded222f014b1bf09d14ac568e1"},
+      {"file": "figure/recorded/scatter-incidence.json", "bytes": 516, "sha256": "0ddbab6312195b0ee75d0ad97fc980be4bfc9bf378922504e1ab1cd3f671c724"},
+      {"file": "figure/recorded/provenance.json", "bytes": 3417, "sha256": "6fcddcce4e443cd6976b571518d86084c9201a0c15e76c9ffed6806be48cb7af"}
+    ],
+    "harness_case_sha256": {"cylinder": "1503a793c909145fa36693130b6e99293aa208f3f96f0eab34fa3dd60812eb33", "profile": "54a74166ca27dca62518c0bcda18a2260cb19260fa99f6ef3f1556777cbe32d2"},
+    "profile_deployment_manifest_sha256": "9f3711fc160f0b90578a9ac4bc806f4989a9bc48641c6e25971d8e41b8dd2c7f"
+  },
+  "shared_numerics": {
+    "discretization": "DGSEM",
+    "polynomial_order": 5,
+    "geometry_order": 2,
+    "time_integrator": "SSPRK(3,3)",
+    "gamma": 1.4,
+    "Euler_flux": {"volume": "central", "surface": "Rusanov", "volume_dissipation": "none", "stabilization": "none"},
+    "IGR": {"space": "L2", "gradient": "BrokenL2", "sigma_basis": "LGL", "IP": "SIPG", "exact_DG_faces": true, "sigma_cadence": "every-stage", "alpha_length": "max", "tensor_volume": "FP64 SIMT cached", "local_tensor": "projected WMMA FP64; no fallback"},
+    "limiter": {"points": "consumer", "vtk_points": false, "rho_floor": 5e-07, "pressure_floor": 1e-06, "quadrature_order": 12, "pressure_bisections": 12},
+    "nan_scan": false,
+    "admissibility_scan": false,
+    "H1_L2_VTK_diagnostics": false,
+    "restart": false
+  },
+  "cylinder": {
+    "job": "3449176",
+    "binary": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/supersonic_cylinder_w_igr", "bytes": 61882360, "sha256": "e9fc77ec18a1f6d6f282f434002179c1aed625e29556b372526c51ac2a405b74"},
+    "mesh": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/source/examples/supersonic_example_w_igr/supersonic_cylinder.msh", "bytes": 315765, "sha256": "ebaf3e098b78fe635995ffd9756d8e5ff19dbadf19d0dd1448536f54a8aecda2"},
+    "configuration": {
+      "elements": 1322,
+      "conserved_dofs": 190368,
+      "target_time": 0.1,
+      "nominal_dt": 1e-05,
+      "CFL_control": false,
+      "c_alpha": 0.03809796472055992,
+      "alpha": 0.0004,
+      "modal_damping_rate": 80000,
+      "startup": "normal",
+      "startup_width": 0.08,
+      "velocity": [3, 0],
+      "solver": "CUDA FP64 FGMRES",
+      "preconditioner": "projected local WMMA FP64",
+      "rtol_rhs": 1e-06,
+      "atol": 0,
+      "max_iterations": 1000,
+      "save_interval": 0.0025,
+      "retained_times": [0, 0.0025, 0.1]
+    },
+    "completion": {"success": true, "termination_reason": "target-reached", "final_time": 0.1, "steps": 10000, "accepted_attempts": 10000, "rejected_attempts": 0, "rhs_evaluations": 30000, "linear_calls": 30001, "converged_linear_calls": 30001, "production_linear_calls": 30000, "output_only_linear_calls": 1, "total_iterations": 2629065, "average_iterations": 87.6325789140362, "maximum_iterations": 197, "last_iterations": 83, "application_wall_seconds": 661.0221901589539, "solver_segment_elapsed_seconds": 645.882980046, "linear_solve_seconds": 631.7595129469971, "IGR_seconds": 634.4215629059971, "application_cap_seconds": 900, "input_hashes_rechecked_equal": true, "dispatch_valid": true},
+    "final_current_equation_certificate": {"scope": "final-committed-accepted-state", "precision": "fp64", "certified": true, "time": 0.1, "state_generation": 30000, "residual_rel_rhs": 9.552961528518312e-07, "relative_limit": 1e-06, "residual_abs": 4.515147526516039e-09, "q_sigma_admitted": true, "q_sigma_nonpositive_samples": 0, "q_sigma_nonfinite_samples": 0},
+    "common_endpoint_equivalence": {
+      "status": "passed",
+      "time": 0.0025,
+      "reference_source": "f7b69da28a399f70b4390c7990c3719dd5e6d095",
+      "reference_job": "3448829",
+      "reference_archive": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/cylinder-control-r1/selected/control/selected-results.tar.gz", "bytes": 3088774, "sha256": "f020d99ac591e732ea9a96280d771ccaa08f99ac5988967d9f7b199154d39451"},
+      "reference_receipt_sha256": "90de812bfe0532ae38ff47be446ef8d7cac6025cd986011ba168b51c93f61dba",
+      "matching_steps": 250,
+      "matching_rhs_evaluations": 750,
+      "matching_rejections": 0,
+      "normalized_argv_and_controls_match": true,
+      "native_VTU_byte_identical": true,
+      "reference_and_candidate_VTU_sha256": "762c903507f6720492657c84515ad323f32d8c1e4228d1df94ace9dcef350122",
+      "fields": ["density", "momentum_x", "momentum_y", "energy", "sigma"],
+      "all_normalized_L2_and_sampled_Linf_differences": 0.0,
+      "limits": {"normalized_l2": 1e-10, "normalized_linf_at_gl_points": 1e-09},
+      "comparison": "Native VTK reader, ordered Q5 cell polynomials, independently fitted matching Q2 geometry, tensor GL8 weighted norms.",
+      "sampled_minima_both_inputs": {"density_min": 1.3103260351876531, "pressure_min": 0.8965620832450458, "q_sigma_min": 1.3124765328955972},
+      "meaning": "Execution equivalence at .0025; does not establish .1 accuracy."
+    },
+    "final_field_audit": {
+      "status": "passed",
+      "time": 0.1,
+      "VTU_sha256": "1e34297201965e8c87d8a0d53b6fa5f61af467c5dbcdb68a202533475663d526",
+      "GL8_samples": 84608,
+      "sampled_minima": {"density_min": 0.03339440948855456, "pressure_min": 0.0013540274299831286, "q_sigma_min": 0.010621745946183096},
+      "integrals": {"density": 10.925110822006905, "momentum_x": 32.15460420192132, "momentum_y": 1.6693709890727281e-09, "energy": 68.12357026243146, "sigma": 0.2515229570785446},
+      "meaning": "Standalone finite-value, geometry, sampled positivity and integral audit; self-comparison is not an accuracy comparison."
+    }
+  },
+  "profile": {
+    "job": "3449190",
+    "status": "natural-complete-capture-qualified",
+    "binary": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast", "bytes": 61881200, "sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26"},
+    "mesh": {"path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh", "sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836"},
+    "allocated_gpu_uuid": "GPU-01a91920-866f-5023-6511-8640c3a5d2d5",
+    "configuration": {"case": "mapped Sedov", "elements": 262144, "conserved_dofs": 37748736, "target_time": 0.01, "CFL": 0.3, "c_alpha": 0.16666666666666666, "modal_damping_rate": 0, "solve_mode": "fixed element-block Jacobi", "initial_sweeps": 50, "regular_sweeps": 2, "omega": 0.7, "limiter_enabled": true, "cooperative": true, "fused_faces": true, "exact_reference_row_dedup": true, "true_residual_diagnostic": false, "tolerance_convergence_certified": false, "unchanged_output_interval": 0.02},
+    "natural_application_completion": {"success": true, "steps": 647, "accepted_attempts": 647, "rejected_attempts": 0, "rhs_evaluations": 1942, "final_time": 0.01, "outputs": "initial and final only"},
+    "selected_capture": {"RK_steps": 300, "stages": 900, "policy": "Skip first100 recorded RK scopes; retain last300 eligible complete evolved steps, independently of durations and expected kernel counts.", "recorded_activity_union_seconds": 11.344859672, "exclusive_additive_integer_ns": true, "overlapping_phase_union_seconds": 0.0, "phase_ownership": "At every recorded active nanosecond, the first active phase in priority owns time. This is a display convention, not causal attribution of overlap.", "share_denominator": "Union of selected recorded GPU-active intervals; excludes idle gaps and is not host elapsed time.", "mean_GPU_union_ms_per_RK": 37.81619890666666, "mean_inclusive_host_ms_per_RK": 38.42115893333333},
+    "work_counts": {"current_A_plus_residual_scopes": 1800, "local_P_plus_update_scopes": 1800, "sweeps": 1800, "limiter_scopes": 900, "cooperative_limiter_kernels": 900, "current_A_and_local_P_each_per_stage": 2, "independent_original_A_scopes": 0, "meaning": "Each regular stage performs two fixed Jacobi sweeps: current A plus b-Ax and projected FP64 local P plus damped update. These residual calculations are iteration work; they are not a true-residual convergence certificate."},
+    "exclusive_GPU_partition_per_stage": [
+      {"phase": "positivity_limiter", "ms": 3.473936283333333, "share_percent": 27.55911263245108},
+      {"phase": "sigma_current_A_plus_residual", "ms": 2.866739483333333, "share_percent": 22.74215468145281},
+      {"phase": "sigma_P_plus_solution_update", "ms": 0.4363552011111111, "share_percent": 3.461653051286856},
+      {"phase": "sigma_preparation_and_refresh", "ms": 1.9395438888888887, "share_percent": 15.386611650281152},
+      {"phase": "sigma_other_updates_copies", "ms": 0.5278063311111111, "share_percent": 4.187144766297996},
+      {"phase": "Euler_CFL_reductions", "ms": 0.04366385777777778, "share_percent": 0.34639011090625677},
+      {"phase": "Euler_spatial_RHS", "ms": 2.886261545555555, "share_percent": 22.897025314567504},
+      {"phase": "RK_copies_memsets", "ms": 0.015143395555555553, "share_percent": 0.12013419640295397},
+      {"phase": "RK_common_other", "ms": 0.41594964888888886, "share_percent": 3.2997735963533916}
+    ],
+    "sigma_to_Euler": {"numerator": "Sum of all four sigma_* rows, including preparation, refresh and copies.", "denominator": "Euler_spatial_RHS only; CFL, positivity and RK common work excluded.", "sigma_ms_per_stage": 5.770444904444444, "Euler_spatial_RHS_ms_per_stage": 2.886261545555555, "ratio": 1.9992799728528186},
+    "capture_gates": {"natural_zero_rejection_completion": true, "complete_three_stage_sigma_Euler_limiter_ancestry": true, "selected_recorded_launch_device_reciprocity": true, "capture_boundary_and_output_exclusion": true, "source_GLL_nonidentity_direct_template": true, "DGSEM_p5_SIMT_FP64_kernel_configuration": true, "fused_FP64_local_update": true, "forbidden_ordinary_DG_kernels_absent": true, "all_stage_work_counts_match_expected": true, "grouped_recorded_activity_and_kernel_counts_match_selection": true, "semantic_replay_of_original_audit_passed": true, "lossless_acquisition_established": false},
+    "scatter_incidence": {"selected_limiter_calls": 900, "calls_with_recorded_scatter": 0, "no_op_calls_inferred": false, "active_element_count_inferred": false, "interpretation": "0/900 have a recorded scatter; absence does not establish no-op calls or active element counts."},
+    "diagnostics": {
+      "warning_count": 4,
+      "all_preserved": true,
+      "MPI_helper": {
+        "pid": 3516297,
+        "globalPid": 340468650999808,
+        "name": "orted",
+        "warnings": ["No NVTX events collected. Does the process use NVTX?", "CUDA profiling might have not been started correctly.", "No CUDA events collected. Does the process use CUDA?"]
+      },
+      "main_application": {
+        "pid": 3516284,
+        "globalPid": 340468432896000,
+        "kernel_records": 89100,
+        "memcpy_records": 19005,
+        "NVTX_records": 49747,
+        "warnings": ["Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 12.9"]
+      }
+    },
+    "one_actual_RK_figure": {"selection_policy": "chronologically-first-qualified-complete-RK; never duration-ranked", "recorded_activity_records": 165, "device_span_ms": 38.302111, "GPU_active_union_ms": 37.879807, "three_stage_A_and_P_counts_verified": true, "PNG_sha256": "32ab8b5a9debd305ebe8452e51461333ea7b35411e512115e59f43bbb3e71e7b", "SVG_sha256": "7103f9f5c3977c6d536ec0e9a936aff81c3d495627bd6a8ab5b6bccecc051664", "timeline_remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/positivity-strengthening-20261024/application-timeline-r1/timeline.json", "timeline_sha256": "f67a5918a5e10ffb61382d7d73cb9b20fa6cc656c67668389225583112e2c189"}
+  },
+  "historical_fixed_cylinder_failure": {"target_time": 0.1, "DGSEM_fixed_sweeps": "50 initial /2 regular", "final_time": 0.0006117298531532297, "accepted_steps": 69, "rejected_attempts": 25, "rhs_evaluations": 238, "termination_reason": "limiter-dt-min", "original_limiter_reproduced_same_failure": true, "current_followup_reran_fixed_arm": false, "same_method_full_endpoint_speed_ratio_available": false, "source_commit": "f7b69da28a399f70b4390c7990c3719dd5e6d095", "optimized_job": "3448703", "original_limiter_control_job": "3448829"},
+  "limits": [
+    "The .0025 comparison proves execution equivalence to the prior converged control, not discretization accuracy at .1.",
+    "The1322-cell cylinder is a compatibility case, not a GPU-saturating performance benchmark.",
+    "GL8 minima are sampled; no continuous, between-frame or all-time positivity claim.",
+    "The .1 cylinder result uses converged FGMRES; the large Sedov profile uses fixed50/2 closure and is not a converged tolerance solve.",
+    "Profile ms/shares concern recorded evolved selected stages, not unprofiled costs, full-run fractions or application speedup.",
+    "Recorded launch/activity reciprocity cannot detect records missing from both inventories; four attributed diagnostics preclude a lossless-acquisition claim.",
+    "Fixed DGSEM failed before .1, so no same-method fixed-versus-converged full-endpoint speed ratio exists; successful DG fixed data changes discretization and closure.",
+    "The earlier positivity_limiter_performance_20261024.json remains historical and is not rewritten by this follow-up."
+  ]
+}
