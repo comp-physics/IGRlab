@@ -30,5 +30,31 @@ are not part of DGSEM's already fused Euler residual.
 Native qualification covers projected GLL SIMT/WMMA against an independent
 oracle, actual consistent mass, FP64 residual/update fusion, current coefficient
 refresh, output/prefetch history, mapped DGSEM residual/CFL versus host assembly,
-and native VTK parity. Numerical qualification and performance results are
-pending; no measured DGSEM improvement is claimed by this source change.
+and native VTK parity. Native qualification passed as recorded below. Large-case accuracy and
+performance remain pending; no measured DGSEM speedup is claimed here.
+
+## Native qualification
+
+Canonical DeltaAI job **3446614** passed all **31 selected CPU/CUDA test groups**
+on source `96c7ea05a6cd8a99c69008e85e242f66fba31876`, with unchanged installed
+MFEM/Spack dependencies. The mapped p5 GLL wrapper fixture preserves 50/2 sweep
+budgets, output-only history, and one consumed stage-zero prefetch. Its Euler
+residual differs from separate host evaluation by at most 5.62e-16 in relative
+maximum norm; the CFL maximum agrees exactly. The host oracle uses the base
+operator's mass matrices, rather than independently assembling them.
+
+Projected GLL SIMT and FP64 WMMA oracles, current consistent-mass scaling,
+residual/update fusion, stage/face preparation, and native VTK parity all pass.
+These small fixtures qualify algebra and execution. Their positive projected
+operators do not imply stability of a fixed damping choice for every mapping;
+the large-case trajectory and flow comparison are separate requirements.
+
+The [native record](benchmarks/dgsem_mapped_native_validation.json) binds the
+source, executable, GPU, test selection, canonical commands and log hashes.
+The application binary SHA-256 is
+`6338e9b0a1502c26af26706b80a726707da0e2dfe3c4623b667913524658694b`.
+
+All large fields and profiler data remain on DeltaAI. Field analysis uses a
+prebuilt ARM VTK wheel unpacked into job-local temporary storage; only compact
+metrics and selected render images return to the local machine. Runtime/build
+scratch is cleaned, while installed application dependencies are reused.
