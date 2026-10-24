@@ -1,0 +1,1601 @@
+{
+  "schema": "dgsem-cylinder-spectral-correction-study-v1",
+  "date": "2026-10-24",
+  "status": "completed-stability-and-matched-timing-with-reported-approximation-error",
+  "numerical_source": "30a472fdf7ee761724c56a72bacb005e782928dc",
+  "branch": "dg-positivity-throughput",
+  "no_application_source_change": true,
+  "native_validation_job": "3448740",
+  "inputs": {
+    "binary": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/supersonic_cylinder_w_igr",
+      "bytes": 61882360,
+      "sha256": "e9fc77ec18a1f6d6f282f434002179c1aed625e29556b372526c51ac2a405b74"
+    },
+    "mesh": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/source/examples/supersonic_example_w_igr/supersonic_cylinder.msh",
+      "bytes": 315765,
+      "sha256": "ebaf3e098b78fe635995ffd9756d8e5ff19dbadf19d0dd1448536f54a8aecda2"
+    },
+    "native_receipt": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/run.json",
+      "bytes": 121189,
+      "sha256": "12460aa210db4d00fe5f40d74eddbbf07e1b632f6d2271b0edd9d4bed9ee2dc9"
+    }
+  },
+  "exact_run_configuration": {
+    "FGMRES_argv": [
+      "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/supersonic_cylinder_w_igr",
+      "-m",
+      "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/source/examples/supersonic_example_w_igr/supersonic_cylinder.msh",
+      "--device",
+      "cuda",
+      "--discretization",
+      "dgsem",
+      "--regularization",
+      "igr",
+      "--time-integrator",
+      "rk3ssp",
+      "-o",
+      "5",
+      "-rs",
+      "0",
+      "-rp",
+      "0",
+      "-tf",
+      "0.1",
+      "-c",
+      "0",
+      "--element-assembly-divergence",
+      "--igr-space",
+      "L2",
+      "--igr-grad",
+      "BrokenL2",
+      "--c-alpha",
+      "0.038097964720559922",
+      "--igr-alpha-length",
+      "max",
+      "--igr-ip-kind",
+      "sipg",
+      "--igr-exact-dg-face",
+      "--igr-sigma-cadence",
+      "every-stage",
+      "--igr-stage-rtol-scale",
+      "1",
+      "--igr-linear-solver",
+      "fgmres",
+      "--igr-preconditioner",
+      "none",
+      "--igr-lin-rtol",
+      "1e-6",
+      "--igr-lin-atol",
+      "0",
+      "--igr-lin-maxit",
+      "1000",
+      "--igr-nonconvergence-policy",
+      "error",
+      "--igr-lin-print",
+      "0",
+      "--positivity-limiter",
+      "zhang-shu",
+      "--modal-damping-rate",
+      "80000",
+      "--dgsem-surface-flux",
+      "rusanov",
+      "--no-igr-sigma-cfl",
+      "--no-igr-sigma-rusanov",
+      "--no-igr-invariant-domain-flux",
+      "--no-admissibility-scan",
+      "--no-conservation-balance",
+      "--no-nan-scan",
+      "-no-glvis",
+      "-vtk",
+      "--time-step-save",
+      "0.0025",
+      "--no-vtk-h1-diagnostics",
+      "--no-vtk-l2-diagnostics",
+      "--no-save-state",
+      "-vs",
+      "1000",
+      "-as",
+      "0",
+      "--igr-solve-mode",
+      "krylov",
+      "--igr-jacobi-blocks",
+      "current",
+      "--dgsem-stab",
+      "none",
+      "--dgsem-volume-flux",
+      "central",
+      "--dgsem-volume-dissipation",
+      "none",
+      "--zhang-shu-points",
+      "consumer",
+      "--no-zhang-shu-vtk-points",
+      "--no-vtk-zhang-shu-diagnostics",
+      "-dt",
+      "1e-5",
+      "--startup",
+      "normal",
+      "--startup-width",
+      "0.08",
+      "--velocity-x",
+      "3",
+      "--velocity-y",
+      "0",
+      "--no-vtk-mpi-rank-field"
+    ],
+    "FGMRES_environment_controls": {
+      "PROFILE_NVTX": "0",
+      "IGR_PARTIAL_ASSEMBLY": "1",
+      "IGR_DEVICE_QF": "1",
+      "IGR_FACE_DENSITY_CUDA": "1",
+      "IGR_FACE_DENSITY_CACHE": "1",
+      "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+      "IGR_IPDG_PENALTY_SCALE": "1",
+      "IGR_KRYLOV_BACKEND": "cuda-fp64",
+      "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+      "IGR_TENSOR_VOLUME": "simt",
+      "IGR_TENSOR_VOLUME_STORAGE": "cached",
+      "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+      "IGR_TENSOR_MG": "off",
+      "IGR_TENSOR_MG_OPERATOR": "sampled",
+      "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+      "IGR_TRUE_RESIDUAL": "0",
+      "IGR_EVENT_LOG_MIN_ITERS": "0",
+      "IGR_OPERATOR_PROBE_EVERY": "0",
+      "IGR_PRECONDITIONER_PROBE": "0",
+      "SHARED_OPERATOR_PRECISION": "off",
+      "SHARED_EULER_LAYOUT": "dense",
+      "SHARED_EULER_FLUX_EXECUTION": "element",
+      "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+      "DG_FORCE_MATRIX_FREE": "0",
+      "DG_FORCE_NLFORM_FACE": "0",
+      "DG_NATIVE_MASS_INV": "0",
+      "DG_PACKED_INVMASS_DEVICE": "1",
+      "WEAKDIV_SIGMA_STORAGE": "auto",
+      "IGR_SHARE_STATE_INTERPOLATION": "1",
+      "IGR_FACTORIZED_FACE_NORMALS": "1",
+      "IGR_COMPACT_FACE_QDATA": "1",
+      "IGR_COMPACT_FACE_LIFT": "1",
+      "VTK_PRESSURE_COEFFICIENT": "1",
+      "IGR_LOCAL_TENSOR_PRECONDITIONER": "1",
+      "IGR_EXTENDED_CERTIFICATE": "0",
+      "IGR_EXTENDED_CERTIFICATE_START": "1",
+      "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+      "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+      "DG_PACKED_DENSE_EXECUTION": "rows",
+      "SOLVER_WALL_TIMING": "0",
+      "IGR_TENSOR_VOLUME_COMPACT": "1",
+      "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+      "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+      "IGR_FACE_COALESCED_TRACE": "0",
+      "VTK_OUTPUT_TIMING": "0",
+      "IGR_COEFFICIENT_EXECUTION": "fused",
+      "IGR_FACE_DENSITY_EXECUTION": "tensor",
+      "IGR_STAGE_STATE_DIRECT": "1",
+      "VTK_CACHED_EVALUATION": "1",
+      "LIMITER_TIMING": "0",
+      "LIMITER_CPU_PHASE_TIMING": "0",
+      "TIMING_WARMUP_CALLS": "0",
+      "LIMITER_COOPERATIVE": "1",
+      "DG_TENSOR_FACE": "off",
+      "DG_WEAKDIV_ROW_REUSE": "0",
+      "DG_INVMASS_ROW_REUSE": "0",
+      "DG_TENSOR_FACE_ROW_REUSE": "0",
+      "DG_MAPPED_WEAKDIV_TENSOR": "0",
+      "IGR_SIGMA_BASIS": "lgl",
+      "DGSEM_PRODUCTION_STRICT": "1",
+      "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+      "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+      "DGSEM_FUSED_RESIDUAL": "1",
+      "DGSEM_FUSED_DMMA": "0",
+      "DGSEM_SUBCELL_BLEND": "0",
+      "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+      "DGSEM_TIMING": "0",
+      "IGR_EXACT_FACE_TIMING": "0",
+      "IGR_KRYLOV_APPLY_TIMING": "0",
+      "IGR_KRYLOV_APPLY_SYNC": "0"
+    },
+    "fixed_only_differences": {
+      "--igr-solve-mode": "element-block-jacobi",
+      "--igr-jacobi-blocks": "tensor",
+      "--igr-sweeps": "4",
+      "--igr-initial-sweeps": "50",
+      "--igr-jacobi-omega": "0.2",
+      "IGR_LOCAL_TENSOR_PRECONDITIONER": "0"
+    }
+  },
+  "jobs": {
+    "original_omega07": "3449636",
+    "residual_diagnostic": "3449649",
+    "omega02_and_matched_FGMRES": "3449650"
+  },
+  "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-cylinder-correction-sweep-20261024",
+  "resource_policy": {
+    "GPU_count": 1,
+    "concurrent_GPU_applications": 1,
+    "account": "bdiy-dtai-gh",
+    "partition": "ghx4",
+    "constraint": "projects",
+    "scratch": "job-local /tmp",
+    "dependencies_rebuilt": false
+  },
+  "physical_configuration": {
+    "case": "supersonic cylinder",
+    "method": "p5 DGSEM GLL",
+    "elements": 1322,
+    "geometry": "Q2 non-Cartesian cylinder",
+    "conserved_dofs": 190368,
+    "nominal_dt": 1e-05,
+    "CFL_control": false,
+    "time_integrator": "SSPRK3",
+    "IGR_space": "L2",
+    "gradient": "BrokenL2",
+    "c_alpha": 0.03809796472055992,
+    "alpha_length": "max",
+    "effective_alpha": 0.0004,
+    "positivity": "Zhang-Shu consumer points",
+    "modal_damping_rate": 80000,
+    "optional_nonfinite_admissibility_conservation_scans": "off",
+    "output_interval": 0.0025,
+    "restarts": false
+  },
+  "solver_configuration": {
+    "A": "Current FP64 consistent mass/diffusion/exact SIPG face operator",
+    "P": "Projected element-local spectral inverse, FP64 WMMA, current mass scaling; no Cartesian restriction",
+    "fixed_update": "sigma <- sigma + omega * P * (b-A sigma)",
+    "initial_corrections": 50,
+    "warm_start": "previous committed sigma with existing transactional RK rollback",
+    "screen_counts": [
+      4,
+      8,
+      16,
+      32
+    ],
+    "screen_endpoint": 0.0025,
+    "full_endpoint": 0.1,
+    "matched_FGMRES": "cuda-fp64, same local WMMA P, RHS-relative tolerance1e-6 with final current-equation FP64 certificate"
+  },
+  "initial_omega07_screens": [
+    {
+      "label": "screen-4",
+      "regular_sweeps": 4,
+      "omega": 0.7,
+      "target": 0.0025,
+      "outcome": "native-target-not-completed",
+      "primary_usable": false,
+      "actual_counts": {
+        "steps": 39.0,
+        "accepted_attempts": 39.0,
+        "rejected_attempts": 25.0,
+        "rhs_evaluations": 154.0,
+        "final_time": 0.000313147374391556,
+        "calls": 155.0,
+        "converged_calls": 0.0,
+        "production_calls": 154.0,
+        "output_only_calls": 1.0,
+        "total_iters": 666.0,
+        "total_krylov_operator_apply_count": 666.0,
+        "total_krylov_preconditioner_apply_count": 666.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "0.00031314737439155601",
+        "success": "0",
+        "termination_reason": "limiter-dt-min"
+      },
+      "application_wall_seconds": 15.533578498987481,
+      "sampled_admissibility": null,
+      "fields": null,
+      "engineering_budgets": null,
+      "engineering_qualification_passed": null,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.00031314737439155601",
+        "state_generation": "117",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "0",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    },
+    {
+      "label": "screen-8",
+      "regular_sweeps": 8,
+      "omega": 0.7,
+      "target": 0.0025,
+      "outcome": "native-target-not-completed",
+      "primary_usable": false,
+      "actual_counts": {
+        "steps": 21.0,
+        "accepted_attempts": 21.0,
+        "rejected_attempts": 25.0,
+        "rhs_evaluations": 98.0,
+        "final_time": 0.00016070377588272097,
+        "calls": 99.0,
+        "converged_calls": 0.0,
+        "production_calls": 98.0,
+        "output_only_calls": 1.0,
+        "total_iters": 834.0,
+        "total_krylov_operator_apply_count": 834.0,
+        "total_krylov_preconditioner_apply_count": 834.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "0.00016070377588272097",
+        "success": "0",
+        "termination_reason": "limiter-dt-min"
+      },
+      "application_wall_seconds": 13.002601854968816,
+      "sampled_admissibility": null,
+      "fields": null,
+      "engineering_budgets": null,
+      "engineering_qualification_passed": null,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.00016070377588272097",
+        "state_generation": "63",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "0",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    },
+    {
+      "label": "screen-16",
+      "regular_sweeps": 16,
+      "omega": 0.7,
+      "target": 0.0025,
+      "outcome": "native-target-not-completed",
+      "primary_usable": false,
+      "actual_counts": {
+        "steps": 12.0,
+        "accepted_attempts": 12.0,
+        "rejected_attempts": 25.0,
+        "rhs_evaluations": 83.0,
+        "final_time": 8.063491940498352e-05,
+        "calls": 84.0,
+        "converged_calls": 0.0,
+        "production_calls": 83.0,
+        "output_only_calls": 1.0,
+        "total_iters": 1378.0,
+        "total_krylov_operator_apply_count": 1378.0,
+        "total_krylov_preconditioner_apply_count": 1378.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "8.0634919404983516e-05",
+        "success": "0",
+        "termination_reason": "limiter-dt-min"
+      },
+      "application_wall_seconds": 12.974169557914138,
+      "sampled_admissibility": null,
+      "fields": null,
+      "engineering_budgets": null,
+      "engineering_qualification_passed": null,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "8.0634919404983516e-05",
+        "state_generation": "36",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "0",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    },
+    {
+      "label": "screen-32",
+      "regular_sweeps": 32,
+      "omega": 0.7,
+      "target": 0.0025,
+      "outcome": "native-target-not-completed",
+      "primary_usable": false,
+      "actual_counts": {
+        "steps": 6.0,
+        "accepted_attempts": 6.0,
+        "rejected_attempts": 25.0,
+        "rhs_evaluations": 65.0,
+        "final_time": 4.015626907348633e-05,
+        "calls": 66.0,
+        "converged_calls": 0.0,
+        "production_calls": 65.0,
+        "output_only_calls": 1.0,
+        "total_iters": 2130.0,
+        "total_krylov_operator_apply_count": 2130.0,
+        "total_krylov_preconditioner_apply_count": 2130.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "4.0156269073486331e-05",
+        "success": "0",
+        "termination_reason": "limiter-dt-min"
+      },
+      "application_wall_seconds": 12.908622859977186,
+      "sampled_admissibility": null,
+      "fields": null,
+      "engineering_budgets": null,
+      "engineering_qualification_passed": null,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "4.0156269073486331e-05",
+        "state_generation": "18",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "0",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    }
+  ],
+  "residual_diagnostics": [
+    {
+      "regular_sweeps": 16,
+      "omega": 0.7,
+      "target": 0.0002,
+      "final_status": {
+        "event": "final-status",
+        "final_time": "8.0634919404983516e-05",
+        "success": "0",
+        "termination_reason": "limiter-dt-min"
+      },
+      "explicit_counts": {
+        "event": "run-summary",
+        "steps": "12",
+        "final_time": "8.0634919404983516e-05",
+        "cfl_control_enabled": "0",
+        "cfl_safety_factor": "0",
+        "ssp_coefficient": "1",
+        "ssp_scaled_cfl_factor": "0",
+        "nominal_global_courant": "0",
+        "rhs_evaluations": "83",
+        "accepted_attempts": "12",
+        "rejected_attempts": "25",
+        "rejected_limiter_elements": "34",
+        "rejected_q_sigma_attempts": "0",
+        "rejected_q_sigma_nonpositive_samples": "0",
+        "rejected_q_sigma_nonfinite_samples": "0",
+        "last_q_sigma_rejection_reason": "none",
+        "last_q_sigma_rejection_stage": "-1",
+        "minimum_attempted_dt": "9.9999999999999998e-13",
+        "maximum_attempted_dt": "1.0000000000000001e-05",
+        "minimum_accepted_dt": "1.1920928955078126e-12",
+        "maximum_accepted_dt": "1.0000000000000001e-05",
+        "maximum_accepted_step_growth_ratio": "1",
+        "characteristic_speed_probes": "0",
+        "minimum_characteristic_speed": "0",
+        "maximum_characteristic_speed": "0",
+        "dt_min_reached": "1",
+        "success": "0",
+        "termination_reason": "limiter-dt-min"
+      },
+      "dispatch_valid": true,
+      "true_residual_requested": true,
+      "current_A_extra_application_each_solve_verified": true,
+      "first_relative_rhs_residual": 0.8272619542950835,
+      "minimum_relative_rhs_residual": 0.5851143683465112,
+      "maximum_relative_rhs_residual": 87184161178.4301,
+      "last_relative_rhs_residual": 87184161178.4301,
+      "solve_calls": 84,
+      "timing_use": "diagnostic only, excluded from speedup"
+    },
+    {
+      "regular_sweeps": 16,
+      "omega": 0.2,
+      "target": 0.0002,
+      "final_status": {
+        "event": "final-status",
+        "final_time": "0.00020000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "explicit_counts": {
+        "event": "run-summary",
+        "steps": "20",
+        "final_time": "0.00020000000000000001",
+        "cfl_control_enabled": "0",
+        "cfl_safety_factor": "0",
+        "ssp_coefficient": "1",
+        "ssp_scaled_cfl_factor": "0",
+        "nominal_global_courant": "0",
+        "rhs_evaluations": "60",
+        "accepted_attempts": "20",
+        "rejected_attempts": "0",
+        "rejected_limiter_elements": "0",
+        "rejected_q_sigma_attempts": "0",
+        "rejected_q_sigma_nonpositive_samples": "0",
+        "rejected_q_sigma_nonfinite_samples": "0",
+        "last_q_sigma_rejection_reason": "none",
+        "last_q_sigma_rejection_stage": "-1",
+        "minimum_attempted_dt": "9.9999999999999991e-06",
+        "maximum_attempted_dt": "1.0000000000000001e-05",
+        "minimum_accepted_dt": "9.9999999999999991e-06",
+        "maximum_accepted_dt": "1.0000000000000001e-05",
+        "maximum_accepted_step_growth_ratio": "1",
+        "characteristic_speed_probes": "0",
+        "minimum_characteristic_speed": "0",
+        "maximum_characteristic_speed": "0",
+        "dt_min_reached": "0",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "dispatch_valid": true,
+      "true_residual_requested": true,
+      "current_A_extra_application_each_solve_verified": true,
+      "first_relative_rhs_residual": 0.9645289584317225,
+      "minimum_relative_rhs_residual": 0.37444961021998635,
+      "maximum_relative_rhs_residual": 0.9645289584317225,
+      "last_relative_rhs_residual": 0.37444961021998635,
+      "solve_calls": 61,
+      "timing_use": "diagnostic only, excluded from speedup"
+    },
+    {
+      "regular_sweeps": 16,
+      "omega": 0.1,
+      "target": 0.0002,
+      "final_status": {
+        "event": "final-status",
+        "final_time": "0.00020000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "explicit_counts": {
+        "event": "run-summary",
+        "steps": "20",
+        "final_time": "0.00020000000000000001",
+        "cfl_control_enabled": "0",
+        "cfl_safety_factor": "0",
+        "ssp_coefficient": "1",
+        "ssp_scaled_cfl_factor": "0",
+        "nominal_global_courant": "0",
+        "rhs_evaluations": "60",
+        "accepted_attempts": "20",
+        "rejected_attempts": "0",
+        "rejected_limiter_elements": "0",
+        "rejected_q_sigma_attempts": "0",
+        "rejected_q_sigma_nonpositive_samples": "0",
+        "rejected_q_sigma_nonfinite_samples": "0",
+        "last_q_sigma_rejection_reason": "none",
+        "last_q_sigma_rejection_stage": "-1",
+        "minimum_attempted_dt": "9.9999999999999991e-06",
+        "maximum_attempted_dt": "1.0000000000000001e-05",
+        "minimum_accepted_dt": "9.9999999999999991e-06",
+        "maximum_accepted_dt": "1.0000000000000001e-05",
+        "maximum_accepted_step_growth_ratio": "1",
+        "characteristic_speed_probes": "0",
+        "minimum_characteristic_speed": "0",
+        "maximum_characteristic_speed": "0",
+        "dt_min_reached": "0",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "dispatch_valid": true,
+      "true_residual_requested": true,
+      "current_A_extra_application_each_solve_verified": true,
+      "first_relative_rhs_residual": 0.9721151489588893,
+      "minimum_relative_rhs_residual": 0.5921182276352689,
+      "maximum_relative_rhs_residual": 0.977878014268715,
+      "last_relative_rhs_residual": 0.5921182276352689,
+      "solve_calls": 61,
+      "timing_use": "diagnostic only, excluded from speedup"
+    }
+  ],
+  "omega02_screens": [
+    {
+      "label": "screen-4",
+      "regular_sweeps": 4,
+      "omega": 0.2,
+      "target": 0.0025,
+      "outcome": "target-completed",
+      "primary_usable": true,
+      "actual_counts": {
+        "steps": 250.0,
+        "accepted_attempts": 250.0,
+        "rejected_attempts": 0.0,
+        "rhs_evaluations": 750.0,
+        "final_time": 0.0025,
+        "calls": 751.0,
+        "converged_calls": 0.0,
+        "production_calls": 750.0,
+        "output_only_calls": 1.0,
+        "total_iters": 3050.0,
+        "total_krylov_operator_apply_count": 3050.0,
+        "total_krylov_preconditioner_apply_count": 3050.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "0.0025000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "application_wall_seconds": 13.33083310071379,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 1.3103260351876531,
+          "pressure_min": 0.8965620832450458,
+          "q_sigma_min": 1.3124765328955972
+        },
+        "candidate": {
+          "density_min": 1.3096555004531645,
+          "pressure_min": 0.8976588592117043,
+          "q_sigma_min": 1.3046717568669934
+        }
+      },
+      "fields": {
+        "density": {
+          "normalized_l2": 0.00018646245515392104,
+          "normalized_linf_at_gl_points": 0.00966631359152231,
+          "integral_reference": 10.925110815232651,
+          "integral_candidate": 10.925110815223308,
+          "integral_candidate_minus_reference": -9.342564425797732e-12,
+          "reference_gl_l1": 10.925110815232651,
+          "integral_abs_difference_over_reference_gl_l1": 8.551459645399286e-13
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0001963824756938381,
+          "normalized_linf_at_gl_points": 0.00713648530184098,
+          "integral_reference": 32.49923884270021,
+          "integral_candidate": 32.49925926792229,
+          "integral_candidate_minus_reference": 2.0425222010880883e-05,
+          "reference_gl_l1": 32.49923884270021,
+          "integral_abs_difference_over_reference_gl_l1": 6.284830887806678e-07
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0030996662177833587,
+          "normalized_linf_at_gl_points": 0.005157440047302175,
+          "integral_reference": -1.3859697894566536e-13,
+          "integral_candidate": -1.8646439921014206e-09,
+          "integral_candidate_minus_reference": -1.864505296708152e-09,
+          "reference_gl_l1": 0.17584313871380275,
+          "integral_abs_difference_over_reference_gl_l1": 1.0603230301426588e-08
+        },
+        "energy": {
+          "normalized_l2": 0.00019976690291954402,
+          "normalized_linf_at_gl_points": 0.00659820593354619,
+          "integral_reference": 68.12357001725091,
+          "integral_candidate": 68.1235700099407,
+          "integral_candidate_minus_reference": -7.3101177897655574e-09,
+          "reference_gl_l1": 68.12357001725091,
+          "integral_abs_difference_over_reference_gl_l1": 1.0730673374743012e-10
+        },
+        "sigma": {
+          "normalized_l2": 0.08116428782145729,
+          "normalized_linf_at_gl_points": 0.10723635767495758,
+          "integral_reference": 0.06869869981689232,
+          "integral_candidate": 0.06334272586158313,
+          "integral_candidate_minus_reference": -0.005355973955309245,
+          "reference_gl_l1": 0.06869869981848589,
+          "integral_abs_difference_over_reference_gl_l1": 0.07796325067957144
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": false,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": false,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.0025000000000000001",
+        "state_generation": "750",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    },
+    {
+      "label": "screen-8",
+      "regular_sweeps": 8,
+      "omega": 0.2,
+      "target": 0.0025,
+      "outcome": "target-completed",
+      "primary_usable": true,
+      "actual_counts": {
+        "steps": 250.0,
+        "accepted_attempts": 250.0,
+        "rejected_attempts": 0.0,
+        "rhs_evaluations": 750.0,
+        "final_time": 0.0025,
+        "calls": 751.0,
+        "converged_calls": 0.0,
+        "production_calls": 750.0,
+        "output_only_calls": 1.0,
+        "total_iters": 6050.0,
+        "total_krylov_operator_apply_count": 6050.0,
+        "total_krylov_preconditioner_apply_count": 6050.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "0.0025000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "application_wall_seconds": 13.483262952417135,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 1.3103260351876531,
+          "pressure_min": 0.8965620832450458,
+          "q_sigma_min": 1.3124765328955972
+        },
+        "candidate": {
+          "density_min": 1.3102077899943612,
+          "pressure_min": 0.896844065704799,
+          "q_sigma_min": 1.3082194096207904
+        }
+      },
+      "fields": {
+        "density": {
+          "normalized_l2": 0.0001148435355759177,
+          "normalized_linf_at_gl_points": 0.0056347105784215175,
+          "integral_reference": 10.925110815232651,
+          "integral_candidate": 10.92511081522376,
+          "integral_candidate_minus_reference": -8.913366180455101e-12,
+          "reference_gl_l1": 10.925110815232651,
+          "integral_abs_difference_over_reference_gl_l1": 8.158604824426479e-13
+        },
+        "momentum_x": {
+          "normalized_l2": 0.00010932967407639412,
+          "normalized_linf_at_gl_points": 0.003925709372270836,
+          "integral_reference": 32.49923884270021,
+          "integral_candidate": 32.49925209916404,
+          "integral_candidate_minus_reference": 1.3256463762832187e-05,
+          "reference_gl_l1": 32.49923884270021,
+          "integral_abs_difference_over_reference_gl_l1": 4.079007458296143e-07
+        },
+        "momentum_y": {
+          "normalized_l2": 0.001688267075706772,
+          "normalized_linf_at_gl_points": 0.003124747853988565,
+          "integral_reference": -1.3859697894566536e-13,
+          "integral_candidate": -1.564141940011286e-09,
+          "integral_candidate_minus_reference": -1.5640035829897333e-09,
+          "reference_gl_l1": 0.17584313871380275,
+          "integral_abs_difference_over_reference_gl_l1": 8.894311114039318e-09
+        },
+        "energy": {
+          "normalized_l2": 0.0001143004651897173,
+          "normalized_linf_at_gl_points": 0.0038708886341312946,
+          "integral_reference": 68.12357001725091,
+          "integral_candidate": 68.12357001279783,
+          "integral_candidate_minus_reference": -4.4531300997513e-09,
+          "reference_gl_l1": 68.12357001725091,
+          "integral_abs_difference_over_reference_gl_l1": 6.536841945634434e-11
+        },
+        "sigma": {
+          "normalized_l2": 0.019778633231183222,
+          "normalized_linf_at_gl_points": 0.024997333463560423,
+          "integral_reference": 0.06869869981689232,
+          "integral_candidate": 0.06797665078970792,
+          "integral_candidate_minus_reference": -0.0007220490271844791,
+          "reference_gl_l1": 0.06869869981848589,
+          "integral_abs_difference_over_reference_gl_l1": 0.01051037398221888
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": false,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": false,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.0025000000000000001",
+        "state_generation": "750",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    },
+    {
+      "label": "screen-16",
+      "regular_sweeps": 16,
+      "omega": 0.2,
+      "target": 0.0025,
+      "outcome": "target-completed",
+      "primary_usable": true,
+      "actual_counts": {
+        "steps": 250.0,
+        "accepted_attempts": 250.0,
+        "rejected_attempts": 0.0,
+        "rhs_evaluations": 750.0,
+        "final_time": 0.0025,
+        "calls": 751.0,
+        "converged_calls": 0.0,
+        "production_calls": 750.0,
+        "output_only_calls": 1.0,
+        "total_iters": 12050.0,
+        "total_krylov_operator_apply_count": 12050.0,
+        "total_krylov_preconditioner_apply_count": 12050.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "0.0025000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "application_wall_seconds": 13.832952517084777,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 1.3103260351876531,
+          "pressure_min": 0.8965620832450458,
+          "q_sigma_min": 1.3124765328955972
+        },
+        "candidate": {
+          "density_min": 1.3102568342471916,
+          "pressure_min": 0.8966159183319108,
+          "q_sigma_min": 1.3102254543333938
+        }
+      },
+      "fields": {
+        "density": {
+          "normalized_l2": 6.306161962384587e-05,
+          "normalized_linf_at_gl_points": 0.002942436534609773,
+          "integral_reference": 10.925110815232651,
+          "integral_candidate": 10.925110815226557,
+          "integral_candidate_minus_reference": -6.09601938281476e-12,
+          "reference_gl_l1": 10.925110815232651,
+          "integral_abs_difference_over_reference_gl_l1": 5.579823844271867e-13
+        },
+        "momentum_x": {
+          "normalized_l2": 5.651891293926161e-05,
+          "normalized_linf_at_gl_points": 0.0019661106605397645,
+          "integral_reference": 32.49923884270021,
+          "integral_candidate": 32.499246223633904,
+          "integral_candidate_minus_reference": 7.380933661749303e-06,
+          "reference_gl_l1": 32.49923884270021,
+          "integral_abs_difference_over_reference_gl_l1": 2.2711097012067916e-07
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0008551793816300059,
+          "normalized_linf_at_gl_points": 0.0016477447856415646,
+          "integral_reference": -1.3859697894566536e-13,
+          "integral_candidate": -8.31639728243516e-10,
+          "integral_candidate_minus_reference": -8.31500879291565e-10,
+          "reference_gl_l1": 0.17584313871380275,
+          "integral_abs_difference_over_reference_gl_l1": 4.72865125914803e-09
+        },
+        "energy": {
+          "normalized_l2": 6.032598418792649e-05,
+          "normalized_linf_at_gl_points": 0.002008161352179007,
+          "integral_reference": 68.12357001725091,
+          "integral_candidate": 68.123570014999,
+          "integral_candidate_minus_reference": -2.251976642041635e-09,
+          "reference_gl_l1": 68.12357001725091,
+          "integral_abs_difference_over_reference_gl_l1": 3.3057231755049944e-11
+        },
+        "sigma": {
+          "normalized_l2": 0.008766448621672923,
+          "normalized_linf_at_gl_points": 0.008938190690402364,
+          "integral_reference": 0.06869869981689232,
+          "integral_candidate": 0.06851582876250205,
+          "integral_candidate_minus_reference": -0.0001828710543901892,
+          "reference_gl_l1": 0.06869869981848589,
+          "integral_abs_difference_over_reference_gl_l1": 0.002661928899285821
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.0025000000000000001",
+        "state_generation": "750",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    },
+    {
+      "label": "screen-32",
+      "regular_sweeps": 32,
+      "omega": 0.2,
+      "target": 0.0025,
+      "outcome": "target-completed",
+      "primary_usable": true,
+      "actual_counts": {
+        "steps": 250.0,
+        "accepted_attempts": 250.0,
+        "rejected_attempts": 0.0,
+        "rhs_evaluations": 750.0,
+        "final_time": 0.0025,
+        "calls": 751.0,
+        "converged_calls": 0.0,
+        "production_calls": 750.0,
+        "output_only_calls": 1.0,
+        "total_iters": 24050.0,
+        "total_krylov_operator_apply_count": 24050.0,
+        "total_krylov_preconditioner_apply_count": 24050.0
+      },
+      "dispatch_valid": true,
+      "termination": {
+        "event": "final-status",
+        "final_time": "0.0025000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "application_wall_seconds": 14.083909993991256,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 1.3103260351876531,
+          "pressure_min": 0.8965620832450458,
+          "q_sigma_min": 1.3124765328955972
+        },
+        "candidate": {
+          "density_min": 1.3102900087830256,
+          "pressure_min": 0.8966012182282161,
+          "q_sigma_min": 1.3113135359988166
+        }
+      },
+      "fields": {
+        "density": {
+          "normalized_l2": 3.280503950435984e-05,
+          "normalized_linf_at_gl_points": 0.0014864887120050183,
+          "integral_reference": 10.925110815232651,
+          "integral_candidate": 10.925110815229171,
+          "integral_candidate_minus_reference": -3.4787327717366497e-12,
+          "reference_gl_l1": 10.925110815232651,
+          "integral_abs_difference_over_reference_gl_l1": 3.1841624589165045e-13
+        },
+        "momentum_x": {
+          "normalized_l2": 2.857914830896036e-05,
+          "normalized_linf_at_gl_points": 0.0009781006949947523,
+          "integral_reference": 32.49923884270021,
+          "integral_candidate": 32.499242646032435,
+          "integral_candidate_minus_reference": 3.803332161248773e-06,
+          "reference_gl_l1": 32.49923884270021,
+          "integral_abs_difference_over_reference_gl_l1": 1.1702834579164476e-07
+        },
+        "momentum_y": {
+          "normalized_l2": 0.00042837742101168,
+          "normalized_linf_at_gl_points": 0.0008287587731898713,
+          "integral_reference": -1.3859697894566536e-13,
+          "integral_candidate": -4.119337170362721e-10,
+          "integral_candidate_minus_reference": -4.117951171050593e-10,
+          "reference_gl_l1": 0.17584313871380275,
+          "integral_abs_difference_over_reference_gl_l1": 2.3418321585767713e-09
+        },
+        "energy": {
+          "normalized_l2": 3.0839701915141225e-05,
+          "normalized_linf_at_gl_points": 0.0010048402520341985,
+          "integral_reference": 68.12357001725091,
+          "integral_candidate": 68.12357001612867,
+          "integral_candidate_minus_reference": -1.1222771375362079e-09,
+          "reference_gl_l1": 68.12357001725091,
+          "integral_abs_difference_over_reference_gl_l1": 1.647413864616922e-11
+        },
+        "sigma": {
+          "normalized_l2": 0.004346298338415576,
+          "normalized_linf_at_gl_points": 0.004567966397285855,
+          "integral_reference": 0.06869869981689232,
+          "integral_candidate": 0.06860119325194941,
+          "integral_candidate_minus_reference": -9.75065649428426e-05,
+          "reference_gl_l1": 0.06869869981848589,
+          "integral_abs_difference_over_reference_gl_l1": 0.0014193363950187148
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "certificate": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.0025000000000000001",
+        "state_generation": "750",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "retained_final": null
+    }
+  ],
+  "full_fixed": {
+    "label": "full-4",
+    "regular_sweeps": 4,
+    "omega": 0.2,
+    "target": 0.1,
+    "outcome": "target-completed",
+    "primary_usable": true,
+    "actual_counts": {
+      "steps": 10000.0,
+      "accepted_attempts": 10000.0,
+      "rejected_attempts": 0.0,
+      "rhs_evaluations": 30000.0,
+      "final_time": 0.1,
+      "calls": 30001.0,
+      "converged_calls": 0.0,
+      "production_calls": 30000.0,
+      "output_only_calls": 1.0,
+      "total_iters": 120050.0,
+      "total_krylov_operator_apply_count": 120050.0,
+      "total_krylov_preconditioner_apply_count": 120050.0
+    },
+    "dispatch_valid": true,
+    "termination": {
+      "event": "final-status",
+      "final_time": "0.10000000000000001",
+      "success": "1",
+      "termination_reason": "target-reached"
+    },
+    "application_wall_seconds": 29.551550903357565,
+    "sampled_admissibility": {
+      "reference": {
+        "density_min": 0.03339440948855456,
+        "pressure_min": 0.0013540274299831286,
+        "q_sigma_min": 0.010621745946183096
+      },
+      "candidate": {
+        "density_min": 0.0336920390606083,
+        "pressure_min": 0.0013548731997636285,
+        "q_sigma_min": 0.010707571408027064
+      }
+    },
+    "fields": {
+      "density": {
+        "normalized_l2": 0.0016354826344303303,
+        "normalized_linf_at_gl_points": 0.011371470848193932,
+        "integral_reference": 10.925110822006905,
+        "integral_candidate": 10.92511082091129,
+        "integral_candidate_minus_reference": -1.0956374186630067e-09,
+        "reference_gl_l1": 10.925110822006905,
+        "integral_abs_difference_over_reference_gl_l1": 1.0028616061779609e-10
+      },
+      "momentum_x": {
+        "normalized_l2": 0.0009195041657888277,
+        "normalized_linf_at_gl_points": 0.010177322410500015,
+        "integral_reference": 32.15460420192132,
+        "integral_candidate": 32.15407838251257,
+        "integral_candidate_minus_reference": -0.0005258194087298351,
+        "reference_gl_l1": 32.15461019957473,
+        "integral_abs_difference_over_reference_gl_l1": 1.6352846620320387e-05
+      },
+      "momentum_y": {
+        "normalized_l2": 0.007873254600187759,
+        "normalized_linf_at_gl_points": 0.02313294583382938,
+        "integral_reference": 1.6693709890727281e-09,
+        "integral_candidate": 2.702814548783067e-08,
+        "integral_candidate_minus_reference": 2.5358772629622197e-08,
+        "reference_gl_l1": 0.4674563899891859,
+        "integral_abs_difference_over_reference_gl_l1": 5.424842439357572e-08
+      },
+      "energy": {
+        "normalized_l2": 0.0017136318316587616,
+        "normalized_linf_at_gl_points": 0.01756685589023032,
+        "integral_reference": 68.12357026243146,
+        "integral_candidate": 68.12357023717269,
+        "integral_candidate_minus_reference": -2.5258893278289562e-08,
+        "reference_gl_l1": 68.12357026243146,
+        "integral_abs_difference_over_reference_gl_l1": 3.7078052693047483e-10
+      },
+      "sigma": {
+        "normalized_l2": 0.015996767608988674,
+        "normalized_linf_at_gl_points": 0.021277491560521472,
+        "integral_reference": 0.2515229570785446,
+        "integral_candidate": 0.2512547081598345,
+        "integral_candidate_minus_reference": -0.0002682489187103943,
+        "reference_gl_l1": 0.2515229570868519,
+        "integral_abs_difference_over_reference_gl_l1": 0.0010664987475388452
+      }
+    },
+    "engineering_budgets": {
+      "normalized_l2": 0.001,
+      "normalized_linf_at_gl_points": 0.01,
+      "components": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "all_conservative_components_pass": false,
+      "sigma_budget": null,
+      "meaning": "engineering comparison thresholds, not discretization error bounds"
+    },
+    "engineering_qualification_passed": false,
+    "certificate": {
+      "event": "accepted-state",
+      "scope": "final-committed-accepted-state",
+      "precision": "fp64",
+      "time": "0.10000000000000001",
+      "state_generation": "30000",
+      "solved": "1",
+      "supported": "0",
+      "certified": "0",
+      "residual_rel_rhs": "nan",
+      "run_success": "1",
+      "residual_abs": "nan",
+      "relative_limit": "nan",
+      "absolute_limit": "nan",
+      "skipped_nonfinite": "0",
+      "q_sigma_admitted": "1",
+      "q_sigma_nonpositive_samples": "0",
+      "q_sigma_nonfinite_samples": "0",
+      "jacobi_blocks": "tensor",
+      "solve_mode": "element-block-jacobi",
+      "approximate": "1",
+      "acceptance": "fixed-sweeps"
+    },
+    "retained_final": {
+      "path": "/tmp/igrlab-3449650-spzt66v9/run/sweep/finals/fixed-4.vtu",
+      "bytes": 5855139,
+      "sha256": "6970bcefdd2d66a4c827638ce409327b60ca3b1ee5829888bf6f7e0dc4093e22"
+    }
+  },
+  "matched_FGMRES": {
+    "label": "matched-fgmres",
+    "regular_sweeps": null,
+    "omega": null,
+    "target": 0.1,
+    "outcome": "target-completed",
+    "primary_usable": true,
+    "actual_counts": {
+      "steps": 10000.0,
+      "accepted_attempts": 10000.0,
+      "rejected_attempts": 0.0,
+      "rhs_evaluations": 30000.0,
+      "final_time": 0.1,
+      "calls": 30001.0,
+      "converged_calls": 30001.0,
+      "production_calls": 30000.0,
+      "output_only_calls": 1.0,
+      "total_iters": 2629065.0,
+      "total_krylov_operator_apply_count": 2719070.0,
+      "total_krylov_preconditioner_apply_count": 2629065.0
+    },
+    "dispatch_valid": true,
+    "termination": {
+      "event": "final-status",
+      "final_time": "0.10000000000000001",
+      "success": "1",
+      "termination_reason": "target-reached"
+    },
+    "application_wall_seconds": 651.1442102519795,
+    "sampled_admissibility": {
+      "reference": {
+        "density_min": 0.03339440948855456,
+        "pressure_min": 0.0013540274299831286,
+        "q_sigma_min": 0.010621745946183096
+      },
+      "candidate": {
+        "density_min": 0.03339440948855456,
+        "pressure_min": 0.0013540274299831286,
+        "q_sigma_min": 0.010621745946183096
+      }
+    },
+    "fields": {
+      "density": {
+        "normalized_l2": 0.0,
+        "normalized_linf_at_gl_points": 0.0,
+        "integral_reference": 10.925110822006905,
+        "integral_candidate": 10.925110822006905,
+        "integral_candidate_minus_reference": 0.0,
+        "reference_gl_l1": 10.925110822006905,
+        "integral_abs_difference_over_reference_gl_l1": 0.0
+      },
+      "momentum_x": {
+        "normalized_l2": 0.0,
+        "normalized_linf_at_gl_points": 0.0,
+        "integral_reference": 32.15460420192132,
+        "integral_candidate": 32.15460420192132,
+        "integral_candidate_minus_reference": 0.0,
+        "reference_gl_l1": 32.15461019957473,
+        "integral_abs_difference_over_reference_gl_l1": 0.0
+      },
+      "momentum_y": {
+        "normalized_l2": 0.0,
+        "normalized_linf_at_gl_points": 0.0,
+        "integral_reference": 1.6693709890727281e-09,
+        "integral_candidate": 1.6693709890727281e-09,
+        "integral_candidate_minus_reference": 0.0,
+        "reference_gl_l1": 0.4674563899891859,
+        "integral_abs_difference_over_reference_gl_l1": 0.0
+      },
+      "energy": {
+        "normalized_l2": 0.0,
+        "normalized_linf_at_gl_points": 0.0,
+        "integral_reference": 68.12357026243146,
+        "integral_candidate": 68.12357026243146,
+        "integral_candidate_minus_reference": 0.0,
+        "reference_gl_l1": 68.12357026243146,
+        "integral_abs_difference_over_reference_gl_l1": 0.0
+      },
+      "sigma": {
+        "normalized_l2": 0.0,
+        "normalized_linf_at_gl_points": 0.0,
+        "integral_reference": 0.2515229570785446,
+        "integral_candidate": 0.2515229570785446,
+        "integral_candidate_minus_reference": 0.0,
+        "reference_gl_l1": 0.2515229570868519,
+        "integral_abs_difference_over_reference_gl_l1": 0.0
+      }
+    },
+    "engineering_budgets": {
+      "normalized_l2": 0.001,
+      "normalized_linf_at_gl_points": 0.01,
+      "components": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "all_conservative_components_pass": true,
+      "sigma_budget": null,
+      "meaning": "engineering comparison thresholds, not discretization error bounds"
+    },
+    "engineering_qualification_passed": true,
+    "certificate": {
+      "event": "accepted-state",
+      "scope": "final-committed-accepted-state",
+      "precision": "fp64",
+      "time": "0.10000000000000001",
+      "state_generation": "30000",
+      "solved": "1",
+      "supported": "1",
+      "certified": "1",
+      "residual_rel_rhs": "9.5529615285183118e-07",
+      "run_success": "1",
+      "residual_abs": "4.5151475265160389e-09",
+      "relative_limit": "9.9999999999999995e-07",
+      "absolute_limit": "0",
+      "skipped_nonfinite": "0",
+      "q_sigma_admitted": "1",
+      "q_sigma_nonpositive_samples": "0",
+      "q_sigma_nonfinite_samples": "0"
+    },
+    "retained_final": {
+      "path": "/tmp/igrlab-3449650-spzt66v9/run/sweep/finals/fgmres.vtu",
+      "bytes": 5855139,
+      "sha256": "1e34297201965e8c87d8a0d53b6fa5f61af467c5dbcdb68a202533475663d526"
+    }
+  },
+  "matched_timing": {
+    "admissible": true,
+    "fgmres_over_fixed_application_wall": 22.0341806215659,
+    "fixed_application_wall_seconds": 29.551550903357565,
+    "fgmres_application_wall_seconds": 651.1442102519795,
+    "fixed_fraction_of_fgmres": 0.04538403388693531,
+    "study_descriptive_much_faster_at_least_2x": true,
+    "same_job_gpu_source_mesh_physics_output_schedule": true,
+    "includes_startup_termination_and_native_output": true,
+    "excludes_harness_analysis_and_screening": true,
+    "repeated_trial_confidence_interval": false
+  },
+  "matched_fields": {
+    "status": "completed",
+    "finite_native_and_derived_fields": true,
+    "sampled_density_pressure_positive": true,
+    "sampled_q_sigma_positive": true,
+    "gate_passed": true,
+    "sampled_admissibility": {
+      "reference": {
+        "density_min": 0.03339440948855456,
+        "pressure_min": 0.0013540274299831286,
+        "q_sigma_min": 0.010621745946183096
+      },
+      "candidate": {
+        "density_min": 0.0336920390606083,
+        "pressure_min": 0.0013548731997636285,
+        "q_sigma_min": 0.010707571408027064
+      }
+    },
+    "components": {
+      "density": {
+        "normalized_l2": 0.0016354826344303303,
+        "normalized_linf_at_gl_points": 0.011371470848193932,
+        "integral_reference": 10.925110822006905,
+        "integral_candidate": 10.92511082091129,
+        "integral_candidate_minus_reference": -1.0956374186630067e-09,
+        "reference_gl_l1": 10.925110822006905,
+        "integral_abs_difference_over_reference_gl_l1": 1.0028616061779609e-10
+      },
+      "momentum_x": {
+        "normalized_l2": 0.0009195041657888277,
+        "normalized_linf_at_gl_points": 0.010177322410500015,
+        "integral_reference": 32.15460420192132,
+        "integral_candidate": 32.15407838251257,
+        "integral_candidate_minus_reference": -0.0005258194087298351,
+        "reference_gl_l1": 32.15461019957473,
+        "integral_abs_difference_over_reference_gl_l1": 1.6352846620320387e-05
+      },
+      "momentum_y": {
+        "normalized_l2": 0.007873254600187759,
+        "normalized_linf_at_gl_points": 0.02313294583382938,
+        "integral_reference": 1.6693709890727281e-09,
+        "integral_candidate": 2.702814548783067e-08,
+        "integral_candidate_minus_reference": 2.5358772629622197e-08,
+        "reference_gl_l1": 0.4674563899891859,
+        "integral_abs_difference_over_reference_gl_l1": 5.424842439357572e-08
+      },
+      "energy": {
+        "normalized_l2": 0.0017136318316587616,
+        "normalized_linf_at_gl_points": 0.01756685589023032,
+        "integral_reference": 68.12357026243146,
+        "integral_candidate": 68.12357023717269,
+        "integral_candidate_minus_reference": -2.5258893278289562e-08,
+        "reference_gl_l1": 68.12357026243146,
+        "integral_abs_difference_over_reference_gl_l1": 3.7078052693047483e-10
+      },
+      "sigma": {
+        "normalized_l2": 0.015996767608988674,
+        "normalized_linf_at_gl_points": 0.021277491560521472,
+        "integral_reference": 0.2515229570785446,
+        "integral_candidate": 0.2512547081598345,
+        "integral_candidate_minus_reference": -0.0002682489187103943,
+        "reference_gl_l1": 0.2515229570868519,
+        "integral_abs_difference_over_reference_gl_l1": 0.0010664987475388452
+      }
+    },
+    "existing_engineering_budgets": {
+      "normalized_l2": 0.001,
+      "normalized_linf_at_gl_points": 0.01,
+      "components": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "all_conservative_components_pass": false,
+      "sigma_budget": null,
+      "meaning": "engineering comparison thresholds, not discretization error bounds"
+    },
+    "existing_engineering_qualification_passed": false,
+    "engineering_budgets_are_selection_gate": false,
+    "sigma_has_no_accuracy_budget": true,
+    "scope": "Configured finite trajectory and sampled admissibility; no unconditional stability, discretization accuracy, or between-frame positivity claim."
+  },
+  "matched_GPU": {
+    "hostname": "gh006.hsn.cm.delta.internal.ncsa.edu",
+    "identity": [
+      "GPU-8d1ac016-1267-753e-4674-204cd5dfdf83, NVIDIA GH200 120GB"
+    ],
+    "CUDA_VISIBLE_DEVICES": "0"
+  },
+  "receipts": [
+    {
+      "file": "result-r1.json",
+      "bytes": 120586,
+      "sha256": "c869cac747c8e7a049e6756b80ce3e64d5b543bc35c6c1cbf53618300f9a517a"
+    },
+    {
+      "file": "diagnostic-result.json",
+      "bytes": 133429,
+      "sha256": "21dcff8c2e23dcb7d71fb7d0bf061c735510403bd450ff436f17d813f72c175a"
+    },
+    {
+      "file": "result-omega02.json",
+      "bytes": 226281,
+      "sha256": "5bcd41eae65971e73a7529af2da56d806955c0518a63c42f45bddc427b891605"
+    },
+    {
+      "file": "submission.json",
+      "bytes": 1233,
+      "sha256": "0cee76350dfa28b307ca481bdcc3b51394b56facefb2913e7edd10af5a845cb0"
+    },
+    {
+      "file": "diagnostic-submission.json",
+      "bytes": 607,
+      "sha256": "7e94858547b1cd092494a76cee0238466cfb9d4d4131d34d685842b4c740929e"
+    },
+    {
+      "file": "omega02-submission.json",
+      "bytes": 1241,
+      "sha256": "d3b97d6af198f62bf74ce0d314193e2f68e7bc667ca842924546e0e4e9c02c38"
+    }
+  ],
+  "interpretation": [
+    "Higher counts alone at omega.7 fail earlier; all four arms stop at limiter-dt-min after25 rejections.",
+    "Independent current-equation residual diagnostics show explosive growth along the omega.7 trajectory. Lower omega avoids the short-run failure; this is not a formal eigenvalue or unconditional stability proof.",
+    "Omega affects the initial50 corrections as well as regular corrections. Conservative physical startup is unchanged, but initial approximate sigma changes.",
+    "All four omega.2 counts pass the .0025 screen; only the lowest count4 receives a complete .1 trajectory in this bounded search.",
+    "The final four-correction trajectory completes at nominal dt with zero rejections and finite positive GL8 samples; this is configured trajectory evidence, not global-in-time or between-sample positivity proof.",
+    "Conserved-field errors are reported explicitly. Existing comparator1e-3 relativeL2/1e-2 normalized sampledLinf thresholds are engineering comparisons, not user-approved or discretization-error bounds.",
+    "Sigma remains approximate and has no convergence certificate. FGMRES is certified; fixed fields are compared to that converged flow.",
+    "Fixed-mode residual nan strings in native summaries mean unavailable diagnostics, not measured nonfinite solution fields; the retained final fields pass finite decoding.",
+    "Timing is one unprofiled same-GPU full-application pair with identical physics/output schedule. No repeated-trial uncertainty interval or general HPC-size speedup is claimed; the1322-cell cylinder is a compatibility case."
+  ],
+  "retention": "Only compact logs/comparisons and chosen fixed+FGMRES .1 finals retained remotely; no intermediate VTK or large field download.",
+  "allocation_runtime": {
+    "authority": "Slurm sacct",
+    "jobs": [
+      {
+        "job": "3449636",
+        "state": "COMPLETED",
+        "elapsed_seconds": 67,
+        "exit_code": "0:0",
+        "allocated_TRES": "billing=1000,cpu=4,gres/gpu=1,mem=16G,node=1"
+      },
+      {
+        "job": "3449649",
+        "state": "COMPLETED",
+        "elapsed_seconds": 46,
+        "exit_code": "0:0",
+        "allocated_TRES": "billing=1000,cpu=4,gres/gpu=1,mem=16G,node=1"
+      },
+      {
+        "job": "3449650",
+        "state": "COMPLETED",
+        "elapsed_seconds": 755,
+        "exit_code": "0:0",
+        "allocated_TRES": "billing=1000,cpu=4,gres/gpu=1,mem=16G,node=1"
+      }
+    ],
+    "GPU_count_each": 1,
+    "total_allocated_GPU_minutes": 14.466666666666667,
+    "billed_credits_claim": false
+  },
+  "retained_matched_results": {
+    "remote_archive": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-cylinder-correction-sweep-20261024/omega02-r1/selected/sweep/selected-results.tar.gz",
+    "archive_bytes": 6896936,
+    "archive_sha256": "2236f3f3ff8b5f38c194b42074545d7d45c9114ee2c8589851c4b32c660404ac",
+    "VTU_members": [
+      "finals/fixed-4.vtu",
+      "finals/fgmres.vtu"
+    ],
+    "wrapper_exit": 0,
+    "child_exit": 0,
+    "bulk_fields_downloaded": false
+  }
+}
