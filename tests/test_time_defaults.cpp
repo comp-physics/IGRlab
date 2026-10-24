@@ -95,12 +95,12 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(candidate).empty(),
               "fixed element Jacobi: ordinary-DG every-stage candidate is admitted");
     // Exercise resolved policies, including cases that enable positivity by
-    // default. The raw CLI value alone cannot determine retry admission.
+    // default. The resolved limiter policy keeps transactional retry support.
     struct PositivityAdmission
     {
       bool case_default;
       const char* selection;
-      bool rejected;
+      bool enabled;
     };
     const PositivityAdmission positivity_admission[] = {
       {true, "case", true},
@@ -126,10 +126,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
         const std::string rejection =
           dg_sim::ValidateFixedElementJacobiIGRSelection(policy_run);
         ctx.Check(policy_run.case_config.limiter_pipeline.zhang_shu ==
-                    policy.rejected &&
-                    (policy.rejected
-                      ? rejection.find("RK rejection") != std::string::npos
-                      : rejection.empty()),
+                    policy.enabled && rejection.empty(),
                   std::string("fixed element Jacobi: ") + blocks +
                     " resolves positivity " + policy.selection +
                     (policy.case_default ? " over enabled case policy" :
@@ -207,8 +204,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
               "fixed element Jacobi: DGSEM tensor closure is explicitly admitted");
     unsupported.case_config.limiter_pipeline.zhang_shu = true;
-    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
-              "fixed element Jacobi: DGSEM tensor closure retains retry exclusion");
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: DGSEM tensor closure admits transactional positivity retry");
     unsupported = candidate;
     unsupported.device_backend = dg_sim::DeviceBackend::CPU;
     ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
@@ -1456,9 +1453,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     EulerConsFromPrim2D(/*rho=*/1.2, /*u=*/0.3, /*v=*/-0.1, /*p=*/0.9, gamma);
   FillConstantState(state, bundle.sol);
 
-#ifdef MFEM_USE_EXCEPTIONS
-  // Direct library callers bypass CLI admission. Even terminal rejection must
-  // stop before the converged-solver recovery path can consume fixed history.
+  // An entry limiter can reject before any closure solve, even on CPU. The
+  // fixed-history transaction restores without entering a recovery solver.
   {
     mfem::L2_FECollection sigma_fec(1, 2, mfem::BasisType::GaussLegendre);
     mfem::ParFiniteElementSpace sigma_space(&example_ctx.Mesh(), &sigma_fec);
@@ -1470,29 +1466,20 @@ int RunTimeDefaultsTests(TestContext& ctx)
     mfem::DGHyperbolicConservationLaws base(
       *bundle.sol.ParFESpace(), std::move(integrator), true);
     mfem::EulerWithIGR wrapped(base, igr, bundle.sol);
-    wrapped.BeginRKStep(0, 0.0, 1.0e-4, 3);
-    const mfem::ErrorAction previous_action = mfem::get_error_action();
-    mfem::set_error_action(mfem::MFEM_ERROR_THROW);
+    const mfem::Vector sigma_before(igr.GetSigma());
     for (const double retry_dt : {0.0, 5.0e-5})
     {
-      bool rejected = false;
-      try
-      {
-        wrapped.AbortRKStep(bundle.sol, 0.0, 0, retry_dt);
-      }
-      catch (const mfem::ErrorException& error)
-      {
-        rejected = std::string(error.what()).find("does not support RK abort/retry") !=
-                   std::string::npos;
-      }
-      ctx.Check(rejected && igr.GetLinearSolveCalls() == 0,
+      wrapped.BeginRKStep(0, 0.0, 1.0e-4, 3);
+      wrapped.AbortRKStep(bundle.sol, 0.0, 0, retry_dt);
+      mfem::Vector sigma_error(igr.GetSigma());
+      sigma_error -= sigma_before;
+      ctx.Check(igr.GetLinearSolveCalls() == 0 && sigma_error.Normlinf() == 0.0 &&
+                  !igr.HasPendingStage0PrefetchAccounting(),
                 retry_dt > 0.0
-                  ? "fixed element Jacobi: direct RK retry fails before sigma recovery"
-                  : "fixed element Jacobi: terminal RK abort fails before sigma recovery");
+                  ? "fixed element Jacobi: entry rejection restores without a retry solve"
+                  : "fixed element Jacobi: terminal entry rejection restores without a recovery solve");
     }
-    mfem::set_error_action(previous_action);
   }
-#endif
 
   // --- initial Zhang-Shu admission precedes all consumers and is strict ---
   {

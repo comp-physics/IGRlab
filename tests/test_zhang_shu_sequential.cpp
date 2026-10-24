@@ -832,7 +832,7 @@ int main(int argc, char** argv)
       if (result != 0) { return result; }
     }
   }
-  for (int order = 1; order <= 3; ++order)
+  for (int order : {1, 2, 3, 5})
   {
     const int result = CurvedDGSEMConservationCase(order);
     if (result != 0) { return result; }

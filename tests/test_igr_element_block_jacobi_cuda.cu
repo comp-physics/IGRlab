@@ -3,6 +3,7 @@
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
+#include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "physics/bc/boundary_state.hpp"
 #include "physics/igr/IGR.hpp"
 #include "physics/igr/igr_coupling.hpp"
@@ -1003,6 +1004,262 @@ void CheckDGSEMMappedFixedLifecycle()
             << "rhs_relative_max=" << max_rhs_error << " cfl_relative_error=" << max_speed_error << '\n';
 }
 
+void CheckFixedPositivityRollback(bool dgsem, const char* block_policy)
+{
+  LifecycleEnvironment environment;
+  const std::pair<const char*, const char*> settings[] = {
+    {"IGRLAB_IGR_TRUE_RESIDUAL", "0"},
+    {"IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", "projected"},
+    {"IGRLAB_IGR_LOCAL_TENSOR_EXECUTION", "simt-fp64"},
+    {"IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor"},
+    {"IGRLAB_IGR_STAGE_STATE_DIRECT", "1"},
+    {"IGRLAB_IGR_TENSOR_VOLUME_COMPACT", "1"},
+    {"IGRLAB_IGR_COMPACT_FACE_QDATA", "1"},
+    {"IGRLAB_IGR_COMPACT_FACE_LIFT", "1"},
+    {"IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL", "1"},
+    {"IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE", "1"},
+    {"IGRLAB_DGSEM_PRODUCTION_STRICT", "1"},
+    {"IGRLAB_DGSEM_FUSED_RESIDUAL", "1"},
+    {"IGRLAB_DGSEM_FUSED_DMMA", "0"},
+    {"IGRLAB_DGSEM_SUBCELL_BLEND", "0"},
+    {"IGRLAB_DGSEM_VOLUME_QUADRATURE_MIN_ORDER", "0"}};
+  for (const auto& setting : settings) { environment.Set(setting.first, setting.second); }
+
+  Mesh serial = Mesh::MakeCartesian2D(3, 2, Element::QUADRILATERAL, true, 1.0, .8);
+  serial.SetCurvature(2, false, 2, Ordering::byVDIM);
+  serial.Transform([](const Vector& x, Vector& y)
+  {
+    y.SetSize(2);
+    y[0] = x[0] + .08*x[0]*x[1];
+    y[1] = x[1] + .04*x[0]*(1.0-x[0]);
+  });
+  ParMesh mesh(MPI_COMM_WORLD, serial);
+  DG_FECollection collection(5, 2,
+    dgsem ? BasisType::GaussLobatto : BasisType::GaussLegendre);
+  ParFiniteElementSpace scalar_space(&mesh, &collection);
+  ParFiniteElementSpace vector_space(&mesh, &collection, 4, Ordering::byNODES);
+  ::igrlab::IGRConfig config;
+  config.alpha = .002;
+  config.backend = ::igrlab::IGRGradBackend::BrokenDG;
+  config.ip_kind = ::igrlab::IGRIPKind::SIPG;
+  config.solve_mode = ::igrlab::IGRSolveMode::FixedElementJacobi;
+  config.element_jacobi_reference_blocks = std::strcmp(block_policy, "reference") == 0;
+  config.element_jacobi_tensor_blocks = std::strcmp(block_policy, "tensor") == 0;
+  config.regular_sweeps = 2;
+  config.warm_start_sweeps = 50;
+  config.element_jacobi_omega = .7;
+  config.exact_dg_face_operator = true;
+  config.nan_scan = false;
+
+  struct Scenario
+  {
+    bool warm, prefetch, entry_mutation, output, terminal;
+  };
+  const Scenario scenarios[] = {
+    {false, false, false, false, false},
+    {true, false, false, true, false},
+    {false, true, false, false, false},
+    {true, true, false, true, false},
+    {false, true, false, true, false},
+    {false, false, true, false, false},
+    {false, true, true, false, false},
+    {false, true, false, false, true}};
+  struct Result
+  {
+    Vector state, sigma;
+    int iterations = 0;
+    int output_iterations = 0;
+    long long reuses = 0;
+  };
+  const auto same = [](const Vector& a, const Vector& b)
+  {
+    return a.Size() == b.Size() &&
+      std::memcmp(a.HostRead(), b.HostRead(),
+                  std::size_t(a.Size())*sizeof(double)) == 0;
+  };
+
+  for (const auto& scenario : scenarios)
+  {
+    const auto run = [&](bool reject)
+    {
+      int phase = 0;
+      VectorFunctionCoefficient initial(4, [&](const Vector& x, Vector& value)
+      {
+        const double rho = .9+.15*x[0]+.08*x[1]+.03*phase*x[0]*x[1];
+        const double u = .2+.06*x[0]+.03*phase*x[1];
+        const double v = -.1+.08*x[1]-.02*phase*x[0];
+        value.SetSize(4);
+        value[0] = rho; value[1] = rho*u; value[2] = rho*v;
+        value[3] = 2.5+.5*rho*(u*u+v*v);
+      });
+      ParGridFunction state(&vector_space);
+      state.ProjectCoefficient(initial);
+      ::igrlab::IGRSolver solver(scalar_space, vector_space, 2, 4, config.alpha);
+      solver.ApplyConfig(config);
+      EulerFlux euler(2, 1.4);
+      FluxWithIGR physical(euler);
+      physical.SetSigmaField(&solver.GetSigma());
+      RusanovFluxWithSides flux(physical);
+      auto integrator = std::make_unique<HyperbolicFormIntegrator>(flux, 2);
+      DGHyperbolicConservationLaws base(vector_space, std::move(integrator), true);
+      base.SetNumericalFlux(&flux);
+      if (dgsem)
+      {
+        base.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+        base.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+        base.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::None);
+        base.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+        base.SetDGSEMGamma(1.4);
+        base.SetDGSEMDiagnosticStateScan(false);
+      }
+      Array<int> boundary(mesh.bdr_attributes.Max()); boundary = 1;
+      base.AddBdrFaceIntegrator(std::make_unique<BdrHyperbolicFluxIntegrator>(
+        flux, std::make_unique<SlipWallState>(2), 2), boundary);
+      EulerWithIGR wrapped(base, solver, state);
+      mfem::RK3SSPWithLimiter stepper(vector_space);
+      stepper.SetEulerParams(2, 1.4);
+      stepper.SetLimiterParams(1.e-10, 1.e-10, 12, 30);
+      stepper.LimitInitial(scenario.entry_mutation);
+      bool force_failure = false;
+      int callback = 0;
+      std::vector<int> sweeps;
+      stepper.AddAlwaysCallback([&](ParFiniteElementSpace&, ParGridFunction& stage, double)
+      {
+        ++callback;
+        if (scenario.entry_mutation && callback == 1)
+        {
+          // Model an earlier limiter that changes the entry state. The failed
+          // attempt deliberately chooses a different reference coefficient
+          // from the accepted retry, exposing leaked first-initialization data.
+          phase = force_failure ? 4 : 2;
+          stage.ProjectCoefficient(initial);
+          return;
+        }
+        sweeps.push_back(solver.GetLastLinearIters());
+        if (force_failure && sweeps.size() == 2)
+        {
+          // The real Zhang-Shu gate below rejects these negative means after
+          // two production RHS evaluations have already advanced sigma.
+          double* values = stage.HostReadWrite();
+          for (int i = 0; i < vector_space.GetNDofs(); ++i) { values[i] = -1.0; }
+        }
+      });
+      stepper.AddZhangShuLimiter(mfem::ZhangShuPointSet::kConsumer, true, false);
+      stepper.Init(wrapped);
+      double time = 0.0;
+      double dt = 1.e-5;
+      int step = 0;
+      if (scenario.warm)
+      {
+        stepper.Step(state, time, dt);
+        ++step;
+      }
+      const auto generation = stepper.GetStateGeneration();
+      if (scenario.output && reject)
+      {
+        const auto output = wrapped.PrepareSigmaForOutput(
+          state, generation, step, time, false);
+        MFEM_VERIFY(output.solved && output.output_only,
+                    "Rollback fixture did not interpose an output-only solve.");
+      }
+      if (scenario.prefetch)
+      {
+        const auto prefetch = wrapped.PrepareSigmaForOutput(
+          state, generation, step, time, true);
+        MFEM_VERIFY(prefetch.solved && prefetch.reusable_stage0 &&
+                      solver.HasPendingStage0PrefetchAccounting(),
+                    "Rollback fixture did not initialize its stage-zero prefetch.");
+      }
+      if (reject)
+      {
+        Vector accepted(state), accepted_sigma(solver.GetSigma());
+        const double accepted_time = time;
+        callback = 0; sweeps.clear(); force_failure = true;
+        dt = 2.e-5;
+        bool rejected = false;
+        try { stepper.Step(state, time, dt); }
+        catch (const mfem::RecoverableLimiterFailure& failure)
+        {
+          rejected = failure.GlobalRejectedElementCount() == mesh.GetNE();
+        }
+        MFEM_VERIFY(rejected && sweeps.size() == 2,
+                    "Rollback fixture did not force the intended late Zhang-Shu rejection.");
+        state = accepted;
+        time = accepted_time;
+        stepper.RestoreStateGeneration(generation);
+        const int calls = solver.GetLinearSolveCalls();
+        wrapped.AbortRKStep(state, time, generation, scenario.terminal ? 0.0 : 1.e-5);
+        MFEM_VERIFY(solver.GetLinearSolveCalls() == calls &&
+                      same(solver.GetSigma(), accepted_sigma) &&
+                      solver.HasPendingStage0PrefetchAccounting() ==
+                        (scenario.prefetch && !scenario.terminal),
+                    "Fixed rollback changed the accepted sigma/prefetch or performed an extra solve.");
+        if (scenario.entry_mutation && scenario.prefetch)
+        {
+          MFEM_VERIFY(solver.GetOutputOnlyLinearIterations() == 0 &&
+                        wrapped.GetSigmaPrefetchInvalidationCount() == 0 &&
+                        wrapped.GetSigmaOutputOnlySolveCount() == 0,
+                      "Restoring an entry-invalidated prefetch retained output-only accounting.");
+        }
+      }
+      callback = 0; sweeps.clear(); force_failure = false;
+      dt = 1.e-5;
+      stepper.Step(state, time, dt);
+      MFEM_VERIFY(sweeps.size() == 3 &&
+                    sweeps[0] == (scenario.warm ? 2 : 50) &&
+                    sweeps[1] == 2 && sweeps[2] == 2 &&
+                    !solver.GetLastLinearConverged() &&
+                    !solver.HasPendingStage0PrefetchAccounting(),
+                  "Accepted retry changed the initialization/regular sweep budget or certificate.");
+      // A subsequent accepted step witnesses the retained reference factors
+      // and proves accept releases the transaction for another begin.
+      callback = 0; sweeps.clear();
+      stepper.Step(state, time, dt);
+      MFEM_VERIFY(sweeps.size() == 3 && sweeps[0] == 2 &&
+                    sweeps[1] == 2 && sweeps[2] == 2,
+                  "Accepted fixed history was not retained for the following step.");
+      if (dgsem)
+      {
+        const auto selection = base.GetDGSEMProductionSelection();
+        MFEM_VERIFY(selection.supported && selection.strict && selection.uses_sigma &&
+                      base.GetDGSEMProductionBridgeEvidence().fallback_mult_calls == 0,
+                    "Rollback fixture left the native packed DGSEM sigma path.");
+      }
+      Result result;
+      result.state = state; result.sigma = solver.GetSigma();
+      result.iterations = solver.GetProductionLinearIterations();
+      result.output_iterations = solver.GetOutputOnlyLinearIterations();
+      result.reuses = wrapped.GetSigmaStage0ReuseCount();
+      return result;
+    };
+    const auto clean = run(false);
+    const auto retried = run(true);
+    MFEM_VERIFY(same(clean.state, retried.state) && same(clean.sigma, retried.sigma) &&
+                  retried.iterations > clean.iterations,
+                "Rejected fixed closure history changed the accepted retry state/sigma or hid rejected work.");
+    if (scenario.prefetch && !scenario.entry_mutation && !scenario.terminal)
+    {
+      MFEM_VERIFY(clean.reuses == 1 && retried.reuses == 2 &&
+                    clean.iterations == (scenario.warm ? 66 : 60) &&
+                    retried.iterations == clean.iterations + 2,
+                  "Restored stage-zero prefetch was recomputed or counted twice.");
+    }
+    if (scenario.output)
+    {
+      MFEM_VERIFY(clean.output_iterations == 0 &&
+                    retried.output_iterations == (scenario.warm ? 2 : 50),
+                  "Interposed output-only work contaminated production accounting.");
+    }
+    std::cout << "fixed_positivity_rollback passed backend=" << (dgsem ? "dgsem" : "dg")
+              << " basis=" << (dgsem ? "gll" : "gl") << " geometry=q2 p=5 blocks=" << block_policy
+              << " warm=" << scenario.warm << " prefetch=" << scenario.prefetch
+              << " entry_mutation=" << scenario.entry_mutation << " output=" << scenario.output
+              << " terminal=" << scenario.terminal
+              << " accepted_state=bitwise accepted_sigma=bitwise abort_solves=0 "
+                 "initial_sweeps=50 regular_sweeps=2 rejected_work=retained\n";
+  }
+}
+
 }
 
 int main(int argc, char** argv)
@@ -1013,7 +1270,20 @@ int main(int argc, char** argv)
                 ::igrlab::dg_face::UsesOrdinaryCUDAForDGDiffusionFaces2D(),
               "Element-block fixture requires one native CUDA rank.");
   const bool gll_only = argc==2 && std::strcmp(argv[1], "--qualify-dgsem-mapped")==0;
-  MFEM_VERIFY(argc==1 || gll_only, "Expected no arguments or --qualify-dgsem-mapped.");
+  const bool rollback_dg = argc==2 && std::strcmp(argv[1], "--qualify-positivity-rollback-dg")==0;
+  const bool rollback_dgsem = argc==2 && std::strcmp(argv[1], "--qualify-positivity-rollback-dgsem")==0;
+  MFEM_VERIFY(argc==1 || gll_only || rollback_dg || rollback_dgsem,
+              "Expected a supported mapped-lifecycle or positivity-rollback qualification argument.");
+  if (rollback_dg || rollback_dgsem)
+  {
+    if (rollback_dg)
+    {
+      CheckFixedPositivityRollback(false, "current");
+      CheckFixedPositivityRollback(false, "reference");
+    }
+    CheckFixedPositivityRollback(rollback_dgsem, "tensor");
+    return 0;
+  }
   if (gll_only)
   {
     int current_device = 0;

@@ -828,6 +828,23 @@ if (MFEM_USE_CUDA)
     RUN_SERIAL TRUE
   )
 
+  set_source_files_properties(test_zhang_shu_throughput.cpp PROPERTIES LANGUAGE CUDA)
+  add_executable(dg_igr_zhang_shu_throughput_test test_zhang_shu_throughput.cpp)
+  target_link_libraries(dg_igr_zhang_shu_throughput_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_zhang_shu_throughput_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(dg_igr_zhang_shu_throughput_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_zhang_shu_throughput_test PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  foreach(_limiter_device cpu cuda)
+    add_test(NAME dg_igr_zhang_shu_throughput_${_limiter_device}
+      COMMAND dg_igr_zhang_shu_throughput_test ${_limiter_device})
+    set_tests_properties(dg_igr_zhang_shu_throughput_${_limiter_device} PROPERTIES
+      LABELS "limiter;admissibility;conservation;${_limiter_device}"
+      TIMEOUT 180 RUN_SERIAL TRUE)
+  endforeach()
+
   add_executable(dg_igr_limiter_device_alias_test
     test_limiter_device_alias.cpp
   )
@@ -2035,6 +2052,13 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA AND MFEM_USE_MP
   set_tests_properties(dg_igr_dgsem_mapped_fixed_cuda PROPERTIES
     LABELS "cuda;igr;dgsem;mapped;element-block" TIMEOUT 180 RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+
+  foreach(_fixed_limiter_backend dg dgsem)
+    add_test(NAME dg_igr_fixed_positivity_rollback_${_fixed_limiter_backend}_cuda
+      COMMAND dg_igr_element_block_jacobi_test --qualify-positivity-rollback-${_fixed_limiter_backend})
+    set_tests_properties(dg_igr_fixed_positivity_rollback_${_fixed_limiter_backend}_cuda PROPERTIES
+      LABELS "cuda;igr;limiter;mapped;rollback" TIMEOUT 240 RUN_SERIAL TRUE)
+  endforeach()
 
   add_executable(dg_igr_local_tensor_jacobi_test test_igr_local_tensor_jacobi_cuda.cu)
   target_link_libraries(dg_igr_local_tensor_jacobi_test PRIVATE igr_mfem mfem MPI::MPI_CXX)

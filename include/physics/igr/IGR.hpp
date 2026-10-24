@@ -8,6 +8,8 @@
 #include <memory>
 #include <string>
 
+namespace mfem { class EulerWithIGR; }
+
 /**
  * @file physics/igr/IGR.hpp
  * @brief Information Geometric Regularization (IGR) solver for sigma coupled to Euler.
@@ -570,6 +572,8 @@ public:
   int NumEquations() const { return num_eq_; }
 
 private:
+  friend class mfem::EulerWithIGR;
+
   struct SolveAccountingDelta
   {
     bool valid = false;
@@ -583,6 +587,11 @@ private:
   };
 
   void AddOutputOnlyAccounting_(const SolveAccountingDelta& delta);
+  void BeginFixedElementJacobiRKStep_();
+  void AcceptFixedElementJacobiRKStep_();
+  bool AbortFixedElementJacobiRKStep_();
+  void CommitElementJacobiHistory_();
+  void DiscardUncommittedElementJacobiBlocks_();
 
   // --- QuadratureFunction coefficient path for PA/device operators. ---
   // On CUDA this is the default host-sync-free path. On CPU it is explicit
@@ -776,6 +785,30 @@ private:
   mfem::Vector element_jacobi_history_;
   mfem::Vector element_jacobi_residual_, element_jacobi_correction_;
   bool element_jacobi_history_valid_ = false;
+
+  // Protect the accepted history on its first overwrite by swapping buffers;
+  // accepted steps add no history copy. Only the live scalar field needs a
+  // checkpoint, because output or a pending prefetch can differ from history.
+  struct FixedElementJacobiRKSnapshot
+  {
+    bool active = false;
+    bool history_saved = false;
+    bool history_valid = false;
+    bool first_call = true;
+    bool blocks_present = false;
+    bool original_prefetch_pending = false;
+    bool original_prefetch_reclassified = false;
+    bool last_converged = false;
+    double last_final_norm = std::numeric_limits<double>::quiet_NaN();
+    mfem::Vector sigma, history, prefetch_sigma_checkpoint;
+    std::unique_ptr<mfem::Solver> abandoned_blocks;
+    std::string tensor_key;
+    SolveAccountingDelta prefetch_accounting;
+    bool prefetch_first_call = true;
+    bool prefetch_last_converged = false;
+    double prefetch_last_final_norm =
+      std::numeric_limits<double>::quiet_NaN();
+  } fixed_element_jacobi_rk_snapshot_;
 
   // New solve controls
   SolveMode solve_mode_ = SolveMode::Krylov;

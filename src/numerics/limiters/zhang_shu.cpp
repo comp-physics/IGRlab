@@ -90,6 +90,12 @@ struct ElementFaceCacheEntry
   std::vector<std::vector<int>> elem_faces;
 };
 
+struct LimiterAdmissionCounts
+{
+  int rejected;
+  int active;
+};
+
 struct DeviceLimiterCache
 {
   const mfem::Mesh* mesh = nullptr;
@@ -103,6 +109,8 @@ struct DeviceLimiterCache
   int num_eq = 0;
   bool collocated_lgl_average = false;
   bool tensor_points = false;
+  bool compact_reference_requested = false;
+  bool shared_reference_points = false;
   bool mfem_volume_points = false;
   bool mfem_face_points = false;
   bool enforce_nodes = false;
@@ -131,6 +139,7 @@ struct DeviceLimiterCache
   mfem::Vector collapsed_average;
   mfem::Vector average_repair;
   mfem::Array<mfem::real_t> admissibility_reduce_workspace;
+  mfem::Array<LimiterAdmissionCounts> admission_counts_workspace;
 
   struct FaceCopyPlan
   {
@@ -298,6 +307,35 @@ struct ActiveCountReductionBody
   }
 };
 
+struct LimiterAdmissionReductionBody
+{
+  const double* rejected = nullptr;
+  const double* active = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int i, LimiterAdmissionCounts& counts) const
+  {
+    counts.rejected += rejected[i] != 0.0 ? 1 : 0;
+    counts.active += active[i] != 0.0 ? 1 : 0;
+  }
+};
+
+struct LimiterAdmissionReducer
+{
+  using value_type = LimiterAdmissionCounts;
+
+  static MFEM_HOST_DEVICE void Join(value_type& a, const value_type& b)
+  {
+    a.rejected += b.rejected;
+    a.active += b.active;
+  }
+
+  static MFEM_HOST_DEVICE void SetInitialValue(value_type& value)
+  {
+    value.rejected = 0;
+    value.active = 0;
+  }
+};
+
 struct MinimumThetaReductionBody
 {
   const mfem::real_t* theta_rho = nullptr;
@@ -457,7 +495,8 @@ void RecordLimiterTiming(double seconds,
                          const mfem::Vector* active,
                          const mfem::Vector* theta_rho,
                          const mfem::Vector* theta_p,
-                         MPI_Comm communicator)
+                         MPI_Comm communicator,
+                         double known_local_active = -1.0)
 {
   LimiterTimingState& timing = GetLimiterTimingState();
   if (!timing.enabled)
@@ -469,8 +508,10 @@ void RecordLimiterTiming(double seconds,
     return;
   }
 
-  double local_active =
-    CountActiveElements(active, timing.active_reduce_workspace);
+  const double local_active = known_local_active >= 0.0
+                                ? known_local_active
+                                : CountActiveElements(
+                                    active, timing.active_reduce_workspace);
   const double local_minimum_theta =
     MinimumTheta(theta_rho, theta_p, timing.theta_reduce_workspace);
 
@@ -807,6 +848,255 @@ MFEM_HOST_DEVICE inline double DeviceThetaForPressure(const double* average,
   return lo;
 }
 
+// Each CUDA block owns one p5 tensor cell.  Point evaluations are independent:
+// their dof sums and pressure bisections retain the serial kernel's order, and
+// only finite scalar minima/boolean admission flags are reduced across lanes.
+// Keep the cell mean serial so curved DG and collocated DGSEM use exactly the
+// existing physical/discrete mean and its accumulation order.
+struct CooperativeZhangShuQuadKernel
+{
+  static constexpr int kD1D = 6;
+  static constexpr int kDof = kD1D * kD1D;
+  static constexpr int kNumEq = 4;
+  static constexpr int kLanes = 32;
+
+  int ne = 0;
+  int volume_nq = 0;
+  int total_face_points = 0;
+  int p_bisect_iters = 0;
+  double gamma = 0.0;
+  double rho_min = 0.0;
+  double p_min = 0.0;
+  bool capture_diagnostics = false;
+  bool shared_reference_points = false;
+  const double* weights = nullptr;
+  const int* offsets = nullptr;
+  const int* face_offsets = nullptr;
+  const double* factors = nullptr;
+  const double* volume_values = nullptr;
+  const double* face_values = nullptr;
+  double* state = nullptr;
+  double* averages = nullptr;
+  double* theta_rho = nullptr;
+  double* theta_p = nullptr;
+  double* active = nullptr;
+  double* inadmissible_average = nullptr;
+  double* rejected_element = nullptr;
+  double* collapsed_average = nullptr;
+  double* average_repair = nullptr;
+
+  MFEM_HOST_DEVICE void LoadPoint(int e,
+                                  int point,
+                                  int face_begin,
+                                  int face_count,
+                                  const double* cell_state,
+                                  const double* average,
+                                  double rho_theta,
+                                  bool pressure_pass,
+                                  double* value) const
+  {
+    if (point < volume_nq)
+    {
+      for (int c = 0; c < kNumEq; ++c)
+      {
+        const double original =
+          volume_values[point + volume_nq * (c + kNumEq * e)];
+        value[c] = pressure_pass
+                     ? average[c] + rho_theta * (original - average[c])
+                     : original;
+      }
+      return;
+    }
+    point -= volume_nq;
+    if (point < face_count)
+    {
+      for (int c = 0; c < kNumEq; ++c)
+      {
+        const double original =
+          face_values[face_begin + point + total_face_points * c];
+        value[c] = pressure_pass
+                     ? average[c] + rho_theta * (original - average[c])
+                     : original;
+      }
+      return;
+    }
+    point += (shared_reference_points ? 0 : offsets[e]) - face_count;
+    for (int c = 0; c < kNumEq; ++c) { value[c] = 0.0; }
+    for (int d = 0; d < kDof; ++d)
+    {
+      const double basis = LimiterPointBasis(nullptr,
+                                             factors,
+                                             true,
+                                             point,
+                                             d,
+                                             kDof,
+                                             2,
+                                             kD1D);
+      for (int c = 0; c < kNumEq; ++c)
+      {
+        value[c] += basis * cell_state[d + kDof * c];
+      }
+    }
+  }
+
+  MFEM_HOST_DEVICE void operator()(int e) const
+  {
+    MFEM_SHARED double cell_state[kDof * kNumEq];
+    MFEM_SHARED double average[kNumEq];
+    MFEM_SHARED double lane_theta[kLanes];
+    MFEM_SHARED int lane_finite[kLanes];
+    MFEM_SHARED double rho_theta;
+    MFEM_SHARED double pressure_theta;
+    MFEM_SHARED int average_is_admissible;
+
+    MFEM_FOREACH_THREAD(i, x, kDof * kNumEq)
+    {
+      cell_state[i] = state[i + kDof * kNumEq * e];
+    }
+    MFEM_SYNC_THREAD;
+    if (MFEM_THREAD_ID(x) == 0)
+    {
+      for (int c = 0; c < kNumEq; ++c) { average[c] = 0.0; }
+      for (int d = 0; d < kDof; ++d)
+      {
+        for (int c = 0; c < kNumEq; ++c)
+        {
+          average[c] += weights[e * kDof + d] *
+                        cell_state[d + kDof * c];
+        }
+      }
+      bool finite = true;
+      for (int c = 0; c < kNumEq; ++c)
+      {
+        finite = finite && std::isfinite(average[c]);
+        averages[c + kNumEq * e] = average[c];
+        if (capture_diagnostics) { average_repair[e + ne * c] = 0.0; }
+      }
+      if (capture_diagnostics) { collapsed_average[e] = 0.0; }
+      double momentum_sq = 0.0;
+      for (int d = 0; d < 2; ++d)
+      {
+        momentum_sq += average[1 + d] * average[1 + d];
+      }
+      const double kinetic = finite && average[0] > rho_min
+                               ? 0.5 * momentum_sq / average[0]
+                               : 0.0;
+      const double pressure = (gamma - 1.0) * (average[3] - kinetic);
+      average_is_admissible = finite && average[0] > rho_min &&
+                              std::isfinite(pressure) && pressure > p_min;
+      inadmissible_average[e] = average_is_admissible ? 0.0 : 1.0;
+      theta_rho[e] = 1.0;
+      theta_p[e] = 1.0;
+      active[e] = 0.0;
+      rejected_element[e] = average_is_admissible ? 0.0 : 1.0;
+    }
+    MFEM_SYNC_THREAD;
+    if (!average_is_admissible) { return; }
+
+    const int face_begin = face_offsets ? face_offsets[e] : 0;
+    const int face_count = face_offsets ? face_offsets[e + 1] - face_begin : 0;
+    const int point_count = volume_nq + face_count +
+                            offsets[e + 1] - offsets[e];
+    MFEM_FOREACH_THREAD(lane, x, kLanes)
+    {
+      double minimum = 1.0;
+      bool finite = true;
+      for (int point = lane; point < point_count; point += kLanes)
+      {
+        double value[kNumEq];
+        LoadPoint(e, point, face_begin, face_count, cell_state, average,
+                  1.0, false, value);
+        const bool point_finite = EulerConsumerPointIsFinite(value, 2, gamma);
+        finite = finite && point_finite;
+        if (point_finite && value[0] < rho_min)
+        {
+          const double denominator = average[0] - value[0];
+          const double candidate = denominator > 0.0
+                                     ? (average[0] - rho_min) / denominator
+                                     : 0.0;
+          minimum = candidate < minimum ? candidate : minimum;
+        }
+      }
+      lane_theta[lane] = minimum;
+      lane_finite[lane] = finite ? 1 : 0;
+    }
+    MFEM_SYNC_THREAD;
+    if (MFEM_THREAD_ID(x) == 0)
+    {
+      rho_theta = 1.0;
+      for (int lane = 0; lane < kLanes; ++lane)
+      {
+        rho_theta = lane_theta[lane] < rho_theta
+                      ? lane_theta[lane] : rho_theta;
+      }
+      theta_rho[e] = rho_theta;
+    }
+    MFEM_SYNC_THREAD;
+    if (rho_theta < 1.0)
+    {
+      MFEM_FOREACH_THREAD(i, x, kDof * kNumEq)
+      {
+        const int c = i / kDof;
+        cell_state[i] = average[c] +
+                        rho_theta * (cell_state[i] - average[c]);
+      }
+    }
+    MFEM_SYNC_THREAD;
+
+    MFEM_FOREACH_THREAD(lane, x, kLanes)
+    {
+      double minimum = 1.0;
+      bool finite = lane_finite[lane] != 0;
+      for (int point = lane; point < point_count; point += kLanes)
+      {
+        double value[kNumEq];
+        LoadPoint(e, point, face_begin, face_count, cell_state, average,
+                  rho_theta, true, value);
+        const bool point_finite = EulerConsumerPointIsFinite(value, 2, gamma);
+        finite = finite && point_finite;
+        if (point_finite && DevicePressure(value, 2, gamma) < p_min)
+        {
+          const double candidate = DeviceThetaForPressure(
+            average, value, 2, gamma, p_min, 1.0, p_bisect_iters);
+          minimum = candidate < minimum ? candidate : minimum;
+        }
+      }
+      lane_theta[lane] = minimum;
+      lane_finite[lane] = finite ? 1 : 0;
+    }
+    MFEM_SYNC_THREAD;
+    if (MFEM_THREAD_ID(x) == 0)
+    {
+      pressure_theta = 1.0;
+      bool finite = true;
+      for (int lane = 0; lane < kLanes; ++lane)
+      {
+        pressure_theta = lane_theta[lane] < pressure_theta
+                           ? lane_theta[lane] : pressure_theta;
+        finite = finite && lane_finite[lane] != 0;
+      }
+      theta_p[e] = pressure_theta;
+      active[e] = (rho_theta < 1.0 || pressure_theta < 1.0) ? 1.0 : 0.0;
+      rejected_element[e] = finite ? 0.0 : 1.0;
+    }
+    MFEM_SYNC_THREAD;
+    if (rho_theta < 1.0 || pressure_theta < 1.0)
+    {
+      MFEM_FOREACH_THREAD(i, x, kDof * kNumEq)
+      {
+        double value = cell_state[i];
+        if (pressure_theta < 1.0)
+        {
+          const int c = i / kDof;
+          value = average[c] + pressure_theta * (value - average[c]);
+        }
+        state[i + kDof * kNumEq * e] = value;
+      }
+    }
+  }
+};
+
+
 inline int NativeDof(const mfem::FiniteElement& fe, int lex_dof)
 {
   const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
@@ -940,6 +1230,12 @@ DeviceLimiterCache& GetDeviceLimiterCache(
      l2_fec->GetBasisType() == mfem::BasisType::GaussLobatto) ||
     consumer_points;
   const bool requested_enforce_vtk_points = enforce_vtk_points;
+  const bool requested_compact_reference_points =
+    requested_mfem_volume_points && requested_mfem_face_points &&
+    mesh.Dimension() == 2 && dof == CooperativeZhangShuQuadKernel::kDof &&
+    ne > 0 && vfes.GetFE(0)->GetOrder() + 1 ==
+      CooperativeZhangShuQuadKernel::kD1D &&
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_COOPERATIVE", true);
   const mfem::QuadratureInterpolator* current_volume_interpolator = nullptr;
   int current_volume_nq = 0;
   if (requested_mfem_volume_points)
@@ -964,7 +1260,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     cache_ptr->mfem_volume_points != requested_mfem_volume_points ||
     cache_ptr->mfem_face_points != requested_mfem_face_points ||
     cache_ptr->enforce_nodes != requested_enforce_nodes ||
-    cache_ptr->enforce_vtk_points != requested_enforce_vtk_points;
+    cache_ptr->enforce_vtk_points != requested_enforce_vtk_points ||
+    cache_ptr->compact_reference_requested != requested_compact_reference_points;
   if (!rebuild)
   {
     return *cache_ptr;
@@ -997,6 +1294,24 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.mfem_face_points = requested_mfem_face_points;
   cache.enforce_nodes = requested_enforce_nodes;
   cache.enforce_vtk_points = requested_enforce_vtk_points;
+  cache.compact_reference_requested = requested_compact_reference_points;
+  cache.shared_reference_points = requested_compact_reference_points;
+  if (cache.shared_reference_points)
+  {
+    // With MFEM volume/face QI, the remaining points are reference FE nodes
+    // and optional reference VTK points.  Reuse their exact basis data only
+    // when every cell uses the identical FE object. Keep logical per-cell
+    // offsets so point counts and diagnostic semantics retain the full union.
+    const mfem::FiniteElement* reference_fe = vfes.GetFE(0);
+    for (int e = 1; e < ne; ++e)
+    {
+      if (vfes.GetFE(e) != reference_fe)
+      {
+        cache.shared_reference_points = false;
+        break;
+      }
+    }
+  }
   if (cache.mfem_volume_points)
   {
     cache.volume_nq = current_volume_nq;
@@ -1218,33 +1533,37 @@ DeviceLimiterCache& GetDeviceLimiterCache(
       }
     }
 
-    if (cache.enforce_nodes)
+    if (!cache.shared_reference_points || e == 0)
     {
-      const mfem::IntegrationRule& nodes = fe.GetNodes();
-      for (int q = 0; q < nodes.GetNPoints(); ++q)
+      if (cache.enforce_nodes)
       {
-        fe.CalcShape(nodes.IntPoint(q), shape);
-        for (int d = 0; d < dof; ++d)
+        const mfem::IntegrationRule& nodes = fe.GetNodes();
+        for (int q = 0; q < nodes.GetNPoints(); ++q)
         {
-          point_shapes.push_back(shape(NativeDof(fe, d)));
+          fe.CalcShape(nodes.IntPoint(q), shape);
+          for (int d = 0; d < dof; ++d)
+          {
+            point_shapes.push_back(shape(NativeDof(fe, d)));
+          }
+        }
+      }
+      if (cache.enforce_vtk_points)
+      {
+        const mfem::RefinedGeometry* refined =
+          mfem::GlobGeometryRefiner.Refine(fe.GetGeomType(), fe.GetOrder(), 1);
+        for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
+        {
+          fe.CalcShape(refined->RefPts.IntPoint(q), shape);
+          for (int d = 0; d < dof; ++d)
+          {
+            point_shapes.push_back(shape(NativeDof(fe, d)));
+          }
         }
       }
     }
-    if (cache.enforce_vtk_points)
-    {
-      const mfem::RefinedGeometry* refined =
-        mfem::GlobGeometryRefiner.Refine(fe.GetGeomType(), fe.GetOrder(), 1);
-      for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
-      {
-        fe.CalcShape(refined->RefPts.IntPoint(q), shape);
-        for (int d = 0; d < dof; ++d)
-        {
-          point_shapes.push_back(shape(NativeDof(fe, d)));
-        }
-      }
-    }
-    cache.point_offsets[e + 1] =
-      static_cast<int>(point_shapes.size()) / dof;
+    const int stored_points = static_cast<int>(point_shapes.size()) / dof;
+    cache.point_offsets[e + 1] = cache.shared_reference_points
+                                 ? (e + 1) * stored_points : stored_points;
     if (cache.mfem_face_points)
     {
       cache.face_point_offsets[e + 1] = mfem_face_point_count;
@@ -1256,6 +1575,19 @@ DeviceLimiterCache& GetDeviceLimiterCache(
                         dynamic_cast<const mfem::TensorBasisElement*>(
                           vfes.GetFE(0)) != nullptr &&
                         BuildTensorPointFactors(cache, point_shapes);
+  if (cache.shared_reference_points && !cache.tensor_points)
+  {
+    // A failed tensor factorization must retain the complete serial fallback
+    // table. This is cold setup only; no state-dependent result is cached.
+    const std::vector<double> reference_shapes(point_shapes);
+    point_shapes.reserve(reference_shapes.size() * ne);
+    for (int e = 1; e < ne; ++e)
+    {
+      point_shapes.insert(point_shapes.end(), reference_shapes.begin(),
+                           reference_shapes.end());
+    }
+    cache.shared_reference_points = false;
+  }
   cache.point_shapes.SetSize(cache.tensor_points
                                ? 0
                                : static_cast<int>(point_shapes.size()));
@@ -1498,6 +1830,43 @@ void ApplyDeviceZhangShuPositivityLimiter(
   double* collapsed_average = cache.collapsed_average.Write();
   double* average_repair = cache.average_repair.Write();
 
+  // Retain a same-binary serial baseline and a fallback for other orders,
+  // dimensions, and non-tensor elements.  This switch changes execution only;
+  // point sets, average rules, finite admission, and pressure solves are shared.
+  const bool cooperative = dim == 2 && tensor_points &&
+    d1d == CooperativeZhangShuQuadKernel::kD1D &&
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_COOPERATIVE", true);
+  if (cooperative)
+  {
+    CooperativeZhangShuQuadKernel kernel;
+    kernel.ne = ne;
+    kernel.volume_nq = mfem_volume_points ? volume_nq : 0;
+    kernel.total_face_points = total_face_points;
+    kernel.p_bisect_iters = p_bisect_iters;
+    kernel.gamma = gamma;
+    kernel.rho_min = rho_min;
+    kernel.p_min = p_min;
+    kernel.capture_diagnostics = capture_diagnostics;
+    kernel.shared_reference_points = cache.shared_reference_points;
+    kernel.weights = weights;
+    kernel.offsets = offsets;
+    kernel.face_offsets = face_offsets;
+    kernel.factors = factors;
+    kernel.volume_values = volume_values;
+    kernel.face_values = face_values;
+    kernel.state = state;
+    kernel.averages = averages;
+    kernel.theta_rho = theta_rho;
+    kernel.theta_p = theta_p;
+    kernel.active = active;
+    kernel.inadmissible_average = inadmissible_average;
+    kernel.rejected_element = rejected_element;
+    kernel.collapsed_average = collapsed_average;
+    kernel.average_repair = average_repair;
+    mfem::forall_2D(ne, CooperativeZhangShuQuadKernel::kLanes, 1, kernel);
+  }
+  else
+  {
   mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
   {
     double average[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -1795,12 +2164,25 @@ void ApplyDeviceZhangShuPositivityLimiter(
     }
   });
 
-  const int local_rejected_elements = static_cast<int>(
-    CountActiveElements(&cache.rejected_element,
-                        cache.admissibility_reduce_workspace));
+  }
+
+  LimiterAdmissionCounts counts{0, 0};
+  if (cooperative)
+  {
+    mfem::reduce(ne,
+                 counts,
+                 LimiterAdmissionReductionBody{rejected_element, active},
+                 LimiterAdmissionReducer{},
+                 true,
+                 cache.admission_counts_workspace);
+  }
+  const int local_rejected_elements = cooperative
+    ? counts.rejected
+    : static_cast<int>(CountActiveElements(
+        &cache.rejected_element, cache.admissibility_reduce_workspace));
   const int global_rejected_elements =
     GlobalRejectedElementCount(vfes, local_rejected_elements);
-  if (global_rejected_elements == 0)
+  if (global_rejected_elements == 0 && (!cooperative || counts.active > 0))
   {
     cache.restriction->MultTranspose(cache.element_state, U);
   }
@@ -1832,7 +2214,8 @@ void ApplyDeviceZhangShuPositivityLimiter(
                         &cache.active,
                         &cache.theta_rho,
                         &cache.theta_p,
-                        vfes.GetComm());
+                        vfes.GetComm(),
+                        cooperative ? counts.active : -1.0);
   }
   if (global_rejected_elements > 0)
   {
@@ -1840,9 +2223,10 @@ void ApplyDeviceZhangShuPositivityLimiter(
   }
   if (local_state_modified != nullptr)
   {
-    *local_state_modified =
-      CountActiveElements(&cache.active,
-                          cache.admissibility_reduce_workspace) > 0.0;
+    *local_state_modified = cooperative
+      ? counts.active > 0
+      : CountActiveElements(&cache.active,
+                            cache.admissibility_reduce_workspace) > 0.0;
   }
 }
 
