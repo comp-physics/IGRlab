@@ -241,3 +241,17 @@ are separate geometry/method comparisons and are not a matched speedup baseline.
 
 
 Compact reproducible inputs and measurements: [full comparison](benchmarks/dgsem_mapped_full_comparison.json), [Nsight Systems](benchmarks/dgsem_mapped_nsys.json), [Nsight Compute](benchmarks/dgsem_mapped_ncu.json).
+
+## Final review qualification
+
+Independent review found and fixed a test-only portability issue: the mapped
+WMMA fixture now returns CTest skip code 77 below SM80. The existing suite
+behavior is unchanged. Canonical DeltaAI job **3447039** rebuilt and passed
+`dg_igr_dgsem_mapped_fixed_cuda` on review source
+`acf33f524497f0a0938e3fbc056d17a63752499d`, with persistent dependencies
+unchanged. The pre-SM80 skip branch was reviewed statically, not run on SM70.
+The production/application source is byte-identical to the measured 96c7ea0
+revision; subsequent changes are test qualification and documentation only.
+The [focused review record](benchmarks/dgsem_mapped_review_validation.json)
+contains command, source, fixture, GPU and log identities. Temporary review
+executables are retired after retaining their hashes and validation logs.
