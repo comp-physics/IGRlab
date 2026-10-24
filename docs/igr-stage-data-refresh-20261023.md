@@ -70,7 +70,7 @@ Complete final Q5 polynomial comparison on matching Q2 cells gives maximum conse
 
 A separate offline comparison with the retained converged FP64 t=0.1 fields reproduces the previous physical result: maximum conserved relative L2 **8.206696155040836e-7**, sigma relative L2 **0.015288468095394612** (1.52885%). No additional converged GPU run was required, and no new cumulative speedup against that earlier reference is claimed.
 
-Fresh Nsight Systems job **3443736** follows the pair. Its trajectory starts continuously at t=0 and intentionally terminates after a 15-second evolved-state capture following 180 seconds of startup/evolution. Its diagnostic output cadence is 0.1 to keep VTK out of the captured window; unprofiled timing arms retain 0.02. Profile timing must not be substituted for full-run wall timing. 
+Fresh Nsight Systems job **3443736** follows the pair. Its trajectory starts continuously at t=0 and intentionally terminates after a 15-second evolved-state capture following 180 seconds of startup/evolution. Its diagnostic output cadence is 0.1 to keep VTK out of the captured window; unprofiled timing arms retain 0.02. Profile timing must not be substituted for full-run wall timing.
 
 The fresh recorded-activity analysis retains 290 complete RK steps / 870 stages. Each stage has exactly two current-A applications and two local-P applications, and exactly one of each new refresh kernel. All 37,120 selected kernel launches and 9,570 selected memcpy calls match unique successful runtime/device activity records; there are no unmatched activities, correlation ambiguities or phase-accounting gaps. All 870 volume-pack → mass-scaling → current-A ordering checks pass.
 
@@ -96,4 +96,3 @@ The unchanged Euler spatial RHS is now 58.06% of selected recorded GPU activity.
 ![Stage refresh and full-run comparison](figures/igr-stage-data-refresh-20261023.png)
 
 The [compact benchmark record](benchmarks/igr-stage-data-refresh-20261023.json) binds tested source/binaries, exact arguments/environments, full and short run receipts, field hashes/comparisons and profile analysis. Raw evidence remains under `/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-stage-data-refresh-20261023`; concise records and local analysis are preserved in the matching `~/.cache/igrlab-experiments/igr-stage-data-refresh-20261023` folder. No full raw field or trace is placed in Git.
-
