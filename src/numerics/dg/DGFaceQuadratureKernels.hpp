@@ -2,6 +2,8 @@
 // This file is intentionally included after MFEM backend headers.
 #pragma once
 
+#include "utils/config/env_flags.hpp"
+
 #include "igrlab/compat.hpp"
 
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
@@ -287,11 +289,13 @@ inline bool UsesOrdinaryCUDAForDGDiffusionFaces2D()
 
 // This private witness is also the dispatch predicate. Its inverse-map proof
 // belongs to the geometry build; applies only compare revisions and sizes.
+// Host C++ selection logs query the same metadata as CUDA dispatch. Keep this
+// body independent of the translation-unit compiler; launches remain guarded.
 inline bool UsesInteriorFaceDGDiffusionCompactLift2D(
   const InteriorFaceDGDiffusionApplyInfo& info,
   const InteriorFaceDGDiffusionApplyScratch& work)
 {
-#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+#if defined(MFEM_USE_CUDA) && defined(MFEM_USE_DOUBLE)
   const auto& factor = work.normal_factorization;
   return work.compact_lift && UsesOrdinaryCUDAForDGDiffusionFaces2D() &&
     HasCurrentInteriorFaceDGDiffusionTensorData2D(info, work) &&
@@ -495,6 +499,28 @@ bool TryLaunchInteriorFaceDGDiffusionAddToBase2D(
   const InteriorFaceDGDiffusionApplyScratch& work,
   const mfem::Vector& scalar,
   mfem::real_t ip_sigma,
+  mfem::Vector& y);
+
+// Private fixed-sweep finalizer: after the caller writes the current volume
+// action into y, replace it with rhs - (volume + completed face action).
+// Preflight performs no numerical kernels or logical output writes. Acquiring
+// device pointers may allocate or transfer storage. Disjoint read-only aliases
+// are admitted. The caller must preflight before computing
+// volume and leave the same geometry, coefficients and buffers bound until
+// Launch. Unsupported layouts retain the original full-operator path.
+bool CanLaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  const mfem::Vector& rhs,
+  const mfem::Vector& y);
+
+void LaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  const mfem::Vector& rhs,
   mfem::Vector& y);
 
 void LaunchSharedFaceDGDiffusionApply2D(
@@ -2345,7 +2371,7 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
   const mfem::real_t* side_coefficient = nullptr;
   int slot_count = 0;
 
-  template <bool CompactLift>
+  template <bool CompactLift, bool CoalescedTrace = false>
   MFEM_HOST_DEVICE void Apply(int face) const
   {
 #if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
@@ -2365,7 +2391,42 @@ struct InteriorFaceDGDiffusionTensorRecord2DWarp
     const int axis = Axis(side, slot);
 
     mfem::real_t trace = 0.0, normal_trace = 0.0;
-    if (active)
+    if constexpr (CoalescedTrace)
+    {
+      // Gather each side's complete lexicographic state with 32+4 cooperating
+      // lanes, instead of strided rows in twelve lanes. Broadcast values into
+      // the original ascending-i contractions; do not factor or reorder sums.
+      const int left = F(0, face), right = F(1, face);
+      const int native = lex_to_native[lane];
+      const mfem::real_t left_low = record.x[D(native, 0, left)];
+      const mfem::real_t right_low = record.x[D(native, 0, right)];
+      mfem::real_t left_high = 0.0, right_high = 0.0;
+      if (lane < 4)
+      {
+        const int tail_native = lex_to_native[lane+32];
+        left_high = record.x[D(tail_native, 0, left)];
+        right_high = record.x[D(tail_native, 0, right)];
+      }
+#pragma unroll 1
+      for (int i = 0; i < 6; ++i)
+      {
+        const int lex = axis == 0 ? i+6*index : index+6*i;
+        const int source_lane = lex%32;
+        // Select the side after each full-warp shuffle: selecting before it
+        // would mix the source lanes' own side assignments.
+        const mfem::real_t a = __shfl_sync(0xffffffffu, left_low, source_lane);
+        const mfem::real_t b = __shfl_sync(0xffffffffu, right_low, source_lane);
+        const mfem::real_t c = __shfl_sync(0xffffffffu, left_high, source_lane);
+        const mfem::real_t d = __shfl_sync(0xffffffffu, right_high, source_lane);
+        if (active)
+        {
+          const mfem::real_t x = side == 0 ? (lex < 32 ? a : c) : (lex < 32 ? b : d);
+          trace += E(0, i, side, slot) * x;
+          normal_trace += E(1, i, side, slot) * x;
+        }
+      }
+    }
+    else if (active)
     {
       const int element = F(side, face);
 #pragma unroll 1
@@ -2472,6 +2533,14 @@ struct InteriorFaceDGDiffusionTensorLiftRecord2DWarp
   : InteriorFaceDGDiffusionTensorRecord2DWarp
 {
   MFEM_HOST_DEVICE void operator()(int face) const { Apply<true>(face); }
+};
+
+// IGRLAB_IGR_FACE_COALESCED_TRACE opts into this load schedule only after the
+// existing compact p5/Q6/native-CUDA layout and coefficient admission succeeds.
+struct InteriorFaceDGDiffusionTensorLiftCoalescedRecord2DWarp
+  : InteriorFaceDGDiffusionTensorRecord2DWarp
+{
+  MFEM_HOST_DEVICE void operator()(int face) const { Apply<true, true>(face); }
 };
 
 struct InteriorFaceDGDiffusionGather2D
@@ -2590,6 +2659,60 @@ struct InteriorFaceDGDiffusionTensorLiftGather2D
   }
 };
 
+// Keep residual data and arithmetic out of the legacy gather's functor and
+// kernel type. Even a disabled runtime branch changes register allocation and
+// can change which of two quiet-NaN operand payloads the legacy add preserves.
+struct InteriorFaceDGDiffusionTensorLiftResidual2D
+  : InteriorFaceDGDiffusionTensorLiftGather2D
+{
+  const mfem::real_t* rhs = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int element = row / 36;
+    const int native = row - element * 36;
+    const int lex = native_to_lex[native];
+    auto D = mfem::Reshape(element_vdof_map, 36, vdim, ne);
+    auto E = mfem::Reshape(endpoint, 2, 6, 2, slot_count);
+    auto Axis = mfem::Reshape(axes, 2, slot_count);
+    auto L = mfem::Reshape(contribution, 2, 6, 2, nf);
+    mfem::real_t sum = 0.0;
+    for (int incidence = element_face_offsets[element];
+         incidence < element_face_offsets[element + 1]; ++incidence)
+    {
+      const int side = element_face_sides[incidence];
+      const int face = element_face_ids[incidence];
+      const int slot = face_slots[face];
+      const int axis = Axis(side, slot);
+      const int i = axis == 0 ? lex % 6 : lex / 6;
+      const int t = axis == 0 ? lex / 6 : lex % 6;
+      const mfem::real_t a = L(0, t, side, face);
+      const mfem::real_t b = L(1, t, side, face);
+      const mfem::real_t face_value =
+        E(0, i, side, slot) * a + E(1, i, side, slot) * b;
+      // The separate old record rounds before the ordered incidence gather.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+      sum = __dadd_rn(sum, face_value);
+#else
+      volatile mfem::real_t rounded_face_value = face_value;
+      sum += rounded_face_value;
+#endif
+    }
+    const int output = D(native, 0, element);
+    // Retain the old scratch/base/subtract sequence as three rounded FP64
+    // operations, with no store of the completed action between kernels.
+#if defined(__CUDA_ARCH__) && defined(MFEM_USE_DOUBLE)
+    const mfem::real_t face = __dadd_rn(0.0, sum);
+    const mfem::real_t action = __dadd_rn(y[output], face);
+    y[output] = __dsub_rn(rhs[output], action);
+#else
+    const mfem::real_t face = mfem::real_t(0.0) + sum;
+    const mfem::real_t action = y[output] + face;
+    y[output] = rhs[output] - action;
+#endif
+  }
+};
+
 struct SharedFaceDGDiffusionRecord2D
 {
   int dof = 0;
@@ -2693,7 +2816,8 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   const mfem::Vector& scalar,
   mfem::real_t ip_sigma,
   mfem::Vector& y,
-  bool add_to_base = false)
+  bool add_to_base = false,
+  const mfem::Vector* residual_rhs = nullptr)
 {
   MFEM_VERIFY(info.vdim == 1 &&
                 scalar.Size() == info.ne * info.dof &&
@@ -2727,8 +2851,16 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       factor.tensor_axes.Read(), factor.tensor_face_slots.Read(),
       factor.tensor_lex_to_native.Read(), factor.normal_geometry.Read(),
       work.side_coefficient.Read(), factor.tensor_slot_count};
-    mfem::forall_2D_batch(info.nf, 32, 1, 4,
-      InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record});
+    if (::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_COALESCED_TRACE", false))
+    {
+      mfem::forall_2D_batch(info.nf, 32, 1, 4,
+        InteriorFaceDGDiffusionTensorLiftCoalescedRecord2DWarp{tensor_record});
+    }
+    else
+    {
+      mfem::forall_2D_batch(info.nf, 32, 1, 4,
+        InteriorFaceDGDiffusionTensorLiftRecord2DWarp{tensor_record});
+    }
 
     InteriorFaceDGDiffusionTensorLiftGather2D gather;
     gather.dof = info.dof;
@@ -2747,10 +2879,18 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
     gather.face_slots = factor.tensor_face_slots.Read();
     gather.native_to_lex = factor.tensor_native_to_lex.Read();
     gather.slot_count = factor.tensor_slot_count;
-    mfem::forall(info.ne * info.dof, gather);
+    if (residual_rhs)
+    {
+      InteriorFaceDGDiffusionTensorLiftResidual2D residual;
+      static_cast<InteriorFaceDGDiffusionTensorLiftGather2D&>(residual) = gather;
+      residual.rhs = residual_rhs->Read();
+      mfem::forall(info.ne * info.dof, residual);
+    }
+    else { mfem::forall(info.ne * info.dof, gather); }
     return;
   }
 #endif
+  MFEM_VERIFY(!residual_rhs, "Fused face residual requires its preflighted compact lift layout.");
   if (work.tensor_lift.Size()) { work.tensor_lift.Destroy(); }
   work.face_contribution.SetSize(2 * info.dof * info.nf);
   work.face_contribution.UseDevice(true);

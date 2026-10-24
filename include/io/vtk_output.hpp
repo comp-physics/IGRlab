@@ -2,6 +2,8 @@
 
 #include "mfem.hpp"
 #include "utils/config/io_config.hpp"
+#include <memory>
+#include <string>
 
 /**
  * @file io/vtk_output.hpp
@@ -50,6 +52,11 @@ void ApplyVTKConfig(mfem::ParaViewDataCollection& dc,
 /// @ingroup io_visualization
 void RegisterEulerFields(mfem::ParaViewDataCollection& dc,
                          const EulerVTKFields& fields);
+
+/// Euler-only writer factory. IGRLAB_VTK_CACHED_EVALUATION opts into a private
+/// reference/value cache; mesh and field ownership remains with the caller.
+std::unique_ptr<mfem::ParaViewDataCollection> MakeEulerVTKDataCollection(
+  const std::string& name, mfem::Mesh* mesh);
 
 } // namespace io
 } // namespace mfem

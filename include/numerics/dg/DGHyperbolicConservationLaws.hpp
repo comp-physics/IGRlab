@@ -40,6 +40,7 @@ namespace mfem
 namespace dg_igr_detail
 {
 struct TensorFaceData;
+struct MappedWeakDivTensorData;
 }
 namespace dgsem
 {
@@ -449,6 +450,13 @@ private:
   /// Preassemble the weak-divergence operator on each element (optional).
   /// The layout is (test dof) × (trial node × dim), i.e. ByDim grouped per node.
   void ComputeWeakDivergence();
+  /// Exact-discrete mapped tensor storage, admitted before dense assembly.
+  /// Execution/storage changes require construction or Update, not a live toggle.
+  bool BuildMappedWeakDivTensorData_();
+  bool HasPreassembledWeakDivergence_() const
+  {
+    return !weakdiv.empty() || bool(weakdiv_mapped_tensor_data_);
+  }
   /// Admit every cell before replacing per-element weak-divergence storage.
   void ValidateSharedWeakDivTensorGeometry_() const;
 
@@ -698,13 +706,15 @@ private:
 
   /// Per-element scalar dof count used by packed weak-divergence apply.
   int weakdiv_elem_dof_ = 0;
-  /// Flattened per-element weak-divergence blocks (row-major dof x (dof*dim)).
+  /// Column-major per-element weak-divergence blocks (dof x (dof*dim)).
   Vector weakdiv_data_flat_;
+  std::shared_ptr<dg_igr_detail::MappedWeakDivTensorData> weakdiv_mapped_tensor_data_;
   mutable std::unique_ptr<::igrlab::shared_reference::Map> weakdiv_shared_map_;
   mutable DenseMatrix weakdiv_shared_row_sums_;
   mutable Vector weakdiv_shared_column_sums_;
   mutable Vector weakdiv_shared_mass_fractions_;
   mutable Vector weakdiv_shared_moment_correction_;
+  /// Pointwise FP64 flux scratch for shared maps or dense row applications.
   mutable Vector weakdiv_shared_flux_;
   /// Fixed shared flux launch policy for the lifetime of the packed setup.
   mutable int weakdiv_shared_flux_execution_ = -1;
@@ -712,7 +722,7 @@ private:
   mutable int weakdiv_shared_conservative_fusion_request_ = -1;
   /// Per-element maximum volume-node characteristic speed scratch.
   mutable Vector weakdiv_volume_speed_;
-  /// Optional pointwise speed scratch for the shared Euler flux preparation.
+  /// Optional pointwise speed scratch for the pointwise Euler flux preparation.
   mutable Vector weakdiv_point_speed_;
   /// Persistent per-volume-node q_sigma aggregates (five FP64 scalars/slot).
   mutable Array<double> weakdiv_q_sigma_telemetry_;

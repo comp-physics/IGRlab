@@ -1,0 +1,506 @@
+{
+  "schema": "igr-dg-current-element-jacobi-full-measurements-v1",
+  "status": "complete-finite-fields-slow-prototype",
+  "job": "3432379",
+  "node": "gh096",
+  "offline_results_sha256": "a4ffb31635d7428d03a800612af41a619e3b698ac507cf934ca7253ad3ae9e20",
+  "durable_evidence_directory": "/home/jarias9/.cache/igrlab-experiments/igr-dg-current-block-jacobi-full-20261021",
+  "remote_evidence_directory": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-current-block-jacobi-full-20261021/full-3432379",
+  "results": {
+    "schema": "igr-dg-current-block-jacobi-full-offline-results-v1",
+    "status": "complete-fields-and-figures-verified",
+    "time_utc": "2026-10-22T11:14:28.613950+00:00",
+    "offline_only": true,
+    "application_executed_during_analysis": false,
+    "gpu_used_during_analysis": false,
+    "tested_case": {
+      "mesh_n": 512,
+      "elements": 262144,
+      "order": 5,
+      "euler_dofs": 37748736,
+      "sigma_dofs": 9437184,
+      "target_time": 0.1,
+      "cfl": 0.3,
+      "c_alpha": 0.16666666666666666,
+      "physical_alpha": 6.357828776041666e-07,
+      "linear_rtol": 1e-06,
+      "residual_scale": "rhs",
+      "nan_scan": false,
+      "admissibility_scan": false,
+      "positivity_limiter": "none",
+      "modal_damping_rate": 0
+    },
+    "discretization": "ordinary-DG Q5, GL6, RK3SSP",
+    "candidate_arguments": {
+      "--igr-solve-mode": "element-block-jacobi",
+      "--igr-sweeps": "2",
+      "--igr-initial-sweeps": "50",
+      "--igr-jacobi-omega": "0.7",
+      "--igr-jacobi-blocks": "current"
+    },
+    "comparison_scope": "Latest optimized ordinary-DG/GL converged TF32-spectral IGR reference versus fixed damped current-element-block Jacobi: current FP64 blocks assembled/factored each state, initial50 sweeps at t=0 then2 warm sweeps at omega0.7, current A/RHS/Euler unchanged. Candidate has no convergence certificate, coarse correction or converged cleanup.",
+    "same_gpu": true,
+    "gpu_uuid": "GPU-015c0bcf-db3b-861d-86f5-3144f60d8485",
+    "sources": {
+      "reference": {
+        "source_commit": "97ba1681ac27e07145df790d4c23ed837a21caea",
+        "binary_sha256": "5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495"
+      },
+      "candidate": {
+        "source_commit": "e3a32d91672c5d968d12493b24361a4e4cd0e303",
+        "binary_sha256": "8782cdc2d4d54191901040ee4e291e2fef80c03f2d087ea1affb5e80f7d1dafd"
+      }
+    },
+    "measurements": {
+      "reference": {
+        "application_wall_seconds": 675.2871994750021,
+        "native_done_seconds": 594.747909506,
+        "accepted_steps": 4939,
+        "rhs_evaluations": 14818,
+        "linear_calls": 14818,
+        "iterations": 51742
+      },
+      "candidate": {
+        "application_wall_seconds": 4155.322162008015,
+        "native_done_seconds": 4076.907963576,
+        "accepted_steps": 4939,
+        "rhs_evaluations": 14818,
+        "linear_calls": 14818,
+        "iterations": 29684
+      }
+    },
+    "application_candidate_over_control": 6.153414673399029,
+    "native_candidate_over_control": 6.854850430600581,
+    "host_scalar_counters": {
+      "reference": {
+        "total_assemble_s": 93.26353658699978,
+        "total_form_s": 13.631720494000051,
+        "total_pc_setup_s": 3.329190035000476,
+        "total_solve_s": 231.53909116399973,
+        "total_igr_s": 341.76353828000003,
+        "total_update_s": 349.210340004999
+      },
+      "candidate": {
+        "total_assemble_s": 92.24047668,
+        "total_form_s": 13.963463328999898,
+        "total_pc_setup_s": 3504.2129287080015,
+        "total_solve_s": 219.63167808399947,
+        "total_igr_s": 3830.0485468010006,
+        "total_update_s": 3830.6296343640106
+      }
+    },
+    "host_counter_scope": "Application host scalar counters only; not a GPU timing partition or a measured sigma/flow GPU ratio. Candidate assembly/factorization is included in pc_setup.",
+    "grid": {
+      "nx": 512,
+      "ny": 512,
+      "bounds_xy": [
+        0.0,
+        1.0,
+        0.0,
+        1.0
+      ],
+      "cells": 262144,
+      "quadrature_points_per_cell": 36,
+      "quadrature_points_total": 9437184,
+      "complete_unique_cell_coverage": true,
+      "integration_measure": "common expected Cartesian cell area; saved coordinates checked against that mesh",
+      "all_corresponding_node_coordinate_difference_bound": 6.661338147750939e-16,
+      "geometry_pair_tolerance": 1e-11
+    },
+    "conserved_and_derived_components": {
+      "density": {
+        "l2_difference": 2.323835211826977e-07,
+        "normalized_l2": 2.275885260323847e-07,
+        "linf_difference_at_gl_points": 9.57085914299327e-07,
+        "normalized_linf_at_gl_points": 7.433449260862262e-07,
+        "reference_range_at_gl_points": [
+          0.44942023773057554,
+          1.287539445972229
+        ],
+        "candidate_range_at_gl_points": [
+          0.44942018086060875,
+          1.2875396440673912
+        ],
+        "integral_reference": 0.9999999999997696,
+        "integral_candidate": 0.9999999999997689,
+        "integral_candidate_minus_reference": 2.7212659200720823e-19,
+        "integral_abs_difference_over_reference_gl_l1": 2.721265920072709e-19,
+        "engineering_budget_pass": true
+      },
+      "momentum_x": {
+        "l2_difference": 2.9864912207987937e-07,
+        "normalized_l2": 1.076929132698702e-06,
+        "linf_difference_at_gl_points": 1.5976424994068594e-06,
+        "normalized_linf_at_gl_points": 1.9814356600698544e-06,
+        "reference_range_at_gl_points": [
+          -0.8063055145331014,
+          0.8063055114454205
+        ],
+        "candidate_range_at_gl_points": [
+          -0.8063046122950301,
+          0.8063046097626971
+        ],
+        "integral_reference": -3.189394918550999e-12,
+        "integral_candidate": -3.1900979491209566e-12,
+        "integral_candidate_minus_reference": -7.207066254897379e-16,
+        "integral_abs_difference_over_reference_gl_l1": 4.065449924156079e-15,
+        "engineering_budget_pass": true
+      },
+      "momentum_y": {
+        "l2_difference": 2.9864905721847877e-07,
+        "normalized_l2": 1.0769288988083807e-06,
+        "linf_difference_at_gl_points": 1.597939989994579e-06,
+        "normalized_linf_at_gl_points": 1.9818046215794035e-06,
+        "reference_range_at_gl_points": [
+          -0.8063055119535937,
+          0.80630551184775
+        ],
+        "candidate_range_at_gl_points": [
+          -0.8063046126684128,
+          0.8063046100925726
+        ],
+        "integral_reference": -3.1886866092717143e-12,
+        "integral_candidate": -3.1900826771169176e-12,
+        "integral_candidate_minus_reference": -1.0780155059338505e-15,
+        "integral_abs_difference_over_reference_gl_l1": 6.081001480817886e-15,
+        "engineering_budget_pass": true
+      },
+      "energy": {
+        "l2_difference": 1.241234333823297e-06,
+        "normalized_l2": 3.425676845489375e-07,
+        "linf_difference_at_gl_points": 4.545388386567595e-06,
+        "normalized_linf_at_gl_points": 8.998012863275086e-07,
+        "reference_range_at_gl_points": [
+          2.5007969112260904,
+          5.0515468866680076
+        ],
+        "candidate_range_at_gl_points": [
+          2.5007969112096706,
+          5.051545577380587
+        ],
+        "integral_reference": 3.499988835752878,
+        "integral_candidate": 3.4999888357528794,
+        "integral_candidate_minus_reference": -2.550080610545837e-17,
+        "integral_abs_difference_over_reference_gl_l1": 7.285967842229682e-18,
+        "engineering_budget_pass": true
+      },
+      "pressure": {
+        "l2_difference": 4.298323420993216e-07,
+        "normalized_l2": 3.044631876996531e-07,
+        "linf_difference_at_gl_points": 1.604643197428146e-06,
+        "normalized_linf_at_gl_points": 8.392906748287843e-07,
+        "reference_range_at_gl_points": [
+          1.0003187644903997,
+          1.911903998880357
+        ],
+        "candidate_range_at_gl_points": [
+          1.0003187644838318,
+          1.911903621335572
+        ],
+        "integral_reference": 1.3703150445411008,
+        "integral_candidate": 1.3703150410941214,
+        "integral_candidate_minus_reference": -3.4469775080138975e-09,
+        "integral_abs_difference_over_reference_gl_l1": 2.5154635218707987e-09,
+        "engineering_budget_pass": null
+      },
+      "speed": {
+        "l2_difference": 2.737499106292753e-07,
+        "normalized_l2": 7.007804979209446e-07,
+        "linf_difference_at_gl_points": 9.577438657148996e-07,
+        "normalized_linf_at_gl_points": 1.3561748346142852e-06,
+        "reference_range_at_gl_points": [
+          4.2589545840752747e-07,
+          0.706209731422494
+        ],
+        "candidate_range_at_gl_points": [
+          4.2589523316913256e-07,
+          0.7062097592925386
+        ],
+        "integral_reference": 0.2846030902343643,
+        "integral_candidate": 0.2846030814746003,
+        "integral_candidate_minus_reference": -8.759764076881031e-09,
+        "integral_abs_difference_over_reference_gl_l1": 3.077887899835367e-08,
+        "engineering_budget_pass": null
+      }
+    },
+    "sigma": {
+      "conservative_component": false,
+      "field_semantics": "IGR scalar sigma, compared as its complete saved Q5 polynomial; not an Euler conserved component.",
+      "l2_reference": 2.0021677608887905e-05,
+      "l2_candidate": 1.99480418929465e-05,
+      "l2_difference": 4.073932023361373e-07,
+      "normalized_l2": 0.02034760574484976,
+      "linf_reference_at_gl_points": 5.652922859240637e-05,
+      "linf_candidate_at_gl_points": 5.61459584081165e-05,
+      "linf_difference_at_gl_points": 1.5027759157818345e-06,
+      "normalized_linf_at_gl_points": 0.026584051351864795,
+      "maximum_difference_location": {
+        "cell_ij": [
+          302,
+          70
+        ],
+        "gauss_ij": [
+          0,
+          5
+        ],
+        "xy": [
+          0.589909697740036,
+          0.138605927259964
+        ],
+        "reference": 4.632262129647091e-05,
+        "candidate": 4.4819845380689075e-05
+      },
+      "reference_range_at_gl_points": [
+        7.966713214852533e-11,
+        5.652922859240637e-05
+      ],
+      "candidate_range_at_gl_points": [
+        7.652298261815338e-11,
+        5.61459584081165e-05
+      ],
+      "integral_reference": 1.3210720332758432e-05,
+      "integral_candidate": 1.3182634681693101e-05,
+      "integral_candidate_minus_reference": -2.80856510653304e-08,
+      "difference_of_separately_accumulated_integrals": -2.808565106533031e-08,
+      "integral_abs_difference_over_reference_gl_l1": 0.0021259742359155706,
+      "polynomial_l2_and_integrals_exact_up_to_roundoff": true,
+      "engineering_budget": null,
+      "engineering_budget_pass": null
+    },
+    "engineering_budgets": {
+      "normalized_l2": 0.001,
+      "normalized_linf_at_gl_points": 0.01,
+      "all_conservative_components_pass": true,
+      "meaning": "engineering comparison budgets, not analytic Sedov error bounds"
+    },
+    "gl6_admissibility": {
+      "status": "pass-at-gl-nodes",
+      "roles": {
+        "reference": {
+          "minimum_finite_density": 0.44942023773057554,
+          "minimum_finite_pressure": 1.0003187644903997,
+          "conservative_nonfinite_samples": 0,
+          "conservative_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_nodal_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "density_nonpositive_samples": 0,
+          "pressure_nonpositive_samples": 0,
+          "pressure_unavailable_or_nonfinite_samples": 0,
+          "samples": 9437184,
+          "cells": 262144,
+          "complete_unique_cell_coverage": true,
+          "all_samples_finite_with_positive_density_and_pressure": true
+        },
+        "candidate": {
+          "minimum_finite_density": 0.44942018086060875,
+          "minimum_finite_pressure": 1.0003187644838318,
+          "conservative_nonfinite_samples": 0,
+          "conservative_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "input_nodal_nonfinite_components": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "density_nonpositive_samples": 0,
+          "pressure_nonpositive_samples": 0,
+          "pressure_unavailable_or_nonfinite_samples": 0,
+          "samples": 9437184,
+          "cells": 262144,
+          "complete_unique_cell_coverage": true,
+          "all_samples_finite_with_positive_density_and_pressure": true
+        }
+      }
+    },
+    "field_qualification": {
+      "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/field-qualification.json",
+      "sha256": "c17fe50dadfdef1d8ee4ae45b4ce0bf6dfe052d73b6acc29037505417951166a",
+      "status": "passed"
+    },
+    "evidence": {
+      "pair-run.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/pair-run.json",
+        "sha256": "91bb56aa084e6c10439be0adb33b01321106a140c8ce996e8f09b8d3e88fd8f0"
+      },
+      "comparison.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/comparison.json",
+        "sha256": "6c7f8ec09d4f65b9768f9316a8e0077daa3670e84b7de43cfae61de5fd4626db"
+      },
+      "final-fields.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/final-fields.json",
+        "sha256": "d149a5df3de7fe7c4453955ed4d02b12efcc50874017be273d1f60017d4ef092"
+      },
+      "case_spec.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/case_spec.json",
+        "sha256": "6d3af6aacde558e83b8109fa4fc6094fe213735456b528d2e82698b3232c033f"
+      },
+      "local-reference-reuse.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/local-reference-reuse.json",
+        "sha256": "c7c229001b0b6af2e9487b632ec16d63579ca076d726b8807d46212621e13edf"
+      },
+      "local-candidate-download.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/local-candidate-download.json",
+        "sha256": "787cf712cc1e5a88fbcba3bc43e9f2fd09c49138811d4e1c7e510e1c822e1e70"
+      },
+      "local-metadata-verification.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/local-metadata-verification.json",
+        "sha256": "af21ad4bd4c1e374fc20763ef2ba11262e324b2ac090519c1a69e509cb8dde5b"
+      },
+      "field-analysis/conserved.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/field-analysis/conserved.json",
+        "sha256": "a0313d1dab4835490466bdda88322259129c8f9c8b89ed86985ef31a3adefb12"
+      },
+      "field-analysis/sigma.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/field-analysis/sigma.json",
+        "sha256": "cefb87cc67e5985128897b7a4bd852cee476aca48ee2bab38dc6138cd3a0becf"
+      },
+      "field-analysis/gl6.json": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/field-analysis/gl6.json",
+        "sha256": "6772b75c48b87f4ef4fa54c1d7534bce9cf80ac88d92e89d5ee806d0fef78bf5"
+      }
+    },
+    "limits": [
+      "Single fresh sequential pair, same GPU; not a timing distribution.",
+      "Saved t=.1 state only; no unsaved-time or between-GL-node positivity claim.",
+      "Conservative and sigma L2/integrals integrate complete saved Q5 fields exactly up to FP64 roundoff on affine cells.",
+      "Pressure and speed norms/integrals are GL6 quadrature estimates.",
+      "Linf is sampled at GL6 nodes, not a continuous supremum.",
+      "Comparison with the latest optimized converged control; no analytic Sedov error or fraction-of-discretization-error claim.",
+      "Fixed two-sweep candidate has no residual-convergence certificate; budgets are existing engineering comparison budgets, not an invented convergence gate."
+    ],
+    "figures": {
+      "plot_evidence": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-plot-evidence.json",
+        "sha256": "7ece27698758e9720e641c3b14969dcd3ee160996f30408308471c06f789c0a6"
+      },
+      "inspection": {
+        "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/full-3432379/figure-inspection.json",
+        "sha256": "f2a8e9eacd16195b7cfad66950fc3d5eb341f27721754887415d0c17b78aecf8"
+      },
+      "outputs": [
+        {
+          "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-cell-averages.png",
+          "sha256": "b09923b62e71ae69920f13b257cc2502c2622aae937e65732f610650d7fa557a",
+          "bytes": 1119946
+        },
+        {
+          "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-cell-averages.svg",
+          "sha256": "6664bd0ba1c89686ebb90117712d91b5b4608b33ad0453e0b3906a2bfb0749c6",
+          "bytes": 1359959
+        },
+        {
+          "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-cell-averages.pdf",
+          "sha256": "bf870e0318be576643a38e8fb3edb01c730a6ed017c9548d374ac2c3c24d7c44",
+          "bytes": 538661
+        },
+        {
+          "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-radial-profiles.png",
+          "sha256": "0cd58250231d66ee6bcb95b96fc44a7bf593a77fc4eb622b32027224abc20481",
+          "bytes": 295037
+        },
+        {
+          "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-radial-profiles.svg",
+          "sha256": "9bb0a62c0bc1f773abbbd0d957280d3b53dcd4bfc0f6d05454e41dfc14c8a5d0",
+          "bytes": 132859
+        },
+        {
+          "path": "/tmp/igr-dg-current-block-jacobi-full-20261021/figures/current-block-t0p1-radial-profiles.pdf",
+          "sha256": "375ea6e609a829d7b999b99245509c459927731a8677e1e409446c8fa63bd570",
+          "bytes": 28594
+        }
+      ],
+      "map_statistics": {
+        "density": {
+          "control_range": [
+            0.4494310398703243,
+            1.2875108156116426
+          ],
+          "candidate_range": [
+            0.4494310037589853,
+            1.2875109131628677
+          ],
+          "max_abs_cell_average_difference": 8.643093412086245e-07,
+          "difference_color_range": [
+            -8.643093412086245e-07,
+            8.643093412086245e-07
+          ]
+        },
+        "pressure": {
+          "control_range": [
+            1.000318980860227,
+            1.9118864096184558
+          ],
+          "candidate_range": [
+            1.0003189808554067,
+            1.9118860250053982
+          ],
+          "max_abs_cell_average_difference": 1.4790532965047731e-06,
+          "difference_color_range": [
+            -1.4790532965047731e-06,
+            1.4790532965047731e-06
+          ]
+        },
+        "sigma": {
+          "control_range": [
+            7.976035033026522e-11,
+            5.6512640141121904e-05
+          ],
+          "candidate_range": [
+            7.768714862312148e-11,
+            5.60450714644734e-05
+          ],
+          "max_abs_cell_average_difference": 1.1056267273407911e-06,
+          "difference_color_range": [
+            -1.1056267273407911e-06,
+            1.1056267273407911e-06
+          ]
+        }
+      }
+    }
+  },
+  "control_residual_authority": {
+    "maximum_rhs_relative_current_fp64_residual": 9.9954522e-07,
+    "tolerance": 1e-06,
+    "factor_one_public_operator_certificate_calls": 14818
+  },
+  "operator_work": {
+    "reference": {
+      "FGMRES_iterations": 51742,
+      "inner_A_actions": 81377,
+      "independent_public_A_actions": 14818,
+      "total_A_actions": 96195,
+      "A_actions_per_iteration_including_public_certificate": 1.8591279811371806,
+      "scope": "Actual full-case counts. A warm nonrestarted N-iteration solve normally uses1initial+NArnoldi+1inner-final A. This validated configuration adds1independent public-A certificate; that is separate from intrinsic FGMRES work."
+    },
+    "candidate": {
+      "fixed_sweeps": 29684,
+      "current_A_actions": 29684,
+      "block_solves": 29684,
+      "regular_sweeps_per_update": 2,
+      "initial_sweeps": 50,
+      "acceptance": "fixed-sweeps; no residual convergence certificate"
+    }
+  },
+  "interpretation": [
+    "Current-block two-sweep physical approximation worked well in this fixed test; numerical idea is not ruled out by the earlier frozen-block failure.",
+    "This exact-current-block implementation is not a competitive replacement for the optimized control:6.153x application time.",
+    "Generic block assembly/factorization is the dominant measured host timer. Linear-solve timer improved only5.14percent before that setup cost; these host timers are not a GPU phase partition.",
+    "Frozen-initial-reference-block mode is a separate approximation and failed the full physical comparison.",
+    "No claim of analytic Sedov accuracy, fraction of discretization error, all-time positivity, or general stability.",
+    "No inferred candidate sigma/Euler GPU ratio from native_done minus sigma; that remainder also contains RK, CFL, I/O and other work."
+  ]
+}

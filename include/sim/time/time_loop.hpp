@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include "mfem.hpp"
 #include "numerics/limiters/zhang_shu.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
+#include "utils/config/env_flags.hpp"
 #include "utils/diagnostics/non_finite.hpp"
 #include "utils/profiling/nvtx.hpp"
 
@@ -125,6 +127,13 @@ struct TimeLoopResult
   std::string termination_reason = "not-started";
   double non_finite_min = std::numeric_limits<double>::infinity();
   double non_finite_max = -std::numeric_limits<double>::infinity();
+  // Opt-in host wall time in disjoint hooks, including their existing waits.
+  // These are not GPU execution times; no device synchronization is added.
+  double scheduled_output_wall_seconds = 0.0;
+  double final_output_wall_seconds = 0.0;
+  // Configured visualize (alive/GLVis) and analysis hooks only. Existing
+  // accepted-state scans and other loop checks stay in the loop complement.
+  double diagnostics_wall_seconds = 0.0;
 };
 
 namespace time_loop_detail
@@ -586,6 +595,9 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                            const TimeLoopHooks& hooks = {})
 {
   ::igrlab::NVTXRange range("Time/RunTimeLoop");
+  using WallClock = std::chrono::steady_clock;
+  const bool wall_timing_enabled =
+    ::igrlab::EnvFlagEnabled("DG_IGR_SOLVER_WALL_TIMING");
   TimeLoopResult result;
   result.termination_reason = "running";
   PopulateExplicitCFLDiagnostics(result, cfg, stepper);
@@ -662,7 +674,16 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     {
       return false;
     }
+    const auto save_start =
+      wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
     hooks.on_save(step, time, cycle, is_final);
+    if (wall_timing_enabled)
+    {
+      const double elapsed =
+        std::chrono::duration<double>(WallClock::now() - save_start).count();
+      (is_final ? result.final_output_wall_seconds
+                : result.scheduled_output_wall_seconds) += elapsed;
+    }
     has_last_save_time = true;
     last_save_time = time;
     return true;
@@ -1198,7 +1219,14 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       (cfg.vis_steps > 0) && (done || (result.steps % cfg.vis_steps == 0));
     if (should_visualize && hooks.on_visualize)
     {
+      const auto hook_start =
+        wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
       hooks.on_visualize(result.steps, t, dt_real, done);
+      if (wall_timing_enabled)
+      {
+        result.diagnostics_wall_seconds +=
+          std::chrono::duration<double>(WallClock::now() - hook_start).count();
+      }
     }
 
     const bool should_analyze =
@@ -1206,7 +1234,14 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       (done || (result.steps % cfg.analysis_steps == 0));
     if (should_analyze && hooks.on_analysis)
     {
+      const auto hook_start =
+        wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
       hooks.on_analysis(result.steps, t, dt_real, done);
+      if (wall_timing_enabled)
+      {
+        result.diagnostics_wall_seconds +=
+          std::chrono::duration<double>(WallClock::now() - hook_start).count();
+      }
     }
 
     bool saved_this_step = false;

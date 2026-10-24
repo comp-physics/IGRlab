@@ -1,0 +1,800 @@
+{
+  "schema": "igr-local-jacobi-tensor-core-prototype-results-v1",
+  "status": "native-benchmark-and-hardware-evidence-complete",
+  "branch": "igr-dg-local-jacobi-tensor-cores",
+  "tested_source_commit": "3508bababd4f4fda9326c2c03fd715f5f31021b0",
+  "source_manifest_sha256": "fbcfca4ad7731938562e34a814148c244cef6f1c4ae3799eb98f40689d6a1471",
+  "application_binary_sha256": "98da2bfc0f8b4d5ac195128aa25a03cb60a12284c7476d5a82f1e0b96641da91",
+  "benchmark_binary_sha256": "1865aee1b1051f57c2980e3d775cbe4a8ddb0a999428f42e0bd0fea627c9b9c6",
+  "native_job": "3438902",
+  "benchmark_node": "gh086",
+  "benchmark_gpu": {
+    "index": 0,
+    "uuid": "GPU-4d24112f-033b-1600-2929-33473cd783e1",
+    "name": "NVIDIA GH200 120GB",
+    "memory_mib": 97871,
+    "cuda_visible_devices": "0",
+    "logical_cuda_device": 0
+  },
+  "native_checks": [
+    "dg_igr_local_tensor_jacobi_cuda",
+    "dg_igr_element_block_jacobi_cuda",
+    "dg_igr_time_defaults_tests",
+    "dg_igr_device_krylov_cuda",
+    "dg_igr_local_tensor_jacobi_cuda_reject_skew",
+    "dg_igr_local_tensor_jacobi_cuda_reject_curved",
+    "dg_igr_local_tensor_jacobi_cuda_reject_nonseparable",
+    "dg_igr_local_tensor_jacobi_cuda_backends"
+  ],
+  "native_checks_passed": [
+    "dg_igr_time_defaults_tests",
+    "dg_igr_element_block_jacobi_cuda",
+    "dg_igr_local_tensor_jacobi_cuda",
+    "dg_igr_local_tensor_jacobi_cuda_backends",
+    "dg_igr_local_tensor_jacobi_cuda_reject_skew",
+    "dg_igr_local_tensor_jacobi_cuda_reject_curved",
+    "dg_igr_local_tensor_jacobi_cuda_reject_nonseparable",
+    "dg_igr_device_krylov_cuda"
+  ],
+  "configuration": {
+    "line": 1,
+    "event": "configuration",
+    "source": "3508bababd4f4fda9326c2c03fd715f5f31021b0",
+    "build": "1865aee1b1051f57c2980e3d775cbe4a8ddb0a999428f42e0bd0fea627c9b9c6",
+    "mesh_n": "512",
+    "elements": "262144",
+    "p": "5",
+    "d1d": "6",
+    "sigma_dofs": "9437184",
+    "alpha": "6.3578287760416663e-07",
+    "kappa": "144",
+    "mass_nq": "36",
+    "diffusion_nq": "36",
+    "face_nq": "6",
+    "repetitions": "64",
+    "warmup": "8",
+    "rounds": "3",
+    "mode_count": "6",
+    "scope": "complete-production-Mult",
+    "gather_current_S_pack_scatter_included": "true",
+    "coefficient_refresh_timed": "false",
+    "setup_timed": "false",
+    "input": "deterministic-signed-varying",
+    "current_density": "heterogeneous",
+    "profile": "false"
+  },
+  "measurement_design": {
+    "rounds": 3,
+    "samples_per_mode_per_round": 64,
+    "warmup_per_construction": 8,
+    "total_timed_samples_per_mode": 192,
+    "order": [
+      [
+        "simt-fp64",
+        "simt-fp32",
+        "simt-dense-fp32",
+        "wmma-factor-tf32",
+        "wmma-dense-tf32",
+        "wmma-dense-fp64"
+      ],
+      [
+        "simt-fp64",
+        "wmma-dense-fp64",
+        "wmma-dense-tf32",
+        "wmma-factor-tf32",
+        "simt-dense-fp32",
+        "simt-fp32"
+      ],
+      [
+        "simt-dense-fp32",
+        "wmma-factor-tf32",
+        "wmma-dense-tf32",
+        "wmma-dense-fp64",
+        "simt-fp64",
+        "simt-fp32"
+      ]
+    ],
+    "scope": "Complete production factory Mult with current mass multiply, native gather/scatter and any packing; coefficient RefreshMassScaling, setup, and correctness scans excluded.",
+    "order_balance_note": "Order is rotated/reversed but not completely balanced: baseline is first in rounds 0 and 1, then fifth in round 2. No confidence interval or multiple-job reproducibility claim.",
+    "inputs": "One deterministic nonconstant signed residual and synthetic heterogeneous current density, reused unchanged across all modes and rounds; not a saved evolved Sedov residual.",
+    "oracle": "One cached hardware-FP64 action from independent pivoted dense inversions of nine native exact EA+SIPG class matrices; small native qualification uses separately assembled MFEM matrices.",
+    "physical_case_executed": false,
+    "tensor_instruction_claim": "Not evaluated here; native backend labels are not an instruction-level tensor-core proof. NCU evidence is separate.",
+    "wall_seconds": {
+      "build": 86.9777047270909,
+      "native": 14.636623349040747,
+      "benchmark": 108.11782213300467
+    }
+  },
+  "results": [
+    {
+      "backend": "simt-fp64",
+      "whole_mult_ms_median_of_round_medians": 0.3154879957437515,
+      "whole_mult_ms_round_medians": [
+        0.3163839876651764,
+        0.3154879957437515,
+        0.3134719878435135
+      ],
+      "whole_mult_ms_round_median_min": 0.3134719878435135,
+      "whole_mult_ms_round_median_max": 0.3163839876651764,
+      "whole_mult_ms_all_sample_min": 0.3089599907398224,
+      "whole_mult_ms_all_sample_max": 0.32764801383018494,
+      "round_positions": [
+        0,
+        0,
+        4
+      ],
+      "timed_samples": 192,
+      "warmup_applies": 24,
+      "speedup_vs_simt_fp64": 1.0,
+      "time_reduction_vs_simt_fp64_percent": 0.0,
+      "speedup_vs_simt_dense_fp32_control": 0.7357744347840626,
+      "time_reduction_vs_simt_dense_fp32_control_percent": -35.91121853717072,
+      "correction_relative_l2": 4.817908117796679e-14,
+      "correction_relative_max_norm": 2.8347076253182933e-13,
+      "qualification_case_count": 8,
+      "qualification_relative_l2_max": 1.8300272173103904e-14,
+      "qualification_relative_max_norm_max": 3.062128104701418e-14,
+      "qualification_symmetry_relative_max": 4.5850317431770545e-17,
+      "qualification_phases": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "qualification_exponents": [
+        -700,
+        -80,
+        0,
+        80,
+        700
+      ],
+      "setup_identity": {
+        "precision": "fp64",
+        "execution": "simt",
+        "tensor_core": "0",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3583529692359501e-13",
+        "owned_bytes": "189800032",
+        "dense_after_setup": "0",
+        "class_dense_matrices": "0",
+        "class_dense_entries": "0",
+        "dense_per_element": "0",
+        "grouping": "element",
+        "group_elements": "1",
+        "groups": "262144",
+        "group_padding": "0",
+        "mass_precision": "fp64",
+        "output_precision": "fp64",
+        "arithmetic_spd": "fp64-roundoff",
+        "fallback": "none"
+      },
+      "setup_seconds_per_round": [
+        5.519127448,
+        4.787952369,
+        4.761028931
+      ],
+      "projection_not_end_to_end_measurement": {
+        "applies": 29684,
+        "sum_of_inverse_apply_seconds_if_representative": 9.36494566565752,
+        "seconds_saved_vs_simt_fp64_if_representative": 0.0,
+        "fraction_of_prior_whole_app_percent": 0.0,
+        "fraction_of_prior_solve_scope_percent": 0.0,
+        "prior_app_minus_projected_savings_seconds": 503.3804369990248
+      }
+    },
+    {
+      "backend": "simt-fp32",
+      "whole_mult_ms_median_of_round_medians": 0.3109759986400604,
+      "whole_mult_ms_round_medians": [
+        0.31198400259017944,
+        0.3109759986400604,
+        0.31065599620342255
+      ],
+      "whole_mult_ms_round_median_min": 0.31065599620342255,
+      "whole_mult_ms_round_median_max": 0.31198400259017944,
+      "whole_mult_ms_all_sample_min": 0.3064959943294525,
+      "whole_mult_ms_all_sample_max": 0.32412800192832947,
+      "round_positions": [
+        1,
+        5,
+        5
+      ],
+      "timed_samples": 192,
+      "warmup_applies": 24,
+      "speedup_vs_simt_fp64": 1.0145091490128584,
+      "time_reduction_vs_simt_fp64_percent": 1.4301644324229312,
+      "speedup_vs_simt_dense_fp32_control": 0.7464498956981963,
+      "time_reduction_vs_simt_dense_fp32_control_percent": -33.9674646299795,
+      "correction_relative_l2": 1.4275022729288717e-07,
+      "correction_relative_max_norm": 2.5393618411899027e-07,
+      "qualification_case_count": 6,
+      "qualification_relative_l2_max": 1.4723496478540956e-07,
+      "qualification_relative_max_norm_max": 3.126981537340336e-07,
+      "qualification_symmetry_relative_max": 4.227925777876912e-08,
+      "qualification_phases": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "qualification_exponents": [
+        -80,
+        0,
+        80
+      ],
+      "setup_identity": {
+        "precision": "fp32",
+        "execution": "simt",
+        "tensor_core": "0",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3583529692359501e-13",
+        "owned_bytes": "189800032",
+        "dense_after_setup": "0",
+        "class_dense_matrices": "0",
+        "class_dense_entries": "0",
+        "dense_per_element": "0",
+        "grouping": "element",
+        "group_elements": "1",
+        "groups": "262144",
+        "group_padding": "0",
+        "mass_precision": "fp64",
+        "output_precision": "fp64",
+        "arithmetic_spd": "rounding-perturbed",
+        "fallback": "none"
+      },
+      "setup_seconds_per_round": [
+        4.803691612,
+        4.802260803,
+        4.766428302
+      ],
+      "projection_not_end_to_end_measurement": {
+        "applies": 29684,
+        "sum_of_inverse_apply_seconds_if_representative": 9.231011543631555,
+        "seconds_saved_vs_simt_fp64_if_representative": 0.13393412202596663,
+        "fraction_of_prior_whole_app_percent": 0.026606938248223206,
+        "fraction_of_prior_solve_scope_percent": 0.17023270306035887,
+        "prior_app_minus_projected_savings_seconds": 503.2465028769989
+      }
+    },
+    {
+      "backend": "simt-dense-fp32",
+      "whole_mult_ms_median_of_round_medians": 0.23212800174951553,
+      "whole_mult_ms_round_medians": [
+        0.23243200033903122,
+        0.23145600408315659,
+        0.23212800174951553
+      ],
+      "whole_mult_ms_round_median_min": 0.23145600408315659,
+      "whole_mult_ms_round_median_max": 0.23243200033903122,
+      "whole_mult_ms_all_sample_min": 0.22803199291229248,
+      "whole_mult_ms_all_sample_max": 0.23916800320148468,
+      "round_positions": [
+        2,
+        4,
+        0
+      ],
+      "timed_samples": 192,
+      "warmup_applies": 24,
+      "speedup_vs_simt_fp64": 1.3591121853717072,
+      "time_reduction_vs_simt_fp64_percent": 26.422556521593744,
+      "speedup_vs_simt_dense_fp32_control": 1.0,
+      "time_reduction_vs_simt_dense_fp32_control_percent": 0.0,
+      "correction_relative_l2": 1.1164194131239771e-07,
+      "correction_relative_max_norm": 2.5456946763922094e-07,
+      "qualification_case_count": 6,
+      "qualification_relative_l2_max": 1.2897096323090774e-07,
+      "qualification_relative_max_norm_max": 2.858426755006196e-07,
+      "qualification_symmetry_relative_max": 1.9457382283949455e-08,
+      "qualification_phases": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "qualification_exponents": [
+        -80,
+        0,
+        80
+      ],
+      "setup_identity": {
+        "precision": "fp32",
+        "execution": "simt",
+        "tensor_core": "0",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3583529692359501e-13",
+        "owned_bytes": "191007796",
+        "dense_after_setup": "9",
+        "class_dense_matrices": "9",
+        "class_dense_entries": "11664",
+        "dense_per_element": "0",
+        "grouping": "verified-class",
+        "group_elements": "16",
+        "groups": "16389",
+        "group_padding": "80",
+        "mass_precision": "fp64",
+        "output_precision": "fp64",
+        "arithmetic_spd": "rounding-perturbed",
+        "fallback": "none"
+      },
+      "setup_seconds_per_round": [
+        4.743329863,
+        4.833031917,
+        4.741409244
+      ],
+      "projection_not_end_to_end_measurement": {
+        "applies": 29684,
+        "sum_of_inverse_apply_seconds_if_representative": 6.890487603932619,
+        "seconds_saved_vs_simt_fp64_if_representative": 2.474458061724901,
+        "fraction_of_prior_whole_app_percent": 0.4915681818063372,
+        "fraction_of_prior_solve_scope_percent": 3.145081164419468,
+        "prior_app_minus_projected_savings_seconds": 500.90597893729995
+      }
+    },
+    {
+      "backend": "wmma-factor-tf32",
+      "whole_mult_ms_median_of_round_medians": 0.19113600254058838,
+      "whole_mult_ms_round_medians": [
+        0.19113600254058838,
+        0.193183995783329,
+        0.1902559995651245
+      ],
+      "whole_mult_ms_round_median_min": 0.1902559995651245,
+      "whole_mult_ms_round_median_max": 0.193183995783329,
+      "whole_mult_ms_all_sample_min": 0.18822400271892548,
+      "whole_mult_ms_all_sample_max": 0.197952002286911,
+      "round_positions": [
+        3,
+        3,
+        1
+      ],
+      "timed_samples": 192,
+      "warmup_applies": 24,
+      "speedup_vs_simt_fp64": 1.6505942969941343,
+      "time_reduction_vs_simt_fp64_percent": 39.41576062506208,
+      "speedup_vs_simt_dense_fp32_control": 1.2144650859286563,
+      "time_reduction_vs_simt_dense_fp32_control_percent": 17.659222024045494,
+      "correction_relative_l2": 0.00043821979967898037,
+      "correction_relative_max_norm": 0.0009082830446799361,
+      "qualification_case_count": 6,
+      "qualification_relative_l2_max": 0.0005785857886209373,
+      "qualification_relative_max_norm_max": 0.0010143005019997559,
+      "qualification_symmetry_relative_max": 7.346724269640076e-05,
+      "qualification_phases": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "qualification_exponents": [
+        -80,
+        0,
+        80
+      ],
+      "setup_identity": {
+        "precision": "tf32",
+        "execution": "wmma",
+        "tensor_core": "1",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3583529692359501e-13",
+        "owned_bytes": "190914484",
+        "dense_after_setup": "0",
+        "class_dense_matrices": "0",
+        "class_dense_entries": "0",
+        "dense_per_element": "0",
+        "grouping": "verified-class",
+        "group_elements": "16",
+        "groups": "16389",
+        "group_padding": "80",
+        "mass_precision": "fp64",
+        "output_precision": "fp64",
+        "arithmetic_spd": "rounding-perturbed",
+        "fallback": "none"
+      },
+      "setup_seconds_per_round": [
+        4.751514532,
+        4.78747107,
+        4.901490378
+      ],
+      "projection_not_end_to_end_measurement": {
+        "applies": 29684,
+        "sum_of_inverse_apply_seconds_if_representative": 5.673681099414825,
+        "seconds_saved_vs_simt_fp64_if_representative": 3.691264566242695,
+        "fraction_of_prior_whole_app_percent": 0.7332951968194675,
+        "fraction_of_prior_solve_scope_percent": 4.691664344509537,
+        "prior_app_minus_projected_savings_seconds": 499.68917243278213
+      }
+    },
+    {
+      "backend": "wmma-dense-tf32",
+      "whole_mult_ms_median_of_round_medians": 0.17161600291728973,
+      "whole_mult_ms_round_medians": [
+        0.17110399901866913,
+        0.17286399751901627,
+        0.17161600291728973
+      ],
+      "whole_mult_ms_round_median_min": 0.17110399901866913,
+      "whole_mult_ms_round_median_max": 0.17286399751901627,
+      "whole_mult_ms_all_sample_min": 0.16921600699424744,
+      "whole_mult_ms_all_sample_max": 0.17875200510025024,
+      "round_positions": [
+        4,
+        2,
+        2
+      ],
+      "timed_samples": 192,
+      "warmup_applies": 24,
+      "speedup_vs_simt_fp64": 1.8383366957672405,
+      "time_reduction_vs_simt_fp64_percent": 45.60300067433272,
+      "speedup_vs_simt_dense_fp32_control": 1.3526011432709426,
+      "time_reduction_vs_simt_dense_fp32_control_percent": 26.068375368829066,
+      "correction_relative_l2": 0.00012270160735779927,
+      "correction_relative_max_norm": 0.00017302589726781787,
+      "qualification_case_count": 6,
+      "qualification_relative_l2_max": 0.0002450780086921755,
+      "qualification_relative_max_norm_max": 0.0003261505897890487,
+      "qualification_symmetry_relative_max": 6.095659319653455e-05,
+      "qualification_phases": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "qualification_exponents": [
+        -80,
+        0,
+        80
+      ],
+      "setup_identity": {
+        "precision": "tf32",
+        "execution": "wmma",
+        "tensor_core": "1",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3583529692359501e-13",
+        "owned_bytes": "191007796",
+        "dense_after_setup": "9",
+        "class_dense_matrices": "9",
+        "class_dense_entries": "11664",
+        "dense_per_element": "0",
+        "grouping": "verified-class",
+        "group_elements": "16",
+        "groups": "16389",
+        "group_padding": "80",
+        "mass_precision": "fp64",
+        "output_precision": "fp64",
+        "arithmetic_spd": "rounding-perturbed",
+        "fallback": "none"
+      },
+      "setup_seconds_per_round": [
+        4.795907572,
+        4.788265416,
+        4.789548817
+      ],
+      "projection_not_end_to_end_measurement": {
+        "applies": 29684,
+        "sum_of_inverse_apply_seconds_if_representative": 5.094249430596829,
+        "seconds_saved_vs_simt_fp64_if_representative": 4.270696235060692,
+        "fraction_of_prior_whole_app_percent": 0.8484032992066725,
+        "fraction_of_prior_solve_scope_percent": 5.428132525504807,
+        "prior_app_minus_projected_savings_seconds": 499.1097407639641
+      }
+    },
+    {
+      "backend": "wmma-dense-fp64",
+      "whole_mult_ms_median_of_round_medians": 0.18731199949979782,
+      "whole_mult_ms_round_medians": [
+        0.18689600378274918,
+        0.18836800009012222,
+        0.18731199949979782
+      ],
+      "whole_mult_ms_round_median_min": 0.18689600378274918,
+      "whole_mult_ms_round_median_max": 0.18836800009012222,
+      "whole_mult_ms_all_sample_min": 0.1841920018196106,
+      "whole_mult_ms_all_sample_max": 0.19392000138759613,
+      "round_positions": [
+        5,
+        1,
+        3
+      ],
+      "timed_samples": 192,
+      "warmup_applies": 24,
+      "speedup_vs_simt_fp64": 1.6842914313350867,
+      "time_reduction_vs_simt_fp64_percent": 40.62785208095904,
+      "speedup_vs_simt_dense_fp32_control": 1.2392585759022132,
+      "time_reduction_vs_simt_dense_fp32_control_percent": 19.306590291539973,
+      "correction_relative_l2": 4.8211986593801275e-14,
+      "correction_relative_max_norm": 2.8360369137709633e-13,
+      "qualification_case_count": 8,
+      "qualification_relative_l2_max": 1.8160998965188056e-14,
+      "qualification_relative_max_norm_max": 2.993266850672248e-14,
+      "qualification_symmetry_relative_max": 4.499630799647095e-17,
+      "qualification_phases": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "qualification_exponents": [
+        -700,
+        -80,
+        0,
+        80,
+        700
+      ],
+      "setup_identity": {
+        "precision": "fp64",
+        "execution": "wmma",
+        "tensor_core": "1",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3583529692359501e-13",
+        "owned_bytes": "191007796",
+        "dense_after_setup": "9",
+        "class_dense_matrices": "9",
+        "class_dense_entries": "11664",
+        "dense_per_element": "0",
+        "grouping": "verified-class",
+        "group_elements": "16",
+        "groups": "16389",
+        "group_padding": "80",
+        "mass_precision": "fp64",
+        "output_precision": "fp64",
+        "arithmetic_spd": "fp64-roundoff",
+        "fallback": "none"
+      },
+      "setup_seconds_per_round": [
+        4.748100002,
+        4.882420338,
+        4.823746852
+      ],
+      "projection_not_end_to_end_measurement": {
+        "applies": 29684,
+        "sum_of_inverse_apply_seconds_if_representative": 5.560169393151998,
+        "seconds_saved_vs_simt_fp64_if_representative": 3.8047762725055216,
+        "fraction_of_prior_whole_app_percent": 0.7558450811454345,
+        "fraction_of_prior_solve_scope_percent": 4.835939786001347,
+        "prior_app_minus_projected_savings_seconds": 499.5756607265193
+      }
+    }
+  ],
+  "fp64_vs_tf32_tradeoff": {
+    "recommended_mode": "wmma-dense-fp64",
+    "raw_microbenchmark_winner": "wmma-dense-tf32",
+    "fp64_fraction_of_fastest_mode_savings_percent": 89.0903043225094,
+    "dense_simt_fp32_fraction_of_fastest_mode_savings_percent": 57.9403901736349,
+    "extra_tf32_saving_seconds_projected": 0.46591996255517004,
+    "extra_tf32_fraction_of_prior_app_percent": 0.09255821806123797,
+    "extra_tf32_fraction_of_prior_solve_percent": 0.5921927395034592,
+    "tf32_time_reduction_vs_fp64_tc_percent": 8.379600145438104,
+    "reason": "FP64 WMMA retains roundoff-level surrogate correction agreement and captures most measured inverse speedup. Dense TF32 saves only about 0.466 projected seconds over the prior full run while introducing about 1.23e-4 relative L2 and 1.73e-4 relative max-norm correction error."
+  },
+  "projection_not_measurement": {
+    "receipt": "/home/jarias9/.codex/worktrees/igr-dg-checkpoint/IGRlab/docs/benchmarks/dg_local_tensor_jacobi_measurements.json",
+    "source_commit": "52d46caf68d2a3a928cb500b656779f34a2c02d1",
+    "application_seconds": 503.3804369990248,
+    "inclusive_solve_seconds": 78.67708120599956,
+    "local_inverse_applies": 29684,
+    "accepted_steps": 4939,
+    "inferred_inverse_apply_fraction_of_app_percent": 1.8604111279111275,
+    "inferred_inverse_apply_fraction_of_solve_percent": 11.903016128848705,
+    "max_possible_app_saving_if_all_inverse_Mult_cost_eliminated_percent": 1.8604111279111275,
+    "projection_assumptions": [
+      "Same 29684 local inverse calls.",
+      "Synthetic current per-call timings represent physical evolved calls.",
+      "All other application costs and step counts remain unchanged.",
+      "Timing transfer across the prior and current node/source/build is representative."
+    ],
+    "not_measured_end_to_end": true
+  },
+  "decision": {
+    "reviewed_by_parent": true,
+    "native_run_sha256": "26098829bb3b864c5d455f19aaf0e1ead8054b1f395dea371b8ef74bd62f6564",
+    "candidate": "wmma-dense-fp64",
+    "fastest_kernel": "wmma-dense-tf32",
+    "material_for_full": false,
+    "decision": "Complete bounded kernel/hardware comparison; retain opt-in prototypes and default FP64 SIMT. No new physical pair in this task.",
+    "reason": "FP64 WMMA retains roundoff correction agreement and89.1% offastestkernel savings. Call-count transfer estimates only3.805s(.756%) versus4.271s(.848%) whole-application savings; these are projections and a single fullpair wouldnot establish sub-percent timing. Full physical accuracy/runtime remainunmeasured.",
+    "source_commit": "3508bababd4f4fda9326c2c03fd715f5f31021b0",
+    "actual_physical_runs_submitted": []
+  },
+  "hardware_proof": {
+    "wmma-factor-tf32": {
+      "status": "verified",
+      "kernel": "ApplyTensorFactorTF32",
+      "instruction_metric": "sm__inst_executed_pipe_tensor_op_hmma.sum",
+      "instruction_values": [
+        1573344.0
+      ],
+      "opcode_regex": "\\b(?:HMMA|HGMMA)\\b[^\\n]*TF32",
+      "report_sha256": "ad5b72718841c266075664d461a1eaac91f968a43ec1f3744d6f16fb0fda4a29",
+      "raw_sha256": "f10932b2373c0920c977d43cbf6a8f6f01154308f923d7b94fe733f63b196ae9",
+      "sass_sha256": "082e1244c8ad518734b4e8ebfce9d7634d6ed8611295cedbd444de4846de5523",
+      "command_receipts_sha256": {
+        "profile": "5fa7514d3337e5ac950534c2d761b8bb645a557fc5c6e1ff62e5361b0fcc7c29",
+        "raw": "a334f022ea6281e3c8486ad4a292bb3ff0a1bceae09904874ef003611ab4a33a",
+        "sass": "ec26463ba4b8c338715ac007ca8399e1ead2216f6c03962e59ce106b3fc559b4"
+      },
+      "sampled_launches": 1,
+      "timing_is_profiled_diagnostic_only": true,
+      "reused_capture": true,
+      "origin_job": "3438903",
+      "origin_gpu": {
+        "index": 0,
+        "uuid": "GPU-0aba9e09-6337-4bf7-9679-ae6be2f235cf",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "origin_node": "gh075",
+      "metrics": {
+        "dram__bytes.sum": 254426368.0,
+        "gpu__time_duration.sum": 194560.0,
+        "sm__inst_executed_pipe_tensor_op_dmma.sum": 0.0,
+        "sm__inst_executed_pipe_tensor_op_hmma.sum": 1573344.0,
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": 3.68,
+        "sm__warps_active.avg.pct_of_peak_sustained_active": 90.4
+      },
+      "observed_tensor_opcodes": [
+        "HMMA.1684.F32.TF32"
+      ],
+      "expected_warp_tensor_instruction_count_for_this_mapping": 1573344
+    },
+    "wmma-dense-tf32": {
+      "status": "verified",
+      "kernel": "ApplyTensorDenseTF32",
+      "instruction_metric": "sm__inst_executed_pipe_tensor_op_hmma.sum",
+      "instruction_values": [
+        983340.0
+      ],
+      "opcode_regex": "\\b(?:HMMA|HGMMA)\\b[^\\n]*TF32",
+      "report_sha256": "3a6a71d68fbfb6445d98629d0f3ac3926ed48f652e698a54224bad1f19cbb597",
+      "raw_sha256": "31cbacf87365a609d4b731c2f36b490d29e03d12ac03caa7273ac5d7311724ec",
+      "sass_sha256": "9316b1bf14678da0929f89822d462f1889b09ad1b247a19d1520b3e229726cb8",
+      "command_receipts_sha256": {
+        "profile": "22ce641573ad7a4a4157f38a94647e597778e5d0623b7e276267b8461db84b4d",
+        "raw": "fac33657b2e16797d4dcdc0a313af083740f89d7ddbbe684995e8fc3d99492df",
+        "sass": "c266e6d8ccab5bc80cb81168dd51cef52ec53be8f137da91cd0fb3bda0e9dee0"
+      },
+      "sampled_launches": 1,
+      "timing_is_profiled_diagnostic_only": true,
+      "reused_capture": false,
+      "origin_job": "3438927",
+      "origin_gpu": {
+        "index": 0,
+        "uuid": "GPU-ade8d2f3-fd42-d899-8fa9-c75bc550ab3d",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "origin_node": "gh077",
+      "metrics": {
+        "dram__bytes.sum": 255153152.0,
+        "gpu__time_duration.sum": 173088.0,
+        "sm__inst_executed_pipe_tensor_op_dmma.sum": 0.0,
+        "sm__inst_executed_pipe_tensor_op_hmma.sum": 983340.0,
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": 2.69,
+        "sm__warps_active.avg.pct_of_peak_sustained_active": 56.43
+      },
+      "observed_tensor_opcodes": [
+        "HMMA.1684.F32.TF32"
+      ],
+      "expected_warp_tensor_instruction_count_for_this_mapping": 983340
+    },
+    "wmma-dense-fp64": {
+      "status": "verified",
+      "kernel": "ApplyTensorDenseFP64",
+      "instruction_metric": "sm__inst_executed_pipe_tensor_op_dmma.sum",
+      "instruction_values": [
+        1475010.0
+      ],
+      "opcode_regex": "\\bDMMA\\b",
+      "report_sha256": "f8d0469169b0922f3646bbb5a018e0749d315121c49de9e79c6f32903bc49a14",
+      "raw_sha256": "52f08205c24c3526a15d0417960d787125e9531dfbd19c27f3e2173a817a3c77",
+      "sass_sha256": "01330b074e40dd257dab166a0426c6ad060d0fa71117658120d7abadfca57910",
+      "command_receipts_sha256": {
+        "profile": "e25d16b7f029d373cb4d72d62ad1707c5c7212b94ac07c8b93e130602fbe7388",
+        "raw": "b87ef766dcc6a803affc60d24ac3146353bea0edc23af05416512a575049df42",
+        "sass": "bc80f21816c77cfc970b72951e095f37e2f466d140266f02d17e133144aadea0"
+      },
+      "sampled_launches": 1,
+      "timing_is_profiled_diagnostic_only": true,
+      "reused_capture": false,
+      "origin_job": "3438927",
+      "origin_gpu": {
+        "index": 0,
+        "uuid": "GPU-ade8d2f3-fd42-d899-8fa9-c75bc550ab3d",
+        "name": "NVIDIA GH200 120GB",
+        "memory_mib": 97871,
+        "cuda_visible_devices": "0",
+        "logical_cuda_device": 0
+      },
+      "origin_node": "gh077",
+      "metrics": {
+        "dram__bytes.sum": 254911744.0,
+        "gpu__time_duration.sum": 192320.0,
+        "sm__inst_executed_pipe_tensor_op_dmma.sum": 1475010.0,
+        "sm__inst_executed_pipe_tensor_op_hmma.sum": 0.0,
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": 13.24,
+        "sm__warps_active.avg.pct_of_peak_sustained_active": 66.61
+      },
+      "observed_tensor_opcodes": [
+        "DMMA.8x8x4"
+      ],
+      "expected_warp_tensor_instruction_count_for_this_mapping": 1475010
+    }
+  },
+  "ncu_tool": {
+    "path": "/opt/nvidia/hpc_sdk/Linux_aarch64/25.5/compilers/bin/ncu",
+    "sha256": "009dbdcb7c57cbcdd0464ee76dd186f59fb1da0517fb4b2a0c8e262cac19307b",
+    "version": "2025.2.0.0"
+  },
+  "evidence_sha256": {
+    "native-3438902/run.json": "26098829bb3b864c5d455f19aaf0e1ead8054b1f395dea371b8ef74bd62f6564",
+    "native-3438902/benchmark.stdout.log": "6c3827d0ebc7c7208992ac63c9ee2900fecbd05da616334383aaf51c6277c77f",
+    "native-3438902/native-detail.log": "ba9ba4dfd292a6fa37569c363772089dfacd862f15f9bba3a73ea51fdd66784b",
+    "native-review/analysis.json": "fee62d30c93de2b4ac56ca67f60f6e3316670c0860d269177d34624e52edffd9",
+    "ncu-3438903/run.json": "32dd069fcbfdf462add56003c40ffafae233f33fc122cb80f4b896d0d1531c93",
+    "ncu-3438927/run.json": "e0a2e0eb4606b1c3159d01dd095f6e6a11ae5d30585eea20159c123aa3f53f72",
+    "ncu-repair-validation.json": "ea904bead3fe909b91e825866b9e613104f0d03b9589c1b9290a48f16f056f83",
+    "performance-decision.json": "64e14dca8b577396bd56eecc6249fb75e220fafe6c22dcd488b98a6fb620db1a",
+    "final-accounting.txt": "d847da87a269eec866f43733b4ab26dafc51b9d9051aa15fe59dd4996cdfc950",
+    "hardware-review.json": "f8766c2c0bec6b5bdd50dd164f0dd4b926edce7d226b7af679f5d3695e8217dc",
+    "hardware-review.txt": "de4adab7b3ec7df565b5270dacfea21af77cc1ade148eb6d43726412feb514b3",
+    "native-review/analysis.txt": "66cd31f08a460dc2079ffb259d1f8cbb3f5765941e6a467fdca8414cc6d25d72"
+  },
+  "artifact_roots": {
+    "local": "/home/jarias9/.cache/igrlab-experiments/igr-dg-jacobi-tensor-cores-20261022",
+    "remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-jacobi-tensor-cores-20261022"
+  },
+  "plots_sha256": {
+    "kernel-comparison.png": "9415587035509014cae787a536203829b3d15867f4d15f5e02e83954ab985bcc",
+    "kernel-comparison.svg": "cbba5ba27b0345c64143be4883f22e540bf1db2ea881cbbc86a2fa0626a01e7e",
+    "kernel-comparison.pdf": "ce7c4332345f2471c5a90966f589d8f6662946afda675abe8d60b3cfed29ec7a"
+  },
+  "scope_limits": [
+    "Synthetic nonconstant density/residual on matched512\u00b2p5Sedovgeometry/operator setup; not an evolved flow-state capture.",
+    "Complete production Mult timing includes gather, mass scaling, shared packing and scatter; excludes setup and coefficient refresh.",
+    "One GPU/job/input; three rotated/reversed rounds, not a confidence interval or fullybalanced ordering.",
+    "FP32/TF32 directly cast without full FP64 dynamicrange; tested residual exponents -80,0,+80, FP64 also -700,+700.",
+    "Correction norms are inverseapplication errors, not evolved sigma/flow errors or convergence certificates.",
+    "No new fullphysicalpair; wholeapplication savings are call-count projections across different source/node/input states.",
+    "Profiled NCU durations are diagnostic only; failed wideCSVpostprocessing was repaired, first capture reused unchanged.",
+    "No default or mesh-support change; grouped modes p5 fixed affineCartesian, WMMA SM80+.",
+    "Historical high-level solver policy labels still containfp64; detailed backend record gives actual arithmetic."
+  ],
+  "independent_hardware_review": "passed",
+  "allocated_gpu_seconds": 369,
+  "allocated_gpu_hours": 0.1025,
+  "accounting_scope": "Sum of requested one-GPU allocated job elapsed times:230s native+48s initial capture/parser failure+91s continuation; not a monetary-credit conversion. Raw Slurm billing TRES retained separately."
+}

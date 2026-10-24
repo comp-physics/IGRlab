@@ -38,6 +38,214 @@ int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
 
+  // Explicit fixed-sweep closure leaves the established solve defaults intact.
+  {
+    const ::igrlab::IGRConfig defaults;
+    ctx.Check(defaults.solve_mode == ::igrlab::IGRSolveMode::Krylov &&
+                !defaults.element_jacobi_reference_blocks &&
+                !defaults.element_jacobi_tensor_blocks &&
+                dg_sim::IGROptions{}.element_jacobi_blocks == "current" &&
+                defaults.regular_sweeps == mfem::igrlab::IGRDefaults::kRegularSweeps &&
+                defaults.warm_start_sweeps == mfem::igrlab::IGRDefaults::kWarmStartSweeps,
+              "fixed element Jacobi: legacy mode and sweep defaults are unchanged");
+    ctx.Check(dg_sim::ParseIGRSolveMode("ELEMENT-BLOCK-JACOBI") ==
+                ::igrlab::IGRSolveMode::FixedElementJacobi &&
+                std::string(dg_sim::IGRSolveModeToString(
+                  ::igrlab::IGRSolveMode::FixedElementJacobi)) == "element-block-jacobi",
+              "fixed element Jacobi: explicit mode parses and round-trips");
+    ctx.Check(!dg_sim::ParseIGRElementJacobiReferenceBlocks("current") &&
+                dg_sim::ParseIGRElementJacobiReferenceBlocks("REFERENCE") &&
+                !dg_sim::ParseIGRElementJacobiReferenceBlocks("TENSOR") &&
+                !dg_sim::ParseIGRElementJacobiTensorBlocks("current") &&
+                !dg_sim::ParseIGRElementJacobiTensorBlocks("REFERENCE") &&
+                dg_sim::ParseIGRElementJacobiTensorBlocks("TENSOR"),
+              "fixed element Jacobi: current/reference/tensor policies parse distinctly");
+    std::vector<std::string> arguments = {
+      "test", "--igr-solve-mode", "element-block-jacobi",
+      "--igr-sweeps", "2", "--igr-initial-sweeps", "50",
+      "--igr-jacobi-omega", "0.7", "--igr-jacobi-blocks", "current",
+      "--igr-sigma-cadence", "every-stage"};
+    std::vector<char*> argv;
+    for (auto& argument : arguments) { argv.push_back(argument.data()); }
+    dg_sim::IGROptions options;
+    mfem::OptionsParser parser(static_cast<int>(argv.size()), argv.data());
+    dg_sim::AddIGROptions(parser, options);
+    parser.Parse();
+    ctx.Check(parser.Good(), "fixed element Jacobi: bounded candidate CLI parses");
+    options.space = "L2";
+    options.grad = "BrokenL2";
+    options.exact_dg_face_operator = true;
+    ::igrlab::IGRConfig configured;
+    configured.element_jacobi_reference_blocks = true;
+    configured.element_jacobi_tensor_blocks = true;
+    dg_sim::ApplyIGRRuntimeOptionOverrides(options, configured);
+    ctx.Check(configured.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi &&
+                configured.regular_sweeps == 2 && configured.warm_start_sweeps == 50 &&
+                configured.element_jacobi_omega == 0.7 &&
+                !configured.element_jacobi_reference_blocks &&
+                !configured.element_jacobi_tensor_blocks,
+              "fixed element Jacobi: exact 2/50 sweep counts and damping reach solver config");
+    dg_sim::CommonOptions common;
+    common.device = "cuda";
+    common.dg_backend = "dg";
+    const auto candidate = dg_sim::MakeRunConfig(
+      dg_sim::CaseConfig{}, common, options,
+      dg_sim::DiscretizationProvenance::DiscretizationOption,
+      dg_sim::Regularization::IGR);
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(candidate).empty(),
+              "fixed element Jacobi: ordinary-DG every-stage candidate is admitted");
+    // Exercise resolved policies, including cases that enable positivity by
+    // default. The raw CLI value alone cannot determine retry admission.
+    struct PositivityAdmission
+    {
+      bool case_default;
+      const char* selection;
+      bool rejected;
+    };
+    const PositivityAdmission positivity_admission[] = {
+      {true, "case", true},
+      {false, "zhang-shu", true},
+      {true, "none", false},
+      {false, "case", false}};
+    for (const char* blocks : {"current", "reference", "tensor"})
+    {
+      for (const auto& policy : positivity_admission)
+      {
+        auto policy_case = candidate.case_config;
+        policy_case.limiter_pipeline.zhang_shu = policy.case_default;
+        // Zhang-Shu is always-on, even when optional limiter callbacks expire.
+        policy_case.rk3_config.max_limiter_steps = 0;
+        auto policy_common = common;
+        policy_common.positivity_limiter = policy.selection;
+        auto policy_options = options;
+        policy_options.element_jacobi_blocks = blocks;
+        const auto policy_run = dg_sim::MakeRunConfig(
+          policy_case, policy_common, policy_options,
+          dg_sim::DiscretizationProvenance::DiscretizationOption,
+          dg_sim::Regularization::IGR);
+        const std::string rejection =
+          dg_sim::ValidateFixedElementJacobiIGRSelection(policy_run);
+        ctx.Check(policy_run.case_config.limiter_pipeline.zhang_shu ==
+                    policy.rejected &&
+                    (policy.rejected
+                      ? rejection.find("RK rejection") != std::string::npos
+                      : rejection.empty()),
+                  std::string("fixed element Jacobi: ") + blocks +
+                    " resolves positivity " + policy.selection +
+                    (policy.case_default ? " over enabled case policy" :
+                                           " over disabled case policy"));
+      }
+    }
+    for (const std::string blocks : {"reference", "tensor"})
+    {
+      std::vector<std::string> block_arguments = {
+        "test", "--igr-jacobi-blocks", blocks};
+      std::vector<char*> block_argv;
+      for (auto& argument : block_arguments)
+      { block_argv.push_back(argument.data()); }
+      auto block_options = options;
+      mfem::OptionsParser block_parser(
+        static_cast<int>(block_argv.size()), block_argv.data());
+      dg_sim::AddIGROptions(block_parser, block_options);
+      block_parser.Parse();
+      ::igrlab::IGRConfig block_config;
+      // Runtime selection must also clear an opposite policy inherited from
+      // a case configuration, rather than accidentally enabling both modes.
+      block_config.element_jacobi_reference_blocks = blocks == "tensor";
+      block_config.element_jacobi_tensor_blocks = blocks == "reference";
+      dg_sim::ApplyIGRRuntimeOptionOverrides(block_options, block_config);
+      ctx.Check(block_parser.Good() &&
+                  block_config.element_jacobi_reference_blocks == (blocks == "reference") &&
+                  block_config.element_jacobi_tensor_blocks == (blocks == "tensor") &&
+                  block_config.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi &&
+                  block_config.regular_sweeps == 2 &&
+                  block_config.warm_start_sweeps == 50 &&
+                  block_config.element_jacobi_omega == 0.7 && !block_config.nan_scan,
+                "fixed element Jacobi: " + blocks +
+                  " CLI selects one policy and preserves 2/50/.7 with scans off");
+      auto block_run = candidate;
+      block_run.igr_opts = block_options;
+      ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(block_run).empty(),
+                "fixed element Jacobi: explicit " + blocks + " mode is admitted");
+      for (const char* other_mode : {"krylov", "smoother"})
+      {
+        auto ignored_selection = block_run;
+        ignored_selection.igr_opts.solve_mode = other_mode;
+        ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(ignored_selection).empty(),
+                  "fixed element Jacobi: " + blocks +
+                    " blocks cannot be ignored by another solver");
+      }
+      block_options.solve_mode = "krylov";
+      ctx.Check(!dg_sim::ValidateHdgIGRSigmaCadence(
+                  dg_sim::Discretization::HDG, dg_sim::Regularization::IGR,
+                  dg_sim::CaseConfig{}, block_options).empty(),
+                "fixed element Jacobi: " + blocks +
+                  " choice cannot disappear at HDG dispatch");
+      block_run.igr_opts.sigma_cadence = "every-step";
+      ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(block_run).empty(),
+                "fixed element Jacobi: " + blocks + " retains every-stage admission");
+    }
+    for (const char* cadence : {"every-step", "every-n-steps", "extrapolated-every-step"})
+    {
+      auto unsupported = candidate;
+      unsupported.igr_opts.sigma_cadence = cadence;
+      ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+                "fixed element Jacobi: unsupported sigma cadence is rejected");
+    }
+    auto unsupported = candidate;
+    unsupported.igr_opts.sigma_cadence.clear();
+    unsupported.case_config.igr_config.sigma_cadence =
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: inherited recoverable sigma admission is rejected");
+    unsupported = candidate;
+    unsupported.discretization = dg_sim::Discretization::DGSEM;
+    unsupported.dg_backend = dg_sim::DGBackend::DGSEM;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: DGSEM is not silently selected");
+    unsupported = candidate;
+    unsupported.device_backend = dg_sim::DeviceBackend::CPU;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: unsupported CPU execution is rejected");
+    unsupported = candidate;
+    unsupported.igr_opts.exact_dg_face_operator = false;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: exact DG faces are required");
+    unsupported = candidate;
+    unsupported.igr_opts.grad = "H1";
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: conforming gradient selection is rejected");
+    unsupported = candidate;
+    unsupported.opts.restart_vtk = "prior.pvd";
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: unqualified approximate-history restart is rejected");
+    unsupported = candidate;
+    unsupported.igr_opts.regular_sweeps = 0;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: zero regular sweeps are rejected");
+    unsupported = candidate;
+    unsupported.igr_opts.initial_sweeps = 1;
+    ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: initial sweeps cannot be silently clamped upward");
+    for (double omega : {0.0, 1.01, std::numeric_limits<double>::quiet_NaN()})
+    {
+      unsupported = candidate;
+      unsupported.igr_opts.element_jacobi_omega = omega;
+      ctx.Check(!dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+                "fixed element Jacobi: invalid damping is rejected");
+    }
+    ctx.Check(!dg_sim::ValidateHdgIGRSigmaCadence(
+                dg_sim::Discretization::HDG, dg_sim::Regularization::IGR,
+                dg_sim::CaseConfig{}, options).empty(),
+              "fixed element Jacobi: HDG early dispatch rejects this DG closure mode");
+    unsupported = candidate;
+    unsupported.igr_opts.solve_mode = "krylov";
+    unsupported.igr_opts.sigma_cadence = "every-step";
+    unsupported.case_config.limiter_pipeline.zhang_shu = true;
+    ctx.Check(dg_sim::ValidateFixedElementJacobiIGRSelection(unsupported).empty(),
+              "fixed element Jacobi: other solver modes retain cadence and positivity policies");
+  }
+
   // --- Diagnostic state scans are opt-in and have paired CLI controls ---
   {
     const dg_sim::CommonOptions defaults;
@@ -1241,6 +1449,44 @@ int RunTimeDefaultsTests(TestContext& ctx)
   const mfem::Vector state =
     EulerConsFromPrim2D(/*rho=*/1.2, /*u=*/0.3, /*v=*/-0.1, /*p=*/0.9, gamma);
   FillConstantState(state, bundle.sol);
+
+#ifdef MFEM_USE_EXCEPTIONS
+  // Direct library callers bypass CLI admission. Even terminal rejection must
+  // stop before the converged-solver recovery path can consume fixed history.
+  {
+    mfem::L2_FECollection sigma_fec(1, 2, mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace sigma_space(&example_ctx.Mesh(), &sigma_fec);
+    ::igrlab::IGRSolver igr(sigma_space, *bundle.sol.ParFESpace(), 2, 4, 0.01);
+    igr.SetSolveMode(::igrlab::IGRSolveMode::FixedElementJacobi);
+    mfem::EulerFlux euler(2, gamma);
+    mfem::RusanovFluxWithSides flux(euler);
+    auto integrator = std::make_unique<mfem::HyperbolicFormIntegrator>(flux, 2);
+    mfem::DGHyperbolicConservationLaws base(
+      *bundle.sol.ParFESpace(), std::move(integrator), true);
+    mfem::EulerWithIGR wrapped(base, igr, bundle.sol);
+    wrapped.BeginRKStep(0, 0.0, 1.0e-4, 3);
+    const mfem::ErrorAction previous_action = mfem::get_error_action();
+    mfem::set_error_action(mfem::MFEM_ERROR_THROW);
+    for (const double retry_dt : {0.0, 5.0e-5})
+    {
+      bool rejected = false;
+      try
+      {
+        wrapped.AbortRKStep(bundle.sol, 0.0, 0, retry_dt);
+      }
+      catch (const mfem::ErrorException& error)
+      {
+        rejected = std::string(error.what()).find("does not support RK abort/retry") !=
+                   std::string::npos;
+      }
+      ctx.Check(rejected && igr.GetLinearSolveCalls() == 0,
+                retry_dt > 0.0
+                  ? "fixed element Jacobi: direct RK retry fails before sigma recovery"
+                  : "fixed element Jacobi: terminal RK abort fails before sigma recovery");
+    }
+    mfem::set_error_action(previous_action);
+  }
+#endif
 
   // --- initial Zhang-Shu admission precedes all consumers and is strict ---
   {

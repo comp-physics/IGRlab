@@ -14,6 +14,8 @@
 #include "IGR_face_density_cuda.hpp"
 #include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
+#include "IGR_element_block_jacobi.hpp"
+#include "IGR_local_tensor_jacobi.hpp"
 #include "IGR_device_krylov.hpp"
 #include "IGR_chebyshev.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
@@ -90,6 +92,32 @@ mfem::real_t ReadEnvReal(const char* name, mfem::real_t default_value)
   MFEM_VERIFY(end && *end == '\0',
               "Invalid real value for " << name << ": " << raw);
   return static_cast<mfem::real_t>(value);
+}
+
+std::string LocalTensorConfigurationKey()
+{
+  const char* reference = ::igrlab::GetEnv("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE");
+  if (!reference) { reference = ::igrlab::GetEnv("DG_IGR_IGR_LOCAL_TENSOR_REFERENCE"); }
+  if (!reference) { reference = ::igrlab::GetEnv("DG_IGR_LOCAL_TENSOR_REFERENCE"); }
+  const char* execution = ::igrlab::GetEnv("IGRLAB_IGR_LOCAL_TENSOR_EXECUTION");
+  if (!execution) { execution = ::igrlab::GetEnv("DG_IGR_LOCAL_TENSOR_EXECUTION"); }
+  return std::string(reference && reference[0] ? reference : "exact") + ":" +
+    (execution && execution[0] ? execution : "simt-fp64");
+}
+
+std::string TensorElementBlockName(const ElementBlockJacobi& blocks)
+{
+  const char* backend = blocks.BackendName();
+  const char* reference = blocks.ReferencePolicy();
+  MFEM_VERIFY(backend && backend[0] && reference && reference[0],
+              "Local tensor backend must expose immutable execution/reference metadata.");
+  // Preserve the established name of the default exact FP64 implementation.
+  if (std::strcmp(backend, "tensor-element-density-fp64") == 0 &&
+      std::strcmp(reference, "exact") == 0)
+  {
+    return backend;
+  }
+  return std::string("tensor-element-") + reference + "-" + backend;
 }
 
 dg_face::DGDiffusionFaceScaling ReadIPDGFaceScaling()
@@ -1068,6 +1096,15 @@ public:
 
   bool TimingEnabled() const { return timing_enabled_; }
 
+#ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
+  void AddElementBlocks(mfem::DenseTensor& blocks) const
+  {
+    MFEM_VERIFY(HasDirectIdentityLayout() && !has_shared_,
+                "Current element blocks require rank-one identity L2 faces.");
+    igr_internal::AddExactFaceBlocks(info_, scratch_, ip_sigma_, blocks);
+  }
+#endif
+
   bool HasDirectIdentityLayout() const
   { return direct_identity_layout_ && sfes_.GetSequence() == sfes_sequence_; }
 
@@ -1092,12 +1129,51 @@ public:
       added = dg_face::TryLaunchInteriorFaceDGDiffusionAddToBase2D(
         info_, scratch_, x, ip_sigma_, y);
     }
+    if (added) { LogTraceSelection(); }
     if (added && timing_enabled_)
     {
       timing_.local_apply_seconds += ElapsedSeconds(start);
       ++timing_.mult_calls;
     }
     return added;
+  }
+
+  bool CanCompleteResidual(const mfem::Vector& x,
+                           const mfem::Vector& rhs,
+                           const mfem::Vector& y) const
+  {
+    const auto* mesh = sfes_.GetMesh();
+    return HasDirectIdentityLayout() && !has_shared_ && mesh &&
+      mesh->GetSequence() == mesh_sequence_ &&
+      mesh->GetNodesSequence() == nodes_sequence_ &&
+      x.Size() == Width() && y.Size() == Height() &&
+      dg_face::CanLaunchInteriorFaceDGDiffusionResidual2D(
+        info_, scratch_, x, rhs, y);
+  }
+
+  void CompleteResidual(const mfem::Vector& x,
+                        const mfem::Vector& rhs,
+                        mfem::Vector& y) const
+  {
+    const auto start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    {
+      ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
+      dg_face::LaunchInteriorFaceDGDiffusionResidual2D(
+        info_, scratch_, x, ip_sigma_, rhs, y);
+    }
+    LogTraceSelection();
+    if (!residual_execution_reported_)
+    {
+      std::cout << "[igr-element-block-jacobi] event=execution path=fused-current-residual"
+                << " face=compact-lift fp64_order=volume-plus-completed-face-then-rhs-minus"
+                << " elements=" << info_.ne << " interior_faces=" << info_.nf << std::endl;
+      residual_execution_reported_ = true;
+    }
+    if (timing_enabled_)
+    {
+      timing_.local_apply_seconds += ElapsedSeconds(start);
+      ++timing_.mult_calls;
+    }
   }
 
   mfem::MemoryClass GetMemoryClass() const override
@@ -1125,6 +1201,7 @@ public:
         dg_face::LaunchInteriorFaceDGDiffusionApply2D(info_, scratch_, x,
                                                      ip_sigma_, y);
       }
+      LogTraceSelection();
       if (timing_enabled_)
       {
         timing_.local_apply_seconds += ElapsedSeconds(apply_start);
@@ -1155,6 +1232,7 @@ public:
                                                       ip_sigma_,
                                                       local_y_);
       }
+      LogTraceSelection();
       if (has_shared_)
       {
         {
@@ -1211,6 +1289,7 @@ public:
                                                     ip_sigma_,
                                                     local_y_);
     }
+    LogTraceSelection();
     timing_.local_apply_seconds += ElapsedSeconds(local_apply_start);
     if (has_shared_)
     {
@@ -1270,6 +1349,28 @@ public:
   }
 
 private:
+  void LogTraceSelection() const
+  {
+    const bool requested = ::igrlab::EnvFlagEnabledDefault(
+      "DG_IGR_IGR_FACE_COALESCED_TRACE", false);
+    if (!requested && trace_selection_log_.empty()) { return; }
+    const bool selected = requested && OwnedScratchChebyshev::UsesOrdinaryCUDA() &&
+      dg_face::UsesInteriorFaceDGDiffusionCompactLift2D(info_, scratch_);
+    const std::string key = std::string(requested ? "1:" : "0:") + (selected ? "1" : "0");
+    if (trace_selection_log_ == key) { return; }
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-exact-face-trace] event=execution"
+                << " requested=" << (requested ? "coalesced" : "legacy")
+                << " selected=" << (selected ? "coalesced" : "legacy")
+                << " reason=" << (selected ? "compact-native-cuda" :
+                    requested ? "requires-admitted-compact-native-cuda" : "not-requested")
+                << " scope=local-interior-faces elements=" << info_.ne
+                << " interior_faces=" << info_.nf << std::endl;
+    }
+    trace_selection_log_ = key;
+  }
+
   bool RuleMatches(const mfem::IntegrationRule& ir) const
   {
     if (ir.GetOrder() != rule_order_ ||
@@ -1304,6 +1405,8 @@ private:
   mutable mfem::Vector local_y_;
   mutable mfem::ParGridFunction local_x_gf_;
   bool timing_enabled_ = false;
+  mutable bool residual_execution_reported_ = false;
+  mutable std::string trace_selection_log_;
   mutable ExactFaceTimingStats timing_;
 };
 
@@ -1366,6 +1469,37 @@ public:
   }
 
   long long LastMultCalls() const { return operator_mult_calls_; }
+
+  bool TryResidual(const mfem::Vector& x,
+                   const mfem::Vector& rhs,
+                   mfem::Vector& residual) const
+  {
+    // Finish every admission check before submitting the volume action. A
+    // declined attempt leaves the original Mult/subtract path untouched.
+    if (!direct_identity_system_ || !exact_face_ ||
+        !exact_face_->CanCompleteResidual(x, rhs, residual))
+    { return false; }
+    ::igrlab::NVTXRange range("IGR/exact-sum/residual");
+    ++operator_mult_calls_;
+    const auto base_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    {
+      ::igrlab::NVTXRange base_range("IGR/exact-sum/base");
+      base_->Mult(x, residual);
+    }
+    if (timing_enabled_)
+    { timing_.base_seconds += ElapsedSeconds(base_start); }
+    const auto face_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+    {
+      ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
+      exact_face_->CompleteResidual(x, rhs, residual);
+    }
+    if (timing_enabled_)
+    {
+      timing_.face_seconds += ElapsedSeconds(face_start);
+      ++timing_.mult_calls;
+    }
+    return true;
+  }
 
   void LogTimingSummary(MPI_Comm comm,
                         int solve_call,
@@ -1541,6 +1675,11 @@ void IGRSolver::BuildBilinearForm_()
   // layout. Drop both before rebuilding the coefficient-dependent forms.
   Ah_.Clear();
   exact_face_operator_.reset();
+  element_jacobi_blocks_.reset();
+  element_jacobi_tensor_key_.clear();
+  local_tensor_preconditioner_.reset();
+  local_tensor_preconditioner_key_.clear();
+  local_tensor_preconditioner_committed_ = false;
 
   const bool debug_qf =
     ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
@@ -2323,6 +2462,8 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 void IGRSolver::SolveEllipticSystem_(bool warm_start)
 {
   ::igrlab::NVTXRange range("IGR/solve-elliptic-system");
+  const bool fixed_element_jacobi =
+    solve_mode_ == SolveMode::FixedElementJacobi;
   mfem::Operator* A_op = ActiveLinearOperator_();
   MFEM_VERIFY(A_op != nullptr,
               "IGR: linear operator is not assembled before Krylov solve.");
@@ -2456,7 +2597,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 (using_cuda && is_dg && exact_face_sum_op &&
                  direct_identity_system_ && ess_tdof_list_.Size() == 0 &&
                  using_device_coeffs_ && use_partial_assembly_ &&
-                 DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND")),
+                 (fixed_element_jacobi ||
+                  DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND"))),
               "Tensor IGR experiments require CUDA, partial-assembly L2 DG with "
               "exact faces, current device coefficients, direct identity layout, "
               "no essential constraints, and CUDA FP64 FGMRES.");
@@ -2475,6 +2617,44 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool using_two_level_inverse = two_level_env && two_level_env[0];
   const char* patch_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_RADIUS");
   const bool using_screened_patch = patch_env && patch_env[0];
+  const bool using_local_tensor = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_IGR_LOCAL_TENSOR_PRECONDITIONER", false);
+  const std::string local_tensor_key =
+    (using_local_tensor || element_jacobi_tensor_blocks_)
+      ? LocalTensorConfigurationKey() : "";
+  MFEM_VERIFY(!using_local_tensor ||
+                (solve_mode_ == SolveMode::Krylov && using_cuda && is_dg &&
+                 spd_ok && exact_face_sum_op && direct_identity_system_ &&
+                 sfes_.GetNRanks() == 1 && ess_tdof_list_.Size() == 0 &&
+                 using_device_coeffs_ && use_partial_assembly_ &&
+                 backend_ == GradBackend::BrokenDG && invrho_qf_ &&
+                 DeviceKrylovRequested("DG_IGR_IGR_KRYLOV_BACKEND") &&
+                 !mfem::Device::Allows(mfem::Backend::CEED_MASK | mfem::Backend::OCCA_MASK) &&
+                 !using_tensor_mg && !using_dense_inverse &&
+                 !using_two_level_inverse && !using_screened_patch),
+              "IGRLAB_IGR_LOCAL_TENSOR_PRECONDITIONER requires rank-one native "
+              "CUDA FP64 FGMRES, PA L2 SIPG with exact faces and direct identity "
+              "layout, BrokenL2 device coefficients, no essential constraints, "
+              "and no tensor multigrid, dense, two-level or patch preconditioner.");
+  MFEM_VERIFY(!fixed_element_jacobi ||
+                (using_cuda && is_dg && spd_ok && exact_face_sum_op &&
+                 direct_identity_system_ && sfes_.GetNRanks() == 1 &&
+                 ess_tdof_list_.Size() == 0 && using_device_coeffs_ &&
+                 use_partial_assembly_ && !using_tensor_mg &&
+                 !using_dense_inverse && !using_two_level_inverse &&
+                 !using_screened_patch && tensor_volume_mode != "wmma" &&
+                 !certify_current_solve_ &&
+                 sigma_cadence_ == IGRSigmaUpdateCadence::EveryStage &&
+                 regular_sweeps_ > 0 && warm_start_sweeps_ > 0),
+              "Fixed element-block Jacobi requires rank-one CUDA PA L2 SIPG "
+              "with current device coefficients, exact faces, identity layout, "
+              "no essential constraints, every-stage updates and positive sweep "
+              "counts. Disable global/patch preconditioners and do not request "
+              "a converged residual certificate for this approximate mode.");
+  MFEM_VERIFY(!element_jacobi_tensor_blocks_ ||
+                (backend_ == GradBackend::BrokenDG && invrho_qf_),
+              "Tensor element-block Jacobi requires BrokenL2 gradients and "
+              "current collocated inverse-density quadrature data.");
   MFEM_VERIFY(!using_tensor_mg ||
                 !(using_dense_inverse || using_two_level_inverse || using_screened_patch),
               "Tensor multigrid cannot be combined with another experimental preconditioner.");
@@ -2599,12 +2779,14 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(!using_two_level_inverse ||
                 solver_choice == LinearSolverType::FGMRES,
               "Two-level inverse experiment requires explicit FGMRES.");
+  MFEM_VERIFY(!using_local_tensor || solver_choice == LinearSolverType::FGMRES,
+              "Local tensor preconditioning requires explicit FGMRES.");
   MFEM_VERIFY(!using_screened_patch || solver_choice == LinearSolverType::FGMRES ||
                 ((patch_kind == "vertex-p1" || patch_kind == "face-condensed" || patch_kind == "trace-pairs") &&
                  patch_precision == "fp64" && solver_choice == LinearSolverType::CG),
               "Screened RAS and mixed precision require FGMRES; FP64 vertex/face-condensed also permit CG.");
 
-  MFEM_VERIFY(!(using_tensor_mg || using_tensor_volume) ||
+  MFEM_VERIFY(fixed_element_jacobi || !(using_tensor_mg || using_tensor_volume) ||
                 solver_choice == LinearSolverType::FGMRES,
               "Tensor IGR experiments require explicit FGMRES.");
 
@@ -2621,7 +2803,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
 
   // --- Choose preconditioner (Auto policy is space-aware) ---
-  PrecondType prec_choice = prec_type_;
+  PrecondType prec_choice = (fixed_element_jacobi || using_local_tensor)
+    ? PrecondType::None : prec_type_;
   if (prec_choice == PrecondType::Auto)
   {
     // CPU: keep BoomerAMG as robust default.
@@ -2720,6 +2903,187 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     MFEM_ABORT("Tensor volume experiment requires a CUDA build.");
 #endif
   }
+  if (fixed_element_jacobi)
+  {
+#ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
+    // Current policy refreshes exact diagonal blocks every state. Reference
+    // retains the initial inverse; tensor retains initial normalized factors
+    // and refreshes current mass scaling. A and b refresh for every policy.
+    const bool refresh_blocks =
+      !(element_jacobi_reference_blocks_ || element_jacobi_tensor_blocks_) ||
+      !element_jacobi_blocks_;
+    auto* exact_face = dynamic_cast<ExactL2DGFaceOperator*>(
+      &exact_face_sum_op->FaceOperator());
+    MFEM_VERIFY(exact_face, "Fixed element Jacobi requires exact L2 face data.");
+    MFEM_VERIFY(!element_jacobi_tensor_blocks_ || !element_jacobi_blocks_ ||
+                  element_jacobi_tensor_key_ == local_tensor_key,
+                "Cannot change local tensor execution/reference policy on a live solver.");
+    if (!element_jacobi_blocks_)
+    {
+      element_jacobi_blocks_ = element_jacobi_tensor_blocks_
+        ? MakeTensorElementBlockJacobi(sfes_, *invrho_qf_)
+        : MakeElementBlockJacobi(sfes_, element_jacobi_reference_blocks_);
+      element_jacobi_tensor_key_ = local_tensor_key;
+      const auto& blocks = dynamic_cast<const ElementBlockJacobi&>(*element_jacobi_blocks_);
+      if (mfem::Mpi::Root())
+      {
+        std::string block_name = element_jacobi_reference_blocks_
+          ? "reference-fp64" : "current-fp64";
+        if (element_jacobi_tensor_blocks_)
+        {
+          block_name = TensorElementBlockName(blocks);
+          if (block_name == "tensor-element-density-fp64")
+          { block_name = "tensor-density-fp64"; }
+        }
+        std::cout << "[igr-element-block-jacobi] event=setup"
+                  << " blocks=" << block_name
+                  << " reference_policy=" << blocks.ReferencePolicy()
+                  << " refresh="
+                  << (element_jacobi_tensor_blocks_ ? "current-mass-scaling" :
+                      (element_jacobi_reference_blocks_ ? "initial-only" : "every-state"))
+                  << (element_jacobi_tensor_blocks_ ? " initial_reference=once certified=0" : "")
+                  << " regular_sweeps=" << regular_sweeps_
+                  << " initial_sweeps=" << warm_start_sweeps_
+                  << " omega=" << element_jacobi_omega_
+                  << " coarse=none fallback=none acceptance=fixed-sweeps"
+                  << std::endl;
+      }
+    }
+    auto& blocks = dynamic_cast<ElementBlockJacobi&>(*element_jacobi_blocks_);
+    if (refresh_blocks)
+    {
+      {
+        ::igrlab::NVTXRange block_range("IGR/element-block-assembly");
+        auto& matrices = blocks.PrepareVolumeBlocks(*a_);
+        exact_face->AddElementBlocks(matrices);
+      }
+      {
+        ::igrlab::NVTXRange factor_range("IGR/element-block-factor");
+        blocks.FactorBlocks();
+      }
+    }
+    if (element_jacobi_tensor_blocks_)
+    {
+      ::igrlab::NVTXRange scaling_range("IGR/element-tensor-mass-scaling");
+      blocks.RefreshMassScaling(*invrho_qf_);
+    }
+    last_pc_setup_seconds_ = ElapsedSeconds(pc_setup_start);
+    total_pc_setup_seconds_ += last_pc_setup_seconds_;
+
+    const bool initialized = element_jacobi_history_valid_;
+    const int sweeps = initialized ? regular_sweeps_ : warm_start_sweeps_;
+    last_warm_start_effective_ = warm_start && initialized;
+    last_warm_start_guard_rejected_ = false;
+    last_warm_start_residual_norm_ = std::numeric_limits<double>::quiet_NaN();
+    last_zero_start_residual_norm_ = std::numeric_limits<double>::quiet_NaN();
+    if (last_warm_start_effective_)
+    {
+      MFEM_VERIFY(element_jacobi_history_.Size() == X_.Size(),
+                  "Fixed element Jacobi production history size changed.");
+      X_ = element_jacobi_history_;
+    }
+    else { X_ = 0.0; }
+    if (diagnostic_nan_scan_)
+    {
+      MFEM_VERIFY(VectorIsFinite(X_) && VectorIsFinite(B_),
+                  "Nonfinite fixed element-Jacobi initial state or RHS.");
+    }
+    auto& residual = element_jacobi_residual_;
+    auto& correction = element_jacobi_correction_;
+    residual.SetSize(X_.Size());
+    correction.SetSize(X_.Size());
+    residual.UseDevice(true);
+    correction.UseDevice(true);
+    // Initialization retains the original application sequence and reference
+    // setup. Regular sweeps may finish b-Ax inside the exact face row gather.
+    const bool fused_residual_enabled = initialized && element_jacobi_tensor_blocks_ &&
+      using_tensor_volume && tensor_volume_mode == "simt" &&
+      ::igrlab::EnvFlagEnabledDefault(
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL", false);
+    const bool fused_update_enabled = initialized && element_jacobi_tensor_blocks_ &&
+      ::igrlab::EnvFlagEnabledDefault(
+        "DG_IGR_IGR_ELEMENT_JACOBI_FUSED_UPDATE", false);
+    int fused_residual_sweeps = 0;
+    int fused_update_sweeps = 0;
+    const auto sweep_start = Clock::now();
+    for (int sweep = 0; sweep < sweeps; ++sweep)
+    {
+      ::igrlab::NVTXRange sweep_range("IGR/element-jacobi-sweep");
+      bool fused_residual = false;
+      {
+        ::igrlab::NVTXRange apply_range("IGR/element-jacobi-current-A");
+        fused_residual = fused_residual_enabled &&
+          iteration_face_sum->TryResidual(X_, B_, residual);
+        if (!fused_residual) { iteration_operator->Mult(X_, residual); }
+      }
+      if (!fused_residual) { subtract(B_, residual, residual); }
+      else { ++fused_residual_sweeps; }
+      bool fused_update = false;
+      {
+        ::igrlab::NVTXRange block_range("IGR/element-jacobi-block-solve");
+        fused_update = fused_update_enabled &&
+          blocks.TryAddMult(residual, element_jacobi_omega_, X_);
+        if (!fused_update) { blocks.Mult(residual, correction); }
+      }
+      if (!fused_update) { X_.Add(element_jacobi_omega_, correction); }
+      else { ++fused_update_sweeps; }
+    }
+    last_krylov_operator_apply_count_ = sweeps;
+    last_krylov_preconditioner_apply_count_ = sweeps;
+    // Explicit diagnostic only; fixed sweeps are not a tolerance certificate.
+    // This never retries, substitutes a converged solve, or changes acceptance.
+    if (true_residual_requested)
+    {
+      A_op->Mult(X_, residual);
+      subtract(B_, residual, residual);
+      last_linear_true_residual_abs_ = OperatorProbeNorm(residual, comm);
+      const double rhs_norm = OperatorProbeNorm(B_, comm);
+      last_linear_true_residual_rel_rhs_ = rhs_norm > 0.0
+        ? last_linear_true_residual_abs_ / rhs_norm
+        : (last_linear_true_residual_abs_ == 0.0 ? 0.0
+             : std::numeric_limits<double>::infinity());
+      ++last_krylov_operator_apply_count_;
+    }
+    if (diagnostic_nan_scan_)
+    {
+      MFEM_VERIFY(VectorIsFinite(X_),
+                  "Fixed element Jacobi produced nonfinite sigma.");
+    }
+    X_.SyncAliasMemory(sigma_);
+    last_linear_iters_ = sweeps;
+    last_linear_solver_name_ = "fixed-element-jacobi";
+    last_precond_name_ = element_jacobi_tensor_blocks_
+      ? TensorElementBlockName(blocks) : (element_jacobi_reference_blocks_
+          ? "reference-element-inverse-fp64" : "current-element-lu-fp64");
+    last_linear_solve_seconds_ = ElapsedSeconds(sweep_start);
+    total_linear_solve_seconds_ += last_linear_solve_seconds_;
+    ++linear_solve_calls_;
+    total_linear_iters_ += sweeps;
+    max_linear_iters_ = std::max(max_linear_iters_, sweeps);
+    total_krylov_operator_apply_count_ += last_krylov_operator_apply_count_;
+    total_krylov_preconditioner_apply_count_ += sweeps;
+    ++exact_face_operator_uses_;
+    last_exact_face_operator_mult_calls_ =
+      iteration_face_sum->LastMultCalls() +
+      (iteration_face_sum != exact_face_sum_op
+         ? exact_face_sum_op->LastMultCalls() : 0);
+    if ((lin_print_ > 0 || true_residual_requested) && mfem::Mpi::Root())
+    {
+      std::cout << "[igr-element-block-jacobi] event=solve"
+                << " solve_call=" << linear_solve_calls_
+                << " sweeps=" << sweeps
+                << " fused_residual_sweeps=" << fused_residual_sweeps
+                << " fused_update_sweeps=" << fused_update_sweeps
+                << " warm_effective=" << last_warm_start_effective_
+                << " converged=0 acceptance=fixed-sweeps"
+                << " true_residual_rel_rhs=" << last_linear_true_residual_rel_rhs_
+                << std::endl;
+    }
+    return;
+#else
+    MFEM_ABORT("Fixed element-block Jacobi requires a CUDA build.");
+#endif
+  }
   std::unique_ptr<KrylovTelemetryOperator> cheb_operator_telemetry;
   std::unique_ptr<mfem::Solver> owned_prec;
   mfem::Solver* prec = nullptr;
@@ -2729,7 +3093,50 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   bool using_operator_chebyshev_base = false;
   {
     ::igrlab::NVTXRange pc_range("IGR/preconditioner-setup");
-    if (using_tensor_mg)
+    if (using_local_tensor)
+    {
+#ifdef DG_IGR_HAS_ELEMENT_BLOCK_JACOBI_CUDA
+      MFEM_VERIFY(!local_tensor_preconditioner_ ||
+                    local_tensor_preconditioner_key_ == local_tensor_key,
+                  "Cannot change local tensor execution/reference policy on a live solver.");
+      if (!local_tensor_preconditioner_)
+      {
+        auto* exact_face = dynamic_cast<ExactL2DGFaceOperator*>(
+          &exact_face_sum_op->FaceOperator());
+        MFEM_VERIFY(exact_face, "Local tensor preconditioning requires exact L2 face data.");
+        auto blocks = MakeTensorElementBlockJacobi(sfes_, *invrho_qf_);
+        {
+          ::igrlab::NVTXRange block_range("IGR/element-block-assembly");
+          auto& matrices = blocks->PrepareVolumeBlocks(*a_);
+          exact_face->AddElementBlocks(matrices);
+        }
+        {
+          ::igrlab::NVTXRange factor_range("IGR/element-block-factor");
+          blocks->FactorBlocks();
+        }
+        if (mfem::Mpi::Root())
+        {
+          std::cout << "[igr-local-tensor-preconditioner] event=setup"
+                    << " backend=" << TensorElementBlockName(*blocks)
+                    << " reference_policy=" << blocks->ReferencePolicy()
+                    << " refresh=current-mass-scaling initial_reference=once"
+                    << " coarse=none fallback=none acceptance=original-current-fp64"
+                    << std::endl;
+        }
+        local_tensor_preconditioner_ = std::move(blocks);
+        local_tensor_preconditioner_key_ = local_tensor_key;
+      }
+      auto& blocks = dynamic_cast<ElementBlockJacobi&>(*local_tensor_preconditioner_);
+      {
+        ::igrlab::NVTXRange scaling_range("IGR/element-tensor-mass-scaling");
+        blocks.RefreshMassScaling(*invrho_qf_);
+      }
+      prec = local_tensor_preconditioner_.get();
+#else
+      MFEM_ABORT("Local tensor preconditioning requires a CUDA build.");
+#endif
+    }
+    else if (using_tensor_mg)
     {
 #ifdef DG_IGR_HAS_TENSOR_PIPELINE_CUDA
       MFEM_VERIFY(!tensor_multigrid_preconditioner_ || tensor_multigrid_key_ == tensor_mg_key,
@@ -3042,7 +3449,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     }
     // else None -> leave prec null
     if (!using_dense_inverse && !using_two_level_inverse && !using_screened_patch &&
-        !using_tensor_mg)
+        !using_tensor_mg && !using_local_tensor)
     { prec = owned_prec.get(); }
   }
   const auto pc_setup_stop = std::chrono::steady_clock::now();
@@ -3280,8 +3687,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool device_krylov_admitted = using_cuda && krylov_ranks == 1 &&
     !mfem::Device::Allows(mfem::Backend::CEED_MASK | mfem::Backend::OCCA_MASK);
   const bool use_device_krylov = device_krylov_requested && device_krylov_admitted;
-  MFEM_VERIFY(!(mixed_two_level || shared_patch_two_level || using_tensor_mg || using_tensor_volume) || use_device_krylov,
-              "FP32 two-level blocks and shared patches require the admitted rank-one CUDA FGMRES path.");
+  MFEM_VERIFY(!(mixed_two_level || shared_patch_two_level || using_tensor_mg ||
+                 using_tensor_volume || using_local_tensor) || use_device_krylov,
+              "Experimental tensor and mixed-precision preconditioners require "
+              "the admitted rank-one CUDA FGMRES path.");
   MFEM_VERIFY(!use_device_krylov || solver_choice == LinearSolverType::FGMRES,
               "CUDA FP64 Krylov currently requires explicit FGMRES.");
   if (use_device_krylov)
@@ -3400,7 +3809,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     extended_certificate_enabled &&
     last_linear_iters_ >= extended_certificate_start;
   const bool certify_independent_residual =
-    certify_current_solve_ || certify_extended_solve || using_tensor_mg || using_tensor_volume;
+    certify_current_solve_ || certify_extended_solve || using_tensor_mg ||
+    using_tensor_volume || using_local_tensor;
   auto recompute_true_residual = [&]()
   {
     mfem::Vector residual(B_);
@@ -3446,7 +3856,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     // method and must not be weakened by the optional diagnostic environment
     // used to screen unusually long solves.
     constexpr double caller_certificate_factor = 5.0;
-    const double certificate_factor = (using_tensor_mg || using_tensor_volume)
+    const double certificate_factor = (using_tensor_mg || using_tensor_volume || using_local_tensor)
                                         ? 1.0 : (certify_current_solve_
                                           ? caller_certificate_factor
                                           : extended_certificate_factor);
@@ -3524,7 +3934,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 << " rk_stage=" << rk_stage_index_
                 << " iterations=" << last_linear_iters_
                 << " reason="
-                << ((using_tensor_mg || using_tensor_volume) ? "tensor-pipeline"
+                << ((using_tensor_mg || using_tensor_volume || using_local_tensor) ? "tensor-pipeline"
                       : (certify_current_solve_ ? "caller-requested"
                                                : "extended-solve"))
                 << " start=" << extended_certificate_start
@@ -3592,6 +4002,11 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (using_tensor_mg)
   {
     last_precond_name_ = (tensor_mg_operator == "spectral" ? "tensor-spectral-" : "tensor-multigrid-") + tensor_mg_precision;
+  }
+  if (using_local_tensor)
+  {
+    last_precond_name_ = TensorElementBlockName(
+      dynamic_cast<const ElementBlockJacobi&>(*local_tensor_preconditioner_));
   }
   if (using_dense_inverse)
   {

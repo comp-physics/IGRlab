@@ -8,7 +8,7 @@ namespace dg_igr_detail
 struct TensorFaceKey
 {
   std::array<const void*, 11> objects{};
-  std::array<long, 18> metadata{};
+  std::array<long, 19> metadata{};
   std::array<real_t, 3> contract{};
   bool operator==(const TensorFaceKey& other) const
   {
@@ -42,7 +42,8 @@ inline TensorFaceKey MakeTensorFaceKey(
     static_cast<long>(state.GetOrdering()),
     scalar ? static_cast<long>(scalar->GetOrdering()) : -1,
     state.GetVSize(), sigma ? sigma->Size() : 0, requested ? 1L : 0L,
-    igr && igr->GetInvariantDomainFlux() ? 1L : 0L, order_offset}};
+    igr && igr->GetInvariantDomainFlux() ? 1L : 0L, order_offset,
+    ::igrlab::EnvFlagEnabled("DG_IGR_DG_TENSOR_FACE_ROW_REUSE") ? 1L : 0L}};
   key.contract = {{gamma, igr ? igr->GetVelocityRhoFloor() : 0.0,
     igr ? igr->GetInvariantDomainPressureFloor() : 0.0}};
   return key;
@@ -84,6 +85,11 @@ inline bool Requested()
   return value && std::string(value) == "fp64";
 }
 
+inline bool RowReuseRequested()
+{
+  return ::igrlab::EnvFlagEnabled("DG_IGR_DG_TENSOR_FACE_ROW_REUSE");
+}
+
 inline int CheckedSize(std::size_t count)
 {
   MFEM_VERIFY(count <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
@@ -119,6 +125,35 @@ struct TraceKernel
       }
       traces[(field * (4 * elements) + incidence) * n + tangent] = sum;
     }
+  }
+};
+
+// Share each endpoint coefficient across independent field accumulators.
+// Preserve every ascending-k sum and the original FP64 product/add order.
+struct TraceRowReuseKernel : TraceKernel
+{
+  MFEM_HOST_DEVICE void operator()(int sample) const
+  {
+    const int tangent = sample % n, incidence = sample / n;
+    const int side = incidence % 4, e = incidence / 4, dof = n * n;
+    real_t v0 = 0.0, v1 = 0.0, v2 = 0.0, v3 = 0.0, vs = 0.0;
+    for (int k = 0; k < n; ++k)
+    {
+      const int lex = side < 2 ? k + n * tangent : tangent + n * k;
+      const int node = local[lex], offset = (e * dof + node) * 4;
+      const real_t weight = endpoints[(side % 2) * n + k];
+      v0 += weight * state[state_map[offset]];
+      v1 += weight * state[state_map[offset + 1]];
+      v2 += weight * state[state_map[offset + 2]];
+      v3 += weight * state[state_map[offset + 3]];
+      if (use_sigma) { vs += weight * sigma[sigma_map[e * dof + node]]; }
+    }
+    const int offset = incidence * n + tangent, stride = 4 * elements * n;
+    traces[offset] = v0;
+    traces[stride + offset] = v1;
+    traces[2 * stride + offset] = v2;
+    traces[3 * stride + offset] = v3;
+    if (use_sigma) { traces[4 * stride + offset] = vs; }
   }
 };
 
@@ -275,6 +310,67 @@ struct LiftKernel
       sum += endpoints[(side % 2) * n + normal] * face_sum;
     }
     residual[state_map[(e * dof + local[lex]) * 4 + eq]] = sum;
+  }
+};
+
+// One thread owns all Euler components at one node. Face/geometry weights
+// are shared while every component retains the legacy q-then-side sum order.
+struct LiftRowReuseKernel : LiftKernel
+{
+  MFEM_HOST_DEVICE void operator()(int node) const
+  {
+    const int dof = n * n, e = node / dof, lex = node % dof;
+    const int i = lex % n, j = lex / n;
+    const int faces = interior_faces + boundary_faces;
+    const int output = (e * dof + local[lex]) * 4;
+    real_t sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+    for (int side = 0; side < 4; ++side)
+    {
+      const int incidence = 4 * e + side, encoded = element_faces[incidence];
+      const int f = encoded / 2, map = side_maps[incidence];
+      const int tangent = side < 2 ? j : i, normal = side < 2 ? i : j;
+      if (f >= interior_faces)
+      {
+        for (int q = 0; q < n; ++q)
+          if (boundary_rejected[(f - interior_faces) * n + q])
+          {
+            const real_t rejected = std::numeric_limits<real_t>::quiet_NaN();
+            residual[state_map[output]] = rejected;
+            residual[state_map[output + 1]] = rejected;
+            residual[state_map[output + 2]] = rejected;
+            residual[state_map[output + 3]] = rejected;
+            return;
+          }
+      }
+      real_t face0 = 0.0, face1 = 0.0, face2 = 0.0, face3 = 0.0;
+      const bool sparse = tangent_sparse[map];
+      const int first_q = sparse ? tangent_inverse[map * n + tangent] : 0;
+      const int last_q = sparse ? first_q + 1 : n;
+      for (int q = first_q; q < last_q; ++q)
+      {
+        const real_t weight = f < interior_faces ? interior_weights[f * n + q]
+          : boundary_weights[(f - interior_faces) * n + q];
+        const real_t signed_weight = encoded % 2 ? weight : -weight;
+        const real_t coefficient = tangents[(map * n + q) * n + tangent];
+        const real_t w0 = signed_weight * flux[f * n + q];
+        const real_t w1 = signed_weight * flux[(faces + f) * n + q];
+        const real_t w2 = signed_weight * flux[(2 * faces + f) * n + q];
+        const real_t w3 = signed_weight * flux[(3 * faces + f) * n + q];
+        face0 += coefficient * w0;
+        face1 += coefficient * w1;
+        face2 += coefficient * w2;
+        face3 += coefficient * w3;
+      }
+      const real_t endpoint = endpoints[(side % 2) * n + normal];
+      sum0 += endpoint * face0;
+      sum1 += endpoint * face1;
+      sum2 += endpoint * face2;
+      sum3 += endpoint * face3;
+    }
+    residual[state_map[output]] = sum0;
+    residual[state_map[output + 1]] = sum1;
+    residual[state_map[output + 2]] = sum2;
+    residual[state_map[output + 3]] = sum3;
   }
 };
 

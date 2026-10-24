@@ -1,0 +1,120 @@
+{
+  "schema": "igr-dg-mapped-tensor-physical-case-v1",
+  "mesh": {
+    "mesh_n": 512,
+    "elements": 262144,
+    "geometry_order": 2,
+    "amplitude": 0.035,
+    "mapping": "(x+a*sin(2*pi*x)*sin(2*pi*y), y+a*sin(2*pi*x)*sin(2*pi*y))",
+    "mapping_applied_after_final_mesh_construction": true,
+    "serial_refinements": 0,
+    "parallel_refinements": 0,
+    "boundary_fixed": true,
+    "jacobian_validation": "sampled; no between-sample validity claim"
+  },
+  "resource_policy": {
+    "account": "bdiy-dtai-gh",
+    "partition": "ghx4",
+    "constraint": "projects",
+    "nodes": 1,
+    "tasks": 1,
+    "cpus": 8,
+    "gpus": 1,
+    "memory": "96G",
+    "omp_num_threads": 1
+  },
+  "common_arguments": [
+    "-m", "@MESH@", "--device", "cuda", "--discretization", "dg",
+    "--regularization", "igr", "--time-integrator", "rk3ssp",
+    "-o", "5", "-rs", "0", "-rp", "0", "-tf", "@TARGET@", "-c", "0.3",
+    "--element-assembly-divergence", "--igr-space", "L2", "--igr-grad", "BrokenL2",
+    "--c-alpha", "0.16666666666666666", "--igr-alpha-length", "max",
+    "--igr-ip-kind", "sipg", "--igr-exact-dg-face", "--igr-sigma-cadence", "every-stage",
+    "--igr-stage-rtol-scale", "1", "--igr-linear-solver", "fgmres",
+    "--igr-preconditioner", "none", "--igr-lin-rtol", "1e-6",
+    "--igr-lin-atol", "0", "--igr-lin-maxit", "1000",
+    "--igr-nonconvergence-policy", "error", "--igr-lin-print", "0",
+    "--positivity-limiter", "none", "--modal-damping-rate", "0",
+    "--dgsem-surface-flux", "rusanov", "--no-igr-sigma-cfl", "--no-igr-sigma-rusanov",
+    "--no-igr-invariant-domain-flux", "--no-admissibility-scan", "--no-conservation-balance",
+    "--no-nan-scan", "-no-glvis", "-vtk", "--time-step-save", "0.02",
+    "--no-vtk-h1-diagnostics", "--no-vtk-l2-diagnostics", "--no-save-state",
+    "-vs", "100", "-as", "500"
+  ],
+  "common_environment": {
+    "PROFILE_NVTX": "0",
+    "IGR_PARTIAL_ASSEMBLY": "1",
+    "IGR_DEVICE_QF": "1",
+    "IGR_FACE_DENSITY_CUDA": "1",
+    "IGR_FACE_DENSITY_CACHE": "1",
+    "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+    "IGR_IPDG_PENALTY_SCALE": "1",
+    "IGR_KRYLOV_BACKEND": "cuda-fp64",
+    "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+    "IGR_TENSOR_VOLUME": "simt",
+    "IGR_TENSOR_VOLUME_STORAGE": "cached",
+    "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+    "IGR_TENSOR_MG": "off",
+    "IGR_TENSOR_MG_OPERATOR": "sampled",
+    "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+    "IGR_TRUE_RESIDUAL": "0",
+    "IGR_EVENT_LOG_MIN_ITERS": "0",
+    "IGR_OPERATOR_PROBE_EVERY": "0",
+    "IGR_PRECONDITIONER_PROBE": "0",
+    "SHARED_OPERATOR_PRECISION": "off",
+    "SHARED_EULER_LAYOUT": "dense",
+    "SHARED_EULER_FLUX_EXECUTION": "element",
+    "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+    "DG_FORCE_MATRIX_FREE": "0",
+    "DG_FORCE_NLFORM_FACE": "0",
+    "DG_NATIVE_MASS_INV": "0",
+    "DG_PACKED_INVMASS_DEVICE": "1",
+    "DG_TENSOR_FACE": "fp64",
+    "WEAKDIV_SIGMA_STORAGE": "auto",
+    "IGR_SHARE_STATE_INTERPOLATION": "1",
+    "IGR_FACTORIZED_FACE_NORMALS": "1",
+    "IGR_COMPACT_FACE_QDATA": "1",
+    "IGR_COMPACT_FACE_LIFT": "1",
+    "VTK_PRESSURE_COEFFICIENT": "1"
+  },
+  "arms": {
+    "control": {
+      "arguments": ["--igr-solve-mode", "krylov", "--igr-jacobi-blocks", "current"],
+      "environment": {
+        "IGR_LOCAL_TENSOR_PRECONDITIONER": "1",
+        "IGR_EXTENDED_CERTIFICATE": "1",
+        "IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGR_EXTENDED_CERTIFICATE_FACTOR": "1"
+      }
+    },
+    "candidate": {
+      "arguments": ["--igr-solve-mode", "element-block-jacobi", "--igr-jacobi-blocks", "tensor",
+                    "--igr-sweeps", "2", "--igr-initial-sweeps", "50", "--igr-jacobi-omega", "0.7"],
+      "environment": {
+        "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+        "IGR_EXTENDED_CERTIFICATE": "0",
+        "IGR_EXTENDED_CERTIFICATE_START": "1",
+        "IGR_EXTENDED_CERTIFICATE_FACTOR": "1"
+      }
+    }
+  },
+  "execution_order": ["control", "candidate"],
+  "admission": {"target_time": 0.0025, "arm_timeout_seconds": 600},
+  "full": {"target_time": 0.1, "arm_timeout_seconds": 1800},
+  "method": {
+    "reference_policy": "projected",
+    "default_execution": "wmma-factor-fp64",
+    "same_new_binary": true,
+    "same_current_operator_and_rhs": "FP64; actual Q2 geometry; GL7 mass, GL6 diffusion; exact SIPG faces",
+    "same_local_surrogate": "S_current Q_boundary diag(1/d_element) Q_boundary^T S_current",
+    "only_solver_budget_changes": "converged FP64 FGMRES/current-A certificate versus fixed 50/2 sweeps at omega=0.7",
+    "euler_volume": "generic packed per-element FP64 weak divergence",
+    "euler_mass": "exact dense inverse on actual Q2 mass quadrature, packed FP64 device apply",
+    "euler_faces": "FP64 tensor reference shapes plus per-face quadrature normals",
+    "alpha": "C_alpha=1/6, h_eff=max; bind each arm's actual [igr-regularization] resolved record",
+    "coarse": "none",
+    "fallback": "none",
+    "automatic_full_promotion": false,
+    "repeat_policy": "one matched pair per explicitly selected phase; no automatic retries or duplicate jobs"
+  }
+}

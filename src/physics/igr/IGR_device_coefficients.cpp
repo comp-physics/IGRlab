@@ -12,6 +12,9 @@
 #include "IGR_device_kernels.hpp"
 #include "IGR_internal_utils.hpp"
 #include "IGR_nodal_source.hpp"
+#ifdef DG_IGR_HAS_STAGE_COEFFICIENTS_CUDA
+#include "IGR_stage_coefficients_cuda.hpp"
+#endif
 #include <chrono>
 #include <cstdlib>
 #include <cerrno>
@@ -958,339 +961,435 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 
   const mfem::Operator* R = ufes.GetElementRestriction(ordering);
   MFEM_VERIFY(R, "IGR device coefficients require element restriction.");
-  device_qinterp_evec_.SetSize(R->Height());
-  R->Mult(U, device_qinterp_evec_);
+  bool restricted_state_ready = false;
+  const auto restrict_state = [&]()
+  {
+    if (!restricted_state_ready)
+    {
+      device_qinterp_evec_.SetSize(R->Height());
+      R->Mult(U, device_qinterp_evec_);
+      restricted_state_ready = true;
+    }
+  };
 
   const int dim = dim_;
   const int num_eq = num_eq_;
   const mfem::real_t alpha = static_cast<mfem::real_t>(alpha_);
   const mfem::real_t rho_floor = static_cast<mfem::real_t>(rho_floor_);
 
-  auto project_state =
-    [&](mfem::QuadratureSpace& qs,
-        mfem::QuadratureFunction* values,
-        mfem::QuadratureFunction* derivatives)
+  const char* coefficient_execution_raw =
+    ::igrlab::GetEnv("DG_IGR_IGR_COEFFICIENT_EXECUTION");
+  const std::string coefficient_execution = coefficient_execution_raw
+    ? coefficient_execution_raw : "baseline";
+  MFEM_VERIFY(coefficient_execution == "baseline" || coefficient_execution == "fused",
+              "IGRLAB_IGR_COEFFICIENT_EXECUTION must be baseline|fused.");
+  bool fused_coefficients = false;
+  std::string fused_reason;
+  const bool direct_state_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_IGR_STAGE_STATE_DIRECT", false);
+  bool direct_state_selected = false;
+  std::string direct_state_reason;
+  if (coefficient_execution == "fused")
   {
-    if (!values && !derivatives) { return; }
-    const mfem::QuadratureInterpolator* qi =
-      ufes.GetQuadratureInterpolator(qs);
-    MFEM_VERIFY(qi,
-                "IGR device coefficients require quadrature interpolator.");
-    qi->SetOutputLayout(mfem::QVectorLayout::byVDIM);
-    qi->DisableTensorProducts(!use_tensor);
-    if (values) { qi->Values(device_qinterp_evec_, *values); }
-    if (derivatives)
+    // Diagnostic consumers need the materialized state/gradient QFs. The
+    // alternate nodal-source policy has its own algebra and stays separate.
+    if (ingestion_audit || diagnostic_nan_scan_ || debug_qf)
+      fused_reason = "explicit-diagnostics";
+    else if (GetNodalSourceMode() != NodalSourceMode::Baseline)
+      fused_reason = "alternate-nodal-source";
+    else
     {
-      qi->PhysDerivatives(device_qinterp_evec_, *derivatives);
-    }
-  };
-
-  project_state(*mass_qs_, u_mass_qf_.get(), nullptr);
-  project_state(*sigma_qs_, device_diff_values_share_mass_ ? nullptr : u_qf_.get(),
-                need_diff_gradient ? grad_u_qf_.get() : nullptr);
-  project_state(*rhs_qs_,
-                (device_rhs_values_share_mass_ || device_rhs_values_share_diff_)
-                  ? nullptr : u_rhs_qf_.get(),
-                grad_u_rhs_qf_.get());
-
-  // Read the owner directly; unused wrappers never receive Values or Read
-  // and therefore need no device buffer.  These references are chosen anew for
-  // this update, with no memory aliases or persistent current-state reuse.
-  const mfem::QuadratureFunction& mass_values = *u_mass_qf_;
-  const mfem::QuadratureFunction& diff_values = device_diff_values_share_mass_
-    ? mass_values : *u_qf_;
-  const mfem::QuadratureFunction& rhs_values = device_rhs_values_share_mass_
-    ? mass_values : (device_rhs_values_share_diff_ ? diff_values : *u_rhs_qf_);
-
-  const int mass_ne = mass_qs_->GetNE();
-  const int mass_nq = mass_qs_->GetIntRule(0).GetNPoints();
-  const int diff_ne = sigma_qs_->GetNE();
-  const int diff_nq = sigma_qs_->GetIntRule(0).GetNPoints();
-  const int rhs_ne = rhs_qs_->GetNE();
-  const int rhs_nq = rhs_qs_->GetIntRule(0).GetNPoints();
-  if (use_element_local_alpha)
-  {
-    MFEM_VERIFY(device_element_alpha_.Size() == diff_ne &&
-                  device_element_alpha_.Size() == rhs_ne,
-                "IGR local-alpha element cache must match volume quadrature "
-                "element counts.");
-  }
-
-  const mfem::real_t* u_mass_data = mass_values.Read();
-  const mfem::real_t* u_diff_data = diff_values.Read();
-  const mfem::real_t* u_rhs_data = rhs_values.Read();
-  const mfem::real_t* grad_rhs_data = grad_u_rhs_qf_->Read();
-  mfem::real_t* invrho_data = invrho_qf_->Write();
-  mfem::real_t* ck_data = ck_qf_->Write();
-  mfem::real_t* src_data = src_qf_->Write();
-
-#ifdef DG_IGR_HAS_ACCEL_FORALL
-  if (debug_qf && mfem::Mpi::Root())
-  {
-    std::cout << "[igr-linear] event=device-qf-kernel-start" << "\n";
-  }
-  igr_device::IGRDeviceInvRhoKernel invrho_kernel;
-  invrho_kernel.nq = mass_nq;
-  invrho_kernel.ne = mass_ne;
-  invrho_kernel.num_eq = num_eq;
-  invrho_kernel.rho_floor = rho_floor;
-  invrho_kernel.u = u_mass_data;
-  invrho_kernel.invrho = invrho_data;
-  mfem::forall(mass_ne * mass_nq, invrho_kernel);
-
-  if (use_element_local_alpha)
-  {
-    const mfem::real_t* element_alpha = device_element_alpha_.Read();
-
-    igr_device::IGRDeviceLocalAlphaOverRhoKernel ck_kernel;
-    ck_kernel.nq = diff_nq;
-    ck_kernel.ne = diff_ne;
-    ck_kernel.num_eq = num_eq;
-    ck_kernel.rho_floor = rho_floor;
-    ck_kernel.element_alpha = element_alpha;
-    ck_kernel.u = u_diff_data;
-    ck_kernel.ck = ck_data;
-    mfem::forall(diff_ne * diff_nq, ck_kernel);
-
-    igr_device::IGRDeviceLocalSourceKernel src_kernel;
-    src_kernel.nq = rhs_nq;
-    src_kernel.ne = rhs_ne;
-    src_kernel.dim = dim;
-    src_kernel.num_eq = num_eq;
-    src_kernel.rho_floor = rho_floor;
-    src_kernel.element_alpha = element_alpha;
-    src_kernel.u = u_rhs_data;
-    src_kernel.grad = grad_rhs_data;
-    src_kernel.src = src_data;
-    mfem::forall(rhs_ne * rhs_nq, src_kernel);
-  }
-  else
-  {
-    igr_device::IGRDeviceAlphaOverRhoKernel ck_kernel;
-    ck_kernel.nq = diff_nq;
-    ck_kernel.ne = diff_ne;
-    ck_kernel.num_eq = num_eq;
-    ck_kernel.alpha = alpha;
-    ck_kernel.rho_floor = rho_floor;
-    ck_kernel.u = u_diff_data;
-    ck_kernel.ck = ck_data;
-    mfem::forall(diff_ne * diff_nq, ck_kernel);
-
-    igr_device::IGRDeviceSourceKernel src_kernel;
-    src_kernel.nq = rhs_nq;
-    src_kernel.ne = rhs_ne;
-    src_kernel.dim = dim;
-    src_kernel.num_eq = num_eq;
-    src_kernel.alpha = alpha;
-    src_kernel.rho_floor = rho_floor;
-    src_kernel.u = u_rhs_data;
-    src_kernel.grad = grad_rhs_data;
-    src_kernel.src = src_data;
-    mfem::forall(rhs_ne * rhs_nq, src_kernel);
-  }
+#ifdef DG_IGR_HAS_STAGE_COEFFICIENTS_CUDA
+      if (mfem::Device::Allows(mfem::Backend::CUDA))
+      {
+        if (direct_state_requested)
+        {
+          fused_coefficients = TryUpdateFusedStageCoefficientsCUDA(
+            *U.ParFESpace(), *mass_qs_, *sigma_qs_, *rhs_qs_, U,
+            alpha, rho_floor, use_element_local_alpha ? &device_element_alpha_ : nullptr,
+            *invrho_qf_, *ck_qf_, *src_qf_, fused_stage_coefficients_, &fused_reason,
+            StageCoefficientStateLayout::Native);
+          direct_state_selected = fused_coefficients;
+          if (!fused_coefficients) { direct_state_reason = fused_reason; }
+        }
+        if (!fused_coefficients)
+        {
+          restrict_state();
+          fused_coefficients = TryUpdateFusedStageCoefficientsCUDA(
+            *U.ParFESpace(), *mass_qs_, *sigma_qs_, *rhs_qs_, device_qinterp_evec_,
+            alpha, rho_floor, use_element_local_alpha ? &device_element_alpha_ : nullptr,
+            *invrho_qf_, *ck_qf_, *src_qf_, fused_stage_coefficients_, &fused_reason);
+        }
+      }
+      else fused_reason = "cuda-required";
 #else
-  const auto u_mass = mfem::Reshape(u_mass_data, num_eq, mass_nq, mass_ne);
-  auto invrho = mfem::Reshape(invrho_data, mass_nq, mass_ne);
-  for (int e = 0; e < mass_ne; ++e)
-  {
-    for (int q = 0; q < mass_nq; ++q)
-    {
-      invrho(q, e) =
-        frozen_scalar_igr_algebra::SafeInverseDensity(u_mass(0, q, e),
-                                                      rho_floor);
-    }
-  }
-
-  const auto u_diff = mfem::Reshape(u_diff_data, num_eq, diff_nq, diff_ne);
-  auto ck = mfem::Reshape(ck_data, diff_nq, diff_ne);
-  const mfem::real_t* element_alpha =
-    use_element_local_alpha ? device_element_alpha_.HostRead() : nullptr;
-  for (int e = 0; e < diff_ne; ++e)
-  {
-    const mfem::real_t alpha_e =
-      use_element_local_alpha ? element_alpha[e] : alpha;
-    for (int q = 0; q < diff_nq; ++q)
-    {
-      ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha_e,
-                                                             u_diff(0, q, e),
-                                                             rho_floor);
-    }
-  }
-
-  auto src = mfem::Reshape(src_data, rhs_nq, rhs_ne);
-  for (int e = 0; e < rhs_ne; ++e)
-  {
-    const mfem::real_t alpha_e =
-      use_element_local_alpha ? element_alpha[e] : alpha;
-    for (int q = 0; q < rhs_nq; ++q)
-    {
-      src(q, e) =
-        frozen_scalar_igr_algebra::SourceFromConservativeStateGradient(
-          dim,
-          u_rhs_data + num_eq * (q + rhs_nq * e),
-          1,
-          grad_rhs_data + num_eq * dim * (q + rhs_nq * e),
-          1,
-          num_eq,
-          alpha_e,
-          rho_floor);
-    }
-  }
+      fused_reason = "cuda-build-required";
 #endif
-
-  const auto nodal_source_mode = GetNodalSourceMode();
-  if (nodal_source_mode != NodalSourceMode::Baseline)
-  {
-    if (!nodal_velocity_source_cache_)
-      nodal_velocity_source_cache_ = std::make_shared<NodalVelocitySourceCache>();
-    MFEM_VERIFY(!NodalSourceMirrorWalls() || HasNodalSourceBoundaryMarker(),
-                "Mirror source requires the actual Euler slip boundary marker before state update.");
-    ApplyNodalVelocitySource2D(ufes, *rhs_qs_, device_qinterp_evec_, alpha,
-      use_element_local_alpha ? &device_element_alpha_ : nullptr, rho_floor,
-      nodal_source_mode == NodalSourceMode::Central,
-      *nodal_velocity_source_cache_, *src_qf_,
-      NodalSourceMirrorWalls() ? &nodal_source_slip_marker_ : nullptr);
+    }
   }
-
-  if (ingestion_audit)
+  if (direct_state_requested && !direct_state_selected && direct_state_reason.empty())
+  { direct_state_reason = fused_reason.empty() ? "fused-path-not-active" : fused_reason; }
+  const std::string coefficient_selected = fused_coefficients ? "fused" : "baseline";
+  const std::string coefficient_log_key = coefficient_execution + ":" +
+    coefficient_selected + ":" + fused_reason + ":" +
+    (direct_state_requested ? "direct" : "restricted") + ":" +
+    (direct_state_selected ? "direct" : "restricted") + ":" + direct_state_reason;
+  if (device_coeff_execution_logged_ != coefficient_log_key)
   {
-    const int solve_call = linear_solve_calls_ + 1;
-    const MPI_Comm comm = vfes_.GetComm();
-    LogStateQuadratureAudit("mass",
-                            mass_values,
-                            *mass_qs_,
-                            num_eq,
-                            dim,
-                            rho_floor,
-                            solve_call,
-                            comm);
-    LogStateQuadratureAudit("diffusion",
-                            diff_values,
-                            *sigma_qs_,
-                            num_eq,
-                            dim,
-                            rho_floor,
-                            solve_call,
-                            comm);
-    LogStateQuadratureAudit("rhs",
-                            rhs_values,
-                            *rhs_qs_,
-                            num_eq,
-                            dim,
-                            rho_floor,
-                            solve_call,
-                            comm);
-    LogScalarQuadratureAudit("grad_diffusion",
-                             *grad_u_qf_,
-                             solve_call,
-                             comm);
-    LogScalarQuadratureAudit("grad_rhs",
-                             *grad_u_rhs_qf_,
-                             solve_call,
-                             comm);
-    LogScalarQuadratureAudit("invrho", *invrho_qf_, solve_call, comm);
-    LogScalarQuadratureAudit("alpha_over_rho", *ck_qf_, solve_call, comm);
-    LogScalarQuadratureAudit("rhs_source", *src_qf_, solve_call, comm);
-  }
-
-  if (diagnostic_nan_scan_ && !device_coeff_diagnostics_logged_)
-  {
-    const MPI_Comm comm = vfes_.GetComm();
-    int finite[8] = {VectorIsFinite(mass_values) ? 1 : 0,
-                     VectorIsFinite(diff_values) ? 1 : 0,
-                     VectorIsFinite(rhs_values) ? 1 : 0,
-                     VectorIsFinite(*grad_u_qf_) ? 1 : 0,
-                     VectorIsFinite(*grad_u_rhs_qf_) ? 1 : 0,
-                     VectorIsFinite(*invrho_qf_) ? 1 : 0,
-                     VectorIsFinite(*ck_qf_) ? 1 : 0,
-                     VectorIsFinite(*src_qf_) ? 1 : 0};
-    MPI_Allreduce(MPI_IN_PLACE, finite, 8, MPI_INT, MPI_MIN, comm);
     if (mfem::Mpi::Root())
     {
-      std::cout << "[igr-linear] event=device-qf-finite"
-                << " u_mass=" << finite[0]
-                << " u_diff=" << finite[1]
-                << " u_rhs=" << finite[2]
-                << " grad_diff=" << finite[3]
-                << " grad_rhs=" << finite[4]
-                << " invrho=" << finite[5]
-                << " ck=" << finite[6]
-                << " src=" << finite[7] << "\n";
+      std::cout << "[igr-stage-coefficients] event="
+                << (coefficient_execution == "fused" && !fused_coefficients
+                      ? "fallback" : "setup")
+                << " requested=" << coefficient_execution
+                << " selected=" << coefficient_selected << " precision=fp64";
+      if (!fused_reason.empty()) { std::cout << " reason=" << fused_reason; }
+      std::cout << " state_requested=" << (direct_state_requested ? "direct" : "restricted")
+                << " state_selected=" << (direct_state_selected ? "direct" : "restricted");
+      if (!direct_state_reason.empty()) { std::cout << " state_reason=" << direct_state_reason; }
+      std::cout << "\n";
     }
-    if (!(finite[0] && finite[1] && finite[2] && finite[3] && finite[4] &&
-          finite[5] && finite[6] && finite[7]))
-    {
-      MFEM_ABORT("IGR device quadrature data contains non-finite values.");
-    }
+    device_coeff_execution_logged_ = coefficient_log_key;
+  }
 
-    const mfem::Vector& inv_vals = *invrho_qf_;
-    const mfem::Vector& ck_vals = *ck_qf_;
-    const mfem::Vector& src_vals = *src_qf_;
-    auto host_minmax = [](const mfem::Vector& v, double& vmin, double& vmax)
+  if (!fused_coefficients)
+  {
+    // Diagnostic and unsupported paths still materialize the original current
+    // restriction, including transitions from a previously admitted direct stage.
+    restrict_state();
+    auto project_state =
+      [&](mfem::QuadratureSpace& qs,
+          mfem::QuadratureFunction* values,
+          mfem::QuadratureFunction* derivatives)
     {
-      const double* data = v.HostRead();
-      const int n = v.Size();
-      vmin = (n > 0) ? data[0] : 0.0;
-      vmax = vmin;
-      for (int i = 1; i < n; ++i)
+      if (!values && !derivatives) { return; }
+      const mfem::QuadratureInterpolator* qi =
+        ufes.GetQuadratureInterpolator(qs);
+      MFEM_VERIFY(qi,
+                  "IGR device coefficients require quadrature interpolator.");
+      qi->SetOutputLayout(mfem::QVectorLayout::byVDIM);
+      qi->DisableTensorProducts(!use_tensor);
+      if (values) { qi->Values(device_qinterp_evec_, *values); }
+      if (derivatives)
       {
-        vmin = std::min(vmin, data[i]);
-        vmax = std::max(vmax, data[i]);
+        qi->PhysDerivatives(device_qinterp_evec_, *derivatives);
       }
     };
-    double inv_min = 0.0, inv_max = 0.0;
-    double ck_min = 0.0, ck_max = 0.0;
-    double src_min = 0.0, src_max = 0.0;
-    host_minmax(inv_vals, inv_min, inv_max);
-    host_minmax(ck_vals, ck_min, ck_max);
-    host_minmax(src_vals, src_min, src_max);
-    MPI_Allreduce(MPI_IN_PLACE, &inv_min, 1, MPI_DOUBLE, MPI_MIN, comm);
-    MPI_Allreduce(MPI_IN_PLACE, &inv_max, 1, MPI_DOUBLE, MPI_MAX, comm);
-    MPI_Allreduce(MPI_IN_PLACE, &ck_min, 1, MPI_DOUBLE, MPI_MIN, comm);
-    MPI_Allreduce(MPI_IN_PLACE, &ck_max, 1, MPI_DOUBLE, MPI_MAX, comm);
-    MPI_Allreduce(MPI_IN_PLACE, &src_min, 1, MPI_DOUBLE, MPI_MIN, comm);
-    MPI_Allreduce(MPI_IN_PLACE, &src_max, 1, MPI_DOUBLE, MPI_MAX, comm);
-    if (mfem::Mpi::Root())
+
+    project_state(*mass_qs_, u_mass_qf_.get(), nullptr);
+    project_state(*sigma_qs_, device_diff_values_share_mass_ ? nullptr : u_qf_.get(),
+                  need_diff_gradient ? grad_u_qf_.get() : nullptr);
+    project_state(*rhs_qs_,
+                  (device_rhs_values_share_mass_ || device_rhs_values_share_diff_)
+                    ? nullptr : u_rhs_qf_.get(),
+                  grad_u_rhs_qf_.get());
+
+    // Read the owner directly; unused wrappers never receive Values or Read
+    // and therefore need no device buffer.  These references are chosen anew for
+    // this update, with no memory aliases or persistent current-state reuse.
+    const mfem::QuadratureFunction& mass_values = *u_mass_qf_;
+    const mfem::QuadratureFunction& diff_values = device_diff_values_share_mass_
+      ? mass_values : *u_qf_;
+    const mfem::QuadratureFunction& rhs_values = device_rhs_values_share_mass_
+      ? mass_values : (device_rhs_values_share_diff_ ? diff_values : *u_rhs_qf_);
+
+    const int mass_ne = mass_qs_->GetNE();
+    const int mass_nq = mass_qs_->GetIntRule(0).GetNPoints();
+    const int diff_ne = sigma_qs_->GetNE();
+    const int diff_nq = sigma_qs_->GetIntRule(0).GetNPoints();
+    const int rhs_ne = rhs_qs_->GetNE();
+    const int rhs_nq = rhs_qs_->GetIntRule(0).GetNPoints();
+    if (use_element_local_alpha)
     {
-      std::cout << "[igr-linear] event=device-qf-range"
-                << " invrho_min=" << inv_min
-                << " invrho_max=" << inv_max
-                << " ck_min=" << ck_min
-                << " ck_max=" << ck_max
-                << " src_min=" << src_min
-                << " src_max=" << src_max << "\n";
+      MFEM_VERIFY(device_element_alpha_.Size() == diff_ne &&
+                    device_element_alpha_.Size() == rhs_ne,
+                  "IGR local-alpha element cache must match volume quadrature "
+                  "element counts.");
     }
 
-    if (mfem::Mpi::Root() && inv_vals.Size() > 0 && ck_vals.Size() > 0 &&
-        src_vals.Size() > 0)
+    const mfem::real_t* u_mass_data = mass_values.Read();
+    const mfem::real_t* u_diff_data = diff_values.Read();
+    const mfem::real_t* u_rhs_data = rhs_values.Read();
+    const mfem::real_t* grad_rhs_data = grad_u_rhs_qf_->Read();
+    mfem::real_t* invrho_data = invrho_qf_->Write();
+    mfem::real_t* ck_data = ck_qf_->Write();
+    mfem::real_t* src_data = src_qf_->Write();
+
+  #ifdef DG_IGR_HAS_ACCEL_FORALL
+    if (debug_qf && mfem::Mpi::Root())
     {
-      const mfem::real_t inv_q = inv_vals(0);
-      const mfem::real_t ck_q = ck_vals(0);
-      const mfem::real_t src_q = src_vals(0);
-      std::cout << "[igr-linear] event=device-qf-sample"
-                << " invrho_q=" << inv_q
-                << " ck_q=" << ck_q
-                << " src_q=" << src_q
-                << " mass_qorder=" << device_mass_qorder_
-                << " diff_qorder=" << device_diff_qorder_
-                << " rhs_qorder=" << device_rhs_qorder_
-                << " source_qorder_min_requested=" << NodalSourceQuadratureMinimumOrder()
-                << " operator_qorder_min_requested=" << OperatorQuadratureMinimumOrder()
-                << " face_qorder=" << device_face_qorder_
-                << " source_mode=" << NodalSourceModeName(GetNodalSourceMode()) << "\n";
+      std::cout << "[igr-linear] event=device-qf-kernel-start" << "\n";
     }
-    device_coeff_diagnostics_logged_ = true;
+    igr_device::IGRDeviceInvRhoKernel invrho_kernel;
+    invrho_kernel.nq = mass_nq;
+    invrho_kernel.ne = mass_ne;
+    invrho_kernel.num_eq = num_eq;
+    invrho_kernel.rho_floor = rho_floor;
+    invrho_kernel.u = u_mass_data;
+    invrho_kernel.invrho = invrho_data;
+    mfem::forall(mass_ne * mass_nq, invrho_kernel);
+
+    if (use_element_local_alpha)
+    {
+      const mfem::real_t* element_alpha = device_element_alpha_.Read();
+
+      igr_device::IGRDeviceLocalAlphaOverRhoKernel ck_kernel;
+      ck_kernel.nq = diff_nq;
+      ck_kernel.ne = diff_ne;
+      ck_kernel.num_eq = num_eq;
+      ck_kernel.rho_floor = rho_floor;
+      ck_kernel.element_alpha = element_alpha;
+      ck_kernel.u = u_diff_data;
+      ck_kernel.ck = ck_data;
+      mfem::forall(diff_ne * diff_nq, ck_kernel);
+
+      igr_device::IGRDeviceLocalSourceKernel src_kernel;
+      src_kernel.nq = rhs_nq;
+      src_kernel.ne = rhs_ne;
+      src_kernel.dim = dim;
+      src_kernel.num_eq = num_eq;
+      src_kernel.rho_floor = rho_floor;
+      src_kernel.element_alpha = element_alpha;
+      src_kernel.u = u_rhs_data;
+      src_kernel.grad = grad_rhs_data;
+      src_kernel.src = src_data;
+      mfem::forall(rhs_ne * rhs_nq, src_kernel);
+    }
+    else
+    {
+      igr_device::IGRDeviceAlphaOverRhoKernel ck_kernel;
+      ck_kernel.nq = diff_nq;
+      ck_kernel.ne = diff_ne;
+      ck_kernel.num_eq = num_eq;
+      ck_kernel.alpha = alpha;
+      ck_kernel.rho_floor = rho_floor;
+      ck_kernel.u = u_diff_data;
+      ck_kernel.ck = ck_data;
+      mfem::forall(diff_ne * diff_nq, ck_kernel);
+
+      igr_device::IGRDeviceSourceKernel src_kernel;
+      src_kernel.nq = rhs_nq;
+      src_kernel.ne = rhs_ne;
+      src_kernel.dim = dim;
+      src_kernel.num_eq = num_eq;
+      src_kernel.alpha = alpha;
+      src_kernel.rho_floor = rho_floor;
+      src_kernel.u = u_rhs_data;
+      src_kernel.grad = grad_rhs_data;
+      src_kernel.src = src_data;
+      mfem::forall(rhs_ne * rhs_nq, src_kernel);
+    }
+  #else
+    const auto u_mass = mfem::Reshape(u_mass_data, num_eq, mass_nq, mass_ne);
+    auto invrho = mfem::Reshape(invrho_data, mass_nq, mass_ne);
+    for (int e = 0; e < mass_ne; ++e)
+    {
+      for (int q = 0; q < mass_nq; ++q)
+      {
+        invrho(q, e) =
+          frozen_scalar_igr_algebra::SafeInverseDensity(u_mass(0, q, e),
+                                                        rho_floor);
+      }
+    }
+
+    const auto u_diff = mfem::Reshape(u_diff_data, num_eq, diff_nq, diff_ne);
+    auto ck = mfem::Reshape(ck_data, diff_nq, diff_ne);
+    const mfem::real_t* element_alpha =
+      use_element_local_alpha ? device_element_alpha_.HostRead() : nullptr;
+    for (int e = 0; e < diff_ne; ++e)
+    {
+      const mfem::real_t alpha_e =
+        use_element_local_alpha ? element_alpha[e] : alpha;
+      for (int q = 0; q < diff_nq; ++q)
+      {
+        ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha_e,
+                                                               u_diff(0, q, e),
+                                                               rho_floor);
+      }
+    }
+
+    auto src = mfem::Reshape(src_data, rhs_nq, rhs_ne);
+    for (int e = 0; e < rhs_ne; ++e)
+    {
+      const mfem::real_t alpha_e =
+        use_element_local_alpha ? element_alpha[e] : alpha;
+      for (int q = 0; q < rhs_nq; ++q)
+      {
+        src(q, e) =
+          frozen_scalar_igr_algebra::SourceFromConservativeStateGradient(
+            dim,
+            u_rhs_data + num_eq * (q + rhs_nq * e),
+            1,
+            grad_rhs_data + num_eq * dim * (q + rhs_nq * e),
+            1,
+            num_eq,
+            alpha_e,
+            rho_floor);
+      }
+    }
+  #endif
+
+    const auto nodal_source_mode = GetNodalSourceMode();
+    if (nodal_source_mode != NodalSourceMode::Baseline)
+    {
+      if (!nodal_velocity_source_cache_)
+        nodal_velocity_source_cache_ = std::make_shared<NodalVelocitySourceCache>();
+      MFEM_VERIFY(!NodalSourceMirrorWalls() || HasNodalSourceBoundaryMarker(),
+                  "Mirror source requires the actual Euler slip boundary marker before state update.");
+      ApplyNodalVelocitySource2D(ufes, *rhs_qs_, device_qinterp_evec_, alpha,
+        use_element_local_alpha ? &device_element_alpha_ : nullptr, rho_floor,
+        nodal_source_mode == NodalSourceMode::Central,
+        *nodal_velocity_source_cache_, *src_qf_,
+        NodalSourceMirrorWalls() ? &nodal_source_slip_marker_ : nullptr);
+    }
+
+    if (ingestion_audit)
+    {
+      const int solve_call = linear_solve_calls_ + 1;
+      const MPI_Comm comm = vfes_.GetComm();
+      LogStateQuadratureAudit("mass",
+                              mass_values,
+                              *mass_qs_,
+                              num_eq,
+                              dim,
+                              rho_floor,
+                              solve_call,
+                              comm);
+      LogStateQuadratureAudit("diffusion",
+                              diff_values,
+                              *sigma_qs_,
+                              num_eq,
+                              dim,
+                              rho_floor,
+                              solve_call,
+                              comm);
+      LogStateQuadratureAudit("rhs",
+                              rhs_values,
+                              *rhs_qs_,
+                              num_eq,
+                              dim,
+                              rho_floor,
+                              solve_call,
+                              comm);
+      LogScalarQuadratureAudit("grad_diffusion",
+                               *grad_u_qf_,
+                               solve_call,
+                               comm);
+      LogScalarQuadratureAudit("grad_rhs",
+                               *grad_u_rhs_qf_,
+                               solve_call,
+                               comm);
+      LogScalarQuadratureAudit("invrho", *invrho_qf_, solve_call, comm);
+      LogScalarQuadratureAudit("alpha_over_rho", *ck_qf_, solve_call, comm);
+      LogScalarQuadratureAudit("rhs_source", *src_qf_, solve_call, comm);
+    }
+
+    if (diagnostic_nan_scan_ && !device_coeff_diagnostics_logged_)
+    {
+      const MPI_Comm comm = vfes_.GetComm();
+      int finite[8] = {VectorIsFinite(mass_values) ? 1 : 0,
+                       VectorIsFinite(diff_values) ? 1 : 0,
+                       VectorIsFinite(rhs_values) ? 1 : 0,
+                       VectorIsFinite(*grad_u_qf_) ? 1 : 0,
+                       VectorIsFinite(*grad_u_rhs_qf_) ? 1 : 0,
+                       VectorIsFinite(*invrho_qf_) ? 1 : 0,
+                       VectorIsFinite(*ck_qf_) ? 1 : 0,
+                       VectorIsFinite(*src_qf_) ? 1 : 0};
+      MPI_Allreduce(MPI_IN_PLACE, finite, 8, MPI_INT, MPI_MIN, comm);
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-linear] event=device-qf-finite"
+                  << " u_mass=" << finite[0]
+                  << " u_diff=" << finite[1]
+                  << " u_rhs=" << finite[2]
+                  << " grad_diff=" << finite[3]
+                  << " grad_rhs=" << finite[4]
+                  << " invrho=" << finite[5]
+                  << " ck=" << finite[6]
+                  << " src=" << finite[7] << "\n";
+      }
+      if (!(finite[0] && finite[1] && finite[2] && finite[3] && finite[4] &&
+            finite[5] && finite[6] && finite[7]))
+      {
+        MFEM_ABORT("IGR device quadrature data contains non-finite values.");
+      }
+
+      const mfem::Vector& inv_vals = *invrho_qf_;
+      const mfem::Vector& ck_vals = *ck_qf_;
+      const mfem::Vector& src_vals = *src_qf_;
+      auto host_minmax = [](const mfem::Vector& v, double& vmin, double& vmax)
+      {
+        const double* data = v.HostRead();
+        const int n = v.Size();
+        vmin = (n > 0) ? data[0] : 0.0;
+        vmax = vmin;
+        for (int i = 1; i < n; ++i)
+        {
+          vmin = std::min(vmin, data[i]);
+          vmax = std::max(vmax, data[i]);
+        }
+      };
+      double inv_min = 0.0, inv_max = 0.0;
+      double ck_min = 0.0, ck_max = 0.0;
+      double src_min = 0.0, src_max = 0.0;
+      host_minmax(inv_vals, inv_min, inv_max);
+      host_minmax(ck_vals, ck_min, ck_max);
+      host_minmax(src_vals, src_min, src_max);
+      MPI_Allreduce(MPI_IN_PLACE, &inv_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+      MPI_Allreduce(MPI_IN_PLACE, &inv_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+      MPI_Allreduce(MPI_IN_PLACE, &ck_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+      MPI_Allreduce(MPI_IN_PLACE, &ck_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+      MPI_Allreduce(MPI_IN_PLACE, &src_min, 1, MPI_DOUBLE, MPI_MIN, comm);
+      MPI_Allreduce(MPI_IN_PLACE, &src_max, 1, MPI_DOUBLE, MPI_MAX, comm);
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-linear] event=device-qf-range"
+                  << " invrho_min=" << inv_min
+                  << " invrho_max=" << inv_max
+                  << " ck_min=" << ck_min
+                  << " ck_max=" << ck_max
+                  << " src_min=" << src_min
+                  << " src_max=" << src_max << "\n";
+      }
+
+      if (mfem::Mpi::Root() && inv_vals.Size() > 0 && ck_vals.Size() > 0 &&
+          src_vals.Size() > 0)
+      {
+        const mfem::real_t inv_q = inv_vals(0);
+        const mfem::real_t ck_q = ck_vals(0);
+        const mfem::real_t src_q = src_vals(0);
+        std::cout << "[igr-linear] event=device-qf-sample"
+                  << " invrho_q=" << inv_q
+                  << " ck_q=" << ck_q
+                  << " src_q=" << src_q
+                  << " mass_qorder=" << device_mass_qorder_
+                  << " diff_qorder=" << device_diff_qorder_
+                  << " rhs_qorder=" << device_rhs_qorder_
+                  << " source_qorder_min_requested=" << NodalSourceQuadratureMinimumOrder()
+                  << " operator_qorder_min_requested=" << OperatorQuadratureMinimumOrder()
+                  << " face_qorder=" << device_face_qorder_
+                  << " source_mode=" << NodalSourceModeName(GetNodalSourceMode()) << "\n";
+      }
+      device_coeff_diagnostics_logged_ = true;
+    }
+
   }
 
-  // Exact faces consume their independently projected side coefficients. The
-  // single-valued MFEM projection below is unused by that operator and has a
-  // separate Q1D<=10 limit. Skip it only for this explicit quadrature study.
-  const bool skip_unused_face_projection = OperatorQuadratureMinimumOrder() > 0;
+  // The exact side-aware operator consumes its own two-sided coefficients;
+  // BuildBilinearForm_ does not attach the stock single-valued face integrator
+  // on that route. Retain its projection only for an explicit diagnostic.
+  // Oversampled exact-face studies always skip it because of its Q1D<=10 limit.
+  const bool exact_side_faces = IsDGSpace(sfes_) && UseExactDGFaceOperator_();
+  const bool face_projection_diagnostic = ingestion_audit || debug_qf;
+  const bool skip_unused_face_projection = OperatorQuadratureMinimumOrder() > 0 ||
+    (exact_side_faces && !face_projection_diagnostic);
   if (skip_unused_face_projection && !device_coeff_logged_ && mfem::Mpi::Root())
   {
     std::cout << "[igr-linear] event=face-qf-projector"
               << " mode=skipped-unused-single-valued"
-              << " reason=oversampled-exact-side-operator\n";
+              << " reason=" << (OperatorQuadratureMinimumOrder() > 0
+                   ? "oversampled-exact-side-operator" : "exact-side-coefficients-active")
+              << "\n";
   }
   if (sigma_fqs_ && ck_face_qf_ && !skip_unused_face_projection)
   {

@@ -1,0 +1,898 @@
+{
+  "schema": "igr-dg-local-tensor-jacobi-measured-result-v1",
+  "status": "complete-native-and-full-physical-qualification-passed",
+  "branch": "igr-dg-local-tensor-jacobi",
+  "case_specification": {
+    "file": "dg_local_tensor_jacobi_case.json",
+    "sha256": "cfb4d3d731087b281f804fad15f209852596d73cf599e4f2beafe10bf2af5931"
+  },
+  "tested_source": {
+    "reference": {
+      "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-face-flux-20261021/tuning/run-3429955/t64-p73/native-3429955/frozen/sedov_taylor_blast",
+      "binary_sha256": "5a8f1c3e02d214b55bb857fadd8308cb2864b1e46dff5125d66046a0fcf26495",
+      "source_commit": "97ba1681ac27e07145df790d4c23ed837a21caea",
+      "status": "passed",
+      "native_run": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/reference/native-run.json",
+        "sha256": "bdda480411cdc5ac5892f2d4032ab149eaf59c2a760e25e955f9c6b0b99765e8",
+        "bytes": 96921
+      },
+      "build_receipt": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/reference/build-complete.json",
+        "sha256": "9092b87756880d2ed08782be67e69524aefc4f6844b349195dabb65528473942",
+        "bytes": 96867
+      },
+      "source_manifest": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/reference/source-manifest.json",
+        "sha256": "80c7a75ac8bccdf31657215768d39ee8c5898ad4b2209705781fbd7f7a6f9bd2",
+        "bytes": 183163
+      },
+      "historical_run": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/reference/run.json",
+        "sha256": "1dcad1ad8bdb17c2c38e18114b013ea3eddf99320539bed3603e35ba2ee1229f",
+        "bytes": 19542
+      },
+      "actual_control_run": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/actual-control/run.json",
+        "sha256": "1647f10adbb8af4c9f6d09f77799a5385281cb7ab2f6aebd8c7c099f6eeaa79e",
+        "bytes": 16181
+      },
+      "actual_control_pair": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/actual-control/pair-run.json",
+        "sha256": "91bb56aa084e6c10439be0adb33b01321106a140c8ce996e8f09b8d3e88fd8f0",
+        "bytes": 54924
+      },
+      "actual_control_comparison": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/actual-control/comparison.json",
+        "sha256": "6c7f8ec09d4f65b9768f9316a8e0077daa3670e84b7de43cfae61de5fd4626db",
+        "bytes": 24217
+      },
+      "actual_control_field_qualification": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/actual-control/field-qualification.json",
+        "sha256": "c17fe50dadfdef1d8ee4ae45b4ce0bf6dfe052d73b6acc29037505417951166a",
+        "bytes": 1737
+      }
+    },
+    "candidate": {
+      "status": "passed",
+      "binary": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/native-3436508/frozen/sedov_taylor_blast",
+      "binary_sha256": "cc6f898a86e7f12d32b01f4c1cf5803b1b6006b752097281ad31ad51332f163b",
+      "source_commit": "52d46caf68d2a3a928cb500b656779f34a2c02d1",
+      "native_run": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/native-3436508/run.json",
+        "sha256": "fa31190e5690e7ffb3f20ec2784c39e06f9af07dcacca3663a8856635336a737",
+        "bytes": 103691
+      },
+      "build_receipt": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/native-3436508/frozen/build-complete.json",
+        "sha256": "395689a5653f6acf6e7a9bc1ad4b0d1a4c65daf08cb07f08e9b8bebb9a3173c0",
+        "bytes": 103647
+      },
+      "source_manifest": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/repair-geometry/source-manifest.json",
+        "sha256": "972c62f191d62ad25fb3e78696203a968bfded7064e8b1994b9abe36bdec4ac7",
+        "bytes": 187299
+      },
+      "native_config": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022/native-config.json",
+        "sha256": "e4a6c4bfff3b19cba458295d938bd45bc540f281568f572be7e41b1f21207446",
+        "bytes": 1004
+      }
+    }
+  },
+  "native_qualification": {
+    "job": "3436508",
+    "source_commit": "52d46caf68d2a3a928cb500b656779f34a2c02d1",
+    "binary_sha256": "cc6f898a86e7f12d32b01f4c1cf5803b1b6006b752097281ad31ad51332f163b",
+    "tests": [
+      "dg_igr_local_tensor_jacobi_cuda",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_time_defaults_tests",
+      "dg_igr_device_krylov_cuda",
+      "dg_igr_local_tensor_jacobi_cuda_reject_skew",
+      "dg_igr_local_tensor_jacobi_cuda_reject_curved",
+      "dg_igr_local_tensor_jacobi_cuda_reject_nonseparable"
+    ],
+    "native_check_status": "passed",
+    "native_checks": [
+      "dg_igr_local_tensor_jacobi_cuda",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_time_defaults_tests",
+      "dg_igr_device_krylov_cuda",
+      "dg_igr_local_tensor_jacobi_cuda_reject_skew",
+      "dg_igr_local_tensor_jacobi_cuda_reject_curved",
+      "dg_igr_local_tensor_jacobi_cuda_reject_nonseparable"
+    ]
+  },
+  "full_comparison": {
+    "job": "3436707",
+    "node": "gh115",
+    "gpu_uuid": "GPU-1f8048e7-cea1-5954-c96e-7fc7baee3673",
+    "same_gpu": true,
+    "fresh_both_arms": true,
+    "execution_order": [
+      "reference",
+      "candidate"
+    ],
+    "case": {
+      "mesh_n": 512,
+      "elements": 262144,
+      "order": 5,
+      "euler_dofs": 37748736,
+      "sigma_dofs": 9437184,
+      "target_time": 0.1,
+      "cfl": 0.3,
+      "c_alpha": 0.16666666666666666,
+      "physical_alpha": 6.357828776041666e-07,
+      "linear_rtol": 1e-06,
+      "residual_scale": "rhs",
+      "nan_scan": false,
+      "admissibility_scan": false,
+      "positivity_limiter": "none",
+      "modal_damping_rate": 0
+    },
+    "resource_policy": {
+      "account": "bdiy-dtai-gh",
+      "partition": "ghx4",
+      "constraint": "projects",
+      "nodes": 1,
+      "tasks": 1,
+      "cpus": 8,
+      "gpus": 1,
+      "memory": "96G",
+      "omp_num_threads": 1
+    },
+    "timing": {
+      "application_wall_seconds": {
+        "reference_seconds": 667.6662512419862,
+        "candidate_seconds": 503.3804369990248,
+        "saved_seconds": 164.28581424296135,
+        "observed_speedup": 1.326365115065605,
+        "observed_time_reduction_percent": 24.605978501587956
+      },
+      "native_done_seconds": {
+        "reference_seconds": 587.384927153,
+        "candidate_seconds": 425.386322685,
+        "saved_seconds": 161.99860446800005,
+        "observed_speedup": 1.3808270172991917,
+        "observed_time_reduction_percent": 27.57963253384662
+      },
+      "host_assemble_seconds": {
+        "reference_seconds": 92.72936118999978,
+        "candidate_seconds": 92.42990809800015,
+        "saved_seconds": 0.29945309199962367,
+        "observed_speedup": 1.0032397856728594,
+        "observed_time_reduction_percent": 0.3229323357313518
+      },
+      "host_form_seconds": {
+        "reference_seconds": 13.407451311000381,
+        "candidate_seconds": 13.22771405599985,
+        "saved_seconds": 0.17973725500053028,
+        "observed_speedup": 1.013587930177475,
+        "observed_time_reduction_percent": 1.3405773463675552
+      },
+      "host_pc_setup_seconds": {
+        "reference_seconds": 3.223889048000907,
+        "candidate_seconds": 3.44777372899992,
+        "saved_seconds": -0.22388468099901315,
+        "observed_speedup": 0.935063986619576,
+        "observed_time_reduction_percent": -6.944552919333291
+      },
+      "host_solve_seconds": {
+        "reference_seconds": 231.47224439000018,
+        "candidate_seconds": 78.67708120599956,
+        "saved_seconds": 152.79516318400061,
+        "observed_speedup": 2.942054291311828,
+        "observed_time_reduction_percent": 66.01014457982312
+      },
+      "sum_of_named_host_phases_seconds": {
+        "reference_seconds": 340.83294593900126,
+        "candidate_seconds": 187.78247708899949,
+        "saved_seconds": 153.05046885000178,
+        "observed_speedup": 1.8150412712761455,
+        "observed_time_reduction_percent": 44.90483407592679
+      },
+      "inclusive_sigma_update_host_seconds": {
+        "reference_seconds": 348.4336243959996,
+        "candidate_seconds": 188.15548538000056,
+        "saved_seconds": 160.27813901599902,
+        "observed_speedup": 1.8518387794663536,
+        "observed_time_reduction_percent": 45.99961880654799
+      }
+    },
+    "timing_scopes": {
+      "application_wall_seconds": "Whole child-process wall interval, including startup, setup, initial output, evolution, all further output and teardown.",
+      "native_done_seconds": "Application native stopwatch, started after initial sigma preparation/output; covers the full time-loop and final output/summary preparation.",
+      "inclusive_sigma_update_host_seconds": "Enclosing host UpdateFromState timer across every sigma call, including initial preparation before the native stopwatch; contains the named assembly/form/setup/solve phases plus remaining sigma overhead.",
+      "sum_of_named_host_phases_seconds": "Sum of assembly, form-system, preconditioner setup and solve host counters; these components add to this value and are nested within the broader sigma update scope. Do not add this sum to the enclosing update timer.",
+      "zero_subcomponent_seconds": "Krylov operator/preconditioner apply timing counters are disabled (zero); their work is not zero. Application/native minus sigma is not an Euler cost measurement."
+    },
+    "telemetry": {
+      "reference": {
+        "all_samples": {
+          "utilization_percent": {
+            "samples": 668,
+            "minimum": 0.0,
+            "median": 99.0,
+            "maximum": 100.0,
+            "mean": 55.23652694610779
+          },
+          "sm_MHz": {
+            "samples": 668,
+            "minimum": 345.0,
+            "median": 1965.0,
+            "maximum": 1980.0,
+            "mean": 1949.056886227545
+          },
+          "memory_MHz": {
+            "samples": 668,
+            "minimum": 2619.0,
+            "median": 2619.0,
+            "maximum": 2619.0,
+            "mean": 2619.0
+          },
+          "power_W": {
+            "samples": 668,
+            "minimum": 88.45,
+            "median": 531.685,
+            "maximum": 543.72,
+            "mean": 359.3920658682635
+          },
+          "temperature_C": {
+            "samples": 668,
+            "minimum": 21.0,
+            "median": 43.0,
+            "maximum": 46.0,
+            "mean": 35.84580838323353
+          }
+        },
+        "active_samples_utilization_at_least_50_percent": {
+          "utilization_percent": {
+            "samples": 374,
+            "minimum": 50.0,
+            "median": 99.0,
+            "maximum": 100.0,
+            "mean": 98.46791443850267
+          },
+          "sm_MHz": {
+            "samples": 374,
+            "minimum": 1845.0,
+            "median": 1950.0,
+            "maximum": 1980.0,
+            "mean": 1941.4171122994653
+          },
+          "memory_MHz": {
+            "samples": 374,
+            "minimum": 2619.0,
+            "median": 2619.0,
+            "maximum": 2619.0,
+            "mean": 2619.0
+          },
+          "power_W": {
+            "samples": 374,
+            "minimum": 177.25,
+            "median": 539.34,
+            "maximum": 543.72,
+            "mean": 534.6966310160428
+          },
+          "temperature_C": {
+            "samples": 374,
+            "minimum": 29.0,
+            "median": 45.0,
+            "maximum": 46.0,
+            "mean": 44.467914438502675
+          }
+        },
+        "sampled_other_application_rows": [],
+        "sampler_summary": {
+          "host_max_gap_s": 0.1002117590396665,
+          "host_gaps_over_1_5_s": 0,
+          "process_gpu_uuids": [
+            "GPU-1f8048e7-cea1-5954-c96e-7fc7baee3673"
+          ],
+          "process_peak_gpu_mib": 17840,
+          "gpu_memory_sample_count": 664,
+          "samples": 668,
+          "errors": [],
+          "all_sampler_threads_stopped": true
+        },
+        "process_state_sample_counts": {
+          "I": 5,
+          "D": 22,
+          "R": 641
+        },
+        "process_wchan_sample_counts": {
+          "cl_sync_io_wait": 3,
+          "ptlrpc_set_wait": 2,
+          "__wait_rcu_gp": 1,
+          "0": 641,
+          "folio_wait_bit": 21
+        },
+        "last_sample_process_io": {
+          "rchar": 1949886,
+          "wchar": 6973328825,
+          "syscr": 8909,
+          "syscw": 865378,
+          "read_bytes": 110297088,
+          "write_bytes": 7001538560,
+          "cancelled_write_bytes": 0
+        },
+        "scope": "One-second process-lifetime samples include setup, all output, idle and teardown. Busy subsets are observational, not clock-controlled experiments. Sampled peaks may miss short transients."
+      },
+      "candidate": {
+        "all_samples": {
+          "utilization_percent": {
+            "samples": 504,
+            "minimum": 0.0,
+            "median": 0.0,
+            "maximum": 100.0,
+            "mean": 42.71626984126984
+          },
+          "sm_MHz": {
+            "samples": 504,
+            "minimum": 345.0,
+            "median": 1980.0,
+            "maximum": 1980.0,
+            "mean": 1973.5119047619048
+          },
+          "memory_MHz": {
+            "samples": 504,
+            "minimum": 2619.0,
+            "median": 2619.0,
+            "maximum": 2619.0,
+            "mean": 2619.0
+          },
+          "power_W": {
+            "samples": 504,
+            "minimum": 88.38,
+            "median": 133.24,
+            "maximum": 530.58,
+            "mean": 298.4436507936508
+          },
+          "temperature_C": {
+            "samples": 504,
+            "minimum": 22.0,
+            "median": 26.0,
+            "maximum": 45.0,
+            "mean": 32.35515873015873
+          }
+        },
+        "active_samples_utilization_at_least_50_percent": {
+          "utilization_percent": {
+            "samples": 216,
+            "minimum": 64.0,
+            "median": 100.0,
+            "maximum": 100.0,
+            "mean": 99.6574074074074
+          },
+          "sm_MHz": {
+            "samples": 216,
+            "minimum": 1980.0,
+            "median": 1980.0,
+            "maximum": 1980.0,
+            "mean": 1980.0
+          },
+          "memory_MHz": {
+            "samples": 216,
+            "minimum": 2619.0,
+            "median": 2619.0,
+            "maximum": 2619.0,
+            "mean": 2619.0
+          },
+          "power_W": {
+            "samples": 216,
+            "minimum": 153.24,
+            "median": 527.24,
+            "maximum": 530.58,
+            "mean": 518.4678240740741
+          },
+          "temperature_C": {
+            "samples": 216,
+            "minimum": 25.0,
+            "median": 44.0,
+            "maximum": 45.0,
+            "mean": 42.8287037037037
+          }
+        },
+        "sampled_other_application_rows": [],
+        "sampler_summary": {
+          "host_max_gap_s": 0.10018765600398183,
+          "host_gaps_over_1_5_s": 0,
+          "process_gpu_uuids": [
+            "GPU-1f8048e7-cea1-5954-c96e-7fc7baee3673"
+          ],
+          "process_peak_gpu_mib": 18310,
+          "gpu_memory_sample_count": 502,
+          "samples": 504,
+          "errors": [],
+          "all_sampler_threads_stopped": true
+        },
+        "process_state_sample_counts": {
+          "I": 7,
+          "R": 469,
+          "D": 28
+        },
+        "process_wchan_sample_counts": {
+          "cl_sync_io_wait": 3,
+          "0": 469,
+          "ptlrpc_set_wait": 2,
+          "folio_wait_bit": 28,
+          "osc_extent_wait": 2
+        },
+        "last_sample_process_io": {
+          "rchar": 1949997,
+          "wchar": 6969046293,
+          "syscr": 8911,
+          "syscw": 850558,
+          "read_bytes": 87949312,
+          "write_bytes": 6994984960,
+          "cancelled_write_bytes": 0
+        },
+        "scope": "One-second process-lifetime samples include setup, all output, idle and teardown. Busy subsets are observational, not clock-controlled experiments. Sampled peaks may miss short transients."
+      }
+    },
+    "vtk_schedule": {
+      "reference": [
+        [
+          "0",
+          "0",
+          "0.000000"
+        ],
+        [
+          "1",
+          "966",
+          "0.020000"
+        ],
+        [
+          "2",
+          "1964",
+          "0.040000"
+        ],
+        [
+          "3",
+          "2975",
+          "0.060000"
+        ],
+        [
+          "4",
+          "3973",
+          "0.080000"
+        ],
+        [
+          "5",
+          "4939",
+          "0.100000"
+        ]
+      ],
+      "candidate": [
+        [
+          "0",
+          "0",
+          "0.000000"
+        ],
+        [
+          "1",
+          "966",
+          "0.020000"
+        ],
+        [
+          "2",
+          "1964",
+          "0.040000"
+        ],
+        [
+          "3",
+          "2975",
+          "0.060000"
+        ],
+        [
+          "4",
+          "3973",
+          "0.080000"
+        ],
+        [
+          "5",
+          "4939",
+          "0.100000"
+        ]
+      ]
+    },
+    "interpretation": {
+      "one_observed_sequential_pair": true,
+      "equal_physical_step_counts": true,
+      "equal_solver_accuracy_or_work": false,
+      "broad_stability_or_scaling_proof": false,
+      "clock_controlled": false,
+      "unexplained_integrity_or_fallback_blocker_found": false,
+      "conclusion": "This saved pair supports the reported observed wall/native time improvement. Identical output cadence/byte count, similar pre-native timing envelopes, lower named sigma host scopes, and consistent between-save loop windows do not indicate an I/O-only explanation. Active SM medians differ by about 1.54%; no precise clock correction or repeat-based confidence interval is available. The algorithm intentionally changes closure work/accuracy, and separate field qualification remains the numerical evidence.",
+      "static_link_scope": "The IGR application core is a static archive linked into the qualified frozen app. This does not claim the complete executable and all dependencies are statically linked. Binary hashes are receipt/pre-post-helper bindings; this offline audit did not freshly hash remote executable bytes."
+    }
+  },
+  "arms": {
+    "reference": {
+      "application_wall_seconds": 667.6662512419862,
+      "accepted_steps": 4939,
+      "linear_calls": 14818,
+      "iterations_or_sweeps": 51742,
+      "certificate_count": 14818,
+      "maximum_rhs_residual": 9.9954522e-07,
+      "native_done_seconds": 587.384927153,
+      "linear_summary": {
+        "event": "run-summary",
+        "calls": "14818",
+        "converged_calls": "14818",
+        "production_calls": "14817",
+        "production_converged_calls": "14817",
+        "output_only_calls": "1",
+        "output_only_converged_calls": "1",
+        "output_only_iters": "5",
+        "output_only_solve_s": "0.019894416999989062",
+        "output_only_igr_s": "0.023642310999982818",
+        "total_iters": "51742",
+        "avg_iters": "3.4918342556350384",
+        "max_iters": "5",
+        "avg_solve_iter_s": "0.004473585180124467",
+        "avg_krylov_operator_apply_count": "5.4917667701444186",
+        "avg_krylov_preconditioner_apply_count": "3.4918342556350384",
+        "avg_krylov_preconditioner_operator_apply_count": "0",
+        "krylov_operator_apply_count_per_iter": "1.5727455452050558",
+        "krylov_preconditioner_apply_count_per_iter": "1",
+        "krylov_preconditioner_operator_apply_count_per_iter": "0",
+        "avg_assemble_s": "0.0062578864347415161",
+        "avg_form_s": "0.00090480842968014444",
+        "avg_pc_setup_s": "0.00021756573410722818",
+        "avg_solve_s": "0.015621017977459859",
+        "total_assemble_s": "92.729361189999779",
+        "total_form_s": "13.407451311000381",
+        "total_pc_setup_s": "3.223889048000907",
+        "total_cheb_diag_s": "0",
+        "total_cheb_setup_s": "0",
+        "total_cheb_eigen_reuses": "0",
+        "total_cheb_smoother_reuses": "0",
+        "total_cheb_smoother_builds": "0",
+        "total_krylov_operator_apply_s": "0",
+        "total_krylov_preconditioner_apply_s": "0",
+        "total_krylov_preconditioner_operator_apply_s": "0",
+        "total_krylov_operator_apply_count": "81377",
+        "total_krylov_preconditioner_apply_count": "51742",
+        "total_krylov_preconditioner_operator_apply_count": "0",
+        "total_solve_s": "231.47224439000018",
+        "total_igr_s": "340.83294593900126",
+        "total_update_s": "348.43362439599957",
+        "solve_pct": "39.407249605795059",
+        "total_igr_pct": "58.02548383238004",
+        "solve_pct_stage": "66.432235060910429",
+        "total_igr_pct_stage": "97.818615103472325",
+        "last_solver": "fgmres-cuda-fp64",
+        "last_precond": "tensor-spectral-tf32",
+        "last_cheb_diag_s": "0",
+        "last_cheb_setup_s": "0",
+        "last_cheb_eigen_reused": "0",
+        "last_cheb_smoother_reused": "0",
+        "last_cheb_eigen_estimate": "0",
+        "last_krylov_operator_apply_s": "0",
+        "last_krylov_preconditioner_apply_s": "0",
+        "last_krylov_preconditioner_operator_apply_s": "0",
+        "last_krylov_operator_apply_count": "7",
+        "last_krylov_preconditioner_apply_count": "5",
+        "last_krylov_preconditioner_operator_apply_count": "0",
+        "direct_identity_system": "1",
+        "direct_identity_reason": "active",
+        "direct_identity_uses": "14818",
+        "exact_face_requested": "1",
+        "exact_face_effective": "1",
+        "exact_face_reason": "active",
+        "exact_face_local_nf": "523264",
+        "exact_face_shared_nf": "0",
+        "exact_face_operator_uses": "14818",
+        "exact_face_last_mult_calls": "1"
+      },
+      "approximate_closure": false,
+      "backend": null,
+      "sampled_process_peak_gpu_mib": 17840,
+      "native_final_vtu_sha256": "81d8bf54ddec7ab4f0b6293d77283d6c1ee0f9d19304c1b04f6846bc191debb3"
+    },
+    "candidate": {
+      "application_wall_seconds": 503.3804369990248,
+      "accepted_steps": 4939,
+      "linear_calls": 14818,
+      "iterations_or_sweeps": 29684,
+      "certificate_count": 0,
+      "maximum_rhs_residual": null,
+      "native_done_seconds": 425.386322685,
+      "linear_summary": {
+        "event": "run-summary",
+        "calls": "14818",
+        "converged_calls": "0",
+        "production_calls": "14817",
+        "production_converged_calls": "0",
+        "output_only_calls": "1",
+        "output_only_converged_calls": "0",
+        "output_only_iters": "2",
+        "output_only_solve_s": "0.0053173780000008719",
+        "output_only_igr_s": "0.0090617149999991931",
+        "total_iters": "29684",
+        "avg_iters": "2.0032393035497367",
+        "max_iters": "50",
+        "avg_solve_iter_s": "0.0026504878455059816",
+        "avg_krylov_operator_apply_count": "2.0032393035497367",
+        "avg_krylov_preconditioner_apply_count": "2.0032393035497367",
+        "avg_krylov_preconditioner_operator_apply_count": "0",
+        "krylov_operator_apply_count_per_iter": "1",
+        "krylov_preconditioner_apply_count_per_iter": "1",
+        "krylov_preconditioner_operator_apply_count_per_iter": "0",
+        "avg_assemble_s": "0.0062376776959103897",
+        "avg_form_s": "0.00089267877284382848",
+        "avg_pc_setup_s": "0.0002326747016466406",
+        "avg_solve_s": "0.0053095614256984452",
+        "total_assemble_s": "92.429908098000155",
+        "total_form_s": "13.227714055999851",
+        "total_pc_setup_s": "3.4477737289999202",
+        "total_cheb_diag_s": "0",
+        "total_cheb_setup_s": "0",
+        "total_cheb_eigen_reuses": "0",
+        "total_cheb_smoother_reuses": "0",
+        "total_cheb_smoother_builds": "0",
+        "total_krylov_operator_apply_s": "0",
+        "total_krylov_preconditioner_apply_s": "0",
+        "total_krylov_preconditioner_operator_apply_s": "0",
+        "total_krylov_operator_apply_count": "29684",
+        "total_krylov_preconditioner_apply_count": "29684",
+        "total_krylov_preconditioner_operator_apply_count": "0",
+        "total_solve_s": "78.677081205999556",
+        "total_igr_s": "187.78247708899949",
+        "total_update_s": "188.15548538000056",
+        "solve_pct": "18.495442145247392",
+        "total_igr_pct": "44.143985613767143",
+        "solve_pct_stage": "41.814928247827908",
+        "total_igr_pct_stage": "99.801755292837868",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-density-fp64",
+        "last_cheb_diag_s": "0",
+        "last_cheb_setup_s": "0",
+        "last_cheb_eigen_reused": "0",
+        "last_cheb_smoother_reused": "0",
+        "last_cheb_eigen_estimate": "0",
+        "last_krylov_operator_apply_s": "0",
+        "last_krylov_preconditioner_apply_s": "0",
+        "last_krylov_preconditioner_operator_apply_s": "0",
+        "last_krylov_operator_apply_count": "2",
+        "last_krylov_preconditioner_apply_count": "2",
+        "last_krylov_preconditioner_operator_apply_count": "0",
+        "direct_identity_system": "1",
+        "direct_identity_reason": "active",
+        "direct_identity_uses": "14818",
+        "exact_face_requested": "1",
+        "exact_face_effective": "1",
+        "exact_face_reason": "active",
+        "exact_face_local_nf": "523264",
+        "exact_face_shared_nf": "0",
+        "exact_face_operator_uses": "14818",
+        "exact_face_last_mult_calls": "2",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "approximate_closure": true,
+      "backend": {
+        "event": "setup",
+        "precision": "fp64",
+        "execution": "simt",
+        "d1d": "6",
+        "elements": "262144",
+        "factor_classes": "9",
+        "coefficient_policy": "current-collocated-mass",
+        "initial_blocks": "exact-sipg",
+        "geometry": "affine-cartesian",
+        "reconstruction_relative": "1.3566446e-13",
+        "owned_bytes": "189800032",
+        "dense_after_setup": "0",
+        "fallback": "none"
+      },
+      "sampled_process_peak_gpu_mib": 18310,
+      "native_final_vtu_sha256": "b65da6f0d1abc88217b426558acd2c7b0bb0c4602bf95fa53a34251435a3d093"
+    }
+  },
+  "physical_comparison": {
+    "conservative_budgets": {
+      "normalized_l2": 0.001,
+      "normalized_linf_at_gl_points": 0.01,
+      "all_conservative_components_pass": true,
+      "meaning": "engineering comparison budgets, not analytic Sedov error bounds"
+    },
+    "component_metrics": {
+      "density": {
+        "normalized_l2": 2.2758846598510957e-07,
+        "normalized_linf_at_gl_points": 7.424756480043499e-07,
+        "integral_reference": 0.9999999999997696,
+        "integral_candidate": 0.9999999999997679,
+        "integral_candidate_minus_reference": -3.702718978736673e-18,
+        "integral_abs_difference_over_reference_gl_l1": 3.702718978737526e-18
+      },
+      "momentum_x": {
+        "normalized_l2": 1.0769288489290779e-06,
+        "normalized_linf_at_gl_points": 1.981656004029478e-06,
+        "integral_reference": -3.189394918550999e-12,
+        "integral_candidate": -3.1903850983722734e-12,
+        "integral_candidate_minus_reference": -1.109678692698637e-15,
+        "integral_abs_difference_over_reference_gl_l1": 6.259611050479411e-15
+      },
+      "momentum_y": {
+        "normalized_l2": 1.0769287446716678e-06,
+        "normalized_linf_at_gl_points": 1.981024293518104e-06,
+        "integral_reference": -3.1886866092717143e-12,
+        "integral_candidate": -3.1887265282404525e-12,
+        "integral_candidate_minus_reference": 1.889375447295642e-16,
+        "integral_abs_difference_over_reference_gl_l1": 1.0657819697011635e-15
+      },
+      "energy": {
+        "normalized_l2": 3.425676042279709e-07,
+        "normalized_linf_at_gl_points": 8.997163808454789e-07,
+        "integral_reference": 3.499988835752878,
+        "integral_candidate": 3.4999888357528777,
+        "integral_candidate_minus_reference": -2.2449951655205512e-17,
+        "integral_abs_difference_over_reference_gl_l1": 6.4142923617001575e-18
+      },
+      "pressure": {
+        "normalized_l2": 3.044631245413474e-07,
+        "normalized_linf_at_gl_points": 8.397871587444936e-07,
+        "integral_reference": 1.3703150445411008,
+        "integral_candidate": 1.3703150410941214,
+        "integral_candidate_minus_reference": -3.4469775864767456e-09,
+        "integral_abs_difference_over_reference_gl_l1": 2.5154635791297834e-09
+      },
+      "speed": {
+        "normalized_l2": 7.007804371580427e-07,
+        "normalized_linf_at_gl_points": 1.3566604501166584e-06,
+        "integral_reference": 0.2846030902343643,
+        "integral_candidate": 0.2846030814745971,
+        "integral_candidate_minus_reference": -8.759767268248722e-09,
+        "integral_abs_difference_over_reference_gl_l1": 3.0778890211751565e-08
+      }
+    },
+    "maximum_conservative_normalized_l2": 1.0769288489290779e-06,
+    "maximum_conservative_sampled_normalized_linf": 1.981656004029478e-06,
+    "sigma_metrics": {
+      "conservative_component": false,
+      "field_semantics": "IGR scalar sigma, compared as its complete saved Q5 polynomial; not an Euler conserved component.",
+      "l2_reference": 2.0021677608887905e-05,
+      "l2_candidate": 1.9948041859600522e-05,
+      "l2_difference": 4.0739314419868706e-07,
+      "normalized_l2": 0.020347602841124537,
+      "linf_reference_at_gl_points": 5.652922859240637e-05,
+      "linf_candidate_at_gl_points": 5.61459391547841e-05,
+      "linf_difference_at_gl_points": 1.5027549551357739e-06,
+      "normalized_linf_at_gl_points": 0.026583680558797517,
+      "maximum_difference_location": {
+        "cell_ij": [
+          240,
+          65
+        ],
+        "gauss_ij": [
+          0,
+          5
+        ],
+        "xy": [
+          0.468815947740036,
+          0.128840302259964
+        ],
+        "reference": 4.626095888237652e-05,
+        "candidate": 4.475820392724075e-05
+      },
+      "reference_range_at_gl_points": [
+        7.966713214852533e-11,
+        5.652922859240637e-05
+      ],
+      "candidate_range_at_gl_points": [
+        7.652298240948262e-11,
+        5.61459391547841e-05
+      ],
+      "integral_reference": 1.3210720332758432e-05,
+      "integral_candidate": 1.3182634653317652e-05,
+      "integral_candidate_minus_reference": -2.808567944077994e-08,
+      "difference_of_separately_accumulated_integrals": -2.8085679440779883e-08,
+      "integral_abs_difference_over_reference_gl_l1": 0.0021259763838264206,
+      "polynomial_l2_and_integrals_exact_up_to_roundoff": true,
+      "engineering_budget": null,
+      "engineering_budget_pass": null
+    },
+    "sigma_has_acceptance_budget": false,
+    "gl6": {
+      "reference": {
+        "cells": 262144,
+        "samples": 9437184,
+        "minimum_finite_density": 0.44942023773057554,
+        "minimum_finite_pressure": 1.0003187644903997,
+        "conservative_nonfinite_samples": 0,
+        "density_nonpositive_samples": 0,
+        "pressure_nonpositive_samples": 0,
+        "pressure_unavailable_or_nonfinite_samples": 0,
+        "all_samples_finite_with_positive_density_and_pressure": true
+      },
+      "candidate": {
+        "cells": 262144,
+        "samples": 9437184,
+        "minimum_finite_density": 0.44942018083172564,
+        "minimum_finite_pressure": 1.000318764484991,
+        "conservative_nonfinite_samples": 0,
+        "density_nonpositive_samples": 0,
+        "pressure_nonpositive_samples": 0,
+        "pressure_unavailable_or_nonfinite_samples": 0,
+        "all_samples_finite_with_positive_density_and_pressure": true
+      }
+    }
+  },
+  "independent_review": {
+    "status": "passed",
+    "checks_passed": 103,
+    "failed_checks": [],
+    "audit_sha256": "496c86012c824d2317b68386a28d02d359eb6712d582abc8fd42339ac668a86d",
+    "note_sha256": "f812de03a8b9fc562c20dc39c757a8f5fb3ecab4bc9cd3564751ddaaaca59f05"
+  },
+  "source_artifacts": {
+    "comparison.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/comparison.json",
+      "sha256": "f5f66897d401e2fd5941d144d16b71269b9ead3b84b280ac5648e829d2a917ec"
+    },
+    "pair-run.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/pair-run.json",
+      "sha256": "da0cc09db723a51a97ad206c0b921d312d96a55ae2fe3a92be91af4179523968"
+    },
+    "final-fields.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/final-fields.json",
+      "sha256": "820172ca97530d3a202e0091e52988f3ecafce3e8432686ca832a5b90dd1d5b6"
+    },
+    "field-qualification.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/field-qualification.json",
+      "sha256": "0debefed2d616f6a7ebd371aeade4d7935b92fad76d966a8c17520bd123406c8"
+    },
+    "local-offline-input-binding.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/local-offline-input-binding.json",
+      "sha256": "883b2394024d6d93e090dc961fb750b8594baa0d07c834a6f0725339a20c38d7"
+    },
+    "reference-field-download.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/reference-field-download.json",
+      "sha256": "bb3dc9be58e887e0e11d0acd513c38f66e61d779c68449f181a09a9b8a735256"
+    },
+    "candidate-field-download.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/candidate-field-download.json",
+      "sha256": "27d1e5039ae49057a1744bf12150b33c8f5ef30c3abbbbce3e277ae793799a77"
+    },
+    "field-analysis/conserved.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/field-analysis/conserved.json",
+      "sha256": "07f7667de43f23448b2a2466e2c356ec79c093ac824a71486961b66e5749ccea"
+    },
+    "field-analysis/sigma.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/field-analysis/sigma.json",
+      "sha256": "b75a6248cf3817cf27bb8c04355f22f7fac462f4d22e6cbec0c9cf69ee440da1"
+    },
+    "field-analysis/gl6.json": {
+      "path": "/tmp/igr-dg-local-tensor-jacobi-20261022/full-3436707/field-analysis/gl6.json",
+      "sha256": "658799a81b05572e356288474b9af9ec11fcbd749ab7d3e0013bec8594c2d7a1"
+    }
+  },
+  "external_artifact_roots": {
+    "remote": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-local-tensor-jacobi-20261022",
+    "local_preserved": "/home/jarias9/.cache/igrlab-experiments/igr-dg-local-tensor-jacobi-20261022"
+  },
+  "artifact_note": "Source artifact paths retain original collection locations; matching relative paths are preserved under local_preserved. Raw VTUs are preserved locally as gzip and remain raw remotely.",
+  "plots": {
+    "local-tensor-t0p1-cell-averages.png": "358b0bced679afed5244eb5377e09609a625a66f7ebc85829f0be47ca937a634",
+    "local-tensor-t0p1-cell-averages.svg": "847852e79f1e1aa05bb216309bb655b2eaf091ce46db0352f17ccba0f94f8e76",
+    "local-tensor-t0p1-cell-averages.pdf": "c7c6a56a94f2b044acc21f9bf0739db259c64fec644b08d06787c1ba49e9d4ee",
+    "local-tensor-t0p1-radial-profiles.png": "851bfad90d98b086e36e9d7ca43143a3c8ee59f5bb75a5ffd04c242bc8dd7807",
+    "local-tensor-t0p1-radial-profiles.svg": "99fa1ce02e817640e56ee0ff202ef46dd16307a1e551acba507c2c58e06f5bf7",
+    "local-tensor-t0p1-radial-profiles.pdf": "dbdb85f245446c48e3aee88b2b6f4f689a31fadfb99a7f4599fd8677b3f9243b"
+  },
+  "limits": [
+    "One sequential control-first pair with unlocked clocks; no repeat-based confidence interval.",
+    "Approximate fixed-sweep closure versus converged control, not equal-residual accuracy.",
+    "Current-density local inverse uses FP64 SIMT; no new TF32 or tensor-core execution is claimed.",
+    "Fixed affine Cartesian GL quads and initially separable blocks only; no curved/non-Cartesian validation.",
+    "Conserved field budgets compare against the numerical control, not an analytic or discretization error.",
+    "Final finite/positive GL samples do not prove positivity between nodes or at unsaved times.",
+    "Host timing scopes overlap; native total minus sigma is not Euler-only cost.",
+    "Persistent local-backend bytes are not application peak GPU memory."
+  ]
+}

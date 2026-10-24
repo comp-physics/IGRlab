@@ -52,6 +52,25 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   }
   ApplyGradOption(igr_opts.grad, cfg);
   cfg.solve_mode = ParseIGRSolveMode(igr_opts.solve_mode);
+  cfg.element_jacobi_reference_blocks =
+    ParseIGRElementJacobiReferenceBlocks(igr_opts.element_jacobi_blocks);
+  cfg.element_jacobi_tensor_blocks =
+    ParseIGRElementJacobiTensorBlocks(igr_opts.element_jacobi_blocks);
+  MFEM_VERIFY(!(cfg.element_jacobi_reference_blocks || cfg.element_jacobi_tensor_blocks) ||
+                cfg.solve_mode == ::igrlab::IGRSolveMode::FixedElementJacobi,
+              "Reference/tensor element blocks require the fixed element-block Jacobi mode.");
+  if (igr_opts.regular_sweeps != -1)
+  {
+    cfg.regular_sweeps = igr_opts.regular_sweeps;
+  }
+  if (igr_opts.initial_sweeps != -1)
+  {
+    cfg.warm_start_sweeps = igr_opts.initial_sweeps;
+  }
+  if (igr_opts.element_jacobi_omega != -1.0)
+  {
+    cfg.element_jacobi_omega = igr_opts.element_jacobi_omega;
+  }
   cfg.lin_solver_type = ParseIGRLinearSolverType(igr_opts.linear_solver);
   cfg.prec_type = ParseIGRPrecondType(igr_opts.preconditioner);
   if (!igr_opts.nonconvergence_policy.empty())

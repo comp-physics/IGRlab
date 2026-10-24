@@ -519,11 +519,69 @@ RunEulerCase(ExampleContext& ctx,
              const VTKRestartInfo* restart_info = nullptr,
              const mfem::ParGridFunction* static_source = nullptr)
 {
+  using WallClock = std::chrono::steady_clock;
+  // IGRLAB_SOLVER_WALL_TIMING (legacy DG_IGR_SOLVER_WALL_TIMING) opts in.
+  // Scope begins after the opt-in check, before communicator queries, and
+  // ends before the timing line and local destruction. Pre/post case setup,
+  // metadata, case postprocessing and process lifetime remain external work.
+  const bool wall_timing_enabled =
+    ::igrlab::EnvFlagEnabled("DG_IGR_SOLVER_WALL_TIMING");
+  const auto wall_case_start =
+    wall_timing_enabled ? WallClock::now() : WallClock::time_point{};
+  WallClock::time_point wall_loop_start;
+  WallClock::time_point wall_loop_stop;
+  bool wall_loop_entered = false;
   int num_procs = 1;
   int my_rank = 0;
   MPI_Comm_size(ctx.Mesh().GetComm(), &num_procs);
   MPI_Comm_rank(ctx.Mesh().GetComm(), &my_rank);
   const bool communicator_root = my_rank == 0;
+  const auto emit_case_wall_timing = [&](const TimeLoopResult& timed_result)
+  {
+    if (!wall_timing_enabled || !communicator_root)
+    {
+      return;
+    }
+    const auto wall_case_stop = WallClock::now();
+    const double total_s =
+      std::chrono::duration<double>(wall_case_stop - wall_case_start).count();
+    const double setup_initial_output_s = wall_loop_entered
+      ? std::chrono::duration<double>(wall_loop_start - wall_case_start).count()
+      : total_s;
+    const double loop_s = wall_loop_entered
+      ? std::chrono::duration<double>(wall_loop_stop - wall_loop_start).count()
+      : 0.0;
+    const double postloop_s = wall_loop_entered
+      ? std::chrono::duration<double>(wall_case_stop - wall_loop_stop).count()
+      : 0.0;
+    // The loop complement includes stepping, CFL probes/reductions, control
+    // flow and their existing waits. Hook times include staging and waits;
+    // asynchronous device work can cross these host phase boundaries.
+    const double advancing_cfl_s = loop_s -
+      timed_result.scheduled_output_wall_seconds -
+      timed_result.final_output_wall_seconds -
+      timed_result.diagnostics_wall_seconds;
+    const double final_output_postloop_s =
+      timed_result.final_output_wall_seconds + postloop_s;
+    // Keep every field on this communicator root's timeline. Independent
+    // MPI_MAX reductions of individual bins would destroy additivity.
+    std::ostringstream timing;
+    timing << std::setprecision(17)
+           << "[solver-timing] event=run-summary scope=RunEulerCase"
+           << " clock=steady-host-wall rank=" << my_rank
+           << " origin=before-communicator-query end=before-return-and-destruction"
+           << " total_s=" << total_s
+           << " setup_initial_output_s=" << setup_initial_output_s
+           << " advancing_cfl_s=" << advancing_cfl_s
+           << " scheduled_output_s="
+           << timed_result.scheduled_output_wall_seconds
+           << " diagnostics_s=" << timed_result.diagnostics_wall_seconds
+           << " final_output_postloop_s=" << final_output_postloop_s
+           << " loop_s=" << loop_s
+           << " loop_entered=" << (wall_loop_entered ? 1 : 0)
+           << " success=" << (timed_result.success ? 1 : 0) << '\n';
+    std::cout << timing.str();
+  };
   const mfem::real_t initial_time = restart_info ? restart_info->time : 0.0;
   MFEM_VERIFY(!restart_info ||
                 restart_info->step <= std::numeric_limits<int>::max(),
@@ -561,12 +619,19 @@ RunEulerCase(ExampleContext& ctx,
   const bool sigma_certification_supported =
     sigma_provider &&
     sigma_provider->SupportsIndependentResidualCertification();
+  const bool fixed_element_jacobi =
+    ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) ==
+      ::igrlab::IGRSolveMode::FixedElementJacobi;
+  MFEM_VERIFY(!fixed_element_jacobi ||
+                (!restart_info && initial_time == 0.0 && initial_step == 0),
+              "Fixed element-block Jacobi requires a fresh t=0 state.");
 
   EulerOutputFieldTiming initial_field_timing;
   double initial_sigma_prepare_s = 0.0;
   mfem::IGRSigmaPreparationResult initial_sigma_preparation;
   if (sigma_provider &&
-      (restart_info || run_cfg.opts.vtk_save || glvis_enabled))
+      (restart_info || run_cfg.opts.vtk_save || glvis_enabled ||
+       fixed_element_jacobi))
   {
     const auto prepare_start = std::chrono::steady_clock::now();
     initial_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
@@ -579,6 +644,17 @@ RunEulerCase(ExampleContext& ctx,
       /*certify_residual=*/restart_info != nullptr &&
         sigma_certification_supported);
     initial_sigma_prepare_s = SecondsSince(prepare_start);
+  }
+  if (fixed_element_jacobi && sigma_provider && communicator_root)
+  {
+    std::cout << "[igr-element-block-jacobi] event=initial-preparation"
+              << " time=" << initial_time
+              << " solved=" << (initial_sigma_preparation.solved ? 1 : 0)
+              << " reusable_stage0="
+              << (initial_sigma_preparation.reusable_stage0 ? 1 : 0)
+              << " vtk_enabled=" << (run_cfg.opts.vtk_save ? 1 : 0)
+              << " jacobi_blocks=" << ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks)
+              << " certification_supported=0 certified=0 approximate=1\n";
   }
   if (restart_info && sigma_provider && communicator_root)
   {
@@ -627,6 +703,7 @@ RunEulerCase(ExampleContext& ctx,
                                        bundle.field_list.igr);
       }
     }
+    emit_case_wall_timing(failure);
     return false;
   }
 
@@ -693,6 +770,7 @@ RunEulerCase(ExampleContext& ctx,
                                      num_procs,
                                      bundle.field_list.igr);
     }
+    emit_case_wall_timing(failure);
     return false;
   }
   UpdateEulerOutputFields(bundle.field_list, &initial_field_timing);
@@ -758,7 +836,7 @@ RunEulerCase(ExampleContext& ctx,
   const std::string dc_name = detail::MakeEulerOutputDatasetName(
     case_cfg, run_cfg, c_alpha_value, restart_info, ctx, static_source);
   auto paraview_dc =
-    std::make_unique<mfem::ParaViewDataCollection>(dc_name, &ctx.Mesh());
+    mfem::io::MakeEulerVTKDataCollection(dc_name, &ctx.Mesh());
   const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
   const std::string dataset_dir =
     (std::filesystem::path(vtk_cfg.prefix_path) / dc_name).string();
@@ -954,8 +1032,17 @@ RunEulerCase(ExampleContext& ctx,
                            io,
                            callbacks,
                            initial_step);
+  if (wall_timing_enabled)
+  {
+    wall_loop_start = WallClock::now();
+    wall_loop_entered = true;
+  }
   TimeLoopResult result =
     RunTimeLoop(op, ctx.Mesh(), bundle.sol, rk3, loop_cfg, hooks);
+  if (wall_timing_enabled)
+  {
+    wall_loop_stop = WallClock::now();
+  }
   std::optional<detail::EulerConservedIntegral> final_conservation;
   mfem::Vector accepted_boundary_flux;
   mfem::Vector accepted_boundary_flux_scale;
@@ -1094,7 +1181,9 @@ RunEulerCase(ExampleContext& ctx,
     if (communicator_root)
     {
       std::cout << std::setprecision(17)
-                << "[igr-closure-certificate] event=accepted-state"
+                << (fixed_element_jacobi ? "[igr-closure-approximation]"
+                                         : "[igr-closure-certificate]")
+                << " event=accepted-state"
                 << " scope=final-committed-accepted-state"
                 << " precision=fp64"
                 << " time=" << result.final_time
@@ -1122,7 +1211,12 @@ RunEulerCase(ExampleContext& ctx,
                 << final_q_sigma_nonpositive
                 << " q_sigma_nonfinite_samples="
                 << final_q_sigma_nonfinite
-                << "\n";
+                << (fixed_element_jacobi ? " jacobi_blocks=" : "")
+                << (fixed_element_jacobi
+                      ? ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks) : "")
+                << (fixed_element_jacobi
+                      ? " solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps"
+                      : "") << "\n";
     }
   }
   if (final_sigma_transport_admission_failed && communicator_root)
@@ -1354,6 +1448,7 @@ RunEulerCase(ExampleContext& ctx,
                                      num_procs,
                                      bundle.field_list.igr);
     }
+    emit_case_wall_timing(result);
     return false;
   }
 
@@ -1378,6 +1473,7 @@ RunEulerCase(ExampleContext& ctx,
         BuildRunSummary(ctx, result, elapsed, num_procs, bundle.field_list.igr);
     }
   }
+  emit_case_wall_timing(result);
   return true;
 }
 
@@ -1667,6 +1763,16 @@ struct Solver
       request_resolution.discretization_provenance,
       request_resolution.regularization,
       request_resolution.time_integrator);
+    const std::string fixed_element_jacobi_rejection =
+      ValidateFixedElementJacobiIGRSelection(run_cfg);
+    if (!fixed_element_jacobi_rejection.empty())
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cerr << fixed_element_jacobi_rejection << '\n';
+      }
+      return 1;
+    }
     const std::string cfl_selection_rejection =
       ValidateExplicitSSPRKCFLSelection(run_cfg);
     if (!cfl_selection_rejection.empty())
@@ -2447,7 +2553,14 @@ struct Solver
                 << " exact_face_operator_uses="
                 << igr->GetExactFaceOperatorUseCount()
                 << " exact_face_last_mult_calls="
-                << igr->GetLastExactFaceOperatorMultCalls() << "\n";
+                << igr->GetLastExactFaceOperatorMultCalls()
+                << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
+                      ? " jacobi_blocks=" : "")
+                << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
+                      ? ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks) : "")
+                << (igr->GetSolveMode() == ::igrlab::IGRSolveMode::FixedElementJacobi
+                      ? " solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps"
+                      : "") << "\n";
     }
 
     if (!ok)

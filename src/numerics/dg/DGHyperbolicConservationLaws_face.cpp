@@ -322,7 +322,10 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
   const auto fallback = [](const char* reason)
   {
     if (mfem::Mpi::Root())
-      std::cout << "[dg-tensor-face] event=fallback reason=" << reason << std::endl;
+      std::cout << "[dg-tensor-face] event=fallback reason=" << reason
+                << " row_reuse_requested="
+                << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+                << " row_reuse=0" << std::endl;
     return false;
   };
 #ifndef DG_IGR_HAS_ACCEL_FORALL
@@ -335,7 +338,7 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
       sizeof(real_t) != sizeof(double)) { return fallback("backend"); }
   if (!mesh || !mesh->Conforming() || mesh->Dimension() != 2 ||
       mesh->SpaceDimension() != 2 || dim != 2 || num_equations != 4 ||
-      vfes.GetVDim() != 4 || !invmass_apply_ready_ || weakdiv.empty() ||
+      vfes.GetVDim() != 4 || !invmass_apply_ready_ || !HasPreassembledWeakDivergence_() ||
       vol_mode_ != VolumeMode::WeakDivergence || vfes.GetNE() <= 0 ||
       !dynamic_cast<const L2_FECollection*>(vfes.FEColl()))
     { return fallback("state-layout"); }
@@ -407,6 +410,20 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
     if (point.x != line_rule.IntPoint(i).x || point.y != line_rule.IntPoint(j).x)
       { return fallback("state-layout"); }
   }
+  const auto positive_jacobian = [](ElementTransformation& transform,
+                                    const IntegrationPoint& point)
+  {
+    transform.SetIntPoint(&point);
+    const auto& jacobian = transform.Jacobian();
+    if (jacobian.Height() != 2 || jacobian.Width() != 2) { return false; }
+    const real_t a = jacobian(0, 0), b = jacobian(0, 1);
+    const real_t c = jacobian(1, 0), d = jacobian(1, 1);
+    const real_t determinant = a * d - b * c;
+    return std::isfinite(a) && std::isfinite(b) && std::isfinite(c) &&
+      std::isfinite(d) && std::isfinite(determinant) && determinant > 0.0 &&
+      std::isfinite(transform.Weight()) && transform.Weight() > 0.0;
+  };
+  int maximum_geometry_order = 1;
   Array<int> element_dofs;
   for (int e = 0; e < data.elements; ++e)
   {
@@ -418,19 +435,58 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
       if (element_dofs[i] < 0 || element_dofs[i] >= vfes.GetNDofs())
         { return fallback("state-layout"); }
     auto* transform = vfes.GetElementTransformation(e);
-    if (!transform || transform->Order() != 1) { return fallback("geometry"); }
-    Vector corners[4] = {Vector(2), Vector(2), Vector(2), Vector(2)};
-    for (int c = 0; c < 4; ++c)
+    if (!transform) { return fallback("geometry"); }
+    if (transform->Order() == 1)
     {
-      IntegrationPoint point;
-      point.Set2(c % 2, c / 2);
-      transform->Transform(point, corners[c]);
+      Vector corners[4] = {Vector(2), Vector(2), Vector(2), Vector(2)};
+      for (int c = 0; c < 4; ++c)
+      {
+        IntegrationPoint point;
+        point.Set2(c % 2, c / 2);
+        transform->Transform(point, corners[c]);
+      }
+      for (int d = 0; d < 2; ++d)
+        if (!std::isfinite(corners[0][d]) || !std::isfinite(corners[1][d]) ||
+            !std::isfinite(corners[2][d]) || !std::isfinite(corners[3][d]) ||
+            corners[3][d] - corners[1][d] != corners[2][d] - corners[0][d])
+          { return fallback("geometry"); }
     }
-    for (int d = 0; d < 2; ++d)
-      if (!std::isfinite(corners[0][d]) || !std::isfinite(corners[1][d]) ||
-          !std::isfinite(corners[2][d]) || !std::isfinite(corners[3][d]) ||
-          corners[3][d] - corners[1][d] != corners[2][d] - corners[0][d])
+    else
+    {
+      const auto* isoparametric = dynamic_cast<const IsoparametricTransformation*>(transform);
+      const auto* geometry_fe = isoparametric ? isoparametric->GetFE() : nullptr;
+      if (transform->Order() != 2 || mesh->NURBSext || !geometry_fe ||
+          (typeid(*geometry_fe) != typeid(H1_QuadrilateralElement) &&
+           typeid(*geometry_fe) != typeid(L2_QuadrilateralElement)) ||
+          geometry_fe->GetGeomType() != Geometry::SQUARE ||
+          geometry_fe->GetMapType() != FiniteElement::VALUE ||
+          geometry_fe->GetRangeType() != FiniteElement::SCALAR ||
+          geometry_fe->GetDof() != 9 || geometry_fe->GetNodes().Size() != 9)
         { return fallback("geometry"); }
+      const auto& coordinates = isoparametric->GetPointMat();
+      if (coordinates.Height() != 2 || coordinates.Width() != 9)
+        { return fallback("geometry"); }
+      for (int j = 0; j < 9; ++j) for (int d = 0; d < 2; ++d)
+        if (!std::isfinite(coordinates(d, j))) { return fallback("geometry"); }
+      // These setup samples reject invalid metrics where observed; they do not
+      // certify positivity between samples of the polynomial Q2 map.
+      const IntegrationRule* samples[] = {
+        Geometries.GetVertices(Geometry::SQUARE), &geometry_fe->GetNodes(),
+        &fe.GetNodes(), &MassIntegrator::GetRule(fe, fe, *transform),
+        &GradientIntegrator::GetRule(fe, fe, *transform),
+        &DiffusionIntegrator::GetRule(fe, fe)};
+      for (int sample = 0; sample < 6; ++sample)
+      {
+        bool duplicate = false;
+        for (int previous = 0; previous < sample; ++previous)
+          duplicate = duplicate || samples[previous] == samples[sample];
+        if (duplicate) { continue; }
+        for (int q = 0; q < samples[sample]->GetNPoints(); ++q)
+          if (!positive_jacobian(*transform, samples[sample]->IntPoint(q)))
+            { return fallback("geometry"); }
+      }
+      maximum_geometry_order = 2;
+    }
   }
 
   // Matching sigma coefficients may have a different local-node permutation.
@@ -586,6 +642,12 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
     for (int q = 0; q < n; ++q)
     {
       transform.SetAllIntPoints(&rule.IntPoint(q));
+      if (maximum_geometry_order == 2 &&
+          (!transform.Elem1 ||
+           !positive_jacobian(*transform.Elem1, transform.GetElement1IntPoint()) ||
+           (transform.Elem2No >= 0 && (!transform.Elem2 ||
+            !positive_jacobian(*transform.Elem2, transform.GetElement2IntPoint())))))
+        { return false; }
       CalcOrtho(transform.Jacobian(), normal);
       if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
           !(normal[0] * normal[0] + normal[1] * normal[1] > 0.0)) { return false; }
@@ -716,10 +778,16 @@ bool DGHyperbolicConservationLaws::BuildTensorFaceApplyData_()
     std::cout << "[dg-tensor-face] event=setup selected=fp64 n1d=" << n
               << " elements=" << data.elements << " interior_faces=" << data.interior_faces
               << " boundary_faces=" << data.boundary_faces
+              << " geometry_order_max=" << maximum_geometry_order
+              << " jacobian_validation=" << (maximum_geometry_order == 2 ? "sampled-q2" : "affine-q1")
               << " reference_maps=" << reference_count << " sparse_tangent_maps=" << sparse_count
               << " dense_shape_entries=0 trace_bytes=" << std::size_t(data.traces.Size()) * sizeof(real_t)
               << " flux_bytes=" << std::size_t(data.flux.Size()) * sizeof(real_t)
               << " state=fp64 nonlinear_flux=fp64 lift=element-owned residual_atomics=0"
+              << " row_reuse_requested="
+              << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
+              << " row_reuse="
+              << (dg_igr_detail::tensor_face::RowReuseRequested() ? 1 : 0)
               << std::endl;
   return true;
 #endif
@@ -793,7 +861,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
     return;
   }
 
-  if (!invmass_apply_ready_ || weakdiv.empty() || !num_flux_)
+  if (!invmass_apply_ready_ || !HasPreassembledWeakDivergence_() || !num_flux_)
   {
     return;
   }
@@ -1699,7 +1767,7 @@ bool DGHyperbolicConservationLaws::SupportsPackedEntropyFacePolicy_() const
 bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
 {
   if (!Device::Allows(Backend::DEVICE_MASK) ||
-      vol_mode_ != VolumeMode::WeakDivergence || weakdiv.empty() ||
+      vol_mode_ != VolumeMode::WeakDivergence || !HasPreassembledWeakDivergence_() ||
       !invmass_apply_ready_) { return false; }
   const bool entropy = SupportsPackedEntropyFacePolicy_();
   const unsigned long native = static_cast<unsigned long>(Backend::CPU) |
@@ -1771,7 +1839,17 @@ bool DGHyperbolicConservationLaws::AddTensorFaceContributions_(
   trace.endpoints = data.endpoints.Read(); trace.state = x_in.Read();
   trace.sigma = use_sigma ? sigma->Read() : nullptr;
   trace.traces = data.traces.Write();
-  mfem::forall(data.elements * 4 * data.n, trace);
+  const bool row_reuse = dg_igr_detail::tensor_face::RowReuseRequested();
+  if (row_reuse)
+  {
+    dg_igr_detail::tensor_face::TraceRowReuseKernel reuse;
+    static_cast<dg_igr_detail::tensor_face::TraceKernel&>(reuse) = trace;
+    mfem::forall(data.elements * 4 * data.n, reuse);
+  }
+  else
+  {
+    mfem::forall(data.elements * 4 * data.n, trace);
+  }
 
   dg_igr_detail::tensor_face::FluxKernel flux;
   flux.n = data.n; flux.elements = data.elements;
@@ -1811,7 +1889,16 @@ bool DGHyperbolicConservationLaws::AddTensorFaceContributions_(
   lift.endpoints = data.endpoints.Read(); lift.tangents = data.tangents.Read();
   lift.interior_weights = face_int_weights_.Read(); lift.boundary_weights = face_bdr_weights_.Read();
   lift.flux = data.flux.Read(); lift.residual = z_out.Write();
-  mfem::forall(data.elements * data.n * data.n * 4, lift);
+  if (row_reuse)
+  {
+    dg_igr_detail::tensor_face::LiftRowReuseKernel reuse;
+    static_cast<dg_igr_detail::tensor_face::LiftKernel&>(reuse) = lift;
+    mfem::forall(data.elements * data.n * data.n, reuse);
+  }
+  else
+  {
+    mfem::forall(data.elements * data.n * data.n * 4, lift);
+  }
   if (capture_boundary_flux)
     mfem::forall(4, dg_igr_detail::tensor_face::BoundaryIntegralKernel{
       data.n, data.interior_faces, data.boundary_faces,

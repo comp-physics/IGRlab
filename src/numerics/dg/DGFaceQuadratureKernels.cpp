@@ -200,6 +200,51 @@ bool TryLaunchInteriorFaceDGDiffusionAddToBase2D(
   return false;
 }
 
+bool CanLaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  const mfem::Vector& rhs,
+  const mfem::Vector& y)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  if (!UsesInteriorFaceDGDiffusionCompactLift2D(info, work) ||
+      info.vdim != 1 || info.ne <= 0 || info.nf <= 0 || info.dof != 36 ||
+      std::size_t(info.ne) * info.dof != std::size_t(scalar.Size()) ||
+      rhs.Size() != scalar.Size() || y.Size() != scalar.Size())
+  { return false; }
+  const auto input = reinterpret_cast<std::uintptr_t>(scalar.Read());
+  const auto source = reinterpret_cast<std::uintptr_t>(rhs.Read());
+  const auto output = reinterpret_cast<std::uintptr_t>(y.Read());
+  const auto bytes = std::size_t(y.Size()) * sizeof(mfem::real_t);
+  // Pointer differences avoid overflowing an end address. Object identity or
+  // unequal starting pointers alone do not exclude overlapping MFEM aliases.
+  const auto disjoint = [bytes](std::uintptr_t a, std::uintptr_t b)
+  { return a < b ? b - a >= bytes : a - b >= bytes; };
+  return disjoint(input, output) && disjoint(source, output);
+#else
+  (void)info; (void)work; (void)scalar; (void)rhs; (void)y;
+  return false;
+#endif
+}
+
+void LaunchInteriorFaceDGDiffusionResidual2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  const mfem::Vector& rhs,
+  mfem::Vector& y)
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__) && defined(MFEM_USE_DOUBLE)
+  AddInteriorFaceDGDiffusionApplyDevice2D(
+    info, work, scalar, ip_sigma, y, false, &rhs);
+#else
+  (void)info; (void)work; (void)scalar; (void)ip_sigma; (void)rhs; (void)y;
+  MFEM_ABORT("Fused exact-face residual requires native FP64 CUDA preflight.");
+#endif
+}
+
 void LaunchSharedFaceDGDiffusionApply2D(
   const SharedFaceDGDiffusionApplyInfo& info,
   const SharedFaceDGDiffusionApplyScratch& work,

@@ -39,6 +39,10 @@ struct IGROptions
   std::string space = "H1";
   std::string grad = "H1";
   std::string solve_mode = "krylov";
+  int regular_sweeps = -1;
+  int initial_sweeps = -1;
+  double element_jacobi_omega = -1.0;
+  std::string element_jacobi_blocks = "current";
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
   std::string nonconvergence_policy = "";
@@ -401,10 +405,31 @@ inline ::igrlab::IGRSolveMode ParseIGRSolveMode(const std::string& value)
   {
     return ::igrlab::IGRSolveMode::Krylov;
   }
+  if (lower == "element-block-jacobi")
+  {
+    return ::igrlab::IGRSolveMode::FixedElementJacobi;
+  }
   MFEM_VERIFY(false,
               "Invalid IGR solve mode '" << value
-                                         << "'. Use 'smoother' or 'krylov'.");
+                << "'. Use 'smoother', 'krylov', or 'element-block-jacobi'.");
   return ::igrlab::IGRSolveMode::Krylov;
+}
+
+inline bool ParseIGRElementJacobiReferenceBlocks(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  MFEM_VERIFY(lower == "current" || lower == "reference" || lower == "tensor",
+              "Invalid IGR Jacobi block selection '" << value
+                << "'. Use 'current', 'reference', or 'tensor'.");
+  return lower == "reference";
+}
+
+inline bool ParseIGRElementJacobiTensorBlocks(const std::string& value)
+{
+  // Retain one validation surface for all block choices. Tensor is a distinct
+  // policy and must never be interpreted as a frozen reference inverse.
+  (void)ParseIGRElementJacobiReferenceBlocks(value);
+  return ToLowerCopy(value) == "tensor";
 }
 
 inline ::igrlab::IGRLinearSolverType
@@ -584,6 +609,8 @@ inline const char* IGRSolveModeToString(::igrlab::IGRSolveMode value)
     return "smoother";
   case ::igrlab::IGRSolveMode::Krylov:
     return "krylov";
+  case ::igrlab::IGRSolveMode::FixedElementJacobi:
+    return "element-block-jacobi";
   }
   return "krylov";
 }
@@ -1749,7 +1776,24 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
   args.AddOption(&igr_opts.solve_mode,
                  "-im",
                  "--igr-solve-mode",
-                 "IGR solve mode: krylov | smoother.");
+                 "IGR solve mode: krylov | smoother | element-block-jacobi "
+                 "(fixed approximate closure).");
+  args.AddOption(&igr_opts.regular_sweeps,
+                 "-isw", "--igr-sweeps",
+                 "Regular IGR sweep count (-1 keeps the case default).");
+  args.AddOption(&igr_opts.initial_sweeps,
+                 "-iisw", "--igr-initial-sweeps",
+                 "Initial closure sweep count (fixed mode: t=0; "
+                 "-1 keeps the case default).");
+  args.AddOption(&igr_opts.element_jacobi_omega,
+                 "-ijw", "--igr-jacobi-omega",
+                 "Fixed element-block Jacobi damping in (0,1] "
+                 "(-1 keeps the case default).");
+  args.AddOption(&igr_opts.element_jacobi_blocks,
+                 "-ijb", "--igr-jacobi-blocks",
+                 "Fixed element-block Jacobi blocks: current | reference | tensor. "
+                 "Reference retains the initial FP64 inverse; tensor retains "
+                 "initial tensor factors with current density scaling.");
   args.AddOption(
     &igr_opts.linear_solver,
     "-ils",
@@ -2060,6 +2104,20 @@ inline std::string ValidateHdgIGRSigmaCadence(
   const CaseConfig& case_cfg,
   const IGROptions& igr_opts)
 {
+  if (discretization == Discretization::HDG &&
+      (ParseIGRElementJacobiReferenceBlocks(igr_opts.element_jacobi_blocks) ||
+       ParseIGRElementJacobiTensorBlocks(igr_opts.element_jacobi_blocks)))
+  {
+    return "--igr-jacobi-blocks " + ToLowerCopy(igr_opts.element_jacobi_blocks) +
+           " requires ordinary DG with --igr-solve-mode element-block-jacobi.";
+  }
+  if (discretization == Discretization::HDG &&
+      ParseIGRSolveMode(igr_opts.solve_mode) ==
+        ::igrlab::IGRSolveMode::FixedElementJacobi)
+  {
+    return "--igr-solve-mode element-block-jacobi requires ordinary DG; "
+           "the HDG adapter cannot apply this closure mode.";
+  }
   if (discretization != Discretization::HDG)
   {
     return {};
@@ -2083,6 +2141,83 @@ inline std::string ValidateHdgIGRSigmaCadence(
   return "The HDG instantaneous-IGR backend supports only "
          "--igr-sigma-cadence every-stage; split and extrapolated cadences "
          "are qualified only on their explicitly supported DG/DGSEM routes.";
+}
+
+/** Validate the explicit approximate element-block closure selection. */
+inline std::string ValidateFixedElementJacobiIGRSelection(
+  const RunConfig& run_cfg)
+{
+  const bool reference = ParseIGRElementJacobiReferenceBlocks(
+    run_cfg.igr_opts.element_jacobi_blocks);
+  const bool tensor = ParseIGRElementJacobiTensorBlocks(
+    run_cfg.igr_opts.element_jacobi_blocks);
+  const bool fixed = ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) ==
+    ::igrlab::IGRSolveMode::FixedElementJacobi;
+  if ((reference || tensor) && !fixed)
+  {
+    return "--igr-jacobi-blocks " + ToLowerCopy(run_cfg.igr_opts.element_jacobi_blocks) +
+           " requires --igr-solve-mode element-block-jacobi.";
+  }
+  if (!fixed)
+  {
+    return {};
+  }
+  const std::string prefix =
+    "--igr-solve-mode element-block-jacobi requires ";
+  if (run_cfg.regularization != Regularization::IGR ||
+      run_cfg.discretization != Discretization::DG ||
+      run_cfg.dg_backend != DGBackend::DG ||
+      run_cfg.device_backend != DeviceBackend::CUDA)
+  {
+    return prefix + "active IGR with ordinary DG on CUDA.";
+  }
+  if (!IsL2IGRSpaceName(run_cfg.igr_opts.space) ||
+      !IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ||
+      ParseIGRIPKind(run_cfg.igr_opts.ip_kind) != ::igrlab::IGRIPKind::SIPG ||
+      !run_cfg.igr_opts.exact_dg_face_operator)
+  {
+    return prefix + "the L2/BrokenL2 SIPG closure with exact DG faces.";
+  }
+  const auto cadence = run_cfg.igr_opts.sigma_cadence.empty()
+    ? run_cfg.case_config.igr_config.sigma_cadence
+    : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  // Extrapolated cadence owns recoverable q_sigma admission. Fixed-sweep
+  // history has no RK rollback transaction, so that route remains excluded.
+  if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
+  {
+    return prefix + "--igr-sigma-cadence every-stage.";
+  }
+  // MakeRunConfig resolves both the case default and positivity CLI override
+  // into this flag. Zhang-Shu can reject a CUDA RK attempt after fixed-sweep
+  // history has already advanced to a later stage of that rejected attempt.
+  if (run_cfg.case_config.limiter_pipeline.zhang_shu)
+  {
+    return prefix + "an inactive Zhang-Shu positivity limiter "
+           "(--positivity-limiter none); fixed-sweep sigma history cannot "
+           "be rolled back after RK rejection.";
+  }
+  if (!run_cfg.opts.restart_vtk.empty())
+  {
+    return prefix + "a fresh t=0 state; approximate-history restart is unsupported.";
+  }
+  const int regular = run_cfg.igr_opts.regular_sweeps == -1
+    ? run_cfg.case_config.igr_config.regular_sweeps
+    : run_cfg.igr_opts.regular_sweeps;
+  const int initial = run_cfg.igr_opts.initial_sweeps == -1
+    ? run_cfg.case_config.igr_config.warm_start_sweeps
+    : run_cfg.igr_opts.initial_sweeps;
+  if (regular <= 0 || initial < regular)
+  {
+    return prefix + "positive --igr-sweeps and --igr-initial-sweeps >= --igr-sweeps.";
+  }
+  const double omega = run_cfg.igr_opts.element_jacobi_omega == -1.0
+    ? run_cfg.case_config.igr_config.element_jacobi_omega
+    : run_cfg.igr_opts.element_jacobi_omega;
+  if (!std::isfinite(omega) || omega <= 0.0 || omega > 1.0)
+  {
+    return prefix + "finite --igr-jacobi-omega in (0,1].";
+  }
+  return {};
 }
 
 /** Validate the production-qualified extrapolated instantaneous-IGR tuple.

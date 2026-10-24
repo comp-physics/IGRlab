@@ -144,6 +144,11 @@ public:
       subcell_recovery_(subcell_recovery)
   {
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
+    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi ||
+                  (sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage &&
+                   base_.GetVolumeMode() == VolumeMode::WeakDivergence),
+                "Fixed element-block Jacobi requires ordinary DG with "
+                "every-stage sigma updates.");
     MFEM_VERIFY(base_.GetModalDampingRate() == 0.0 ||
                   sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
                 "Modal damping with IGR requires a current stress solve "
@@ -309,6 +314,9 @@ public:
                    std::uint64_t restored_state_generation,
                    real_t retry_dt) override
   {
+    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi,
+                "Fixed element-block Jacobi does not support RK abort/retry: "
+                "its production sigma history is not transactional.");
     MFEM_VERIFY(rk_step_snapshot_.active,
                 "EulerWithIGR received an abort without an active RK step.");
     MFEM_VERIFY(restored_state.Size() == state_.Size(),
@@ -451,6 +459,10 @@ public:
   {
     MFEM_VERIFY(state.Size() == state_.Size(),
                 "Sigma output preparation received an unexpected state size.");
+    MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi ||
+                  !certify_residual,
+                "Fixed element-block Jacobi output is approximate and cannot "
+                "request an independent convergence certificate.");
     if (accepted_state_generation_ != kInvalidGeneration)
     {
       MFEM_VERIFY(state_generation == accepted_state_generation_,

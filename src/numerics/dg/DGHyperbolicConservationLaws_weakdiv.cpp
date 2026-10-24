@@ -5,6 +5,152 @@ namespace mfem
 {
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
+#include "DGHyperbolicConservationLaws_mapped_weakdiv.hpp"
+
+bool DGHyperbolicConservationLaws::BuildMappedWeakDivTensorData_()
+{
+  weakdiv_mapped_tensor_data_.reset();
+  const bool requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_DG_MAPPED_WEAKDIV_TENSOR", false);
+  if (!requested) { return false; }
+  const auto fallback = [](const char* reason)
+  {
+    if (mfem::Mpi::Root())
+      std::cout << "[dg-mapped-weakdiv] event=setup requested=1 selected=0 reason="
+                << reason << '\n';
+    return false;
+  };
+#if defined(MFEM_USE_CUDA) && defined(DG_IGR_HAS_ACCEL_FORALL)
+  const int ne = vfes.GetNE();
+  const auto* mesh = vfes.GetMesh();
+  if (sizeof(real_t) != sizeof(double) || dim != 2 || num_equations != 4 || !mesh || mesh->Dimension() != 2 ||
+      ne <= 0 || !invmass_apply_ready_ ||
+      !UsePackedDenseRows_(vfes, invmass_elem_dof_, num_equations))
+    { return fallback("backend-or-state-layout"); }
+  if (::igrlab::shared_reference::RequestedPrecision() !=
+        ::igrlab::shared_reference::Precision::Off)
+    { return fallback("shared-reference-selected"); }
+  const auto& flux = formIntegrator->GetFluxFunction();
+  const auto* igr = dynamic_cast<const FluxWithIGR*>(&flux);
+  if (!dynamic_cast<const EulerFlux*>(&flux) && !(igr && igr->HasEulerBase()))
+    { return fallback("non-euler-flux"); }
+  const auto& reference = *vfes.GetFE(0);
+  const auto* tensor = dynamic_cast<const TensorBasisElement*>(&reference);
+  const int n = reference.GetOrder() + 1, dof = n * n;
+  if (!tensor || tensor->GetBasisType() != BasisType::GaussLegendre ||
+      reference.GetGeomType() != Geometry::SQUARE ||
+      reference.GetMapType() != FiniteElement::VALUE ||
+      reference.GetRangeType() != FiniteElement::SCALAR ||
+      n < 2 || n > 8 || dof != invmass_elem_dof_ ||
+      reference.GetDof() != dof || reference.GetNodes().GetNPoints() != dof || mesh->NURBSext)
+    { return fallback("state-layout"); }
+  const auto& rule = GradientIntegrator::GetRule(reference, reference,
+    *vfes.GetElementTransformation(0));
+  const int q1d = static_cast<int>(std::sqrt(real_t(rule.GetNPoints())) + 0.5);
+  if (q1d < n || q1d > 10 || q1d * q1d != rule.GetNPoints() ||
+      std::size_t(ne) * q1d * q1d * 4 > std::size_t(std::numeric_limits<int>::max()))
+    { return fallback("native-quadrature-or-indexing"); }
+  auto data = std::make_shared<dg_igr_detail::MappedWeakDivTensorData>();
+  data->n = n; data->q = q1d; data->elements = ne;
+  data->space_sequence = vfes.GetSequence();
+  data->mesh_sequence = mesh->GetSequence();
+  data->nodes_sequence = mesh->GetNodesSequence();
+  data->lex_to_local.SetSize(dof);
+  auto* local = data->lex_to_local.HostWrite();
+  const auto& permutation = tensor->GetDofMap();
+  if (permutation.Size() && permutation.Size() != dof) { return fallback("node-permutation"); }
+  const auto& node_rule = IntRules.Get(Geometry::SEGMENT, 2 * reference.GetOrder() + 1);
+  if (node_rule.GetNPoints() != n) { return fallback("node-permutation"); }
+  std::vector<char> seen(static_cast<std::size_t>(dof), 0);
+  for (int j = 0; j < n; ++j) for (int i = 0; i < n; ++i)
+  {
+    const int lex = i + n * j, index = permutation.Size() ? permutation[lex] : lex;
+    if (index < 0 || index >= dof || seen[static_cast<std::size_t>(index)])
+      { return fallback("node-permutation"); }
+    seen[static_cast<std::size_t>(index)] = 1;
+    const auto& point = reference.GetNodes().IntPoint(index);
+    if (point.x != node_rule.IntPoint(i).x || point.y != node_rule.IntPoint(j).x)
+      { return fallback("node-permutation"); }
+    local[lex] = index;
+  }
+  data->basis.SetSize(n * q1d); data->derivative.SetSize(n * q1d);
+  auto* B = data->basis.HostWrite(); auto* G = data->derivative.HostWrite();
+  Vector shape1d(n), derivative1d(n), shape(dof);
+  DenseMatrix derivative(dof, 2);
+  for (int q = 0; q < q1d; ++q)
+  {
+    tensor->GetBasis1D().Eval(rule.IntPoint(q).x, shape1d, derivative1d);
+    for (int i = 0; i < n; ++i)
+    {
+      B[q + q1d * i] = shape1d[i];
+      G[q + q1d * i] = derivative1d[i];
+    }
+  }
+  const real_t tolerance = 128 * std::numeric_limits<real_t>::epsilon();
+  for (int qy = 0; qy < q1d; ++qy) for (int qx = 0; qx < q1d; ++qx)
+  {
+    const auto& point = rule.IntPoint(qx + q1d * qy);
+    if (point.x != rule.IntPoint(qx).x || point.y != rule.IntPoint(qy).x)
+      { return fallback("non-tensor-native-rule"); }
+    reference.CalcShape(point, shape); reference.CalcDShape(point, derivative);
+    for (int j = 0; j < n; ++j) for (int i = 0; i < n; ++i)
+    {
+      const int index = local[i + n * j];
+      const real_t b = B[qx + q1d * i] * B[qy + q1d * j];
+      const real_t gx = G[qx + q1d * i] * B[qy + q1d * j];
+      const real_t gy = B[qx + q1d * i] * G[qy + q1d * j];
+      if (!std::isfinite(b) || !std::isfinite(gx) || !std::isfinite(gy) ||
+          !std::isfinite(shape[index]) || !std::isfinite(derivative(index, 0)) || !std::isfinite(derivative(index, 1)) ||
+          std::abs(b - shape[index]) > tolerance * std::max(real_t(1), std::abs(b)) ||
+          std::abs(gx - derivative(index, 0)) > tolerance * std::max(real_t(1), std::abs(gx)) ||
+          std::abs(gy - derivative(index, 1)) > tolerance * std::max(real_t(1), std::abs(gy)))
+        { return fallback("basis-factorization"); }
+    }
+  }
+  data->weighted_adjugate.SetSize(ne * q1d * q1d * 4);
+  auto* geometry = data->weighted_adjugate.HostWrite();
+  DenseMatrix adjugate(2);
+  Array<int> dofs;
+  for (int e = 0; e < ne; ++e)
+  {
+    const auto& fe = *vfes.GetFE(e);
+    auto* tr = vfes.GetElementTransformation(e);
+    if (&fe != &reference || vfes.GetElementDofs(e, dofs) || dofs.Size() != dof ||
+        !tr || tr->Order() < 1 || tr->Order() > 2 ||
+        &GradientIntegrator::GetRule(fe, fe, *tr) != &rule)
+      { return fallback("geometry-or-nonuniform-rule"); }
+    for (int j = 0; j < dof; ++j)
+      if (dofs[j] < 0 || dofs[j] >= vfes.GetNDofs()) { return fallback("state-layout"); }
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      const auto& point = rule.IntPoint(q); tr->SetIntPoint(&point);
+      const auto& J = tr->Jacobian();
+      if (J.Height() != 2 || J.Width() != 2) { return fallback("geometry"); }
+      const real_t determinant = J(0, 0) * J(1, 1) - J(0, 1) * J(1, 0);
+      if (!std::isfinite(determinant) || determinant <= 0.0 ||
+          !std::isfinite(point.weight) || point.weight <= 0.0)
+        { return fallback("quadrature-geometry"); }
+      CalcAdjugate(J, adjugate);
+      for (int r = 0; r < 2; ++r) for (int d = 0; d < 2; ++d)
+      {
+        const real_t value = point.weight * adjugate(r, d);
+        if (!std::isfinite(value)) { return fallback("quadrature-geometry"); }
+        geometry[4 * (e * rule.GetNPoints() + q) + 2 * r + d] = value;
+      }
+    }
+  }
+  weakdiv_mapped_tensor_data_ = std::move(data);
+  if (mfem::Mpi::Root())
+    std::cout << "[dg-mapped-weakdiv] event=setup requested=1 selected=1 precision=fp64 n1d="
+              << n << " q1d=" << q1d << " elements=" << ne
+              << " quadrature=original-gradient-integrator flux=nodal-then-interpolate"
+              << " geometry=weighted-adjugate-per-quadrature validation=native-quadrature"
+              << " dense_matrix_entries=0 geometry_entries=" << ne * q1d * q1d * 4 << '\n';
+  return true;
+#else
+  return fallback("native-cuda-required");
+#endif
+}
 
 void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
 {
@@ -12,7 +158,7 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   weakdiv_volume_path_logged_ = false;
   face_data_dirty_ = true;
   weakdiv_elem_dof_ = 0;
-  if (weakdiv_reference_only_) { weakdiv_data_flat_.Destroy(); }
+  if (weakdiv_reference_only_ || weakdiv_mapped_tensor_data_) { weakdiv_data_flat_.Destroy(); }
   else { weakdiv_data_flat_.SetSize(0); }
   weakdiv_shared_map_.reset();
   weakdiv_shared_row_sums_.SetSize(0);
@@ -34,7 +180,7 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   weakdiv_sigma_elem_dof_map_.SetSize(0);
   weakdiv_sigma_interp_.Destroy();
 
-  if (weakdiv.empty() || !invmass_apply_ready_)
+  if (!HasPreassembledWeakDivergence_() || !invmass_apply_ready_)
   {
     return;
   }
@@ -46,41 +192,51 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
     return;
   }
 
-  const int matrix_count = weakdiv_reference_only_ ? 1 : ne;
-  MFEM_VERIFY(weakdiv.size() == static_cast<std::size_t>(matrix_count),
-              "Invalid weak-divergence matrix storage policy.");
-  for (int e = 0; e < matrix_count; ++e)
+  if (weakdiv_mapped_tensor_data_)
   {
-    MFEM_VERIFY(weakdiv[e].Height() == dof && weakdiv[e].Width() == dof * dim,
-                "Invalid weak-divergence block size for element " << e << ".");
+    MFEM_VERIFY(weakdiv.empty() && weakdiv_mapped_tensor_data_->n * weakdiv_mapped_tensor_data_->n == dof &&
+                  weakdiv_mapped_tensor_data_->elements == ne,
+                "Invalid mapped tensor weak-divergence storage.");
   }
-
-  if (!weakdiv_reference_only_)
+  else
   {
-    weakdiv_data_flat_.SetSize(ne * dof * dof * dim);
-    real_t* weak_flat = weakdiv_data_flat_.HostWrite();
-    for (int e = 0; e < ne; ++e)
+    const int matrix_count = weakdiv_reference_only_ ? 1 : ne;
+    MFEM_VERIFY(weakdiv.size() == static_cast<std::size_t>(matrix_count),
+                "Invalid weak-divergence matrix storage policy.");
+    for (int e = 0; e < matrix_count; ++e)
     {
-      const int eoff = e * dof * dof * dim;
-      for (int i = 0; i < dof; ++i)
+      MFEM_VERIFY(weakdiv[e].Height() == dof && weakdiv[e].Width() == dof * dim,
+                  "Invalid weak-divergence block size for element " << e << ".");
+    }
+
+    if (!weakdiv_reference_only_)
+    {
+      weakdiv_data_flat_.SetSize(ne * dof * dof * dim);
+      real_t* weak_flat = weakdiv_data_flat_.HostWrite();
+      for (int e = 0; e < ne; ++e)
       {
-        const int ioff = eoff + i * dof * dim;
+        const int eoff = e * dof * dof * dim;
+        // Pack the original physical block by columns once. Output-row CUDA
+        // threads then read adjacent matrix entries without a second copy.
         for (int j = 0; j < dof; ++j)
         {
-          const int joff = ioff + j * dim;
           for (int d = 0; d < dim; ++d)
           {
-            weak_flat[joff + d] = weakdiv[e](i, j * dim + d);
+            const int column_offset = eoff + (j * dim + d) * dof;
+            for (int i = 0; i < dof; ++i)
+            {
+              weak_flat[column_offset + i] = weakdiv[e](i, j * dim + d);
+            }
           }
         }
       }
     }
+    else
+      std::cout << "[dg-weakdiv-setup] storage=shared-reference matrix_instances=1 elements=" << ne
+                << " matrix_bytes=" << std::size_t(dof)*dof*dim*sizeof(real_t)
+                << " flat_entries=" << weakdiv_data_flat_.Size()
+                << " geometry=identical-affine local_basis=gauss-legendre" << std::endl;
   }
-  else
-    std::cout << "[dg-weakdiv-setup] storage=shared-reference matrix_instances=1 elements=" << ne
-              << " matrix_bytes=" << std::size_t(dof)*dof*dim*sizeof(real_t)
-              << " flat_entries=" << weakdiv_data_flat_.Size()
-              << " geometry=identical-affine local_basis=gauss-legendre" << std::endl;
 
   weakdiv_elem_dof_ = dof;
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(
@@ -376,13 +532,27 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
   const auto shared_precision = ::igrlab::shared_reference::RequestedPrecision();
   const bool shared = shared_precision != ::igrlab::shared_reference::Precision::Off;
+  const bool rows_admitted = UsePackedDenseRows_(vfes, dof, neq);
+  const bool dense_rows = !shared && rows_admitted;
+  const bool mapped_tensor_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_DG_MAPPED_WEAKDIV_TENSOR", false);
+  const bool mapped_tensor = bool(weakdiv_mapped_tensor_data_);
+  MFEM_VERIFY(!mapped_tensor || (mapped_tensor_requested && dense_rows && dim == 2 && neq == 4 &&
+                weakdiv_mapped_tensor_data_->elements == ne &&
+                weakdiv_mapped_tensor_data_->space_sequence == vfes.GetSequence() &&
+                weakdiv_mapped_tensor_data_->mesh_sequence == vfes.GetMesh()->GetSequence() &&
+                weakdiv_mapped_tensor_data_->nodes_sequence == vfes.GetMesh()->GetNodesSequence()),
+              "Rebuild the DG operator after changing mapped tensor weak-divergence storage, backend or geometry.");
+  const bool row_reuse_requested = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_DG_WEAKDIV_ROW_REUSE", false);
+  const bool row_reuse = row_reuse_requested && dense_rows && !mapped_tensor && dim == 2 && neq == 4;
   const bool fusion_requested = ::igrlab::EnvFlagEnabledDefault(
     "DG_IGR_SHARED_EULER_CONSERVATIVE_FUSION", false);
   const char* execution = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_FLUX_EXECUTION");
   const bool requested_pointwise = execution && std::string(execution) == "pointwise";
   MFEM_VERIFY(!execution || std::string(execution) == "element" || requested_pointwise,
               "SHARED_EULER_FLUX_EXECUTION must be element or pointwise.");
-  const bool pointwise = shared && requested_pointwise;
+  const bool pointwise = (shared && requested_pointwise) || dense_rows;
   if (shared)
   {
     MFEM_VERIFY(weakdiv_shared_flux_execution_ < 0 ||
@@ -637,7 +807,16 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               "Volume-node speed tracking is restricted to exact "
               "invariant-domain Euler+IGR fluxes.");
 
+  Vector state_copy;
 #ifdef DG_IGR_HAS_ACCEL_FORALL
+  if (dense_rows)
+  {
+    const std::size_t flux_entries = std::size_t(ne) * dof * dim * neq;
+    MFEM_VERIFY(flux_entries <= std::size_t(std::numeric_limits<int>::max()),
+                "Packed dense Euler flux scratch exceeds native indexing.");
+    weakdiv_shared_flux_.SetSize(static_cast<int>(flux_entries));
+    weakdiv_shared_flux_.UseDevice(true);
+  }
   if (track_volume_speed && weakdiv_volume_speed_.Size() != ne)
   {
     weakdiv_volume_speed_.SetSize(ne);
@@ -657,9 +836,19 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.track_volume_speed = track_volume_speed;
   kernel.sigma_exact_nodes = weakdiv_sigma_exact_nodes_;
   kernel.state_map = invmass_elem_vdof_map_.Read();
-  kernel.weakdiv = shared ? nullptr : weakdiv_data_flat_.Read();
+  kernel.weakdiv = (shared || mapped_tensor) ? nullptr : weakdiv_data_flat_.Read();
   kernel.x = x_in.Read();
-  kernel.z = shared ? nullptr : z_inout.ReadWrite();
+  kernel.z = (shared || dense_rows) ? nullptr : z_inout.ReadWrite();
+  // Two-pass row/shared execution reads all state before writing the residual.
+  // Only overlapping element execution needs a snapshot.
+  if (kernel.z && PackedPointersOverlap_(kernel.x, x_in.Size(),
+                                        kernel.z, z_inout.Size()))
+  {
+    state_copy.SetSize(x_in.Size());
+    state_copy.UseDevice(true);
+    state_copy = x_in;
+    kernel.x = state_copy.Read();
+  }
   kernel.volume_speed =
     track_volume_speed ? weakdiv_volume_speed_.Write() : nullptr;
   kernel.q_sigma_telemetry =
@@ -667,13 +856,13 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.sigma_map = sigma_map;
   kernel.sigma_interp = sigma_interp;
   kernel.sigma_vals = sigma_vals;
-  kernel.packed_flux = shared ? weakdiv_shared_flux_.Write() : nullptr;
+  kernel.packed_flux = (shared || dense_rows) ? weakdiv_shared_flux_.Write() : nullptr;
   if (pointwise)
   {
     // EvalNode_ may be called concurrently only for the independent packed
     // flux rows. The legacy fused residual scatter remains element-parallel.
     MFEM_VERIFY(kernel.packed_flux != nullptr,
-                "Pointwise DG flux preparation requires the shared packed output.");
+                "Pointwise DG flux preparation requires packed output scratch.");
     if (track_volume_speed && weakdiv_point_speed_.Size() != ne * dof)
     {
       weakdiv_point_speed_.SetSize(ne * dof);
@@ -691,7 +880,30 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   {
     mfem::forall(ne, kernel);
   }
-  if (conservative_fusion)
+  if (mapped_tensor)
+  {
+    const auto& data = *weakdiv_mapped_tensor_data_;
+    mfem::forall_2D(ne, data.q, data.q, dg_igr_detail::MappedWeakDivTensorKernel2D{
+      data.n, data.q, data.lex_to_local.Read(), invmass_elem_vdof_map_.Read(),
+      data.basis.Read(), data.derivative.Read(), data.weighted_adjugate.Read(),
+      weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+  }
+  else if (dense_rows)
+  {
+    if (row_reuse)
+    {
+      mfem::forall(ne * dof, PackedWeakDivRowReuseEulerKernel{
+        dof, invmass_elem_vdof_map_.Read(), weakdiv_data_flat_.Read(),
+        weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+    }
+    else
+    {
+      mfem::forall(ne * dof * neq, PackedWeakDivRowsKernel{
+        dof, neq, dim, invmass_elem_vdof_map_.Read(), weakdiv_data_flat_.Read(),
+        weakdiv_shared_flux_.Read(), z_inout.ReadWrite()});
+    }
+  }
+  else if (conservative_fusion)
   {
     weakdiv_shared_map_->ApplyDGConservativeFusion(
       weakdiv_shared_flux_, weakdiv_shared_column_sums_, weakdiv_shared_row_sums_,
@@ -723,6 +935,11 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   auto weak_flat = weakdiv_data_flat_.HostRead();
   auto xh = x_in.HostRead();
   auto zh = z_inout.HostReadWrite();
+  if (PackedPointersOverlap_(xh, x_in.Size(), zh, z_inout.Size()))
+  {
+    state_copy = x_in;
+    xh = state_copy.HostRead();
+  }
   auto sigma_map_h = weakdiv_sigma_elem_dof_map_.HostRead();
   auto sigma_interp_h = weakdiv_sigma_exact_nodes_ ? nullptr :
     weakdiv_sigma_interp_.HostRead();
@@ -815,12 +1032,12 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
 
       for (int i = 0; i < dof; ++i)
       {
-        const int wbase = weak_off + i * dof * dim + j * dim;
+        const int wbase = weak_off + i + dof * j * dim;
 
         real_t sum_rho = 0.0;
         for (int d = 0; d < dim; ++d)
         {
-          sum_rho += weak_flat[wbase + d] * mom[d];
+          sum_rho += weak_flat[wbase + dof * d] * mom[d];
         }
         zh[state_map[state_off + i * neq + 0]] += sum_rho;
 
@@ -839,7 +1056,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
                   TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
-            sum_m += weak_flat[wbase + d] * flux_md;
+            sum_m += weak_flat[wbase + dof * d] * flux_md;
           }
           zh[state_map[state_off + i * neq + (1 + m)]] += sum_m;
         }
@@ -854,7 +1071,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               TensorSigmaEnergyTermFromInverseDensity(
                 sigma_j, mom[d], inv_rho_sigma);
           }
-          sum_e += weak_flat[wbase + d] * flux_ed;
+          sum_e += weak_flat[wbase + dof * d] * flux_ed;
         }
         zh[state_map[state_off + i * neq + energy_eq]] += sum_e;
       }
@@ -872,8 +1089,17 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     std::cout << "[dg-device] event=weakdiv-volume-path"
               << " selected=" << (shared ? "shared-reference-" : "packed-mfem-forall-")
               << (use_sigma ? "euler-igr" : "euler")
-              << " flux_execution=" << (pointwise ? "pointwise" : "element")
-              << " backend=device\n";
+              << " flux_execution=" << (pointwise ? "pointwise" : "element");
+    if (!shared)
+    {
+      std::cout << " dense_execution=" << (mapped_tensor ? "tensor-mapped" : dense_rows ? "rows" : "element");
+    }
+    std::cout << " backend=device"
+              << " weakdiv_row_reuse_requested=" << int(row_reuse_requested)
+              << " weakdiv_row_reuse=" << int(row_reuse)
+              << " mapped_weakdiv_tensor_requested=" << int(mapped_tensor_requested)
+              << " mapped_weakdiv_tensor=" << int(mapped_tensor)
+              << '\n';
     weakdiv_volume_path_logged_ = true;
   }
   return track_volume_speed
@@ -886,10 +1112,12 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
   const Vector& x_in,
   Vector& z_inout) const
 {
-  if (weakdiv.empty())
+  if (!HasPreassembledWeakDivergence_())
   {
     return 0.0;
   }
+  MFEM_VERIFY(!weakdiv_mapped_tensor_data_ || Device::Allows(Backend::CUDA),
+              "Mapped tensor weak divergence requires CUDA; rebuild after changing the backend.");
   MFEM_VERIFY(!weakdiv_reference_only_ || Device::Allows(Backend::CUDA_MASK),
               "Reference-only DG weak divergence requires its CUDA tensor-line backend.");
 
@@ -1205,6 +1433,12 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
 //
 void DGHyperbolicConservationLaws::ComputeWeakDivergence()
 {
+  if (BuildMappedWeakDivTensorData_())
+  {
+    weakdiv_reference_only_ = false;
+    std::vector<DenseMatrix>().swap(weakdiv);
+    return;
+  }
   const char* layout = ::igrlab::GetEnv("DG_IGR_SHARED_EULER_LAYOUT");
   const bool reference_only = layout && std::string(layout) == "tensor-lines";
   if (reference_only)
