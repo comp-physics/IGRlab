@@ -70,7 +70,8 @@ bool StandardStateElement(const mfem::FiniteElement& fe)
     fe.GetDim() == 2 && fe.GetOrder() == 5 && fe.GetDof() == ndof &&
     fe.GetGeomType() == mfem::Geometry::SQUARE &&
     fe.GetMapType() == mfem::FiniteElement::VALUE &&
-    tensor->GetBasisType() == mfem::BasisType::GaussLegendre;
+    (tensor->GetBasisType() == mfem::BasisType::GaussLegendre ||
+     tensor->GetBasisType() == mfem::BasisType::GaussLobatto);
 }
 
 bool StandardGeometryElement(const mfem::FiniteElement& fe)
@@ -402,7 +403,7 @@ bool BuildReferenceData(const mfem::ParFiniteElementSpace& ufes,
   const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(fe);
   if (!fec || typeid(*fec) != typeid(mfem::L2_FECollection) ||
       !fe || !StandardStateElement(*fe))
-  { return Reject(reason, "requires-builtin-p5-gl-l2-quads"); }
+  { return Reject(reason, "requires-builtin-p5-gl-or-gll-l2-quads"); }
   const auto& lex = tensor->GetDofMap();
   if (lex.Size() != 0 && lex.Size() != ndof)
   { return Reject(reason, "unsupported-l2-element-permutation"); }
@@ -454,6 +455,8 @@ bool BuildReferenceData(const mfem::ParFiniteElementSpace& ufes,
   cache.basis.SetSize(basis_size); cache.basis.UseDevice(true);
   double* out = cache.basis.HostWrite();
   cache.identity_b6 = true;
+  // State nodes may be GL or GLL. Retain the actual map onto the original
+  // GL6 diffusion/source rule; GLL state takes the nonidentity B6 kernel.
   for (int i = 0; i < ndof; ++i)
   {
     if (!std::isfinite(br[i]) || !std::isfinite(gr[i]) ||
@@ -499,7 +502,7 @@ bool TryUpdateFusedStageCoefficientsCUDA(
   const auto* current_fe = ufes.GetFE(0);
   if (!ufes.FEColl() || typeid(*ufes.FEColl()) != typeid(mfem::L2_FECollection) ||
       !current_fe || !StandardStateElement(*current_fe))
-  { return Reject(reason, "requires-builtin-p5-gl-l2-quads"); }
+  { return Reject(reason, "requires-builtin-p5-gl-or-gll-l2-quads"); }
   if (!CheckGeometrySpace(*mesh, reason)) { return false; }
   int ranks = 0; MPI_Comm_size(ufes.GetComm(), &ranks);
   if (ranks != 1) { return Reject(reason, "requires-one-mpi-rank"); }

@@ -81,13 +81,14 @@ void DeviceUpdate(mfem::ParGridFunction& field)
 }
 
 void CheckInterpolation(int geometry_order, int order, int dimension,
-                         mfem::Ordering::Type ordering, bool continuous)
+                         mfem::Ordering::Type ordering, bool continuous,
+                         int basis = mfem::BasisType::GaussLegendre)
 {
   auto serial = Mesh(geometry_order, dimension);
   mfem::ParMesh mesh(MPI_COMM_SELF, serial);
   std::unique_ptr<mfem::FiniteElementCollection> fec;
   if (continuous) { fec = std::make_unique<mfem::H1_FECollection>(order, dimension); }
-  else { fec = std::make_unique<mfem::L2_FECollection>(order, dimension); }
+  else { fec = std::make_unique<mfem::L2_FECollection>(order, dimension, basis); }
   for (int components : {1, dimension})
   {
     mfem::ParFiniteElementSpace fes(&mesh, fec.get(), components, ordering);
@@ -167,12 +168,13 @@ std::map<std::string, std::vector<double>> Arrays(const std::filesystem::path& p
 }
 
 void CheckWriter(const std::filesystem::path& prefix, bool direct_pressure,
-                  mfem::Ordering::Type ordering)
+                  mfem::Ordering::Type ordering,
+                  int basis = mfem::BasisType::GaussLegendre)
 {
   Environment pressure_policy("IGRLAB_VTK_PRESSURE_COEFFICIENT", direct_pressure ? "1" : "0");
   auto serial = Mesh(2, 2, 1); // The same element number is reused across saves.
   mfem::ParMesh mesh(MPI_COMM_SELF, serial);
-  mfem::L2_FECollection fec(5, 2), zero(0, 2);
+  mfem::L2_FECollection fec(5, 2, basis), zero(0, 2);
   mfem::ParFiniteElementSpace scalar_fes(&mesh, &fec), vector_fes(&mesh, &fec, 2, ordering),
     conservative_fes(&mesh, &fec, 4, ordering), zero_fes(&mesh, &zero);
   mfem::ParGridFunction density(&scalar_fes), momentum(&vector_fes), energy(&scalar_fes),
@@ -262,7 +264,11 @@ int main(int argc, char** argv)
       for (int order : {0, 1, 3, 5})
       {
         CheckInterpolation(geometry, order, 2, ordering, false);
-        if (order) { CheckInterpolation(geometry, order, 2, ordering, true); }
+        if (order)
+        {
+          CheckInterpolation(geometry, order, 2, ordering, true);
+          CheckInterpolation(geometry, order, 2, ordering, false, mfem::BasisType::GaussLobatto);
+        }
       }
   CheckInterpolation(2, 2, 3, mfem::Ordering::byVDIM, false);
   const auto token = std::chrono::high_resolution_clock::now().time_since_epoch().count();
@@ -273,6 +279,7 @@ int main(int argc, char** argv)
     {
       const auto output = root/(std::string(direct ? "direct-" : "projected-")+std::to_string(int(ordering)));
       CheckWriter(output, direct, ordering);
+      CheckWriter(output.string()+"-gll", direct, ordering, mfem::BasisType::GaussLobatto);
     }
   std::filesystem::remove_all(root);
   std::cout << "VTK cached interpolation: native scalar/vector/pressure oracles and repeated Save passed.\n";

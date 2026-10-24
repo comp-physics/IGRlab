@@ -148,7 +148,8 @@ inline bool BuildTensorData(const mfem::FiniteElementSpace& vfes,
   {
     const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
     return typeid(fe) == typeid(mfem::L2_QuadrilateralElement) && tensor &&
-      tensor->GetBasisType() == mfem::BasisType::GaussLegendre &&
+      (tensor->GetBasisType() == mfem::BasisType::GaussLegendre ||
+       tensor->GetBasisType() == mfem::BasisType::GaussLobatto) &&
       fe.GetOrder() == order && fe.GetDof() == dof && fe.GetNodes().Size() == dof &&
       fe.GetGeomType() == mfem::Geometry::SQUARE &&
       fe.GetMapType() == mfem::FiniteElement::VALUE &&
@@ -157,14 +158,18 @@ inline bool BuildTensorData(const mfem::FiniteElementSpace& vfes,
   const auto& reference = *vfes.GetFE(0);
   const auto& scalar_reference = *sfes.GetFE(0);
   if (!valid_fe(reference) || !valid_fe(scalar_reference))
-    { return reject("requires-p5-gl-l2"); }
-  const auto& line_rule = mfem::IntRules.Get(mfem::Geometry::SEGMENT, 2 * order + 1);
+    { return reject("requires-p5-gl-or-gll-l2"); }
+  // Face integration stays GL6 independently of either field's native nodes.
+  // Density uses the state basis; scalar trace layout is validated separately.
+  mfem::IntegrationRules gl_rules(0, mfem::Quadrature1D::GaussLegendre);
+  mfem::IntegrationRules gll_rules(0, mfem::Quadrature1D::GaussLobatto);
+  const auto& face_rule = gl_rules.Get(mfem::Geometry::SEGMENT, 2 * order + 1);
   const auto rule_matches = [&](const mfem::IntegrationRule& rule)
   {
-    if (rule.GetNPoints() != n || line_rule.GetNPoints() != n) { return false; }
+    if (rule.GetNPoints() != n || face_rule.GetNPoints() != n) { return false; }
     for (int q = 0; q < n; ++q)
-      if (rule.IntPoint(q).x != line_rule.IntPoint(q).x ||
-          rule.IntPoint(q).weight != line_rule.IntPoint(q).weight) { return false; }
+      if (rule.IntPoint(q).x != face_rule.IntPoint(q).x ||
+          rule.IntPoint(q).weight != face_rule.IntPoint(q).weight) { return false; }
     return true;
   };
   if (fqs.GetFaceType() != mfem::FaceType::Interior || fqs.GetNE() <= 0 ||
@@ -180,7 +185,11 @@ inline bool BuildTensorData(const mfem::FiniteElementSpace& vfes,
   for (int field = 0; field < 2; ++field)
   {
     const auto& fe = field ? scalar_reference : reference;
-    const auto& permutation = dynamic_cast<const mfem::TensorBasisElement&>(fe).GetDofMap();
+    const auto& tensor = dynamic_cast<const mfem::TensorBasisElement&>(fe);
+    const auto& permutation = tensor.GetDofMap();
+    const auto& node_rule = tensor.GetBasisType() == mfem::BasisType::GaussLobatto
+      ? gll_rules.Get(mfem::Geometry::SEGMENT, 2 * order - 1) : face_rule;
+    if (node_rule.GetNPoints() != n) { return reject("native-node-map"); }
     if (permutation.Size() && permutation.Size() != dof) { return reject("native-node-map"); }
     std::array<bool, dof> used{};
     for (int j = 0; j < n; ++j) for (int i = 0; i < n; ++i)
@@ -190,7 +199,7 @@ inline bool BuildTensorData(const mfem::FiniteElementSpace& vfes,
         { return reject("native-node-map"); }
       used[static_cast<std::size_t>(native)] = true;
       const auto& point = fe.GetNodes().IntPoint(native);
-      if (point.x != line_rule.IntPoint(i).x || point.y != line_rule.IntPoint(j).x)
+      if (point.x != node_rule.IntPoint(i).x || point.y != node_rule.IntPoint(j).x)
         { return reject("native-node-map"); }
       if (!field) { local[static_cast<std::size_t>(lex)] = native; }
     }
@@ -247,7 +256,9 @@ inline bool BuildTensorData(const mfem::FiniteElementSpace& vfes,
           { return reject("geometry"); }
   }
 
-  mfem::L2_FECollection line_collection(order, 1, mfem::BasisType::GaussLegendre);
+  const int state_basis =
+    dynamic_cast<const mfem::TensorBasisElement&>(reference).GetBasisType();
+  mfem::L2_FECollection line_collection(order, 1, state_basis);
   const auto& line = *line_collection.FiniteElementForGeometry(mfem::Geometry::SEGMENT);
   mfem::Vector line_shape(n), shape(dof);
   data.endpoints.SetSize(2 * n);
@@ -280,8 +291,8 @@ inline bool BuildTensorData(const mfem::FiniteElementSpace& vfes,
                      first.y == 0.0 ? 2 : first.y == 1.0 ? 3 : -1;
     if (side < 0) { return false; }
     const auto t0 = side < 2 ? first.y : first.x;
-    const bool reverse = std::abs(t0 - line_rule.IntPoint(n - 1).x) <
-                         std::abs(t0 - line_rule.IntPoint(0).x);
+    const bool reverse = std::abs(t0 - face_rule.IntPoint(n - 1).x) <
+                         std::abs(t0 - face_rule.IntPoint(0).x);
     const int signature = 2 * side + static_cast<int>(reverse);
     const int e = second ? tr.Elem2No : tr.Elem1No;
     if (e < 0 || e >= ne) { return false; }

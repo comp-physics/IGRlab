@@ -2164,12 +2164,19 @@ inline std::string ValidateFixedElementJacobiIGRSelection(
   }
   const std::string prefix =
     "--igr-solve-mode element-block-jacobi requires ";
+  const bool ordinary_dg = run_cfg.discretization == Discretization::DG &&
+    run_cfg.dg_backend == DGBackend::DG;
+  const bool dgsem = run_cfg.discretization == Discretization::DGSEM &&
+    run_cfg.dg_backend == DGBackend::DGSEM;
   if (run_cfg.regularization != Regularization::IGR ||
-      run_cfg.discretization != Discretization::DG ||
-      run_cfg.dg_backend != DGBackend::DG ||
-      run_cfg.device_backend != DeviceBackend::CUDA)
+      !(ordinary_dg || dgsem) || run_cfg.device_backend != DeviceBackend::CUDA)
   {
-    return prefix + "active IGR with ordinary DG on CUDA.";
+    return prefix + "active IGR with DG or DGSEM on CUDA.";
+  }
+  if (dgsem && !tensor)
+  {
+    return prefix + "--igr-jacobi-blocks tensor for DGSEM; the local inverse "
+           "must separately admit its actual nodal basis and geometry.";
   }
   if (!IsL2IGRSpaceName(run_cfg.igr_opts.space) ||
       !IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ||

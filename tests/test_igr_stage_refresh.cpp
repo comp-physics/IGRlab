@@ -28,6 +28,17 @@ using mfem::real_t;
 namespace algebra = ::igrlab::frozen_scalar_igr_algebra;
 namespace internal = ::igrlab::igr_internal;
 
+const char* BasisName(int basis)
+{
+  return basis == mfem::BasisType::GaussLobatto ? "GLL" : "GL";
+}
+
+int OtherBasis(int basis)
+{
+  return basis == mfem::BasisType::GaussLobatto
+    ? mfem::BasisType::GaussLegendre : mfem::BasisType::GaussLobatto;
+}
+
 class ScopedEnv
 {
 public:
@@ -359,23 +370,42 @@ void CheckVolumeRejections(Checks& checks, mfem::ParMesh& mesh,
   const auto& eight = mfem::IntRules.Get(mfem::Geometry::SQUARE, 14);
   mfem::QuadratureSpace wrong_size(mesh, eight);
   reject(fes, state, wrong_size, diff_qs, "unsupported mass quadrature size");
-  mfem::L2_FECollection p4(4, 2, mfem::BasisType::GaussLegendre);
+  // DGSEM's Euler mass uses native GLL nodes. IGR must retain its original
+  // GL7 mass rule, even for GLL state and a same-sized GLL7 alternative.
+  mfem::IntegrationRules gll_rules(0, mfem::Quadrature1D::GaussLobatto);
+  mfem::QuadratureSpace euler_mass(
+    mesh, gll_rules.Get(mfem::Geometry::SQUARE, 9));
+  reject(fes, state, euler_mass, diff_qs, "Euler collocated GLL6 mass");
+  mfem::QuadratureSpace gll7_mass(
+    mesh, gll_rules.Get(mfem::Geometry::SQUARE, 11));
+  reject(fes, state, gll7_mass, diff_qs, "same-sized GLL7 mass rule");
+  mfem::QuadratureSpace gll6_diff(
+    mesh, gll_rules.Get(mfem::Geometry::SQUARE, 9));
+  reject(fes, state, mass_qs, gll6_diff, "GLL6 diffusion rule");
+  const int basis = dynamic_cast<const mfem::TensorBasisElement&>(*fes.GetFE(0)).GetBasisType();
+  mfem::L2_FECollection p4(4, 2, basis);
   mfem::ParFiniteElementSpace p4_fes(&mesh, &p4, 4, fes.GetOrdering());
   mfem::ParGridFunction p4_state(&p4_fes);
   mfem::Vector unused_alpha;
   FillState(p4_fes, p4_state, unused_alpha, 0);
   reject(p4_fes, p4_state, mass_qs, diff_qs, "unsupported state polynomial order");
+  mfem::L2_FECollection uniform(5, 2, mfem::BasisType::OpenUniform);
+  mfem::ParFiniteElementSpace uniform_fes(&mesh, &uniform, 4, fes.GetOrdering());
+  mfem::ParGridFunction uniform_state(&uniform_fes);
+  FillState(uniform_fes, uniform_state, unused_alpha, 0);
+  reject(uniform_fes, uniform_state, mass_qs, diff_qs, "unsupported state nodal basis");
 }
 
-void CheckVolume(Checks& checks)
+void CheckVolume(Checks& checks, int basis)
 {
-  // Two bounded cohorts cover both component layouts and both density-floor
-  // branches. All have the physical Q2 geometry and p5 / 7,6,6-point rules.
+  // GL and GLL state cohorts retain the same Q2 geometry and actual IGR
+  // GL7/GL6/GL6 rules, both component layouts and both density-floor branches.
+  const std::string cohort = std::string(BasisName(basis)) + " p5/Q2";
   for (const auto ordering : {mfem::Ordering::byVDIM, mfem::Ordering::byNODES})
   {
     auto serial = MakeMesh();
     mfem::ParMesh mesh(MPI_COMM_SELF, serial);
-    mfem::L2_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+    mfem::L2_FECollection fec(5, 2, basis);
     mfem::ParFiniteElementSpace fes(&mesh, &fec, 4, ordering);
     mfem::ParGridFunction state(&fes);
     mfem::Vector alpha;
@@ -386,9 +416,19 @@ void CheckVolume(Checks& checks)
     mfem::QuadratureSpace mass_qs(mesh, mass_ir), diff_qs(mesh, diff_ir), rhs_qs(mesh, diff_ir);
     checks.True(mass_ir.GetNPoints() == 49 && diff_ir.GetNPoints() == 36,
                 "p5/Q2 fixture has 7-point mass and 6-point diffusion/RHS rules");
+    if (basis == mfem::BasisType::GaussLobatto)
+    {
+      const auto& map = fes.GetFE(0)->GetDofToQuad(diff_ir, mfem::DofToQuad::TENSOR);
+      real_t nonidentity = 0.0;
+      const real_t* b = map.B.HostRead();
+      for (int i = 0; i < 36; ++i)
+      { nonidentity = std::max(nonidentity, std::abs(b[i] - real_t(i%6 == i/6))); }
+      checks.True(map.ndof == 6 && map.nqpt == 6 && nonidentity > .1,
+                  "GLL state requires the nonidentity map onto GL6 source/diffusion points");
+    }
     std::shared_ptr<internal::FusedStageCoefficientCache> cache;
     const auto initial = RunVolume(checks, fes, state, mass_qs, diff_qs, rhs_qs,
-                                   .007, nullptr, cache, "cold p5/Q2", under_floor);
+                                   .007, nullptr, cache, "cold " + cohort, under_floor);
     if (!under_floor && initial.src.Size())
     {
       real_t minimum = 0.0;
@@ -402,13 +442,13 @@ void CheckVolume(Checks& checks)
     checks.True(!state.GetMemory().HostIsValid() && !alpha.GetMemory().HostIsValid(),
                 "warm volume fixture supplies device-current state and local alpha");
     const auto current = RunVolume(checks, fes, state, mass_qs, diff_qs, rhs_qs,
-                                   .009, &alpha, cache, "warm changed device state/local alpha", under_floor);
+                                   .009, &alpha, cache, cohort + " warm changed device state/local alpha", under_floor);
     checks.True(!SameBits(initial.src, current.src) && !SameBits(initial.ck, current.ck),
                 "warm volume refresh consumes changed state and per-element alpha");
     auto energy_increment = StateIncrement(fes, true);
     state.Add(1.0, energy_increment);
     const auto changed_energy = RunVolume(checks, fes, state, mass_qs, diff_qs, rhs_qs,
-                                          .009, &alpha, cache, "energy-only update");
+                                          .009, &alpha, cache, cohort + " energy-only update");
     checks.True(SameBits(current.invrho, changed_energy.invrho) &&
                   SameBits(current.ck, changed_energy.ck) && SameBits(current.src, changed_energy.src),
                 "volume coefficients do not consume conservative energy or gamma");
@@ -423,21 +463,24 @@ void CheckVolume(Checks& checks)
       });
       mesh.NodesUpdated();
       const auto moved = RunVolume(checks, fes, state, mass_qs, diff_qs, rhs_qs,
-                                    .009, &alpha, cache, "updated Q2 geometry");
+                                    .009, &alpha, cache, cohort + " updated Q2 geometry");
       checks.True(!SameBits(before_geometry, moved.src),
                   "geometry update changes physical derivatives on unchanged state dofs");
       std::shared_ptr<internal::FusedStageCoefficientCache> fresh;
       const auto rebuilt = RunVolume(checks, fes, state, mass_qs, diff_qs, rhs_qs,
-                                      .009, &alpha, fresh, "fresh updated-geometry cache");
+                                      .009, &alpha, fresh, cohort + " fresh updated-geometry cache");
       checks.Near(moved.src, rebuilt.src, 1e-14, "reused/fresh geometry cache source");
       CheckVolumeRejections(checks, mesh, fes, state, mass_qs, diff_qs, rhs_qs, cache);
       RunVolume(checks, fes, state, mass_qs, diff_qs, rhs_qs,
-                 .009, &alpha, cache, "valid refresh after rejections");
-      mfem::ParFiniteElementSpace replacement(&mesh, &fec, 4, ordering);
+                 .009, &alpha, cache, cohort + " valid refresh after rejections");
+      mfem::L2_FECollection replacement_fec(5, 2, OtherBasis(basis));
+      mfem::ParFiniteElementSpace replacement(&mesh, &replacement_fec, 4, ordering);
       mfem::ParGridFunction replacement_state(&replacement);
       FillState(replacement, replacement_state, alpha, 0);
+      const auto old_cache = cache;
       RunVolume(checks, replacement, replacement_state, mass_qs, diff_qs, rhs_qs,
-                 .009, &alpha, cache, "replacement state finite-element space");
+                 .009, &alpha, cache, cohort + " replacement state space and nodal basis");
+      checks.True(cache != old_cache, "changing GL/GLL state basis rebuilds the volume reference cache");
     }
   }
 }
@@ -506,6 +549,22 @@ mfem::Vector RunFace(Checks& checks, mfem::ParFiniteElementSpace& fes,
   {
     checks.True(cache.work.shape.Size() == 0 && cache.work.element_vdof_map.Size() == 0,
                 label + " retains no dense per-face shape or per-component vdof map");
+    if (dynamic_cast<const mfem::TensorBasisElement&>(*fes.GetFE(0)).GetBasisType() ==
+        mfem::BasisType::GaussLobatto)
+    {
+      const auto* prepared =
+        dynamic_cast<const internal::face_density_detail::QuadratureSpace*>(&fqs);
+      checks.True(prepared && prepared->tensor,
+                  label + " retains its tensor reference data");
+      if (prepared && prepared->tensor)
+      {
+        const auto& sparse = prepared->tensor->tangent_sparse;
+        const int* values = sparse.HostRead();
+        checks.True(sparse.Size() == 8 &&
+                      std::all_of(values, values+sparse.Size(), [](int value) { return value == 0; }),
+                    label + " GLL state uses dense tangential interpolation onto GL6 faces");
+      }
+    }
   }
   const auto info = internal::ProjectInteriorFaceDensityCoefficientCUDA(
     fes, fqs, state, .007, alpha, .1, cache.side_q, cache.work, &cache.info);
@@ -518,13 +577,14 @@ mfem::Vector RunFace(Checks& checks, mfem::ParFiniteElementSpace& fes,
   return mfem::Vector(cache.side_q);
 }
 
-void CheckFace(Checks& checks)
+void CheckFace(Checks& checks, int basis)
 {
+  const std::string cohort = std::string(BasisName(basis)) + " p5/Q2 face";
   for (const auto ordering : {mfem::Ordering::byVDIM, mfem::Ordering::byNODES})
   {
     auto serial = MakeMesh();
     mfem::ParMesh mesh(MPI_COMM_SELF, serial);
-    mfem::L2_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+    mfem::L2_FECollection fec(5, 2, basis);
     mfem::ParFiniteElementSpace fes(&mesh, &fec, 4, ordering), sfes(&mesh, &fec);
     mfem::ParGridFunction state(&fes);
     mfem::Vector alpha;
@@ -544,12 +604,12 @@ void CheckFace(Checks& checks)
       {
         ScopedEnv execution("IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor");
         tensor = RunFace(checks, fes, sfes, state, rule, local, tensor_cache,
-                         true, "tensor p5/Q2 face", true);
+                         true, "tensor " + cohort, true);
       }
       {
         ScopedEnv execution("IGRLAB_IGR_FACE_DENSITY_EXECUTION", "dense");
         dense = RunFace(checks, fes, sfes, state, rule, local, dense_cache,
-                        false, "dense p5/Q2 face", true);
+                        false, "dense " + cohort, true);
       }
       checks.Near(tensor, dense, 3e-12, "dense/tensor face coefficient parity");
       if (update)
@@ -558,6 +618,31 @@ void CheckFace(Checks& checks)
     }
     checks.True(tensor_cache.rebuilds == 1 && tensor_cache.hits == 1,
                 "changed state and alpha reuse tensor face geometry");
+    {
+      // DGSEM state defaults to GLL while sigma can retain GL. Density
+      // interpolation must follow state nodes independently of scalar nodes.
+      ScopedEnv execution("IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor");
+      mfem::L2_FECollection other_fec(5, 2, OtherBasis(basis));
+      mfem::ParFiniteElementSpace other_sfes(&mesh, &other_fec);
+      internal::FaceDensityCUDAProjectionCache mixed_cache;
+      const auto mixed = RunFace(checks, fes, other_sfes, state, rule, &alpha,
+                                  mixed_cache, true, cohort + " mixed scalar basis");
+      checks.Near(mixed, tensor_cache.side_q, 1e-14,
+                  "changing only scalar nodal basis preserves side density coefficients");
+      mfem::ParFiniteElementSpace other_fes(&mesh, &other_fec, 4, ordering);
+      mfem::ParGridFunction other_state(&other_fes);
+      mfem::Vector other_alpha;
+      FillState(other_fes, other_state, other_alpha, 2);
+      auto delta = StateIncrement(other_fes, false);
+      other_state.Add(.23, delta); other_alpha *= 1.07;
+      checks.True(!other_state.GetMemory().HostIsValid() &&
+                    !other_alpha.GetMemory().HostIsValid(),
+                  "changed face basis fixture supplies device-current state and alpha");
+      RunFace(checks, other_fes, sfes, other_state, rule, &other_alpha,
+               mixed_cache, true, cohort + " replacement state basis and scalar space");
+      checks.True(mixed_cache.rebuilds == 2,
+                  "changing GL/GLL state and scalar bases rebuilds tensor face cache");
+    }
     if (ordering == mfem::Ordering::byVDIM)
     {
       ScopedEnv execution("IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor");
@@ -612,7 +697,7 @@ void CheckFace(Checks& checks)
                    3e-12, "uncached generic CUDA face fallback");
       checks.True(work.shape.Size() > 0 && work.element_vdof_map.Size() > 0,
                   "uncached request retains the generic dense implementation");
-      mfem::L2_FECollection p4(4, 2, mfem::BasisType::GaussLegendre);
+      mfem::L2_FECollection p4(4, 2, basis);
       mfem::ParFiniteElementSpace p4_fes(&mesh, &p4, 4, ordering), p4_sfes(&mesh, &p4);
       mfem::ParGridFunction p4_state(&p4_fes);
       FillState(p4_fes, p4_state, alpha, 2);
@@ -621,11 +706,17 @@ void CheckFace(Checks& checks)
                false, "p4 generic CUDA face fallback");
       checks.True(!unsupported.TensorFallbackReason().empty(),
                   "unsupported face order explains tensor fallback");
+      mfem::L2_FECollection uniform(5, 2, mfem::BasisType::OpenUniform);
+      mfem::ParFiniteElementSpace uniform_sfes(&mesh, &uniform);
+      RunFace(checks, fes, uniform_sfes, state, rule, &alpha, unsupported,
+               false, "unsupported scalar nodal basis generic CUDA face fallback");
+      checks.True(!unsupported.TensorFallbackReason().empty(),
+                  "unsupported scalar nodal basis explains tensor fallback");
     }
   }
 }
 
-void CheckSharedFaceFallback(Checks& checks)
+void CheckSharedFaceFallback(Checks& checks, int basis)
 {
   if (mfem::Mpi::WorldSize() < 2) { return; }
   ScopedEnv execution("IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor");
@@ -633,7 +724,7 @@ void CheckSharedFaceFallback(Checks& checks)
     4*mfem::Mpi::WorldSize(), 2, mfem::Element::QUADRILATERAL, true, 1.2, .9);
   serial.SetCurvature(2, false, 2, mfem::Ordering::byVDIM);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
-  mfem::L2_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  mfem::L2_FECollection fec(5, 2, basis);
   mfem::ParFiniteElementSpace fes(&mesh, &fec, 4), sfes(&mesh, &fec);
   mfem::ParGridFunction state(&fes);
   mfem::Vector alpha;
@@ -694,7 +785,7 @@ std::string UpdateSolver(::igrlab::IGRSolver& solver,
   return output.str();
 }
 
-void CheckSolver(Checks& checks)
+void CheckSolver(Checks& checks, int basis)
 {
   ScopedEnv partial("IGRLAB_IGR_PARTIAL_ASSEMBLY", "1");
   ScopedEnv qf("IGRLAB_IGR_DEVICE_QF", "1");
@@ -711,7 +802,7 @@ void CheckSolver(Checks& checks)
   ScopedEnv operator_order("IGRLAB_IGR_OPERATOR_QUADRATURE_MIN_ORDER", "0");
   auto serial = MakeMesh();
   mfem::ParMesh mesh(MPI_COMM_SELF, serial);
-  mfem::L2_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  mfem::L2_FECollection fec(5, 2, basis);
   mfem::ParFiniteElementSpace fes(&mesh, &fec, 4), sfes(&mesh, &fec);
   mfem::ParGridFunction state(&fes);
   mfem::Vector alpha;
@@ -786,10 +877,13 @@ int main(int argc, char** argv)
   mfem::Device device(backend.c_str());
   MFEM_VERIFY(mfem::Device::Allows(mfem::Backend::CUDA), "CUDA backend is not active.");
   Checks checks;
-  CheckVolume(checks);
-  CheckFace(checks);
-  CheckSharedFaceFallback(checks);
-  CheckSolver(checks);
+  for (const int basis : {mfem::BasisType::GaussLegendre, mfem::BasisType::GaussLobatto})
+  {
+    CheckVolume(checks, basis);
+    CheckFace(checks, basis);
+    CheckSharedFaceFallback(checks, basis);
+    CheckSolver(checks, basis);
+  }
   int failures = checks.failures;
   MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   if (mfem::Mpi::WorldRank() == 0)

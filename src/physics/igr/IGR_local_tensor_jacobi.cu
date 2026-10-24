@@ -13,6 +13,7 @@
 #include <limits>
 #include <numeric>
 #include <type_traits>
+#include <typeinfo>
 #include <unordered_map>
 #include <vector>
 
@@ -385,7 +386,7 @@ public:
                   space.GetTrueVSize() == height &&
                   mfem::IsIdentityProlongation(space.GetProlongationMatrix()) &&
                   mfem::IsIdentityProlongation(space.GetRestrictionTransposeOperator()),
-                "Local tensor Jacobi requires rank-one native CUDA, uniform scalar GL L2 quads, "
+                "Local tensor Jacobi requires rank-one native CUDA, uniform scalar tensor L2 quads, "
                 "D1D <= 8 and an identity true/local map.");
     MFEM_VERIFY(std::size_t(ne_) * dof_ * dof_ <= std::size_t(std::numeric_limits<int>::max()) &&
                   (reference_ == TensorReference::Projected || invrho.Size() == height),
@@ -664,11 +665,13 @@ private:
     const int dense_classes = UsesDenseClasses(execution_) ? class_count : 0;
     const bool projected = reference_ == TensorReference::Projected;
     const bool grouped = grouped_classes_.Size() > 0;
+    const auto& tensor = dynamic_cast<const mfem::TensorBasisElement&>(*space_.GetFE(0));
     std::cout << "[igr-local-tensor-jacobi] event=setup precision=" << PrecisionName(execution_)
               << " execution=" << (UsesTensorCores(execution_) ? "wmma" : "simt")
               << " backend=" << ExecutionName(execution_)
               << " tensor_core=" << int(UsesTensorCores(execution_))
               << " reference=" << ReferenceName(reference_)
+              << " nodes=" << (tensor.GetBasisType() == mfem::BasisType::GaussLegendre ? "gl" : "gll")
               << " d1d=" << axis_ << " elements=" << ne_ << " factor_classes=" << class_count
               << " coefficient_policy=" << (projected ? "current-mass-diagonal" : "current-collocated-mass")
               << " initial_blocks=exact-sipg"
@@ -849,17 +852,19 @@ private:
   {
     const auto& fe = *space_.GetFE(0);
     const auto* tensor = dynamic_cast<const mfem::NodalTensorFiniteElement*>(&fe);
-    MFEM_VERIFY(tensor && tensor->GetBasisType() == mfem::BasisType::GaussLegendre &&
+    MFEM_VERIFY(typeid(fe) == typeid(mfem::L2_QuadrilateralElement) && tensor &&
+                  (tensor->GetBasisType() == mfem::BasisType::GaussLegendre ||
+                   tensor->GetBasisType() == mfem::BasisType::GaussLobatto) &&
                   fe.GetGeomType() == mfem::Geometry::SQUARE && fe.GetDof() == dof_ &&
                   fe.GetMapType() == mfem::FiniteElement::VALUE && fe.GetNodes().GetNPoints() == dof_,
-                "Projected local tensor Jacobi requires actual p5 Gauss-Legendre nodal tensor quads.");
+                "Projected local tensor Jacobi requires builtin p5 GL/GLL nodal tensor quads.");
     const auto& lex = tensor->GetDofMap();
     MFEM_VERIFY(lex.Size() == 0 || lex.Size() == dof_, "Invalid projected tensor native permutation.");
     lex_to_native_.SetSize(dof_);
     int* native = lex_to_native_.HostWrite();
     std::vector<bool> local_seen(dof_, false), seen(height, false);
     mfem::IntegrationRules gl_rules(0, mfem::Quadrature1D::GaussLegendre);
-    const auto& nodal_rule = gl_rules.Get(mfem::Geometry::SEGMENT, 2 * axis_ - 1);
+    const mfem::real_t* nodes = mfem::poly1d.GetPoints(fe.GetOrder(), tensor->GetBasisType());
     for (int i = 0; i < dof_; ++i)
     {
       native[i] = lex.Size() ? lex[i] : i;
@@ -868,9 +873,9 @@ private:
       local_seen[native[i]] = true;
       const auto& node = fe.GetNodes().IntPoint(native[i]);
       MFEM_VERIFY(std::isfinite(node.x) && std::isfinite(node.y) &&
-                    std::abs(node.x - nodal_rule.IntPoint(i % axis_).x) < 1.0e-13 &&
-                    std::abs(node.y - nodal_rule.IntPoint(i / axis_).x) < 1.0e-13,
-                  "Projected local tensor Jacobi requires lexicographic GL6 nodes.");
+                    std::abs(node.x - nodes[i % axis_]) < 1.0e-13 &&
+                    std::abs(node.y - nodes[i / axis_]) < 1.0e-13,
+                  "Projected local tensor Jacobi requires actual lexicographic GL/GLL nodes.");
     }
     const auto& rule = mass_space_->GetIntRule(0);
     mass_axis_ = int(std::sqrt(double(rule.GetNPoints())));

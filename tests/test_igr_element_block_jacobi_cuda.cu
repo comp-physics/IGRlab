@@ -2,6 +2,7 @@
 #include "../src/physics/igr/IGR_element_block_jacobi.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 #include "numerics/riemann/rusanov.hpp"
+#include "numerics/dgsem/dgsem_operator.hpp"
 #include "physics/bc/boundary_state.hpp"
 #include "physics/igr/IGR.hpp"
 #include "physics/igr/igr_coupling.hpp"
@@ -744,7 +745,8 @@ void CheckLifecycle(bool reference_blocks, bool tensor_blocks = false)
 
 void CheckFusedSweepLifecycle(bool compact_lift, int regular_sweeps,
                               bool fuse_residual, bool fuse_update,
-                              const char* execution = "wmma-factor-fp64")
+                              const char* execution = "wmma-factor-fp64",
+                              int basis = BasisType::GaussLegendre)
 {
   LifecycleEnvironment environment;
   environment.Set("IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", "projected");
@@ -760,7 +762,7 @@ void CheckFusedSweepLifecycle(bool compact_lift, int regular_sweeps,
     y[1] = x[1] + 0.04 * x[0] * (1.0 - x[0]);
   });
   ParMesh mesh(MPI_COMM_WORLD, serial);
-  DG_FECollection collection(5, 2, BasisType::GaussLegendre);
+  DG_FECollection collection(5, 2, basis);
   ParFiniteElementSpace scalar_space(&mesh, &collection);
   ParFiniteElementSpace vector_space(&mesh, &collection, 4, Ordering::byNODES);
   ParGridFunction state(&vector_space);
@@ -857,11 +859,150 @@ void CheckFusedSweepLifecycle(bool compact_lift, int regular_sweeps,
                 fused->GetOutputOnlyLinearIterations() == regular_sweeps,
               "Fused residual changed output-only or consumed-prefetch history.");
   std::cout << "element_block_jacobi_fused_sweep passed p=5 geometry=q2 reference=projected"
+            << " basis=" << (basis==BasisType::GaussLobatto ? "gll" : "gl")
             << " execution=" << execution << " volume=simt compact_lift=" << compact_lift
             << " fuse_residual=" << fuse_residual << " fuse_update=" << fuse_update
             << " initial_sweeps=50 regular_sweeps=" << regular_sweeps
             << " production_sigma=bitwise output_history=bitwise original_fp64_diagnostic=true\n";
 }
+void CheckDGSEMMappedFixedLifecycle()
+{
+  LifecycleEnvironment environment;
+  const std::pair<const char*, const char*> settings[] = {
+    {"IGRLAB_IGR_LOCAL_TENSOR_REFERENCE", "projected"},
+    {"IGRLAB_IGR_LOCAL_TENSOR_EXECUTION", "wmma-factor-fp64"},
+    {"IGRLAB_IGR_COEFFICIENT_EXECUTION", "fused"},
+    {"IGRLAB_IGR_FACE_DENSITY_EXECUTION", "tensor"},
+    {"IGRLAB_IGR_STAGE_STATE_DIRECT", "1"},
+    {"IGRLAB_IGR_TENSOR_VOLUME_COMPACT", "1"},
+    {"IGRLAB_IGR_COMPACT_FACE_QDATA", "1"},
+    {"IGRLAB_IGR_COMPACT_FACE_LIFT", "1"},
+    {"IGRLAB_IGR_ELEMENT_JACOBI_FUSED_RESIDUAL", "1"},
+    {"IGRLAB_IGR_ELEMENT_JACOBI_FUSED_UPDATE", "1"},
+    {"IGRLAB_DGSEM_PRODUCTION_STRICT", "1"},
+    {"IGRLAB_DGSEM_FUSED_RESIDUAL", "1"},
+    {"IGRLAB_DGSEM_FUSED_DMMA", "0"},
+    {"IGRLAB_DGSEM_SUBCELL_BLEND", "0"},
+    {"IGRLAB_DGSEM_VOLUME_QUADRATURE_MIN_ORDER", "0"}};
+  for (const auto& setting : settings) { environment.Set(setting.first, setting.second); }
+  Mesh serial = Mesh::MakeCartesian2D(3, 2, Element::QUADRILATERAL, true, 1.0, 0.8);
+  serial.SetCurvature(2, false, 2, Ordering::byVDIM);
+  serial.Transform([](const Vector& x, Vector& y)
+  {
+    y.SetSize(2);
+    y[0] = x[0] + .08*x[0]*x[1];
+    y[1] = x[1] + .04*x[0]*(1.0-x[0]);
+  });
+  ParMesh mesh(MPI_COMM_WORLD, serial);
+  DG_FECollection collection(5, 2, BasisType::GaussLobatto);
+  ParFiniteElementSpace scalar_space(&mesh, &collection);
+  ParFiniteElementSpace vector_space(&mesh, &collection, 4, Ordering::byNODES);
+  ParGridFunction state(&vector_space);
+  int phase = 0;
+  VectorFunctionCoefficient initial(4, [&](const Vector& x, Vector& value)
+  {
+    const double rho = .9+.15*x[0]+.08*x[1]+.02*phase*x[0]*x[1];
+    const double u = .2+.06*x[0]+.03*phase*x[1];
+    const double v = -.1+.08*x[1]-.02*phase*x[0];
+    value.SetSize(4);
+    value[0]=rho; value[1]=rho*u; value[2]=rho*v;
+    value[3]=2.5+.5*rho*(u*u+v*v);
+  });
+  state.ProjectCoefficient(initial);
+  ::igrlab::IGRConfig config;
+  config.alpha=.002;
+  config.backend=::igrlab::IGRGradBackend::BrokenDG;
+  config.ip_kind=::igrlab::IGRIPKind::SIPG;
+  config.solve_mode=::igrlab::IGRSolveMode::FixedElementJacobi;
+  config.element_jacobi_tensor_blocks=true;
+  config.regular_sweeps=2; config.warm_start_sweeps=50; config.element_jacobi_omega=.7;
+  config.exact_dg_face_operator=true;
+  config.sigma_cadence=::igrlab::IGRSigmaUpdateCadence::EveryStage;
+  config.nan_scan=false;
+  const auto make_solver = [&]()
+  {
+    auto result=std::make_unique<::igrlab::IGRSolver>(scalar_space, vector_space, 2, 4, config.alpha);
+    result->ApplyConfig(config);
+    return result;
+  };
+  auto direct=make_solver(), interposed=make_solver();
+  EulerFlux euler(2,1.4);
+  FluxWithIGR physical(euler);
+  physical.SetSigmaField(&interposed->GetSigma());
+  RusanovFluxWithSides flux(physical);
+  auto integrator=std::make_unique<HyperbolicFormIntegrator>(flux,2);
+  DGHyperbolicConservationLaws base(vector_space,std::move(integrator),true);
+  base.SetNumericalFlux(&flux);
+  base.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  base.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+  base.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::None);
+  base.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+  base.SetDGSEMGamma(1.4);
+  base.SetDGSEMDiagnosticStateScan(false);
+  Array<int> boundary(mesh.bdr_attributes.Max()); boundary=1;
+  base.AddBdrFaceIntegrator(std::make_unique<BdrHyperbolicFluxIntegrator>(
+    flux,std::make_unique<SlipWallState>(2),2),boundary);
+  EulerWithIGR wrapped(base,*interposed,state);
+  direct->UpdateFromState(state,true);
+  const auto preparation=wrapped.PrepareSigmaForOutput(state,0,0,0.0,true,false,false);
+  MFEM_VERIFY(preparation.solved && preparation.reusable_stage0 &&
+                interposed->GetLastLinearIters()==50 &&
+                !wrapped.SupportsIndependentResidualCertification(),
+              "Mapped GLL fixed initialization must use exactly 50 uncertified corrections.");
+  wrapped.BeginRKStep(0,0.0,1.0e-4,3);
+  Vector rhs(state.Size()); rhs.UseDevice(true);
+  double max_rhs_error=0.0, max_speed_error=0.0;
+  for (int stage=0; stage<3; ++stage)
+  {
+    if (stage)
+    {
+      phase=stage; state.ProjectCoefficient(initial);
+      // Output must not change the next production approximation's history.
+      interposed->UpdateFromState(state,true,::igrlab::IGRSolvePurpose::OutputOnly);
+      direct->UpdateFromState(state,true);
+    }
+    wrapped.SetRKStageState(stage,stage);
+    wrapped.Mult(state,rhs);
+    MFEM_VERIFY(interposed->GetLastPrecondName()=="tensor-element-projected-wmma-factor-fp64" &&
+                  !interposed->GetLastLinearConverged() &&
+                  interposed->GetLastLinearIters()==(stage ? 2 : 50) &&
+                  std::memcmp(direct->GetSigma().HostRead(),interposed->GetSigma().HostRead(),
+                    std::size_t(scalar_space.GetVSize())*sizeof(double))==0,
+                "Mapped GLL stage/output changed the fixed history, backend or sweep budget.");
+    const auto selection=base.GetDGSEMProductionSelection();
+    const auto bridge=base.GetDGSEMProductionBridgeEvidence();
+    MFEM_VERIFY(selection.supported && selection.strict && selection.uses_sigma &&
+                  selection.order==5 && bridge.fallback_mult_calls==0 &&
+                  bridge.production_mult_calls==stage+1 && !base.GetDGSEMDiagnosticStateScan(),
+                "Mapped GLL wrapper must execute the packed DGSEM sigma path without fallback/scans.");
+    const double actual_speed=base.GetMaxCharSpeed();
+    // Independent host assembly uses the same physical GLL polynomial and
+    // current sigma, with separate volume/face evaluation and host application
+    // of the base operator's inverse mass (not independent mass assembly).
+    mfem::dgsem::DGSEMOperator host(base);
+    Vector weak(state.Size()), expected(state.Size()); weak=0.0;
+    const double surface_speed=host.AssembleSurface(state,weak);
+    const double volume_speed=host.AssembleVolume(state,weak);
+    host.ApplyInverseMass(weak,expected);
+    Vector difference(rhs); difference-=expected;
+    const double error=difference.Normlinf()/std::max(1.0,expected.Normlinf());
+    const double speed=std::max(surface_speed,volume_speed);
+    const double speed_error=std::abs(actual_speed-speed)/std::max(1.0,std::abs(speed));
+    MFEM_VERIFY(std::isfinite(error) && error<2e-10 && std::isfinite(speed_error) && speed_error<2e-12,
+                "Mapped GLL production Euler residual/CFL differs from host assembly.");
+    max_rhs_error=std::max(max_rhs_error,error); max_speed_error=std::max(max_speed_error,speed_error);
+  }
+  MFEM_VERIFY(interposed->GetProductionLinearIterations()==54 &&
+                interposed->GetOutputOnlyLinearIterations()==4 &&
+                wrapped.GetSigmaStage0ReuseCount()==1 &&
+                interposed->GetProductionLinearConvergedCalls()==0,
+              "Mapped GLL wrapper changed initialization, output or production work accounting.");
+  std::cout << "dgsem_mapped_fixed_lifecycle passed basis=gll geometry=q2 p=5 "
+               "initial_sweeps=50 regular_sweeps=2 omega=0.7 history=bitwise "
+               "prefetch=consume-only fallback=none scans=off convergence_claim=false "
+            << "rhs_relative_max=" << max_rhs_error << " cfl_relative_error=" << max_speed_error << '\n';
+}
+
 }
 
 int main(int argc, char** argv)
@@ -871,6 +1012,15 @@ int main(int argc, char** argv)
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1 &&
                 ::igrlab::dg_face::UsesOrdinaryCUDAForDGDiffusionFaces2D(),
               "Element-block fixture requires one native CUDA rank.");
+  const bool gll_only = argc==2 && std::strcmp(argv[1], "--qualify-dgsem-mapped")==0;
+  MFEM_VERIFY(argc==1 || gll_only, "Expected no arguments or --qualify-dgsem-mapped.");
+  if (gll_only)
+  {
+    CheckDGSEMMappedFixedLifecycle();
+    CheckFusedSweepLifecycle(true, 2, true, true, "wmma-factor-fp64", BasisType::GaussLobatto);
+    CheckFusedSweepLifecycle(true, 2, true, true, "simt-fp64", BasisType::GaussLobatto);
+    return 0;
+  }
   CheckCase(2, false);
   CheckCase(5, true);
   CheckCase(2, false, true);

@@ -146,8 +146,9 @@ public:
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
     MFEM_VERIFY(igr_.GetSolveMode() != ::igrlab::IGRSolveMode::FixedElementJacobi ||
                   (sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage &&
-                   base_.GetVolumeMode() == VolumeMode::WeakDivergence),
-                "Fixed element-block Jacobi requires ordinary DG with "
+                   (base_.GetVolumeMode() == VolumeMode::WeakDivergence ||
+                    base_.GetVolumeMode() == VolumeMode::DGSEMFluxDiff)),
+                "Fixed element-block Jacobi requires DG or DGSEM with "
                 "every-stage sigma updates.");
     MFEM_VERIFY(base_.GetModalDampingRate() == 0.0 ||
                   sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
