@@ -1,0 +1,412 @@
+{
+  "schema": "dgsem-sedov-rusanov-wmma-final-independent-review-v1",
+  "status": "passed",
+  "report_errors": [],
+  "reviewed_inputs": {
+    "result.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/result.json",
+      "bytes": 264158,
+      "sha256": "deec582c45858d50d8157abe89042eb7ab71e65dde6d9e9b64e6efa35cd94583"
+    },
+    "sedov_rusanov_wmma_20261024.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/sedov_rusanov_wmma_20261024.json",
+      "bytes": 169212,
+      "sha256": "d2687e5401047f5b99346fc6ab8751fece889d0d04a202dc0c24679d7c25cfe6"
+    },
+    "wrapper-result.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/wrapper-result.json",
+      "bytes": 1519,
+      "sha256": "2439a29cd3dfd129f1361ef0ac94e633d599f7eb58940a835ac496aa2654f472"
+    },
+    "bundle-result.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/bundle-result.json",
+      "bytes": 10643,
+      "sha256": "d40cf9dd0be71728ad3651ec8c6d8fbae6eccdbe03d26c781f6fb0e88467677e"
+    },
+    "allocation-runtime.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/allocation-runtime.json",
+      "bytes": 338,
+      "sha256": "e01b7e13d810422ecf0cb7ba31be781fd173044905e08d05c55bcbcf94f0ec5c"
+    },
+    "submission.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/submission.json",
+      "bytes": 1668,
+      "sha256": "85d364c24739e32b692f3bed61cf73b47de60a342911fbcf51d284e91ea4972f"
+    },
+    "case.json": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/case-work/case.json",
+      "bytes": 37784,
+      "sha256": "ad738004d0448dd567d480aa1311deac9340b82dbd717c6d20a02207edcc82ba"
+    }
+  },
+  "native_metadata_bindings": {
+    "no-igr": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/native-metadata/no-igr.json",
+      "bytes": 5010,
+      "sha256": "84244d6010b1d4a937700c398f7214db3185af4c6d39f2c5798ea35e58271943"
+    },
+    "fixed-simt-fp64": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/native-metadata/fixed-simt-fp64.json",
+      "bytes": 7751,
+      "sha256": "f10a0f683e53350ec45546e250b7c20d39689e52ab59441c7301bb323f1d2a67"
+    },
+    "fixed-wmma-fp64": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/native-metadata/fixed-wmma-fp64.json",
+      "bytes": 7746,
+      "sha256": "2d787b065ac94b436c84d29fc3b0d1dd200353fae196699e3ba679e5a7c79564"
+    },
+    "fixed-wmma-production": {
+      "path": "/tmp/dgsem-sedov-rusanov-wmma-20261024/native-metadata/fixed-wmma-production.json",
+      "bytes": 7769,
+      "sha256": "bb5bfc608507340448b00abf9dc5b18999711800545ec255e33345b7c93a1fe3"
+    }
+  },
+  "checks": {
+    "source_and_binary_pins": true,
+    "case_pin": true,
+    "native_admission": true,
+    "mesh_pin": true,
+    "staged_helper:plan.json": true,
+    "staged_helper:compare-curved-q5-fields.py": true,
+    "staged_helper:frozen_campaign.py": true,
+    "staged_helper:comparator-self-check.json": true,
+    "staged_helper:hashes.json": true,
+    "staged_helper:job.slurm": true,
+    "staged_helper:bootstrap.py": true,
+    "staged_helper:bounded_process.py": true,
+    "staged_helper:run.py": true,
+    "staged_helper:host-checks.json": true,
+    "staged_helper:host_checks.py": true,
+    "staged_helper:case.json": true,
+    "staged_helper:case-review.json": true,
+    "same_single_GPU_allocation": true,
+    "native_execution_completed": true,
+    "arms_are_sequential": true,
+    "no-igr:native_metadata_pin": true,
+    "no-igr:actual_case": true,
+    "no-igr:native_runtime": true,
+    "no-igr:completed_count_accounting": true,
+    "no-igr:timing_math": true,
+    "no-igr:outputs_and_initial_fields": true,
+    "no-igr:actual_zero_IGR": true,
+    "fixed-simt-fp64:native_metadata_pin": true,
+    "fixed-simt-fp64:actual_case": true,
+    "fixed-simt-fp64:native_runtime": true,
+    "fixed-simt-fp64:completed_count_accounting": true,
+    "fixed-simt-fp64:timing_math": true,
+    "fixed-simt-fp64:outputs_and_initial_fields": true,
+    "fixed-simt-fp64:fixed_IGR_accounting": true,
+    "fixed-simt-fp64:matching_alpha": true,
+    "fixed-wmma-fp64:native_metadata_pin": true,
+    "fixed-wmma-fp64:actual_case": true,
+    "fixed-wmma-fp64:native_runtime": true,
+    "fixed-wmma-fp64:completed_count_accounting": true,
+    "fixed-wmma-fp64:timing_math": true,
+    "fixed-wmma-fp64:outputs_and_initial_fields": true,
+    "fixed-wmma-fp64:fixed_IGR_accounting": true,
+    "fixed-wmma-fp64:matching_alpha": true,
+    "fixed-wmma-production:native_metadata_pin": true,
+    "fixed-wmma-production:actual_case": true,
+    "fixed-wmma-production:native_runtime": true,
+    "fixed-wmma-production:completed_count_accounting": true,
+    "fixed-wmma-production:timing_math": true,
+    "fixed-wmma-production:outputs_and_initial_fields": true,
+    "fixed-wmma-production:fixed_IGR_accounting": true,
+    "fixed-wmma-production:matching_alpha": true,
+    "hardware_pair_isolation": true,
+    "fusion_pair_isolation": true,
+    "all_three_full_field_comparisons_positive": true,
+    "no_IGR_zero_sigma_analysis_scope": true,
+    "fixed-simt-fp64--fixed-wmma-fp64:identical_fields": true,
+    "fixed-wmma-fp64--fixed-wmma-production:identical_fields": true,
+    "no-igr--fixed-wmma-production:ratio_math": true,
+    "fixed-simt-fp64--fixed-wmma-fp64:ratio_math": true,
+    "fixed-wmma-fp64--fixed-wmma-production:ratio_math": true,
+    "no-igr:integral_drift:density": true,
+    "no-igr:integral_drift:momentum_x": true,
+    "no-igr:integral_drift:momentum_y": true,
+    "no-igr:integral_drift:energy": true,
+    "fixed-simt-fp64:integral_drift:density": true,
+    "fixed-simt-fp64:integral_drift:momentum_x": true,
+    "fixed-simt-fp64:integral_drift:momentum_y": true,
+    "fixed-simt-fp64:integral_drift:energy": true,
+    "fixed-wmma-fp64:integral_drift:density": true,
+    "fixed-wmma-fp64:integral_drift:momentum_x": true,
+    "fixed-wmma-fp64:integral_drift:momentum_y": true,
+    "fixed-wmma-fp64:integral_drift:energy": true,
+    "fixed-wmma-production:integral_drift:density": true,
+    "fixed-wmma-production:integral_drift:momentum_x": true,
+    "fixed-wmma-production:integral_drift:momentum_y": true,
+    "fixed-wmma-production:integral_drift:energy": true,
+    "result.json:wrapper_pin": true,
+    "bundle-result.json:wrapper_pin": true,
+    "retention_cap_and_two_actual_fields": true,
+    "allocation_hours_math": true,
+    "assembled_receipt:result.json": true,
+    "assembled_receipt:submission.json": true,
+    "assembled_receipt:case-work/case.json": true,
+    "assembled_receipt:harness/hashes.json": true,
+    "assembled_receipt:harness-independent-review.json": true,
+    "assembled_report_values": true,
+    "assembled_comparison:no-igr--fixed-wmma-production": true,
+    "assembled_comparison:fixed-simt-fp64--fixed-wmma-fp64": true,
+    "assembled_comparison:fixed-wmma-fp64--fixed-wmma-production": true,
+    "assembled_overhead_math": true
+  },
+  "source_and_execution": {
+    "numerical_source": "30a472fdf7ee761724c56a72bacb005e782928dc",
+    "binary_sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26",
+    "case_sha256": "ad738004d0448dd567d480aa1311deac9340b82dbd717c6d20a02207edcc82ba",
+    "native_tests": 18,
+    "job": "3450759",
+    "GPU": [
+      "GPU-b7de2193-6349-6d24-39b1-464c7bef6ca1, NVIDIA GH200 120GB"
+    ],
+    "GPU_binding": "0",
+    "all_four_sequential": true,
+    "all_common_Euler_dispatch_equal": true,
+    "no_IGR_native_linear_metadata": {
+      "enabled": false
+    }
+  },
+  "actual_work": {
+    "accepted_steps_each": 6663,
+    "total_RHS_each": 19990,
+    "accepted_stage_RHS_each": 19989,
+    "rejections_each": 0,
+    "no_IGR_sigma_calls": 0,
+    "fixed_sigma_calls_each": 19990,
+    "fixed_production_calls_each": 19989,
+    "fixed_output_only_calls_each": 1,
+    "fixed_A_and_P_applications_each": 40028,
+    "fixed_initial_sweeps": 50,
+    "fixed_regular_sweeps": 2,
+    "omega": 0.7,
+    "convergence_certificate": false
+  },
+  "timings": {
+    "no-igr": {
+      "application_wall_s": 192.45567857590504,
+      "advancing_s": 73.27855546999999,
+      "advancing_ns_per_conserved_dof_total_RHS": 0.09710949404575858,
+      "advancing_ns_per_conserved_dof_accepted_stage_RHS": 0.09711435219244155
+    },
+    "fixed-simt-fp64": {
+      "application_wall_s": 339.44998872000724,
+      "advancing_s": 196.11029315300001,
+      "advancing_ns_per_conserved_dof_total_RHS": 0.25988737391322964,
+      "advancing_ns_per_conserved_dof_accepted_stage_RHS": 0.259900375432761
+    },
+    "fixed-wmma-fp64": {
+      "application_wall_s": 335.7801175850909,
+      "advancing_s": 190.660375836,
+      "advancing_ns_per_conserved_dof_total_RHS": 0.2526650875314824,
+      "advancing_ns_per_conserved_dof_accepted_stage_RHS": 0.25267772773797254
+    },
+    "fixed-wmma-production": {
+      "application_wall_s": 332.6129238361027,
+      "advancing_s": 189.177210693,
+      "advancing_ns_per_conserved_dof_total_RHS": 0.25069958185660596,
+      "advancing_ns_per_conserved_dof_accepted_stage_RHS": 0.2507121237337312
+    }
+  },
+  "numeric_findings": {
+    "WMMA_over_SIMT_advancing_speedup": 1.0285844255425567,
+    "WMMA_advancing_time_reduction_fraction": 0.02779006256825156,
+    "fusion_advancing_speedup": 1.0078400835786023,
+    "fusion_advancing_time_reduction_fraction": 0.007779094825008381,
+    "production_IGR_over_noIGR_application": 1.7282572605667192,
+    "production_IGR_over_noIGR_advancing": 2.581617629873293,
+    "IGR_final_VTU_byte_identical_sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114",
+    "both_execution_pair_all_component_L2_Linf_and_integral_differences": 0,
+    "noIGR_to_production_conserved_normalized_L2_max_fraction": 2.8482307280998328e-05,
+    "noIGR_to_production_conserved_normalized_L2_max_percent": 0.002848230728099833,
+    "noIGR_to_production_conserved_normalized_GL8_Linf_max_fraction": 3.59967755315359e-05
+  },
+  "conservation": {
+    "all_initial_integrals_identical": true,
+    "drift_by_arm": {
+      "no-igr": {
+        "density": {
+          "initial": 0.9999999999998576,
+          "final": 0.9999999999995514,
+          "signed_drift": -3.0619951019161817e-13,
+          "absolute_drift": 3.0619951019161817e-13,
+          "absolute_drift_over_initial_gl_l1": 3.061995101916618e-13
+        },
+        "momentum_x": {
+          "initial": 0.0,
+          "final": 3.3219720042708585e-14,
+          "signed_drift": 3.3219720042708585e-14,
+          "absolute_drift": 3.3219720042708585e-14,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "momentum_y": {
+          "initial": 0.0,
+          "final": 3.749478077194959e-14,
+          "signed_drift": 3.749478077194959e-14,
+          "absolute_drift": 3.749478077194959e-14,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "energy": {
+          "initial": 3.499988835753095,
+          "final": 3.4999888357521587,
+          "signed_drift": -9.36140054363932e-13,
+          "absolute_drift": 9.36140054363932e-13,
+          "absolute_drift_over_initial_gl_l1": 2.6746944013108603e-13
+        }
+      },
+      "fixed-simt-fp64": {
+        "density": {
+          "initial": 0.9999999999998576,
+          "final": 0.9999999999995499,
+          "signed_drift": -3.076428001236309e-13,
+          "absolute_drift": 3.076428001236309e-13,
+          "absolute_drift_over_initial_gl_l1": 3.076428001236747e-13
+        },
+        "momentum_x": {
+          "initial": 0.0,
+          "final": -2.0095568648101375e-11,
+          "signed_drift": -2.0095568648101375e-11,
+          "absolute_drift": 2.0095568648101375e-11,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "momentum_y": {
+          "initial": 0.0,
+          "final": -2.0091236203748693e-11,
+          "signed_drift": -2.0091236203748693e-11,
+          "absolute_drift": 2.0091236203748693e-11,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "energy": {
+          "initial": 3.499988835753095,
+          "final": 3.4999888357521605,
+          "signed_drift": -9.343636975245317e-13,
+          "absolute_drift": 9.343636975245317e-13,
+          "absolute_drift_over_initial_gl_l1": 2.669619079866248e-13
+        }
+      },
+      "fixed-wmma-fp64": {
+        "density": {
+          "initial": 0.9999999999998576,
+          "final": 0.9999999999995499,
+          "signed_drift": -3.076428001236309e-13,
+          "absolute_drift": 3.076428001236309e-13,
+          "absolute_drift_over_initial_gl_l1": 3.076428001236747e-13
+        },
+        "momentum_x": {
+          "initial": 0.0,
+          "final": -2.0095568648101375e-11,
+          "signed_drift": -2.0095568648101375e-11,
+          "absolute_drift": 2.0095568648101375e-11,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "momentum_y": {
+          "initial": 0.0,
+          "final": -2.0091236203748693e-11,
+          "signed_drift": -2.0091236203748693e-11,
+          "absolute_drift": 2.0091236203748693e-11,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "energy": {
+          "initial": 3.499988835753095,
+          "final": 3.4999888357521605,
+          "signed_drift": -9.343636975245317e-13,
+          "absolute_drift": 9.343636975245317e-13,
+          "absolute_drift_over_initial_gl_l1": 2.669619079866248e-13
+        }
+      },
+      "fixed-wmma-production": {
+        "density": {
+          "initial": 0.9999999999998576,
+          "final": 0.9999999999995499,
+          "signed_drift": -3.076428001236309e-13,
+          "absolute_drift": 3.076428001236309e-13,
+          "absolute_drift_over_initial_gl_l1": 3.076428001236747e-13
+        },
+        "momentum_x": {
+          "initial": 0.0,
+          "final": -2.0095568648101375e-11,
+          "signed_drift": -2.0095568648101375e-11,
+          "absolute_drift": 2.0095568648101375e-11,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "momentum_y": {
+          "initial": 0.0,
+          "final": -2.0091236203748693e-11,
+          "signed_drift": -2.0091236203748693e-11,
+          "absolute_drift": 2.0091236203748693e-11,
+          "absolute_drift_over_initial_gl_l1": null
+        },
+        "energy": {
+          "initial": 3.499988835753095,
+          "final": 3.4999888357521605,
+          "signed_drift": -9.343636975245317e-13,
+          "absolute_drift": 9.343636975245317e-13,
+          "absolute_drift_over_initial_gl_l1": 2.669619079866248e-13
+        }
+      }
+    },
+    "scope": "Initial-to-final integrals of conserved variables. Initial signed momentum and GL L1 momentum are zero, so normalized momentum drift is undefined; absolute changes are reported. Momentum balance with slip walls is not a generic exact conservation theorem."
+  },
+  "physical_fields": {
+    "all_three_remote_native_VTK_comparisons_positive": true,
+    "GL8_admissibility_noIGR_and_production": {
+      "reference": {
+        "density_min": 0.4494250913583349,
+        "pressure_min": 1.0003187639058668,
+        "q_sigma_min": 1.4004462694682134
+      },
+      "candidate": {
+        "density_min": 0.4494201728605597,
+        "pressure_min": 1.0003187640020024,
+        "q_sigma_min": 1.4004462696344786
+      }
+    },
+    "explicit_noIGR_zero_sigma": "Native no-IGR VTU has no sigma; zero is synthesized only under the recorded explicit no-closure mode. Sigma relative norms against that zero reference are null.",
+    "scope": "Full saved native conservative/sigma polynomial arrays were finite-checked remotely; initial and final GL8 rho/pressure/q_sigma were positive. Intermediate four saved cycles were written but pruned without offline field analysis. No continuous or all-time positivity or PDE/discretization error claim."
+  },
+  "retention": {
+    "archive_bytes": 1388275968,
+    "wrapper_retained_bytes": 1388553153,
+    "cap_bytes": 3221225472,
+    "actual_final_fields": [
+      {
+        "path": "fixed-wmma-production/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114"
+      },
+      {
+        "path": "no-igr/final.vtu",
+        "bytes": 1060111565,
+        "sha256": "d0cebf4e2b9f9216e5115ffecf4471d15fa1d9072724c650b5deb43b6d973fb1"
+      }
+    ],
+    "intermediate_cycles_pruned": true,
+    "bulk_fields_downloaded": false,
+    "wrapper_and_child_exit": 0,
+    "Slurm_state": "COMPLETED",
+    "allocated_GPU_hours": 0.3958333333333333,
+    "cleanup_evidence": "Runner receipts mark all native cycle trees and initial/control fields pruned; bundle contains only two eligible final VTUs. Source-pinned wrapper removes identity-verified private scratch in finally; successful wrapper/Slurm exits support completed cleanup. No separate remote existence query was made by this reviewer."
+  },
+  "interpretation_notes": [
+    "SIMT/WMMA pair differs only by FP64 local P execution with separate updates in both arms; the fusion pair differs only by IGR_ELEMENT_JACOBI_FUSED_UPDATE.",
+    "No-IGR/IGR field differences are regularization method effects, not accuracy errors against truth.",
+    "Application wall includes setup and six native output saves; no-IGR omits sigma output. Advancing timing isolates the evolution/CFL interval from output bins.",
+    "Native host sub-timers overlap/cover different scopes; zero optional per-apply times mean those timers were disabled.",
+    "The observed 2.86% speedup factor above unity and 0.784% fusion speedup factor above unity are one-pass measurements, with no repeat-based confidence interval.",
+    "No lower-precision, MPI or 3D performance conclusion is supported."
+  ],
+  "reviewer_actions": "Local JSON/hash/math/source audit only; no new jobs, builds, network, field downloads or report edits.",
+  "bookkeeping_refresh": {
+    "status": "passed",
+    "core_unchanged_sha256": "30c58618c17e005b1eca8c0b30d1cc0cac4af6b80cbdea8f53e88c7f3de80402",
+    "added_blocks_verified": [
+      "native_metadata_receipts",
+      "measured_summary"
+    ],
+    "native_metadata_receipt_hashes_and_bytes_match": true,
+    "summary_counts_identity_L2_and_percentage_math_match": true,
+    "review_scope": "Only the two appended derived blocks and report hash were refreshed; previously audited core is byte-identical after removing those blocks."
+  }
+}
