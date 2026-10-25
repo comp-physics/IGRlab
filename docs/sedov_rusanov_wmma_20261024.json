@@ -1,0 +1,4555 @@
+{
+  "schema": "dgsem-sedov-rusanov-wmma-results-v1",
+  "date": "2026-10-24",
+  "status": "completed",
+  "source_commit": "30a472fdf7ee761724c56a72bacb005e782928dc",
+  "merged_main_source": "9b52b5afe0b7c1075f3fa9100c6c66f9e8b60c74",
+  "source_tree": "27fafa21616af0861b22a370a03d8a8889fc2361",
+  "job": "3450759",
+  "GPU": {
+    "node": "gh074.hsn.cm.delta.internal.ncsa.edu",
+    "identity": [
+      "GPU-b7de2193-6349-6d24-39b1-464c7bef6ca1, NVIDIA GH200 120GB"
+    ]
+  },
+  "configuration": {
+    "schema": "dgsem-sedov-rusanov-wmma-case-v1",
+    "native_case_schema": "dg-positivity-final-measurement-case-v1",
+    "status": "prepared-not-run",
+    "source_commit": "30a472fdf7ee761724c56a72bacb005e782928dc",
+    "source_worktree_head": "db61e84f08eebf98b4cbc1cc25f43138047ba0b6",
+    "numerical_source_note": "Frozen native-qualified executable from numerical source 30a472fd; merged main 9b52b5af and audited worktree db61e84 have identical trees. No build is requested.",
+    "parent_case": {
+      "path": "/tmp/dgsem-sedov-correction-comparison-20261024/case-work/case.json",
+      "bytes": 29615,
+      "sha256": "6302c0820a8e814a48d15384d0e38af370861810d16cdf2aefa5a0ba5435e9f2"
+    },
+    "binary": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+      "bytes": 61881200,
+      "sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26"
+    },
+    "benchmark": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/dg_igr_zhang_shu_throughput_test",
+      "bytes": 61108160,
+      "sha256": "08a314948878a992eb13820927b9d4296a2b455ed343f3d46c353caef084a45e"
+    },
+    "native_receipt": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/run.json",
+      "bytes": 121189,
+      "sha256": "12460aa210db4d00fe5f40d74eddbbf07e1b632f6d2271b0edd9d4bed9ee2dc9"
+    },
+    "source_manifest": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/source-manifest.json",
+      "bytes": 103555,
+      "sha256": "50e9184f6076830358e2cdebd3190b69580cb682563e87d11fb8d6747d748fab"
+    },
+    "native_tests": [
+      "dg_igr_time_defaults_tests",
+      "dg_igr_igr_tests",
+      "dg_igr_limiter_tests",
+      "dg_igr_zhang_shu_sequential_cpu",
+      "dg_igr_zhang_shu_sequential_cuda",
+      "dg_igr_zhang_shu_throughput_cpu",
+      "dg_igr_zhang_shu_throughput_cuda",
+      "dg_igr_limiter_device_alias_cuda",
+      "dg_igr_explicit_ssprk_cpu",
+      "dg_igr_explicit_ssprk_cuda",
+      "dg_igr_euler_admissibility_cache_cpu",
+      "dg_igr_euler_admissibility_cache_cuda",
+      "dg_igr_modal_damping_cpu",
+      "dg_igr_modal_damping_cuda",
+      "dg_igr_element_block_jacobi_cuda",
+      "dg_igr_dgsem_mapped_fixed_cuda",
+      "dg_igr_fixed_positivity_rollback_dg_cuda",
+      "dg_igr_fixed_positivity_rollback_dgsem_cuda"
+    ],
+    "required_source_sha256": {
+      "src/numerics/limiters/zhang_shu.cpp": "884a4cc3613bd941442c93e1244483eada8e032694d9e681c05b64e8d060a8a0",
+      "tests/test_zhang_shu_throughput.cpp": "4367127c77bdfc2030cc6e7f0b591345fa9b088300ecc917a160be3aa5f8acb9"
+    },
+    "mesh": {
+      "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+      "sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836"
+    },
+    "case": {
+      "elements": 262144,
+      "conserved_dofs": 37748736,
+      "scalar_dofs": 9437184,
+      "geometry_order": 2,
+      "order": 5,
+      "state_basis": "GLL",
+      "sigma_basis": "GLL"
+    },
+    "inputs": {
+      "binary": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+        "bytes": 61881200,
+        "sha256": "14d8ec173d7033a46353c7a3b2f8fa3f32f10ccf668b70aec3f0defcf87a5e26"
+      },
+      "benchmark": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/dg_igr_zhang_shu_throughput_test",
+        "bytes": 61108160,
+        "sha256": "08a314948878a992eb13820927b9d4296a2b455ed343f3d46c353caef084a45e"
+      },
+      "native_receipt": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/run.json",
+        "bytes": 121189,
+        "sha256": "12460aa210db4d00fe5f40d74eddbbf07e1b632f6d2271b0edd9d4bed9ee2dc9"
+      },
+      "source_manifest": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/source-manifest.json",
+        "bytes": 103555,
+        "sha256": "50e9184f6076830358e2cdebd3190b69580cb682563e87d11fb8d6747d748fab"
+      },
+      "mesh": {
+        "path": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+        "sha256": "def0f9eabe4b39fa860c5856a77fa186ef83f859728d96de0fc25dc191657836"
+      }
+    },
+    "physical_configuration": {
+      "application": "Sedov-Taylor blast",
+      "discretization": "dgsem",
+      "elements_per_direction": [
+        512,
+        512
+      ],
+      "elements": 262144,
+      "scalar_dofs": 9437184,
+      "conserved_dofs": 37748736,
+      "geometry_order": 2,
+      "order": 5,
+      "state_basis": "GLL",
+      "sigma_basis": "GLL",
+      "regularization": "per arm: none for no-igr; igr for the three fixed arms",
+      "IGR_space": "L2",
+      "gradient": "BrokenL2",
+      "c_alpha": 0.16666666666666666,
+      "alpha_length": "max",
+      "alpha_formula": "c_alpha * h_eff^2",
+      "time_integrator": "rk3ssp",
+      "CFL": 0.3,
+      "full_target_time": 0.1,
+      "positivity_limiter": "none",
+      "modal_damping_rate": 0,
+      "surface_flux": "rusanov",
+      "volume_flux": "central",
+      "volume_dissipation": "none",
+      "dgsem_stabilization": "none",
+      "subcell_blend": false,
+      "optional_nonfinite_admissibility_conservation_scans": "off",
+      "sigma_cfl": false,
+      "sigma_rusanov": false,
+      "invariant_domain_flux": false,
+      "gamma": 1.4,
+      "IGR_c_alpha_note": "c_alpha and alpha-length apply only to the three IGR arms; no sigma solver exists in the no-IGR arm.",
+      "initial_condition": "Existing Gaussian Sedov deposition: E_blast=1, ambient rho=1 and p=1, zero velocity, width=6/32, centered at (0.5,0.5), gamma=1.4; independent of the 512x512 mesh resolution."
+    },
+    "save_interval": 0.02,
+    "expected_output_times": [
+      0.0,
+      0.02,
+      0.04,
+      0.06,
+      0.08,
+      0.1
+    ],
+    "common_operator": {
+      "A": "IGR arms: original FP64 consistent mass/diffusion/exact SIPG face operator with current coefficients every stage. No-IGR: physical Euler only, no sigma assembly/preparation/solve.",
+      "P": "IGR arms: same projected element-local spectral inverse and current heterogeneous mass scaling; separate FP64 SIMT or FP64 WMMA execution.",
+      "fixed_update": "sigma <- sigma + 0.7 * P * (b - A sigma)",
+      "reference": "projected",
+      "local_execution": "per-arm simt-fp64 or wmma-factor-fp64",
+      "tensor_volume": "simt",
+      "coarse": "none",
+      "global_or_two_level_preconditioner": false,
+      "fused_residual": "1 for all IGR arms",
+      "fused_solution_update": "0 for both isolation arms; 1 for production WMMA",
+      "Euler_residual": "same strict MFEM native packed FP64 SIMT fused DGSEM residual in all arms; DGSEM_FUSED_DMMA=0"
+    },
+    "arms": {
+      "no-igr": {
+        "label": "DGSEM physical Euler Rusanov, no IGR",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "none",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "krylov",
+          "--igr-jacobi-blocks",
+          "current",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "simt-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "0",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "none",
+        "expected_last_solver": null,
+        "expected_last_precond": null,
+        "target_time": 0.1,
+        "timeout_seconds": 600,
+        "initial_sweeps": null,
+        "regular_sweeps": null,
+        "omega": null,
+        "convergence_claim": false,
+        "regularization": "none",
+        "local_execution": null,
+        "fused_solution_update": false
+      },
+      "fixed-simt-fp64": {
+        "label": "DGSEM fixed 50/2, omega=0.7, projected local FP64 SIMT P, separate solution update",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "igr",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "element-block-jacobi",
+          "--igr-jacobi-blocks",
+          "tensor",
+          "--igr-sweeps",
+          "2",
+          "--igr-initial-sweeps",
+          "50",
+          "--igr-jacobi-omega",
+          "0.7",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "simt-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "0",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "fixed-sweeps",
+        "expected_last_solver": "fixed-element-jacobi",
+        "expected_last_precond": "tensor-element-projected-simt-fp64",
+        "target_time": 0.1,
+        "timeout_seconds": 900,
+        "initial_sweeps": 50,
+        "regular_sweeps": 2,
+        "omega": 0.7,
+        "convergence_claim": false,
+        "regularization": "igr",
+        "local_execution": "simt-fp64",
+        "fused_solution_update": false
+      },
+      "fixed-wmma-fp64": {
+        "label": "DGSEM fixed 50/2, omega=0.7, projected local FP64 WMMA P, separate solution update",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "igr",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "element-block-jacobi",
+          "--igr-jacobi-blocks",
+          "tensor",
+          "--igr-sweeps",
+          "2",
+          "--igr-initial-sweeps",
+          "50",
+          "--igr-jacobi-omega",
+          "0.7",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "0",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "fixed-sweeps",
+        "expected_last_solver": "fixed-element-jacobi",
+        "expected_last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "target_time": 0.1,
+        "timeout_seconds": 900,
+        "initial_sweeps": 50,
+        "regular_sweeps": 2,
+        "omega": 0.7,
+        "convergence_claim": false,
+        "regularization": "igr",
+        "local_execution": "wmma-factor-fp64",
+        "fused_solution_update": false
+      },
+      "fixed-wmma-production": {
+        "label": "DGSEM fixed 50/2, omega=0.7, projected local FP64 WMMA P, fused solution update",
+        "argv": [
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dg-positivity-throughput-20261024/native-3448740/payload/native/frozen/sedov_taylor_blast",
+          "-m",
+          "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/igr-dg-mapped-tensor-20261022/native-3439089/frozen/mapped-sedov-q2-n512.mesh",
+          "--device",
+          "cuda",
+          "--discretization",
+          "dgsem",
+          "--regularization",
+          "igr",
+          "--time-integrator",
+          "rk3ssp",
+          "-o",
+          "5",
+          "-rs",
+          "0",
+          "-rp",
+          "0",
+          "-tf",
+          "0.1",
+          "-c",
+          "0.3",
+          "--element-assembly-divergence",
+          "--igr-space",
+          "L2",
+          "--igr-grad",
+          "BrokenL2",
+          "--c-alpha",
+          "0.16666666666666666",
+          "--igr-alpha-length",
+          "max",
+          "--igr-ip-kind",
+          "sipg",
+          "--igr-exact-dg-face",
+          "--igr-sigma-cadence",
+          "every-stage",
+          "--igr-stage-rtol-scale",
+          "1",
+          "--igr-linear-solver",
+          "fgmres",
+          "--igr-preconditioner",
+          "none",
+          "--igr-lin-rtol",
+          "1e-6",
+          "--igr-lin-atol",
+          "0",
+          "--igr-lin-maxit",
+          "1000",
+          "--igr-nonconvergence-policy",
+          "error",
+          "--igr-lin-print",
+          "0",
+          "--positivity-limiter",
+          "none",
+          "--modal-damping-rate",
+          "0",
+          "--dgsem-surface-flux",
+          "rusanov",
+          "--no-igr-sigma-cfl",
+          "--no-igr-sigma-rusanov",
+          "--no-igr-invariant-domain-flux",
+          "--no-admissibility-scan",
+          "--no-conservation-balance",
+          "--no-nan-scan",
+          "-no-glvis",
+          "-vtk",
+          "--time-step-save",
+          "0.02",
+          "--no-vtk-h1-diagnostics",
+          "--no-vtk-l2-diagnostics",
+          "--no-save-state",
+          "-vs",
+          "100",
+          "-as",
+          "500",
+          "--igr-solve-mode",
+          "element-block-jacobi",
+          "--igr-jacobi-blocks",
+          "tensor",
+          "--igr-sweeps",
+          "2",
+          "--igr-initial-sweeps",
+          "50",
+          "--igr-jacobi-omega",
+          "0.7",
+          "--dgsem-stab",
+          "none",
+          "--dgsem-volume-flux",
+          "central",
+          "--dgsem-volume-dissipation",
+          "none",
+          "--zhang-shu-points",
+          "consumer",
+          "--no-zhang-shu-vtk-points",
+          "--no-vtk-zhang-shu-diagnostics"
+        ],
+        "controls": {
+          "PROFILE_NVTX": "0",
+          "IGR_PARTIAL_ASSEMBLY": "1",
+          "IGR_DEVICE_QF": "1",
+          "IGR_FACE_DENSITY_CUDA": "1",
+          "IGR_FACE_DENSITY_CACHE": "1",
+          "IGR_DIRECT_IDENTITY_SYSTEM": "1",
+          "IGR_IPDG_PENALTY_SCALE": "1",
+          "IGR_KRYLOV_BACKEND": "cuda-fp64",
+          "IGR_KRYLOV_RESIDUAL_SCALE": "rhs",
+          "IGR_TENSOR_VOLUME": "simt",
+          "IGR_TENSOR_VOLUME_STORAGE": "cached",
+          "IGR_TENSOR_VOLUME_COLLOCATED": "0",
+          "IGR_TENSOR_MG": "off",
+          "IGR_TENSOR_MG_OPERATOR": "sampled",
+          "IGR_LOCAL_TENSOR_REFERENCE": "projected",
+          "IGR_TRUE_RESIDUAL": "0",
+          "IGR_EVENT_LOG_MIN_ITERS": "0",
+          "IGR_OPERATOR_PROBE_EVERY": "0",
+          "IGR_PRECONDITIONER_PROBE": "0",
+          "SHARED_OPERATOR_PRECISION": "off",
+          "SHARED_EULER_LAYOUT": "dense",
+          "SHARED_EULER_FLUX_EXECUTION": "element",
+          "SHARED_EULER_CONSERVATIVE_FUSION": "0",
+          "DG_FORCE_MATRIX_FREE": "0",
+          "DG_FORCE_NLFORM_FACE": "0",
+          "DG_NATIVE_MASS_INV": "0",
+          "DG_PACKED_INVMASS_DEVICE": "1",
+          "WEAKDIV_SIGMA_STORAGE": "auto",
+          "IGR_SHARE_STATE_INTERPOLATION": "1",
+          "IGR_FACTORIZED_FACE_NORMALS": "1",
+          "IGR_COMPACT_FACE_QDATA": "1",
+          "IGR_COMPACT_FACE_LIFT": "1",
+          "VTK_PRESSURE_COEFFICIENT": "1",
+          "IGR_LOCAL_TENSOR_PRECONDITIONER": "0",
+          "IGR_EXTENDED_CERTIFICATE": "0",
+          "IGR_EXTENDED_CERTIFICATE_START": "1",
+          "IGR_EXTENDED_CERTIFICATE_FACTOR": "1",
+          "IGR_LOCAL_TENSOR_EXECUTION": "wmma-factor-fp64",
+          "DG_PACKED_DENSE_EXECUTION": "rows",
+          "SOLVER_WALL_TIMING": "1",
+          "IGR_TENSOR_VOLUME_COMPACT": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_RESIDUAL": "1",
+          "IGR_ELEMENT_JACOBI_FUSED_UPDATE": "1",
+          "IGR_FACE_COALESCED_TRACE": "0",
+          "VTK_OUTPUT_TIMING": "1",
+          "IGR_COEFFICIENT_EXECUTION": "fused",
+          "IGR_FACE_DENSITY_EXECUTION": "tensor",
+          "IGR_STAGE_STATE_DIRECT": "1",
+          "VTK_CACHED_EVALUATION": "1",
+          "LIMITER_TIMING": "0",
+          "LIMITER_CPU_PHASE_TIMING": "0",
+          "TIMING_WARMUP_CALLS": "4",
+          "DG_TENSOR_FACE": "off",
+          "DG_WEAKDIV_ROW_REUSE": "0",
+          "DG_INVMASS_ROW_REUSE": "0",
+          "DG_TENSOR_FACE_ROW_REUSE": "0",
+          "DG_MAPPED_WEAKDIV_TENSOR": "0",
+          "IGR_SIGMA_BASIS": "lgl",
+          "DGSEM_PRODUCTION_STRICT": "1",
+          "IGR_SOURCE_QUADRATURE_MIN_ORDER": "0",
+          "IGR_OPERATOR_QUADRATURE_MIN_ORDER": "0",
+          "DGSEM_FUSED_RESIDUAL": "1",
+          "DGSEM_FUSED_DMMA": "0",
+          "DGSEM_SUBCELL_BLEND": "0",
+          "DGSEM_VOLUME_QUADRATURE_MIN_ORDER": "0",
+          "LIMITER_COOPERATIVE": "1",
+          "LIMITER_FUSED_FACE": "0",
+          "LIMITER_REFERENCE_DEDUP": "0",
+          "DGSEM_TIMING": "0",
+          "IGR_EXACT_FACE_TIMING": "0",
+          "IGR_KRYLOV_APPLY_TIMING": "0",
+          "IGR_KRYLOV_APPLY_SYNC": "0"
+        },
+        "solver_policy": "fixed-sweeps",
+        "expected_last_solver": "fixed-element-jacobi",
+        "expected_last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "target_time": 0.1,
+        "timeout_seconds": 900,
+        "initial_sweeps": 50,
+        "regular_sweeps": 2,
+        "omega": 0.7,
+        "convergence_claim": false,
+        "regularization": "igr",
+        "local_execution": "wmma-factor-fp64",
+        "fused_solution_update": true
+      }
+    },
+    "arm_order": [
+      "no-igr",
+      "fixed-simt-fp64",
+      "fixed-wmma-fp64",
+      "fixed-wmma-production"
+    ],
+    "environment_policy": {
+      "control_names": "Canonical unprefixed keys; runner clears inherited IGRLAB_ and DG_IGR_ variables and applies each control under both aliases",
+      "inherited_solver_overrides": "must be removed before execution",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "PMIX_MCA_gds": "hash",
+      "CUDA_VISIBLE_DEVICES": "preserve scheduler binding; never choose a second device"
+    },
+    "diagnostic_policy": {
+      "profilers": false,
+      "new_instrumentation": false,
+      "PROFILE_NVTX": "0",
+      "SOLVER_WALL_TIMING": "1",
+      "VTK_OUTPUT_TIMING": "1",
+      "other_optional_timers": "0",
+      "IGR_TRUE_RESIDUAL": "0",
+      "operator_and_preconditioner_probes": "off",
+      "event_capture": "off",
+      "note": "Existing wall timing partitions are identical across arms. No profiler, event capture, true-residual probe, or new instrumentation. Fixed sweeps have no convergence certificate."
+    },
+    "budget": {
+      "job_seconds": 4500,
+      "analysis_seconds_total": 600,
+      "cleanup_reserve_seconds": 300,
+      "log_bytes_cap_per_stream": 8388608,
+      "min_free_tmp_gib": 32,
+      "retained_bytes_cap": 3221225472,
+      "final_vtu_bytes_cap_per_arm": 1500000000,
+      "fixed_application_seconds": 900,
+      "no_igr_application_seconds": 600,
+      "arm_seconds_total": 3300,
+      "planned_seconds_total": 4200,
+      "job_margin_seconds": 300
+    },
+    "resources": {
+      "account": "bdiy-dtai-gh",
+      "partition": "ghx4",
+      "constraint": "projects",
+      "nodes": 1,
+      "ntasks": 1,
+      "cpus_per_task": 8,
+      "gpus_per_node": 1,
+      "concurrent_gpu_applications": 1,
+      "memory": "96G",
+      "slurm_time": "01:15:00",
+      "scratch": "job-local /tmp",
+      "no_requeue": true
+    },
+    "execution_policy": {
+      "full_trajectories": 4,
+      "each_starts_at_time": 0.0,
+      "each_target_time": 0.1,
+      "all_on_same_allocated_gpu": true,
+      "pilot_or_tiny_substitute": false,
+      "duplicate_runs": false,
+      "builds": false,
+      "restarts": false,
+      "automatic_parameter_fallback": false,
+      "automatic_retry": false,
+      "native_failure_is_reportable": true,
+      "do_not_form_speed_ratio_for_incomplete_or_unusable_arm": true,
+      "precision_arms": false,
+      "arm_order": [
+        "no-igr",
+        "fixed-simt-fp64",
+        "fixed-wmma-fp64",
+        "fixed-wmma-production"
+      ]
+    },
+    "count_expectations": {
+      "acceptance_gate": false,
+      "basis": "Prior full fixed50/2 omega.7 DGSEM Sedov trajectory, prediction only; no-IGR flow/CFL can change actual counts.",
+      "prior_IGR_accepted_steps": 6663,
+      "prior_IGR_rhs_evaluations": 19990,
+      "prior_IGR_linear_calls": 19990,
+      "prior_IGR_production_linear_calls": 19989,
+      "prior_IGR_output_only_linear_calls": 1,
+      "no_IGR_linear_calls": 0,
+      "rejected_attempts": 0,
+      "rhs_formula": "report actual; expected 3*accepted_steps+1 for this application lifecycle",
+      "fixed_correction_formula": "50 + (actual_linear_calls - 1) * 2",
+      "prior_fixed_50_2_corrections": 40028,
+      "correction_counters": "One current A and one P application per fixed correction; no extra true-residual probe."
+    },
+    "comparison_policy": {
+      "endpoint": 0.1,
+      "reference_arm": "fixed-simt-fp64",
+      "pairs": [
+        [
+          "no-igr",
+          "fixed-wmma-production"
+        ],
+        [
+          "fixed-simt-fp64",
+          "fixed-wmma-fp64"
+        ],
+        [
+          "fixed-wmma-fp64",
+          "fixed-wmma-production"
+        ]
+      ],
+      "pair_meanings": [
+        "physical and cost effect of current production IGR",
+        "hardware execution with matched separate update",
+        "benefit and rounding effect of solution-update fusion"
+      ],
+      "require_primary_native_zero_rejections": true,
+      "report_all_actual_counts": true,
+      "minor_CFL_step_count_differences": "Report actual counts; do not reject solely for differing counts.",
+      "require_completed_native_target": true,
+      "conserved_components": [
+        "density",
+        "momentum_x",
+        "momentum_y",
+        "energy"
+      ],
+      "sigma": "Compare IGR arms separately; no-IGR native output has no sigma field. For explicit no-closure comparisons only, synthesize a marked zero sigma polynomial in analysis.",
+      "physical_sampling": "Existing mapped Q2/Q5 native VTU GL8 comparison; require finite saved/derived fields, positive sampled density and pressure, and q_sigma where applicable.",
+      "q_sigma": "q_sigma=gamma*p+(gamma-1)*sigma. For no-IGR derived Euler reference, sigma=0 and q_sigma=gamma*p; label the substitution explicitly.",
+      "error_metrics": [
+        "normalized L2",
+        "normalized sampled Linf",
+        "signed integrals",
+        "signed integral of candidate-reference",
+        "absolute integral difference over reference GL L1",
+        "sampled ranges"
+      ],
+      "error_thresholds": "Report differences without inventing a user-approved pass budget; legacy comparator engineering budgets are descriptive only.",
+      "fixed_residual": "No convergence certificate or tolerance claim for fixed sweeps.",
+      "accuracy_scope": "No-IGR/IGR differences are method effects, not errors against truth. SIMT/WMMA differences isolate FP64 execution with fixed 50/2 sweeps and matching omega .7. No discretization-error or continuous positivity claim.",
+      "timing_metrics": [
+        "application_wall_s",
+        "solver_total_s",
+        "native advancing_cfl_s",
+        "advancing_s_per_accepted_step",
+        "advancing_s_per_actual_rhs",
+        "advancing_ns_per_conserved_dof_rhs",
+        "native total_igr_s",
+        "native total_solve_s",
+        "native coefficient/setup/solve partitions"
+      ],
+      "ratios": "Report raw application/advancing times and per-actual-RHS normalized times. No speed ratio for incomplete/unusable arms. One pass per arm gives no repeat-based confidence interval."
+    },
+    "retention_policy": {
+      "keep_four_final_native_vtu": false,
+      "keep_original_series_metadata": true,
+      "prune_intermediate_cycles_after_each_arm": true,
+      "large_field_download": false,
+      "compressed_archive_bound": true,
+      "preferred_final_labels": [
+        "no-igr",
+        "fixed-wmma-production"
+      ],
+      "note": "Compare all qualified finals remotely, then retain no-IGR and production WMMA native final VTUs with compact receipts within the inherited 3 GiB archive cap. Root runner may reduce field retention explicitly if necessary; all measured metrics and failures remain in compact receipts."
+    },
+    "context_not_control": {
+      "prior_corrections": "/home/jarias9/.codex/worktrees/dg-positivity-throughput/IGRlab/docs/sedov_spectral_corrections_20261024.json",
+      "reason": "Reuse physical controls, frozen binary and mesh; do not reuse historical performance as a measured baseline.",
+      "native_qualification_job": "3448740",
+      "numerical_source": "30a472fdf7ee761724c56a72bacb005e782928dc"
+    },
+    "merged_main_commit": "9b52b5afe0b7c1075f3fa9100c6c66f9e8b60c74",
+    "merged_main_tree": "27fafa21616af0861b22a370a03d8a8889fc2361",
+    "comparator_sha256": "c5ae85fb31c77469e0fe9fe702803c66dd53e762ae55d1eff16fdaaf1c46cb86"
+  },
+  "matched_runs": {
+    "no-igr": {
+      "name": "no-igr",
+      "status": "completed",
+      "error": null,
+      "process": {
+        "status": "native-exit",
+        "effective_timeout_seconds": 597,
+        "pid": 3112156,
+        "returncode": 0,
+        "application_wall_seconds": 192.45567857590504,
+        "logs": {
+          "stdout": {
+            "bytes_seen": 36886,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/no-igr/stdout.log",
+              "bytes": 36886,
+              "sha256": "4e7f2f322701cb6d8c19e4dbe9ee49052b5a947102c44258bcd22d961d64fa27"
+            }
+          },
+          "stderr": {
+            "bytes_seen": 0,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/no-igr/stderr.log",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      },
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 0,
+        "converged_calls": 0,
+        "production_calls": 0,
+        "output_only_calls": 0,
+        "total_iters": 0,
+        "total_krylov_operator_apply_count": 0,
+        "total_krylov_preconditioner_apply_count": 0,
+        "accepted_stage_rhs_evaluations": 19989.0
+      },
+      "metrics": {
+        "application_wall_s": 192.45567857590504,
+        "solver_total_s": 165.494612133,
+        "host_bins_s": {
+          "setup_initial_output_s": 14.723145833,
+          "advancing_cfl_s": 73.27855546999999,
+          "scheduled_output_s": 62.277215993,
+          "diagnostics_s": 0.5410054390000001,
+          "final_output_postloop_s": 14.674689398
+        },
+        "advancing_s_per_accepted_step": 0.010997832128170492,
+        "advancing_s_per_actual_rhs": 0.003665760653826913,
+        "advancing_s_per_accepted_stage_rhs": 0.0036659440427234975,
+        "advancing_ns_per_conserved_dof_rhs": 0.09710949404575858,
+        "advancing_ns_per_conserved_dof_accepted_stage_rhs": 0.09711435219244155,
+        "native_igr_timing": {}
+      },
+      "linear": {},
+      "dispatch_valid": true,
+      "dispatch_errors": [],
+      "dispatch": {
+        "[device] ": [
+          {
+            "requested": "cuda"
+          }
+        ],
+        "[dgsem-production] ": [
+          {
+            "selected": "mfem-native-packed",
+            "strict": "1",
+            "backend": "cuda",
+            "lvec_mode": "P-x-PT",
+            "volume_dissipation": "none",
+            "llf_volume_active": "0",
+            "frozen_sigma_spectral_speed": "0",
+            "order": "5",
+            "dim": "2"
+          }
+        ],
+        "[dgsem-fused-residual] ": [
+          {
+            "enabled": "1",
+            "precision": "fp64",
+            "contraction": "simt",
+            "elements": "262144",
+            "order": "5",
+            "llf_volume": "0",
+            "unique_face_flux": "1",
+            "packed_output": "1"
+          }
+        ],
+        "[vtk-writer] event=setup ": [
+          {
+            "event": "setup",
+            "requested": "cached",
+            "selected": "cached",
+            "interpolation": "gridfunction",
+            "native_mesh_writer": "1",
+            "precision": "unchanged"
+          }
+        ],
+        "fused-solution-update": []
+      },
+      "no_IGR_audit": {
+        "explicitly_no_closure": true,
+        "observed_igr_activity": [],
+        "native_linear_summary_present": false,
+        "zero_counts_inferred_from_absent_IGR": true
+      },
+      "final_status": {
+        "event": "final-status",
+        "final_time": "0.1",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "final_closure_record": {},
+      "fixed_work_accounting": {},
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ],
+      "native_initial": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/no-igr/initial.vtu",
+        "bytes": 1060111565,
+        "sha256": "40d504c018a27ec68f091824a649f5b08f1914f23a1f629fc3bd5701ee9698c1",
+        "retention": "pruned-after-optional-initial-integral-analysis"
+      },
+      "native_final": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/no-igr/final.vtu",
+        "bytes": 1060111565,
+        "sha256": "d0cebf4e2b9f9216e5115ffecf4471d15fa1d9072724c650b5deb43b6d973fb1",
+        "retention": "retained"
+      },
+      "initial_analysis_status": "completed"
+    },
+    "fixed-simt-fp64": {
+      "name": "fixed-simt-fp64",
+      "status": "completed",
+      "error": null,
+      "process": {
+        "status": "native-exit",
+        "effective_timeout_seconds": 897,
+        "pid": 3117570,
+        "returncode": 0,
+        "application_wall_seconds": 339.44998872000724,
+        "logs": {
+          "stdout": {
+            "bytes_seen": 53100,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-simt-fp64/stdout.log",
+              "bytes": 53100,
+              "sha256": "a776aa96ea61f2eef06fa25f629060ff39135ad780035305165871362d30a8a6"
+            }
+          },
+          "stderr": {
+            "bytes_seen": 0,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-simt-fp64/stderr.log",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      },
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 19990.0,
+        "converged_calls": 0.0,
+        "production_calls": 19989.0,
+        "output_only_calls": 1.0,
+        "total_iters": 40028.0,
+        "total_krylov_operator_apply_count": 40028.0,
+        "total_krylov_preconditioner_apply_count": 40028.0,
+        "accepted_stage_rhs_evaluations": 19989.0
+      },
+      "metrics": {
+        "application_wall_s": 339.44998872000724,
+        "solver_total_s": 314.724352246,
+        "host_bins_s": {
+          "setup_initial_output_s": 36.0344025,
+          "advancing_cfl_s": 196.11029315300001,
+          "scheduled_output_s": 65.718876561,
+          "diagnostics_s": 0.4959967999999999,
+          "final_output_postloop_s": 16.364783232
+        },
+        "advancing_s_per_accepted_step": 0.029432731975536548,
+        "advancing_s_per_actual_rhs": 0.009810419867583792,
+        "advancing_s_per_accepted_stage_rhs": 0.009810910658512183,
+        "advancing_ns_per_conserved_dof_rhs": 0.25988737391322964,
+        "advancing_ns_per_conserved_dof_accepted_stage_rhs": 0.259900375432761,
+        "native_igr_timing": {
+          "output_only_solve_s": 0.005169492999996805,
+          "output_only_igr_s": 0.006159833999999531,
+          "avg_solve_iter_s": 0.0025460237021335116,
+          "avg_assemble_s": 0.0018341162766883409,
+          "avg_form_s": 0.00081551278064031,
+          "avg_pc_setup_s": 0.00016910073781890587,
+          "avg_solve_s": 0.005098160917908964,
+          "total_assemble_s": 36.663984370999934,
+          "total_form_s": 16.302100484999798,
+          "total_pc_setup_s": 3.3803237489999285,
+          "total_cheb_diag_s": 0.0,
+          "total_cheb_setup_s": 0.0,
+          "total_krylov_operator_apply_s": 0.0,
+          "total_krylov_preconditioner_apply_s": 0.0,
+          "total_krylov_preconditioner_operator_apply_s": 0.0,
+          "total_solve_s": 101.9122367490002,
+          "total_igr_s": 158.25864535399987,
+          "total_update_s": 159.29339272899875,
+          "last_cheb_diag_s": 0.0,
+          "last_cheb_setup_s": 0.0,
+          "last_krylov_operator_apply_s": 0.0,
+          "last_krylov_preconditioner_apply_s": 0.0,
+          "last_krylov_preconditioner_operator_apply_s": 0.0
+        }
+      },
+      "linear": {
+        "event": "run-summary",
+        "calls": "19990",
+        "converged_calls": "0",
+        "production_calls": "19989",
+        "production_converged_calls": "0",
+        "output_only_calls": "1",
+        "output_only_converged_calls": "0",
+        "output_only_iters": "2",
+        "output_only_solve_s": "0.0051694929999968053",
+        "output_only_igr_s": "0.0061598339999995311",
+        "total_iters": "40028",
+        "avg_iters": "2.0024012006003002",
+        "max_iters": "50",
+        "avg_solve_iter_s": "0.0025460237021335116",
+        "avg_krylov_operator_apply_count": "2.0024012006003002",
+        "avg_krylov_preconditioner_apply_count": "2.0024012006003002",
+        "avg_krylov_preconditioner_operator_apply_count": "0",
+        "krylov_operator_apply_count_per_iter": "1",
+        "krylov_preconditioner_apply_count_per_iter": "1",
+        "krylov_preconditioner_operator_apply_count_per_iter": "0",
+        "avg_assemble_s": "0.0018341162766883409",
+        "avg_form_s": "0.00081551278064031",
+        "avg_pc_setup_s": "0.00016910073781890587",
+        "avg_solve_s": "0.0050981609179089641",
+        "total_assemble_s": "36.663984370999934",
+        "total_form_s": "16.302100484999798",
+        "total_pc_setup_s": "3.3803237489999285",
+        "total_cheb_diag_s": "0",
+        "total_cheb_setup_s": "0",
+        "total_cheb_eigen_reuses": "0",
+        "total_cheb_smoother_reuses": "0",
+        "total_cheb_smoother_builds": "0",
+        "total_krylov_operator_apply_s": "0",
+        "total_krylov_preconditioner_apply_s": "0",
+        "total_krylov_preconditioner_operator_apply_s": "0",
+        "total_krylov_operator_apply_count": "40028",
+        "total_krylov_preconditioner_apply_count": "40028",
+        "total_krylov_preconditioner_operator_apply_count": "0",
+        "total_solve_s": "101.9122367490002",
+        "total_igr_s": "158.25864535399987",
+        "total_update_s": "159.29339272899875",
+        "solve_pct": "36.56832594512349",
+        "total_igr_pct": "56.786642228177236",
+        "solve_pct_stage": "63.977692359394055",
+        "total_igr_pct_stage": "99.350414127496634",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-simt-fp64",
+        "last_cheb_diag_s": "0",
+        "last_cheb_setup_s": "0",
+        "last_cheb_eigen_reused": "0",
+        "last_cheb_smoother_reused": "0",
+        "last_cheb_eigen_estimate": "0",
+        "last_krylov_operator_apply_s": "0",
+        "last_krylov_preconditioner_apply_s": "0",
+        "last_krylov_preconditioner_operator_apply_s": "0",
+        "last_krylov_operator_apply_count": "2",
+        "last_krylov_preconditioner_apply_count": "2",
+        "last_krylov_preconditioner_operator_apply_count": "0",
+        "direct_identity_system": "1",
+        "direct_identity_reason": "active",
+        "direct_identity_uses": "19990",
+        "exact_face_requested": "1",
+        "exact_face_effective": "1",
+        "exact_face_reason": "active",
+        "exact_face_local_nf": "523264",
+        "exact_face_shared_nf": "0",
+        "exact_face_operator_uses": "19990",
+        "exact_face_last_mult_calls": "2",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "dispatch_valid": true,
+      "dispatch_errors": [],
+      "dispatch": {
+        "[device] ": [
+          {
+            "requested": "cuda"
+          }
+        ],
+        "[dgsem-production] ": [
+          {
+            "selected": "mfem-native-packed",
+            "strict": "1",
+            "backend": "cuda",
+            "lvec_mode": "P-x-PT",
+            "volume_dissipation": "none",
+            "llf_volume_active": "0",
+            "frozen_sigma_spectral_speed": "0",
+            "order": "5",
+            "dim": "2"
+          }
+        ],
+        "[dgsem-fused-residual] ": [
+          {
+            "enabled": "1",
+            "precision": "fp64",
+            "contraction": "simt",
+            "elements": "262144",
+            "order": "5",
+            "llf_volume": "0",
+            "unique_face_flux": "1",
+            "packed_output": "1"
+          }
+        ],
+        "[vtk-writer] event=setup ": [
+          {
+            "event": "setup",
+            "requested": "cached",
+            "selected": "cached",
+            "interpolation": "gridfunction",
+            "native_mesh_writer": "1",
+            "precision": "unchanged"
+          }
+        ],
+        "[igr-local-tensor-jacobi] event=setup ": [
+          {
+            "event": "setup",
+            "precision": "fp64",
+            "execution": "simt",
+            "backend": "simt-fp64",
+            "tensor_core": "0",
+            "reference": "projected",
+            "nodes": "gll",
+            "d1d": "6",
+            "elements": "262144",
+            "factor_classes": "9",
+            "coefficient_policy": "current-mass-diagonal",
+            "initial_blocks": "exact-sipg",
+            "geometry": "fixed-q1q2-mapped",
+            "geometry_order_max": "2",
+            "mass_rule": "gl7x7",
+            "mass_quadrature_entries": "12845056",
+            "jacobian_validation": "sampled",
+            "geometry_approximation": "projected-initial-block",
+            "projected_offdiag_frobenius_relative_max": "0.11338504",
+            "projected_diagonal_min": "2.2179665",
+            "projected_diagonal_max": "2311.8865",
+            "density_approximation": "heterogeneous-current-mass",
+            "owned_bytes": "292558224",
+            "dense_after_setup": "0",
+            "class_dense_matrices": "0",
+            "class_dense_entries": "0",
+            "dense_per_element": "0",
+            "class_cache_bytes": "5184",
+            "element_diagonal_bytes": "75497472",
+            "grouping": "element",
+            "group_elements": "1",
+            "groups": "262144",
+            "group_padding": "0",
+            "mass_precision": "fp64",
+            "output_precision": "fp64",
+            "arithmetic_spd": "fp64-roundoff",
+            "fallback": "none"
+          }
+        ],
+        "[igr-tensor-volume] event=setup ": [
+          {
+            "event": "setup",
+            "execution": "simt",
+            "precision": "fp64",
+            "d1d": "6",
+            "mass_q1d": "7",
+            "diffusion_q1d": "6",
+            "elements": "262144",
+            "geometry": "per-quadrature",
+            "coefficient_policy": "current-stage",
+            "quadrature": "original-separate",
+            "local_true": "identity",
+            "faces": "external",
+            "compact_requested": "1",
+            "compact_enabled": "1",
+            "compact_reason": "admitted",
+            "collocated_requested": "0",
+            "collocated_enabled": "0",
+            "collocated_reason": "not-requested",
+            "storage_requested": "cached",
+            "storage": "cached",
+            "storage_reason": "cached-requested",
+            "geometry_layout": "padded",
+            "mass_geometry_shared": "0",
+            "diffusion_geometry_shared": "0",
+            "owned_geometry_bytes": "536870912",
+            "owned_coefficient_bytes": "536870912",
+            "owned_bytes": "1111493632",
+            "kernel": "compact-simt-d6-qmass7-qdiff6",
+            "fallback": "none"
+          }
+        ],
+        "[igr-stage-coefficients] ": [
+          {
+            "event": "setup",
+            "requested": "fused",
+            "selected": "fused",
+            "precision": "fp64",
+            "state_requested": "direct",
+            "state_selected": "direct"
+          }
+        ],
+        "[igr-face-density] event=execution ": [
+          {
+            "event": "execution",
+            "requested": "tensor",
+            "selected": "tensor",
+            "reason": "supported"
+          }
+        ],
+        "[igr-sigma-basis] ": [
+          {
+            "basis": "lgl",
+            "order": "5",
+            "representation": "equivalent-L2-space"
+          }
+        ],
+        "[igr-regularization] event=resolved ": [
+          {
+            "event": "resolved",
+            "c_alpha": "0.16666667",
+            "h_eff_policy": "max",
+            "h_min": "0.0014478828",
+            "h_average": "0.0017532947",
+            "h_max": "0.001953125",
+            "h_eff_reference": "0.001953125",
+            "alpha_effective_min": "6.3578288e-07",
+            "alpha_effective_max": "6.3578288e-07"
+          }
+        ],
+        "[igr-element-block-jacobi] event=setup ": [
+          {
+            "event": "setup",
+            "blocks": "tensor-element-projected-simt-fp64",
+            "reference_policy": "projected",
+            "refresh": "current-mass-scaling",
+            "initial_reference": "once",
+            "certified": "0",
+            "regular_sweeps": "2",
+            "initial_sweeps": "50",
+            "omega": "0.7",
+            "coarse": "none",
+            "fallback": "none",
+            "acceptance": "fixed-sweeps"
+          }
+        ],
+        "fused-solution-update": []
+      },
+      "no_IGR_audit": {
+        "explicitly_no_closure": false,
+        "observed_igr_activity": [
+          "[igr-options] event=effective exact_dg_face=on solver=fgmres preconditioner=none nonconvergence_policy=error sigma_cfl=off sigma_rusanov=off frozen_sigma_spectral_speed=off invariant_domain_flux=off stage_rtol_scale=1 lin_rtol=1e-06 lin_atol=0 lin_maxit=1000",
+          "[igr-sigma-basis] basis=lgl order=5 representation=equivalent-L2-space",
+          "[igr-regularization] event=resolved c_alpha=0.16666667 h_eff_policy=max h_min=0.0014478828 h_average=0.0017532947 h_max=0.001953125 h_eff_reference=0.001953125 alpha_effective_min=6.3578288e-07 alpha_effective_max=6.3578288e-07",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=device-required-partial-assembly precond=auto",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=device-required-partial-assembly precond=none",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=exact-dg-face-required-partial-assembly precond=none",
+          "[igr-stage-coefficients] event=setup requested=fused selected=fused precision=fp64 state_requested=direct state_selected=direct",
+          "[igr-linear] event=face-qf-projector mode=skipped-unused-single-valued reason=exact-side-coefficients-active",
+          "[igr-face-density] event=execution requested=tensor selected=tensor reason=supported",
+          "[igr-linear] event=face-density-path arithmetic=cuda scope=local-interior-faces geometry_cache=per-solver",
+          "[igr-linear] event=face-density-cache rebuilds=1 hits=0 shape_entries=0 map_entries=0",
+          "[igr-tensor-volume] event=setup execution=simt precision=fp64 d1d=6 mass_q1d=7 diffusion_q1d=6 elements=262144 geometry=per-quadrature coefficient_policy=current-stage quadrature=original-separate local_true=identity faces=external compact_requested=1 compact_enabled=1 compact_reason=admitted collocated_requested=0 collocated_enabled=0 collocated_reason=not-requested storage_requested=cached storage=cached storage_reason=cached-requested geometry_layout=padded mass_geometry_shared=0 diffusion_geometry_shared=0 owned_geometry_bytes=536870912 owned_coefficient_bytes=536870912 owned_bytes=1111493632 kernel=compact-simt-d6-qmass7-qdiff6 fallback=none",
+          "[igr-element-block-jacobi] event=setup blocks=tensor-element-projected-simt-fp64 reference_policy=projected refresh=current-mass-scaling initial_reference=once certified=0 regular_sweeps=2 initial_sweeps=50 omega=0.7 coarse=none fallback=none acceptance=fixed-sweeps",
+          "[igr-local-tensor-jacobi] event=setup precision=fp64 execution=simt backend=simt-fp64 tensor_core=0 reference=projected nodes=gll d1d=6 elements=262144 factor_classes=9 coefficient_policy=current-mass-diagonal initial_blocks=exact-sipg geometry=fixed-q1q2-mapped geometry_order_max=2 mass_rule=gl7x7 mass_quadrature_entries=12845056 jacobian_validation=sampled geometry_approximation=projected-initial-block projected_offdiag_frobenius_relative_max=0.11338504 projected_diagonal_min=2.2179665 projected_diagonal_max=2311.8865 density_approximation=heterogeneous-current-mass owned_bytes=292558224 dense_after_setup=0 class_dense_matrices=0 class_dense_entries=0 dense_per_element=0 class_cache_bytes=5184 element_diagonal_bytes=75497472 grouping=element group_elements=1 groups=262144 group_padding=0 mass_precision=fp64 output_precision=fp64 arithmetic_spd=fp64-roundoff fallback=none",
+          "[igr-element-block-jacobi] event=initial-preparation time=0 solved=1 reusable_stage0=1 vtk_enabled=1 jacobi_blocks=tensor certification_supported=0 certified=0 approximate=1",
+          "[igr-element-block-jacobi] event=execution path=fused-current-residual face=compact-lift fp64_order=volume-plus-completed-face-then-rhs-minus elements=262144 interior_faces=523264",
+          "[igr-closure-approximation] event=accepted-state scope=final-committed-accepted-state precision=fp64 time=0.10000000000000001 state_generation=19989 solved=1 supported=0 certified=0 residual_rel_rhs=nan run_success=1 residual_abs=nan relative_limit=nan absolute_limit=nan skipped_nonfinite=0 q_sigma_admitted=1 q_sigma_nonpositive_samples=0 q_sigma_nonfinite_samples=0 jacobi_blocks=tensor solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps",
+          "[igr-sigma-lifecycle] event=run-summary prefetch_solves=5 stage0_reuses=5 output_only_solves=1 prefetch_invalidations=0 endpoint_solves=0 extrapolated_stages=0 exact_anchor_certificates=0 exact_anchor_absolute_only_passes=0 max_exact_anchor_certificate_residual_rel_rhs=0 max_exact_anchor_certificate_relative_limit=0 max_exact_anchor_certificate_residual_abs=0 max_exact_anchor_certificate_absolute_limit=0 max_exact_anchor_certificate_acceptance_ratio=0 max_exact_anchor_relative_pass_residual_rel_rhs=0 max_exact_anchor_absolute_only_residual_abs=0 max_endpoint_prediction_defect=0 max_relative_endpoint_prediction_defect=0",
+          "[igr-linear] event=run-summary calls=19990 converged_calls=0 production_calls=19989 production_converged_calls=0 output_only_calls=1 output_only_converged_calls=0 output_only_iters=2 output_only_solve_s=0.0051694929999968053 output_only_igr_s=0.0061598339999995311 total_iters=40028 avg_iters=2.0024012006003002 max_iters=50 avg_solve_iter_s=0.0025460237021335116 avg_krylov_operator_apply_count=2.0024012006003002 avg_krylov_preconditioner_apply_count=2.0024012006003002 avg_krylov_preconditioner_operator_apply_count=0 krylov_operator_apply_count_per_iter=1 krylov_preconditioner_apply_count_per_iter=1 krylov_preconditioner_operator_apply_count_per_iter=0 avg_assemble_s=0.0018341162766883409 avg_form_s=0.00081551278064031 avg_pc_setup_s=0.00016910073781890587 avg_solve_s=0.0050981609179089641 total_assemble_s=36.663984370999934 total_form_s=16.302100484999798 total_pc_setup_s=3.3803237489999285 total_cheb_diag_s=0 total_cheb_setup_s=0 total_cheb_eigen_reuses=0 total_cheb_smoother_reuses=0 total_cheb_smoother_builds=0 total_krylov_operator_apply_s=0 total_krylov_preconditioner_apply_s=0 total_krylov_preconditioner_operator_apply_s=0 total_krylov_operator_apply_count=40028 total_krylov_preconditioner_apply_count=40028 total_krylov_preconditioner_operator_apply_count=0 total_solve_s=101.9122367490002 total_igr_s=158.25864535399987 total_update_s=159.29339272899875 solve_pct=36.56832594512349 total_igr_pct=56.786642228177236 solve_pct_stage=63.977692359394055 total_igr_pct_stage=99.350414127496634 last_solver=fixed-element-jacobi last_precond=tensor-element-projected-simt-fp64 last_cheb_diag_s=0 last_cheb_setup_s=0 last_cheb_eigen_reused=0 last_cheb_smoother_reused=0 last_cheb_eigen_estimate=0 last_krylov_operator_apply_s=0 last_krylov_preconditioner_apply_s=0 last_krylov_preconditioner_operator_apply_s=0 last_krylov_operator_apply_count=2 last_krylov_preconditioner_apply_count=2 last_krylov_preconditioner_operator_apply_count=0 direct_identity_system=1 direct_identity_reason=active direct_identity_uses=19990 exact_face_r",
+          "[igr-tensor-volume] event=summary execution=simt coefficient_refreshes=19990 submitted_applications=40028 compact_requested=1 compact_enabled=1 compact_reason=admitted collocated_requested=0 collocated_enabled=0 collocated_reason=not-requested storage=cached precision=fp64 fallback=none"
+        ],
+        "native_linear_summary_present": true,
+        "zero_counts_inferred_from_absent_IGR": false
+      },
+      "final_status": {
+        "event": "final-status",
+        "final_time": "0.10000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "final_closure_record": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "fixed_work_accounting": {
+        "formula": "50+(actual_calls-1)*2",
+        "expected_iters": 40028.0,
+        "actual_iters": 40028.0,
+        "A_applications": 40028.0,
+        "P_applications": 40028.0
+      },
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ],
+      "native_initial": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-simt-fp64/initial.vtu",
+        "bytes": 1160774963,
+        "sha256": "eee0ecf48f49010a82fd582ea6cfcb66aa25fe02f62530ab5191d9fabc0908bf",
+        "retention": "pruned-after-optional-initial-integral-analysis"
+      },
+      "native_final": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-simt-fp64/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114",
+        "retention": "pruned-after-field-comparisons; only-no-IGR-and-production-finals-eligible"
+      },
+      "initial_analysis_status": "completed"
+    },
+    "fixed-wmma-fp64": {
+      "name": "fixed-wmma-fp64",
+      "status": "completed",
+      "error": null,
+      "process": {
+        "status": "native-exit",
+        "effective_timeout_seconds": 897,
+        "pid": 3123880,
+        "returncode": 0,
+        "application_wall_seconds": 335.7801175850909,
+        "logs": {
+          "stdout": {
+            "bytes_seen": 53107,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64/stdout.log",
+              "bytes": 53107,
+              "sha256": "7c8ea5e166951705d6c2c4174e1515fd3a81db02d4fc4ce495a63aadaef94491"
+            }
+          },
+          "stderr": {
+            "bytes_seen": 0,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64/stderr.log",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      },
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 19990.0,
+        "converged_calls": 0.0,
+        "production_calls": 19989.0,
+        "output_only_calls": 1.0,
+        "total_iters": 40028.0,
+        "total_krylov_operator_apply_count": 40028.0,
+        "total_krylov_preconditioner_apply_count": 40028.0,
+        "accepted_stage_rhs_evaluations": 19989.0
+      },
+      "metrics": {
+        "application_wall_s": 335.7801175850909,
+        "solver_total_s": 311.308557936,
+        "host_bins_s": {
+          "setup_initial_output_s": 36.607306026,
+          "advancing_cfl_s": 190.660375836,
+          "scheduled_output_s": 67.103575936,
+          "diagnostics_s": 0.5352363630000001,
+          "final_output_postloop_s": 16.402063775
+        },
+        "advancing_s_per_accepted_step": 0.02861479451238181,
+        "advancing_s_per_actual_rhs": 0.009537787685642821,
+        "advancing_s_per_accepted_stage_rhs": 0.009538264837460602,
+        "advancing_ns_per_conserved_dof_rhs": 0.2526650875314824,
+        "advancing_ns_per_conserved_dof_accepted_stage_rhs": 0.25267772773797254,
+        "native_igr_timing": {
+          "output_only_solve_s": 0.004873025999998504,
+          "output_only_igr_s": 0.005868519999999933,
+          "avg_solve_iter_s": 0.0024264203967222973,
+          "avg_assemble_s": 0.0018089117050025063,
+          "avg_form_s": 0.0008279158132065988,
+          "avg_pc_setup_s": 0.0001783294871935961,
+          "avg_solve_s": 0.004858667115557784,
+          "total_assemble_s": 36.1601449830001,
+          "total_form_s": 16.55003710599991,
+          "total_pc_setup_s": 3.564806448999986,
+          "total_cheb_diag_s": 0.0,
+          "total_cheb_setup_s": 0.0,
+          "total_krylov_operator_apply_s": 0.0,
+          "total_krylov_preconditioner_apply_s": 0.0,
+          "total_krylov_preconditioner_operator_apply_s": 0.0,
+          "total_solve_s": 97.12475564000012,
+          "total_igr_s": 153.3997441780001,
+          "total_update_s": 154.23769290500042,
+          "last_cheb_diag_s": 0.0,
+          "last_cheb_setup_s": 0.0,
+          "last_krylov_operator_apply_s": 0.0,
+          "last_krylov_preconditioner_apply_s": 0.0,
+          "last_krylov_preconditioner_operator_apply_s": 0.0
+        }
+      },
+      "linear": {
+        "event": "run-summary",
+        "calls": "19990",
+        "converged_calls": "0",
+        "production_calls": "19989",
+        "production_converged_calls": "0",
+        "output_only_calls": "1",
+        "output_only_converged_calls": "0",
+        "output_only_iters": "2",
+        "output_only_solve_s": "0.0048730259999985037",
+        "output_only_igr_s": "0.0058685199999999327",
+        "total_iters": "40028",
+        "avg_iters": "2.0024012006003002",
+        "max_iters": "50",
+        "avg_solve_iter_s": "0.0024264203967222973",
+        "avg_krylov_operator_apply_count": "2.0024012006003002",
+        "avg_krylov_preconditioner_apply_count": "2.0024012006003002",
+        "avg_krylov_preconditioner_operator_apply_count": "0",
+        "krylov_operator_apply_count_per_iter": "1",
+        "krylov_preconditioner_apply_count_per_iter": "1",
+        "krylov_preconditioner_operator_apply_count_per_iter": "0",
+        "avg_assemble_s": "0.0018089117050025063",
+        "avg_form_s": "0.00082791581320659877",
+        "avg_pc_setup_s": "0.00017832948719359609",
+        "avg_solve_s": "0.0048586671155577844",
+        "total_assemble_s": "36.160144983000102",
+        "total_form_s": "16.550037105999909",
+        "total_pc_setup_s": "3.564806448999986",
+        "total_cheb_diag_s": "0",
+        "total_cheb_setup_s": "0",
+        "total_cheb_eigen_reuses": "0",
+        "total_cheb_smoother_reuses": "0",
+        "total_cheb_smoother_builds": "0",
+        "total_krylov_operator_apply_s": "0",
+        "total_krylov_preconditioner_apply_s": "0",
+        "total_krylov_preconditioner_operator_apply_s": "0",
+        "total_krylov_operator_apply_count": "40028",
+        "total_krylov_preconditioner_apply_count": "40028",
+        "total_krylov_preconditioner_operator_apply_count": "0",
+        "total_solve_s": "97.124755640000117",
+        "total_igr_s": "153.39974417800011",
+        "total_update_s": "154.23769290500042",
+        "solve_pct": "35.356506374229959",
+        "total_igr_pct": "55.842395660051508",
+        "solve_pct_stage": "62.970830158761608",
+        "total_igr_pct_stage": "99.45671598737124",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "last_cheb_diag_s": "0",
+        "last_cheb_setup_s": "0",
+        "last_cheb_eigen_reused": "0",
+        "last_cheb_smoother_reused": "0",
+        "last_cheb_eigen_estimate": "0",
+        "last_krylov_operator_apply_s": "0",
+        "last_krylov_preconditioner_apply_s": "0",
+        "last_krylov_preconditioner_operator_apply_s": "0",
+        "last_krylov_operator_apply_count": "2",
+        "last_krylov_preconditioner_apply_count": "2",
+        "last_krylov_preconditioner_operator_apply_count": "0",
+        "direct_identity_system": "1",
+        "direct_identity_reason": "active",
+        "direct_identity_uses": "19990",
+        "exact_face_requested": "1",
+        "exact_face_effective": "1",
+        "exact_face_reason": "active",
+        "exact_face_local_nf": "523264",
+        "exact_face_shared_nf": "0",
+        "exact_face_operator_uses": "19990",
+        "exact_face_last_mult_calls": "2",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "dispatch_valid": true,
+      "dispatch_errors": [],
+      "dispatch": {
+        "[device] ": [
+          {
+            "requested": "cuda"
+          }
+        ],
+        "[dgsem-production] ": [
+          {
+            "selected": "mfem-native-packed",
+            "strict": "1",
+            "backend": "cuda",
+            "lvec_mode": "P-x-PT",
+            "volume_dissipation": "none",
+            "llf_volume_active": "0",
+            "frozen_sigma_spectral_speed": "0",
+            "order": "5",
+            "dim": "2"
+          }
+        ],
+        "[dgsem-fused-residual] ": [
+          {
+            "enabled": "1",
+            "precision": "fp64",
+            "contraction": "simt",
+            "elements": "262144",
+            "order": "5",
+            "llf_volume": "0",
+            "unique_face_flux": "1",
+            "packed_output": "1"
+          }
+        ],
+        "[vtk-writer] event=setup ": [
+          {
+            "event": "setup",
+            "requested": "cached",
+            "selected": "cached",
+            "interpolation": "gridfunction",
+            "native_mesh_writer": "1",
+            "precision": "unchanged"
+          }
+        ],
+        "[igr-local-tensor-jacobi] event=setup ": [
+          {
+            "event": "setup",
+            "precision": "fp64",
+            "execution": "wmma",
+            "backend": "wmma-factor-fp64",
+            "tensor_core": "1",
+            "reference": "projected",
+            "nodes": "gll",
+            "d1d": "6",
+            "elements": "262144",
+            "factor_classes": "9",
+            "coefficient_policy": "current-mass-diagonal",
+            "initial_blocks": "exact-sipg",
+            "geometry": "fixed-q1q2-mapped",
+            "geometry_order_max": "2",
+            "mass_rule": "gl7x7",
+            "mass_quadrature_entries": "12845056",
+            "jacobian_validation": "sampled",
+            "geometry_approximation": "projected-initial-block",
+            "projected_offdiag_frobenius_relative_max": "0.11338504",
+            "projected_diagonal_min": "2.2179665",
+            "projected_diagonal_max": "2311.8865",
+            "density_approximation": "heterogeneous-current-mass",
+            "owned_bytes": "293672676",
+            "dense_after_setup": "0",
+            "class_dense_matrices": "0",
+            "class_dense_entries": "0",
+            "dense_per_element": "0",
+            "class_cache_bytes": "5184",
+            "element_diagonal_bytes": "75497472",
+            "grouping": "boundary-mask",
+            "group_elements": "16",
+            "groups": "16389",
+            "group_padding": "80",
+            "mass_precision": "fp64",
+            "output_precision": "fp64",
+            "arithmetic_spd": "fp64-roundoff",
+            "fallback": "none"
+          }
+        ],
+        "[igr-tensor-volume] event=setup ": [
+          {
+            "event": "setup",
+            "execution": "simt",
+            "precision": "fp64",
+            "d1d": "6",
+            "mass_q1d": "7",
+            "diffusion_q1d": "6",
+            "elements": "262144",
+            "geometry": "per-quadrature",
+            "coefficient_policy": "current-stage",
+            "quadrature": "original-separate",
+            "local_true": "identity",
+            "faces": "external",
+            "compact_requested": "1",
+            "compact_enabled": "1",
+            "compact_reason": "admitted",
+            "collocated_requested": "0",
+            "collocated_enabled": "0",
+            "collocated_reason": "not-requested",
+            "storage_requested": "cached",
+            "storage": "cached",
+            "storage_reason": "cached-requested",
+            "geometry_layout": "padded",
+            "mass_geometry_shared": "0",
+            "diffusion_geometry_shared": "0",
+            "owned_geometry_bytes": "536870912",
+            "owned_coefficient_bytes": "536870912",
+            "owned_bytes": "1111493632",
+            "kernel": "compact-simt-d6-qmass7-qdiff6",
+            "fallback": "none"
+          }
+        ],
+        "[igr-stage-coefficients] ": [
+          {
+            "event": "setup",
+            "requested": "fused",
+            "selected": "fused",
+            "precision": "fp64",
+            "state_requested": "direct",
+            "state_selected": "direct"
+          }
+        ],
+        "[igr-face-density] event=execution ": [
+          {
+            "event": "execution",
+            "requested": "tensor",
+            "selected": "tensor",
+            "reason": "supported"
+          }
+        ],
+        "[igr-sigma-basis] ": [
+          {
+            "basis": "lgl",
+            "order": "5",
+            "representation": "equivalent-L2-space"
+          }
+        ],
+        "[igr-regularization] event=resolved ": [
+          {
+            "event": "resolved",
+            "c_alpha": "0.16666667",
+            "h_eff_policy": "max",
+            "h_min": "0.0014478828",
+            "h_average": "0.0017532947",
+            "h_max": "0.001953125",
+            "h_eff_reference": "0.001953125",
+            "alpha_effective_min": "6.3578288e-07",
+            "alpha_effective_max": "6.3578288e-07"
+          }
+        ],
+        "[igr-element-block-jacobi] event=setup ": [
+          {
+            "event": "setup",
+            "blocks": "tensor-element-projected-wmma-factor-fp64",
+            "reference_policy": "projected",
+            "refresh": "current-mass-scaling",
+            "initial_reference": "once",
+            "certified": "0",
+            "regular_sweeps": "2",
+            "initial_sweeps": "50",
+            "omega": "0.7",
+            "coarse": "none",
+            "fallback": "none",
+            "acceptance": "fixed-sweeps"
+          }
+        ],
+        "fused-solution-update": []
+      },
+      "no_IGR_audit": {
+        "explicitly_no_closure": false,
+        "observed_igr_activity": [
+          "[igr-options] event=effective exact_dg_face=on solver=fgmres preconditioner=none nonconvergence_policy=error sigma_cfl=off sigma_rusanov=off frozen_sigma_spectral_speed=off invariant_domain_flux=off stage_rtol_scale=1 lin_rtol=1e-06 lin_atol=0 lin_maxit=1000",
+          "[igr-sigma-basis] basis=lgl order=5 representation=equivalent-L2-space",
+          "[igr-regularization] event=resolved c_alpha=0.16666667 h_eff_policy=max h_min=0.0014478828 h_average=0.0017532947 h_max=0.001953125 h_eff_reference=0.001953125 alpha_effective_min=6.3578288e-07 alpha_effective_max=6.3578288e-07",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=device-required-partial-assembly precond=auto",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=device-required-partial-assembly precond=none",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=exact-dg-face-required-partial-assembly precond=none",
+          "[igr-stage-coefficients] event=setup requested=fused selected=fused precision=fp64 state_requested=direct state_selected=direct",
+          "[igr-linear] event=face-qf-projector mode=skipped-unused-single-valued reason=exact-side-coefficients-active",
+          "[igr-face-density] event=execution requested=tensor selected=tensor reason=supported",
+          "[igr-linear] event=face-density-path arithmetic=cuda scope=local-interior-faces geometry_cache=per-solver",
+          "[igr-linear] event=face-density-cache rebuilds=1 hits=0 shape_entries=0 map_entries=0",
+          "[igr-tensor-volume] event=setup execution=simt precision=fp64 d1d=6 mass_q1d=7 diffusion_q1d=6 elements=262144 geometry=per-quadrature coefficient_policy=current-stage quadrature=original-separate local_true=identity faces=external compact_requested=1 compact_enabled=1 compact_reason=admitted collocated_requested=0 collocated_enabled=0 collocated_reason=not-requested storage_requested=cached storage=cached storage_reason=cached-requested geometry_layout=padded mass_geometry_shared=0 diffusion_geometry_shared=0 owned_geometry_bytes=536870912 owned_coefficient_bytes=536870912 owned_bytes=1111493632 kernel=compact-simt-d6-qmass7-qdiff6 fallback=none",
+          "[igr-element-block-jacobi] event=setup blocks=tensor-element-projected-wmma-factor-fp64 reference_policy=projected refresh=current-mass-scaling initial_reference=once certified=0 regular_sweeps=2 initial_sweeps=50 omega=0.7 coarse=none fallback=none acceptance=fixed-sweeps",
+          "[igr-local-tensor-jacobi] event=setup precision=fp64 execution=wmma backend=wmma-factor-fp64 tensor_core=1 reference=projected nodes=gll d1d=6 elements=262144 factor_classes=9 coefficient_policy=current-mass-diagonal initial_blocks=exact-sipg geometry=fixed-q1q2-mapped geometry_order_max=2 mass_rule=gl7x7 mass_quadrature_entries=12845056 jacobian_validation=sampled geometry_approximation=projected-initial-block projected_offdiag_frobenius_relative_max=0.11338504 projected_diagonal_min=2.2179665 projected_diagonal_max=2311.8865 density_approximation=heterogeneous-current-mass owned_bytes=293672676 dense_after_setup=0 class_dense_matrices=0 class_dense_entries=0 dense_per_element=0 class_cache_bytes=5184 element_diagonal_bytes=75497472 grouping=boundary-mask group_elements=16 groups=16389 group_padding=80 mass_precision=fp64 output_precision=fp64 arithmetic_spd=fp64-roundoff fallback=none",
+          "[igr-element-block-jacobi] event=initial-preparation time=0 solved=1 reusable_stage0=1 vtk_enabled=1 jacobi_blocks=tensor certification_supported=0 certified=0 approximate=1",
+          "[igr-element-block-jacobi] event=execution path=fused-current-residual face=compact-lift fp64_order=volume-plus-completed-face-then-rhs-minus elements=262144 interior_faces=523264",
+          "[igr-closure-approximation] event=accepted-state scope=final-committed-accepted-state precision=fp64 time=0.10000000000000001 state_generation=19989 solved=1 supported=0 certified=0 residual_rel_rhs=nan run_success=1 residual_abs=nan relative_limit=nan absolute_limit=nan skipped_nonfinite=0 q_sigma_admitted=1 q_sigma_nonpositive_samples=0 q_sigma_nonfinite_samples=0 jacobi_blocks=tensor solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps",
+          "[igr-sigma-lifecycle] event=run-summary prefetch_solves=5 stage0_reuses=5 output_only_solves=1 prefetch_invalidations=0 endpoint_solves=0 extrapolated_stages=0 exact_anchor_certificates=0 exact_anchor_absolute_only_passes=0 max_exact_anchor_certificate_residual_rel_rhs=0 max_exact_anchor_certificate_relative_limit=0 max_exact_anchor_certificate_residual_abs=0 max_exact_anchor_certificate_absolute_limit=0 max_exact_anchor_certificate_acceptance_ratio=0 max_exact_anchor_relative_pass_residual_rel_rhs=0 max_exact_anchor_absolute_only_residual_abs=0 max_endpoint_prediction_defect=0 max_relative_endpoint_prediction_defect=0",
+          "[igr-linear] event=run-summary calls=19990 converged_calls=0 production_calls=19989 production_converged_calls=0 output_only_calls=1 output_only_converged_calls=0 output_only_iters=2 output_only_solve_s=0.0048730259999985037 output_only_igr_s=0.0058685199999999327 total_iters=40028 avg_iters=2.0024012006003002 max_iters=50 avg_solve_iter_s=0.0024264203967222973 avg_krylov_operator_apply_count=2.0024012006003002 avg_krylov_preconditioner_apply_count=2.0024012006003002 avg_krylov_preconditioner_operator_apply_count=0 krylov_operator_apply_count_per_iter=1 krylov_preconditioner_apply_count_per_iter=1 krylov_preconditioner_operator_apply_count_per_iter=0 avg_assemble_s=0.0018089117050025063 avg_form_s=0.00082791581320659877 avg_pc_setup_s=0.00017832948719359609 avg_solve_s=0.0048586671155577844 total_assemble_s=36.160144983000102 total_form_s=16.550037105999909 total_pc_setup_s=3.564806448999986 total_cheb_diag_s=0 total_cheb_setup_s=0 total_cheb_eigen_reuses=0 total_cheb_smoother_reuses=0 total_cheb_smoother_builds=0 total_krylov_operator_apply_s=0 total_krylov_preconditioner_apply_s=0 total_krylov_preconditioner_operator_apply_s=0 total_krylov_operator_apply_count=40028 total_krylov_preconditioner_apply_count=40028 total_krylov_preconditioner_operator_apply_count=0 total_solve_s=97.124755640000117 total_igr_s=153.39974417800011 total_update_s=154.23769290500042 solve_pct=35.356506374229959 total_igr_pct=55.842395660051508 solve_pct_stage=62.970830158761608 total_igr_pct_stage=99.45671598737124 last_solver=fixed-element-jacobi last_precond=tensor-element-projected-wmma-factor-fp64 last_cheb_diag_s=0 last_cheb_setup_s=0 last_cheb_eigen_reused=0 last_cheb_smoother_reused=0 last_cheb_eigen_estimate=0 last_krylov_operator_apply_s=0 last_krylov_preconditioner_apply_s=0 last_krylov_preconditioner_operator_apply_s=0 last_krylov_operator_apply_count=2 last_krylov_preconditioner_apply_count=2 last_krylov_preconditioner_operator_apply_count=0 direct_identity_system=1 direct_identity_reason=active direct_identity_uses=19990 ex",
+          "[igr-tensor-volume] event=summary execution=simt coefficient_refreshes=19990 submitted_applications=40028 compact_requested=1 compact_enabled=1 compact_reason=admitted collocated_requested=0 collocated_enabled=0 collocated_reason=not-requested storage=cached precision=fp64 fallback=none"
+        ],
+        "native_linear_summary_present": true,
+        "zero_counts_inferred_from_absent_IGR": false
+      },
+      "final_status": {
+        "event": "final-status",
+        "final_time": "0.10000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "final_closure_record": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "fixed_work_accounting": {
+        "formula": "50+(actual_calls-1)*2",
+        "expected_iters": 40028.0,
+        "actual_iters": 40028.0,
+        "A_applications": 40028.0,
+        "P_applications": 40028.0
+      },
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ],
+      "native_initial": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64/initial.vtu",
+        "bytes": 1160774963,
+        "sha256": "eee0ecf48f49010a82fd582ea6cfcb66aa25fe02f62530ab5191d9fabc0908bf",
+        "retention": "pruned-after-optional-initial-integral-analysis"
+      },
+      "native_final": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114",
+        "retention": "pruned-after-field-comparisons; only-no-IGR-and-production-finals-eligible"
+      },
+      "initial_analysis_status": "completed"
+    },
+    "fixed-wmma-production": {
+      "name": "fixed-wmma-production",
+      "status": "completed",
+      "error": null,
+      "process": {
+        "status": "native-exit",
+        "effective_timeout_seconds": 897,
+        "pid": 3130423,
+        "returncode": 0,
+        "application_wall_seconds": 332.6129238361027,
+        "logs": {
+          "stdout": {
+            "bytes_seen": 53274,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-production/stdout.log",
+              "bytes": 53274,
+              "sha256": "06cd51eb7ce8539c1a98c3c20d3507987d09f7946b3f3af6c63b88d270ec313d"
+            }
+          },
+          "stderr": {
+            "bytes_seen": 0,
+            "truncated": false,
+            "retained": {
+              "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-production/stderr.log",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      },
+      "counts": {
+        "steps": 6663.0,
+        "rhs_evaluations": 19990.0,
+        "accepted_attempts": 6663.0,
+        "rejected_attempts": 0.0,
+        "rejected_limiter_elements": 0.0,
+        "final_time": 0.1,
+        "calls": 19990.0,
+        "converged_calls": 0.0,
+        "production_calls": 19989.0,
+        "output_only_calls": 1.0,
+        "total_iters": 40028.0,
+        "total_krylov_operator_apply_count": 40028.0,
+        "total_krylov_preconditioner_apply_count": 40028.0,
+        "accepted_stage_rhs_evaluations": 19989.0
+      },
+      "metrics": {
+        "application_wall_s": 332.6129238361027,
+        "solver_total_s": 308.343876598,
+        "host_bins_s": {
+          "setup_initial_output_s": 35.89525827,
+          "advancing_cfl_s": 189.177210693,
+          "scheduled_output_s": 66.399682646,
+          "diagnostics_s": 0.4676576529999999,
+          "final_output_postloop_s": 16.404067336
+        },
+        "advancing_s_per_accepted_step": 0.028392197312471862,
+        "advancing_s_per_actual_rhs": 0.009463592330815408,
+        "advancing_s_per_accepted_stage_rhs": 0.009464065770823954,
+        "advancing_ns_per_conserved_dof_rhs": 0.25069958185660596,
+        "advancing_ns_per_conserved_dof_accepted_stage_rhs": 0.2507121237337312,
+        "native_igr_timing": {
+          "output_only_solve_s": 0.0048085509999964415,
+          "output_only_igr_s": 0.005806637999993036,
+          "avg_solve_iter_s": 0.002377386633456581,
+          "avg_assemble_s": 0.0018201756624312178,
+          "avg_form_s": 0.0008143511151575736,
+          "avg_pc_setup_s": 0.00017473091235617808,
+          "avg_solve_s": 0.004760481849124564,
+          "total_assemble_s": 36.38531149200004,
+          "total_form_s": 16.278878791999897,
+          "total_pc_setup_s": 3.492870938,
+          "total_cheb_diag_s": 0.0,
+          "total_cheb_setup_s": 0.0,
+          "total_krylov_operator_apply_s": 0.0,
+          "total_krylov_preconditioner_apply_s": 0.0,
+          "total_krylov_preconditioner_operator_apply_s": 0.0,
+          "total_solve_s": 95.16203216400002,
+          "total_igr_s": 151.31909338599996,
+          "total_update_s": 152.2175279629995,
+          "last_cheb_diag_s": 0.0,
+          "last_cheb_setup_s": 0.0,
+          "last_krylov_operator_apply_s": 0.0,
+          "last_krylov_preconditioner_apply_s": 0.0,
+          "last_krylov_preconditioner_operator_apply_s": 0.0
+        }
+      },
+      "linear": {
+        "event": "run-summary",
+        "calls": "19990",
+        "converged_calls": "0",
+        "production_calls": "19989",
+        "production_converged_calls": "0",
+        "output_only_calls": "1",
+        "output_only_converged_calls": "0",
+        "output_only_iters": "2",
+        "output_only_solve_s": "0.0048085509999964415",
+        "output_only_igr_s": "0.0058066379999930362",
+        "total_iters": "40028",
+        "avg_iters": "2.0024012006003002",
+        "max_iters": "50",
+        "avg_solve_iter_s": "0.002377386633456581",
+        "avg_krylov_operator_apply_count": "2.0024012006003002",
+        "avg_krylov_preconditioner_apply_count": "2.0024012006003002",
+        "avg_krylov_preconditioner_operator_apply_count": "0",
+        "krylov_operator_apply_count_per_iter": "1",
+        "krylov_preconditioner_apply_count_per_iter": "1",
+        "krylov_preconditioner_operator_apply_count_per_iter": "0",
+        "avg_assemble_s": "0.0018201756624312178",
+        "avg_form_s": "0.00081435111515757363",
+        "avg_pc_setup_s": "0.00017473091235617808",
+        "avg_solve_s": "0.0047604818491245636",
+        "total_assemble_s": "36.385311492000042",
+        "total_form_s": "16.278878791999897",
+        "total_pc_setup_s": "3.4928709379999998",
+        "total_cheb_diag_s": "0",
+        "total_cheb_setup_s": "0",
+        "total_cheb_eigen_reuses": "0",
+        "total_cheb_smoother_reuses": "0",
+        "total_cheb_smoother_builds": "0",
+        "total_krylov_operator_apply_s": "0",
+        "total_krylov_preconditioner_apply_s": "0",
+        "total_krylov_preconditioner_operator_apply_s": "0",
+        "total_krylov_operator_apply_count": "40028",
+        "total_krylov_preconditioner_apply_count": "40028",
+        "total_krylov_preconditioner_operator_apply_count": "0",
+        "total_solve_s": "95.162032164000024",
+        "total_igr_s": "151.31909338599996",
+        "total_update_s": "152.2175279629995",
+        "solve_pct": "34.928436688693942",
+        "total_igr_pct": "55.540421457318566",
+        "solve_pct_stage": "62.517131527146915",
+        "total_igr_pct_stage": "99.409769302509019",
+        "last_solver": "fixed-element-jacobi",
+        "last_precond": "tensor-element-projected-wmma-factor-fp64",
+        "last_cheb_diag_s": "0",
+        "last_cheb_setup_s": "0",
+        "last_cheb_eigen_reused": "0",
+        "last_cheb_smoother_reused": "0",
+        "last_cheb_eigen_estimate": "0",
+        "last_krylov_operator_apply_s": "0",
+        "last_krylov_preconditioner_apply_s": "0",
+        "last_krylov_preconditioner_operator_apply_s": "0",
+        "last_krylov_operator_apply_count": "2",
+        "last_krylov_preconditioner_apply_count": "2",
+        "last_krylov_preconditioner_operator_apply_count": "0",
+        "direct_identity_system": "1",
+        "direct_identity_reason": "active",
+        "direct_identity_uses": "19990",
+        "exact_face_requested": "1",
+        "exact_face_effective": "1",
+        "exact_face_reason": "active",
+        "exact_face_local_nf": "523264",
+        "exact_face_shared_nf": "0",
+        "exact_face_operator_uses": "19990",
+        "exact_face_last_mult_calls": "2",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "dispatch_valid": true,
+      "dispatch_errors": [],
+      "dispatch": {
+        "[device] ": [
+          {
+            "requested": "cuda"
+          }
+        ],
+        "[dgsem-production] ": [
+          {
+            "selected": "mfem-native-packed",
+            "strict": "1",
+            "backend": "cuda",
+            "lvec_mode": "P-x-PT",
+            "volume_dissipation": "none",
+            "llf_volume_active": "0",
+            "frozen_sigma_spectral_speed": "0",
+            "order": "5",
+            "dim": "2"
+          }
+        ],
+        "[dgsem-fused-residual] ": [
+          {
+            "enabled": "1",
+            "precision": "fp64",
+            "contraction": "simt",
+            "elements": "262144",
+            "order": "5",
+            "llf_volume": "0",
+            "unique_face_flux": "1",
+            "packed_output": "1"
+          }
+        ],
+        "[vtk-writer] event=setup ": [
+          {
+            "event": "setup",
+            "requested": "cached",
+            "selected": "cached",
+            "interpolation": "gridfunction",
+            "native_mesh_writer": "1",
+            "precision": "unchanged"
+          }
+        ],
+        "[igr-local-tensor-jacobi] event=setup ": [
+          {
+            "event": "setup",
+            "precision": "fp64",
+            "execution": "wmma",
+            "backend": "wmma-factor-fp64",
+            "tensor_core": "1",
+            "reference": "projected",
+            "nodes": "gll",
+            "d1d": "6",
+            "elements": "262144",
+            "factor_classes": "9",
+            "coefficient_policy": "current-mass-diagonal",
+            "initial_blocks": "exact-sipg",
+            "geometry": "fixed-q1q2-mapped",
+            "geometry_order_max": "2",
+            "mass_rule": "gl7x7",
+            "mass_quadrature_entries": "12845056",
+            "jacobian_validation": "sampled",
+            "geometry_approximation": "projected-initial-block",
+            "projected_offdiag_frobenius_relative_max": "0.11338504",
+            "projected_diagonal_min": "2.2179665",
+            "projected_diagonal_max": "2311.8865",
+            "density_approximation": "heterogeneous-current-mass",
+            "owned_bytes": "293672676",
+            "dense_after_setup": "0",
+            "class_dense_matrices": "0",
+            "class_dense_entries": "0",
+            "dense_per_element": "0",
+            "class_cache_bytes": "5184",
+            "element_diagonal_bytes": "75497472",
+            "grouping": "boundary-mask",
+            "group_elements": "16",
+            "groups": "16389",
+            "group_padding": "80",
+            "mass_precision": "fp64",
+            "output_precision": "fp64",
+            "arithmetic_spd": "fp64-roundoff",
+            "fallback": "none"
+          }
+        ],
+        "[igr-tensor-volume] event=setup ": [
+          {
+            "event": "setup",
+            "execution": "simt",
+            "precision": "fp64",
+            "d1d": "6",
+            "mass_q1d": "7",
+            "diffusion_q1d": "6",
+            "elements": "262144",
+            "geometry": "per-quadrature",
+            "coefficient_policy": "current-stage",
+            "quadrature": "original-separate",
+            "local_true": "identity",
+            "faces": "external",
+            "compact_requested": "1",
+            "compact_enabled": "1",
+            "compact_reason": "admitted",
+            "collocated_requested": "0",
+            "collocated_enabled": "0",
+            "collocated_reason": "not-requested",
+            "storage_requested": "cached",
+            "storage": "cached",
+            "storage_reason": "cached-requested",
+            "geometry_layout": "padded",
+            "mass_geometry_shared": "0",
+            "diffusion_geometry_shared": "0",
+            "owned_geometry_bytes": "536870912",
+            "owned_coefficient_bytes": "536870912",
+            "owned_bytes": "1111493632",
+            "kernel": "compact-simt-d6-qmass7-qdiff6",
+            "fallback": "none"
+          }
+        ],
+        "[igr-stage-coefficients] ": [
+          {
+            "event": "setup",
+            "requested": "fused",
+            "selected": "fused",
+            "precision": "fp64",
+            "state_requested": "direct",
+            "state_selected": "direct"
+          }
+        ],
+        "[igr-face-density] event=execution ": [
+          {
+            "event": "execution",
+            "requested": "tensor",
+            "selected": "tensor",
+            "reason": "supported"
+          }
+        ],
+        "[igr-sigma-basis] ": [
+          {
+            "basis": "lgl",
+            "order": "5",
+            "representation": "equivalent-L2-space"
+          }
+        ],
+        "[igr-regularization] event=resolved ": [
+          {
+            "event": "resolved",
+            "c_alpha": "0.16666667",
+            "h_eff_policy": "max",
+            "h_min": "0.0014478828",
+            "h_average": "0.0017532947",
+            "h_max": "0.001953125",
+            "h_eff_reference": "0.001953125",
+            "alpha_effective_min": "6.3578288e-07",
+            "alpha_effective_max": "6.3578288e-07"
+          }
+        ],
+        "[igr-element-block-jacobi] event=setup ": [
+          {
+            "event": "setup",
+            "blocks": "tensor-element-projected-wmma-factor-fp64",
+            "reference_policy": "projected",
+            "refresh": "current-mass-scaling",
+            "initial_reference": "once",
+            "certified": "0",
+            "regular_sweeps": "2",
+            "initial_sweeps": "50",
+            "omega": "0.7",
+            "coarse": "none",
+            "fallback": "none",
+            "acceptance": "fixed-sweeps"
+          }
+        ],
+        "fused-solution-update": [
+          {
+            "event": "execution",
+            "path": "fused-solution-update",
+            "reference": "projected",
+            "backend": "wmma-factor-fp64",
+            "correction_rounding": "fp64",
+            "elements": "262144",
+            "groups": "16389"
+          }
+        ]
+      },
+      "no_IGR_audit": {
+        "explicitly_no_closure": false,
+        "observed_igr_activity": [
+          "[igr-options] event=effective exact_dg_face=on solver=fgmres preconditioner=none nonconvergence_policy=error sigma_cfl=off sigma_rusanov=off frozen_sigma_spectral_speed=off invariant_domain_flux=off stage_rtol_scale=1 lin_rtol=1e-06 lin_atol=0 lin_maxit=1000",
+          "[igr-sigma-basis] basis=lgl order=5 representation=equivalent-L2-space",
+          "[igr-regularization] event=resolved c_alpha=0.16666667 h_eff_policy=max h_min=0.0014478828 h_average=0.0017532947 h_max=0.001953125 h_eff_reference=0.001953125 alpha_effective_min=6.3578288e-07 alpha_effective_max=6.3578288e-07",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=device-required-partial-assembly precond=auto",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=device-required-partial-assembly precond=none",
+          "[igr-linear] event=partial-assembly-policy requested=on effective=on reason=exact-dg-face-required-partial-assembly precond=none",
+          "[igr-stage-coefficients] event=setup requested=fused selected=fused precision=fp64 state_requested=direct state_selected=direct",
+          "[igr-linear] event=face-qf-projector mode=skipped-unused-single-valued reason=exact-side-coefficients-active",
+          "[igr-face-density] event=execution requested=tensor selected=tensor reason=supported",
+          "[igr-linear] event=face-density-path arithmetic=cuda scope=local-interior-faces geometry_cache=per-solver",
+          "[igr-linear] event=face-density-cache rebuilds=1 hits=0 shape_entries=0 map_entries=0",
+          "[igr-tensor-volume] event=setup execution=simt precision=fp64 d1d=6 mass_q1d=7 diffusion_q1d=6 elements=262144 geometry=per-quadrature coefficient_policy=current-stage quadrature=original-separate local_true=identity faces=external compact_requested=1 compact_enabled=1 compact_reason=admitted collocated_requested=0 collocated_enabled=0 collocated_reason=not-requested storage_requested=cached storage=cached storage_reason=cached-requested geometry_layout=padded mass_geometry_shared=0 diffusion_geometry_shared=0 owned_geometry_bytes=536870912 owned_coefficient_bytes=536870912 owned_bytes=1111493632 kernel=compact-simt-d6-qmass7-qdiff6 fallback=none",
+          "[igr-element-block-jacobi] event=setup blocks=tensor-element-projected-wmma-factor-fp64 reference_policy=projected refresh=current-mass-scaling initial_reference=once certified=0 regular_sweeps=2 initial_sweeps=50 omega=0.7 coarse=none fallback=none acceptance=fixed-sweeps",
+          "[igr-local-tensor-jacobi] event=setup precision=fp64 execution=wmma backend=wmma-factor-fp64 tensor_core=1 reference=projected nodes=gll d1d=6 elements=262144 factor_classes=9 coefficient_policy=current-mass-diagonal initial_blocks=exact-sipg geometry=fixed-q1q2-mapped geometry_order_max=2 mass_rule=gl7x7 mass_quadrature_entries=12845056 jacobian_validation=sampled geometry_approximation=projected-initial-block projected_offdiag_frobenius_relative_max=0.11338504 projected_diagonal_min=2.2179665 projected_diagonal_max=2311.8865 density_approximation=heterogeneous-current-mass owned_bytes=293672676 dense_after_setup=0 class_dense_matrices=0 class_dense_entries=0 dense_per_element=0 class_cache_bytes=5184 element_diagonal_bytes=75497472 grouping=boundary-mask group_elements=16 groups=16389 group_padding=80 mass_precision=fp64 output_precision=fp64 arithmetic_spd=fp64-roundoff fallback=none",
+          "[igr-element-block-jacobi] event=initial-preparation time=0 solved=1 reusable_stage0=1 vtk_enabled=1 jacobi_blocks=tensor certification_supported=0 certified=0 approximate=1",
+          "[igr-element-block-jacobi] event=execution path=fused-current-residual face=compact-lift fp64_order=volume-plus-completed-face-then-rhs-minus elements=262144 interior_faces=523264",
+          "[igr-local-tensor-jacobi] event=execution path=fused-solution-update reference=projected backend=wmma-factor-fp64 correction_rounding=fp64 elements=262144 groups=16389",
+          "[igr-closure-approximation] event=accepted-state scope=final-committed-accepted-state precision=fp64 time=0.10000000000000001 state_generation=19989 solved=1 supported=0 certified=0 residual_rel_rhs=nan run_success=1 residual_abs=nan relative_limit=nan absolute_limit=nan skipped_nonfinite=0 q_sigma_admitted=1 q_sigma_nonpositive_samples=0 q_sigma_nonfinite_samples=0 jacobi_blocks=tensor solve_mode=element-block-jacobi approximate=1 acceptance=fixed-sweeps",
+          "[igr-sigma-lifecycle] event=run-summary prefetch_solves=5 stage0_reuses=5 output_only_solves=1 prefetch_invalidations=0 endpoint_solves=0 extrapolated_stages=0 exact_anchor_certificates=0 exact_anchor_absolute_only_passes=0 max_exact_anchor_certificate_residual_rel_rhs=0 max_exact_anchor_certificate_relative_limit=0 max_exact_anchor_certificate_residual_abs=0 max_exact_anchor_certificate_absolute_limit=0 max_exact_anchor_certificate_acceptance_ratio=0 max_exact_anchor_relative_pass_residual_rel_rhs=0 max_exact_anchor_absolute_only_residual_abs=0 max_endpoint_prediction_defect=0 max_relative_endpoint_prediction_defect=0",
+          "[igr-linear] event=run-summary calls=19990 converged_calls=0 production_calls=19989 production_converged_calls=0 output_only_calls=1 output_only_converged_calls=0 output_only_iters=2 output_only_solve_s=0.0048085509999964415 output_only_igr_s=0.0058066379999930362 total_iters=40028 avg_iters=2.0024012006003002 max_iters=50 avg_solve_iter_s=0.002377386633456581 avg_krylov_operator_apply_count=2.0024012006003002 avg_krylov_preconditioner_apply_count=2.0024012006003002 avg_krylov_preconditioner_operator_apply_count=0 krylov_operator_apply_count_per_iter=1 krylov_preconditioner_apply_count_per_iter=1 krylov_preconditioner_operator_apply_count_per_iter=0 avg_assemble_s=0.0018201756624312178 avg_form_s=0.00081435111515757363 avg_pc_setup_s=0.00017473091235617808 avg_solve_s=0.0047604818491245636 total_assemble_s=36.385311492000042 total_form_s=16.278878791999897 total_pc_setup_s=3.4928709379999998 total_cheb_diag_s=0 total_cheb_setup_s=0 total_cheb_eigen_reuses=0 total_cheb_smoother_reuses=0 total_cheb_smoother_builds=0 total_krylov_operator_apply_s=0 total_krylov_preconditioner_apply_s=0 total_krylov_preconditioner_operator_apply_s=0 total_krylov_operator_apply_count=40028 total_krylov_preconditioner_apply_count=40028 total_krylov_preconditioner_operator_apply_count=0 total_solve_s=95.162032164000024 total_igr_s=151.31909338599996 total_update_s=152.2175279629995 solve_pct=34.928436688693942 total_igr_pct=55.540421457318566 solve_pct_stage=62.517131527146915 total_igr_pct_stage=99.409769302509019 last_solver=fixed-element-jacobi last_precond=tensor-element-projected-wmma-factor-fp64 last_cheb_diag_s=0 last_cheb_setup_s=0 last_cheb_eigen_reused=0 last_cheb_smoother_reused=0 last_cheb_eigen_estimate=0 last_krylov_operator_apply_s=0 last_krylov_preconditioner_apply_s=0 last_krylov_preconditioner_operator_apply_s=0 last_krylov_operator_apply_count=2 last_krylov_preconditioner_apply_count=2 last_krylov_preconditioner_operator_apply_count=0 direct_identity_system=1 direct_identity_reason=active direct_identity_uses=19990 ex",
+          "[igr-tensor-volume] event=summary execution=simt coefficient_refreshes=19990 submitted_applications=40028 compact_requested=1 compact_enabled=1 compact_reason=admitted collocated_requested=0 collocated_enabled=0 collocated_reason=not-requested storage=cached precision=fp64 fallback=none"
+        ],
+        "native_linear_summary_present": true,
+        "zero_counts_inferred_from_absent_IGR": false
+      },
+      "final_status": {
+        "event": "final-status",
+        "final_time": "0.10000000000000001",
+        "success": "1",
+        "termination_reason": "target-reached"
+      },
+      "final_closure_record": {
+        "event": "accepted-state",
+        "scope": "final-committed-accepted-state",
+        "precision": "fp64",
+        "time": "0.10000000000000001",
+        "state_generation": "19989",
+        "solved": "1",
+        "supported": "0",
+        "certified": "0",
+        "residual_rel_rhs": "nan",
+        "run_success": "1",
+        "residual_abs": "nan",
+        "relative_limit": "nan",
+        "absolute_limit": "nan",
+        "skipped_nonfinite": "0",
+        "q_sigma_admitted": "1",
+        "q_sigma_nonpositive_samples": "0",
+        "q_sigma_nonfinite_samples": "0",
+        "jacobi_blocks": "tensor",
+        "solve_mode": "element-block-jacobi",
+        "approximate": "1",
+        "acceptance": "fixed-sweeps"
+      },
+      "fixed_work_accounting": {
+        "formula": "50+(actual_calls-1)*2",
+        "expected_iters": 40028.0,
+        "actual_iters": 40028.0,
+        "A_applications": 40028.0,
+        "P_applications": 40028.0
+      },
+      "native_save_times": [
+        0.0,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1
+      ],
+      "native_initial": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-production/initial.vtu",
+        "bytes": 1160774963,
+        "sha256": "eee0ecf48f49010a82fd582ea6cfcb66aa25fe02f62530ab5191d9fabc0908bf",
+        "retention": "pruned-after-optional-initial-integral-analysis"
+      },
+      "native_final": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-production/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114",
+        "retention": "retained"
+      },
+      "initial_analysis_status": "completed"
+    }
+  },
+  "comparisons": [
+    {
+      "reference": "no-igr",
+      "candidate": "fixed-wmma-production",
+      "role": "regularization-effect",
+      "status": "completed",
+      "analysis_error": null,
+      "full_fields_finite_and_gl8_rho_p_q_sigma_positive": true,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.4494250913583349,
+          "pressure_min": 1.0003187639058668,
+          "q_sigma_min": 1.4004462694682134
+        },
+        "candidate": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        }
+      },
+      "native_inputs": {
+        "reference": {
+          "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/no-igr/final.vtu",
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy"
+          ],
+          "explicit_no_closure": true,
+          "sigma_source": "absent-explicit-no-closure-physical-zero",
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "ghost_points_and_cells": 0
+        },
+        "candidate": {
+          "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-production/final.vtu",
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy",
+            "sigma"
+          ],
+          "explicit_no_closure": false,
+          "sigma_source": "native-sigma",
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "ghost_points_and_cells": 0
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "report": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/no-igr--fixed-wmma-production.json",
+        "bytes": 22022,
+        "sha256": "dd8fea56b656027bd12d8577aa315339378ebb70537df8d87e3a8707d4ac496b"
+      },
+      "components": {
+        "density": {
+          "normalized_l2": 6.217837807493299e-06,
+          "normalized_linf_at_gl_points": 1.726380047496198e-05,
+          "integral_reference": 0.9999999999995514,
+          "integral_candidate": 0.9999999999995499,
+          "integral_candidate_minus_reference": 1.2524677013395884e-17,
+          "integral_abs_difference_over_reference_gl_l1": 1.2524677013401503e-17,
+          "reference_range_at_gl_points": [
+            0.4494250913583349,
+            1.2875605259054737
+          ],
+          "candidate_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ]
+        },
+        "momentum_x": {
+          "normalized_l2": 2.8482307280990325e-05,
+          "normalized_linf_at_gl_points": 3.59967755315359e-05,
+          "integral_reference": 3.3219720042708585e-14,
+          "integral_candidate": -2.0095568648101375e-11,
+          "integral_candidate_minus_reference": -2.0128883728301866e-11,
+          "integral_abs_difference_over_reference_gl_l1": 1.1354701524013893e-10,
+          "reference_range_at_gl_points": [
+            -0.8063014498823741,
+            0.8063013119619656
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ]
+        },
+        "momentum_y": {
+          "normalized_l2": 2.8482307280998328e-05,
+          "normalized_linf_at_gl_points": 3.5996775521561505e-05,
+          "integral_reference": 3.749478077194959e-14,
+          "integral_candidate": -2.0091236203748693e-11,
+          "integral_candidate_minus_reference": -2.012888050294402e-11,
+          "integral_abs_difference_over_reference_gl_l1": 1.1354699704590009e-10,
+          "reference_range_at_gl_points": [
+            -0.8063014498852709,
+            0.8063013119621718
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ]
+        },
+        "energy": {
+          "normalized_l2": 1.03434300369772e-05,
+          "normalized_linf_at_gl_points": 2.0361589725315802e-05,
+          "integral_reference": 3.4999888357521587,
+          "integral_candidate": 3.4999888357521605,
+          "integral_candidate_minus_reference": 1.873348177783095e-17,
+          "integral_abs_difference_over_reference_gl_l1": 5.352440438229302e-18,
+          "reference_range_at_gl_points": [
+            2.5007969097646994,
+            5.05148650308833
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ]
+        },
+        "sigma": {
+          "normalized_l2": null,
+          "normalized_linf_at_gl_points": null,
+          "integral_reference": 0.0,
+          "integral_candidate": 1.3191041977329996e-05,
+          "integral_candidate_minus_reference": 1.3191041977329996e-05,
+          "integral_abs_difference_over_reference_gl_l1": null,
+          "reference_range_at_gl_points": [
+            0.0,
+            0.0
+          ],
+          "candidate_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ]
+        },
+        "pressure": {
+          "normalized_l2": 9.693986438560325e-06,
+          "normalized_linf_at_gl_points": 1.9350988209443525e-05,
+          "integral_reference": 1.3703154861798033,
+          "integral_candidate": 1.3703150420185484,
+          "integral_candidate_minus_reference": -4.441612546630267e-07,
+          "integral_abs_difference_over_reference_gl_l1": 3.241306539571187e-07,
+          "reference_range_at_gl_points": [
+            1.0003187639058668,
+            1.9118828709790725
+          ],
+          "candidate_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ]
+        },
+        "speed": {
+          "normalized_l2": 2.0422102424005308e-05,
+          "normalized_linf_at_gl_points": 3.202438374957494e-05,
+          "integral_reference": 0.2845994334272857,
+          "integral_candidate": 0.2846030835038651,
+          "integral_candidate_minus_reference": 3.650076580087718e-06,
+          "integral_abs_difference_over_reference_gl_l1": 1.2825312180462585e-05,
+          "reference_range_at_gl_points": [
+            2.504273443345256e-07,
+            0.7062001118455778
+          ],
+          "candidate_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ]
+        },
+        "q_sigma": {
+          "normalized_l2": 9.214877484854155e-06,
+          "normalized_linf_at_gl_points": 1.6084419851000494e-05,
+          "integral_reference": 1.9184416806517228,
+          "integral_candidate": 1.9184463352427608,
+          "integral_candidate_minus_reference": 4.654591034403798e-06,
+          "integral_abs_difference_over_reference_gl_l1": 2.4262353561993946e-06,
+          "reference_range_at_gl_points": [
+            1.4004462694682134,
+            2.6766360193707013
+          ],
+          "candidate_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ]
+        }
+      },
+      "interpretation": "Method/regularization difference, not an accuracy error against truth"
+    },
+    {
+      "reference": "fixed-simt-fp64",
+      "candidate": "fixed-wmma-fp64",
+      "role": "hardware-execution",
+      "status": "completed",
+      "analysis_error": null,
+      "full_fields_finite_and_gl8_rho_p_q_sigma_positive": true,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        },
+        "candidate": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        }
+      },
+      "native_inputs": {
+        "reference": {
+          "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-simt-fp64/final.vtu",
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy",
+            "sigma"
+          ],
+          "explicit_no_closure": false,
+          "sigma_source": "native-sigma",
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "ghost_points_and_cells": 0
+        },
+        "candidate": {
+          "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64/final.vtu",
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy",
+            "sigma"
+          ],
+          "explicit_no_closure": false,
+          "sigma_source": "native-sigma",
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "ghost_points_and_cells": 0
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "report": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-simt-fp64--fixed-wmma-fp64.json",
+        "bytes": 21071,
+        "sha256": "691edc13442416a7bea39eda796d70c538197102383d9a157901f70d1f56c8e2"
+      },
+      "components": {
+        "density": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 0.9999999999995499,
+          "integral_candidate": 0.9999999999995499,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ],
+          "candidate_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ]
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": -2.0095568648101375e-11,
+          "integral_candidate": -2.0095568648101375e-11,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ]
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": -2.0091236203748693e-11,
+          "integral_candidate": -2.0091236203748693e-11,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ]
+        },
+        "energy": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 3.4999888357521605,
+          "integral_candidate": 3.4999888357521605,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ]
+        },
+        "sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 1.3191041977329996e-05,
+          "integral_candidate": 1.3191041977329996e-05,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ],
+          "candidate_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ]
+        },
+        "pressure": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 1.3703150420185484,
+          "integral_candidate": 1.3703150420185484,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ],
+          "candidate_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ]
+        },
+        "speed": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 0.2846030835038651,
+          "integral_candidate": 0.2846030835038651,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ],
+          "candidate_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ]
+        },
+        "q_sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 1.9184463352427608,
+          "integral_candidate": 1.9184463352427608,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ],
+          "candidate_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ]
+        }
+      },
+      "interpretation": "Execution/arithmetic difference at matching fixed-sweep mathematical settings"
+    },
+    {
+      "reference": "fixed-wmma-fp64",
+      "candidate": "fixed-wmma-production",
+      "role": "solution-update-fusion",
+      "status": "completed",
+      "analysis_error": null,
+      "full_fields_finite_and_gl8_rho_p_q_sigma_positive": true,
+      "sampled_admissibility": {
+        "reference": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        },
+        "candidate": {
+          "density_min": 0.4494201728605597,
+          "pressure_min": 1.0003187640020024,
+          "q_sigma_min": 1.4004462696344786
+        }
+      },
+      "native_inputs": {
+        "reference": {
+          "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64/final.vtu",
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy",
+            "sigma"
+          ],
+          "explicit_no_closure": false,
+          "sigma_source": "native-sigma",
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "ghost_points_and_cells": 0
+        },
+        "candidate": {
+          "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-production/final.vtu",
+          "cells": 262144,
+          "points": 9437184,
+          "point_arrays_decoded": [
+            "density",
+            "momentum",
+            "energy",
+            "sigma"
+          ],
+          "explicit_no_closure": false,
+          "sigma_source": "native-sigma",
+          "vtk_parametric_ij_in_connectivity_order": [
+            [
+              0,
+              0
+            ],
+            [
+              5,
+              0
+            ],
+            [
+              5,
+              5
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              1,
+              0
+            ],
+            [
+              2,
+              0
+            ],
+            [
+              3,
+              0
+            ],
+            [
+              4,
+              0
+            ],
+            [
+              5,
+              1
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              5,
+              3
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              2,
+              5
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              4,
+              5
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ],
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              1
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              2
+            ],
+            [
+              3,
+              2
+            ],
+            [
+              4,
+              2
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              3
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              1,
+              4
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ]
+          ],
+          "ghost_points_and_cells": 0
+        }
+      },
+      "engineering_budgets": {
+        "normalized_l2": 0.001,
+        "normalized_linf_at_gl_points": 0.01,
+        "components": [
+          "density",
+          "momentum_x",
+          "momentum_y",
+          "energy"
+        ],
+        "all_conservative_components_pass": true,
+        "sigma_budget": null,
+        "meaning": "engineering comparison thresholds, not discretization error bounds"
+      },
+      "engineering_qualification_passed": true,
+      "report": {
+        "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/fixed-wmma-fp64--fixed-wmma-production.json",
+        "bytes": 21083,
+        "sha256": "ce00179017576947845b50b2827d195dd33e2f3b27eee04bd30b5cf6224a38e1"
+      },
+      "components": {
+        "density": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 0.9999999999995499,
+          "integral_candidate": 0.9999999999995499,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ],
+          "candidate_range_at_gl_points": [
+            0.4494201728605597,
+            1.2875396444601632
+          ]
+        },
+        "momentum_x": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": -2.0095568648101375e-11,
+          "integral_candidate": -2.0095568648101375e-11,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996193505,
+            0.8063063266763614
+          ]
+        },
+        "momentum_y": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": -2.0091236203748693e-11,
+          "integral_candidate": -2.0091236203748693e-11,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ],
+          "candidate_range_at_gl_points": [
+            -0.8063061996222384,
+            0.8063063266765667
+          ]
+        },
+        "energy": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 3.4999888357521605,
+          "integral_candidate": 3.4999888357521605,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ],
+          "candidate_range_at_gl_points": [
+            2.5007969100050382,
+            5.051546018871811
+          ]
+        },
+        "sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 1.3191041977329996e-05,
+          "integral_candidate": 1.3191041977329996e-05,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ],
+          "candidate_range_at_gl_points": [
+            7.727441051168304e-11,
+            5.6311716950583086e-05
+          ]
+        },
+        "pressure": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 1.3703150420185484,
+          "integral_candidate": 1.3703150420185484,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ],
+          "candidate_range_at_gl_points": [
+            1.0003187640020024,
+            1.9119037470732874
+          ]
+        },
+        "speed": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 0.2846030835038651,
+          "integral_candidate": 0.2846030835038651,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ],
+          "candidate_range_at_gl_points": [
+            2.504274990402142e-07,
+            0.7062097801329118
+          ]
+        },
+        "q_sigma": {
+          "normalized_l2": 0.0,
+          "normalized_linf_at_gl_points": 0.0,
+          "integral_reference": 1.9184463352427608,
+          "integral_candidate": 1.9184463352427608,
+          "integral_candidate_minus_reference": 0.0,
+          "integral_abs_difference_over_reference_gl_l1": 0.0,
+          "reference_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ],
+          "candidate_range_at_gl_points": [
+            1.4004462696344786,
+            2.6766677011636375
+          ]
+        }
+      },
+      "interpretation": "Execution/arithmetic difference at matching fixed-sweep mathematical settings"
+    }
+  ],
+  "ratios": {
+    "no-igr--fixed-wmma-production": {
+      "role": "regularization-effect",
+      "reference_over_candidate_application_wall": 0.578617560485229,
+      "reference_over_candidate_advancing": 0.38735403276939984,
+      "reference_over_candidate_advancing_per_actual_rhs": 0.3873540327693999,
+      "reference_over_candidate_advancing_per_accepted_stage_rhs": 0.3873540327693999,
+      "actual_work_counts_equal": true,
+      "common_optimized_euler_dispatch_equal": true,
+      "unconfounded_equal_trajectory_execution_cost_eligible": false,
+      "source": "One completed usable trajectory per arm; actual native counts, no repeat-based uncertainty estimate"
+    },
+    "fixed-simt-fp64--fixed-wmma-fp64": {
+      "role": "hardware-execution",
+      "reference_over_candidate_application_wall": 1.0109293878425851,
+      "reference_over_candidate_advancing": 1.0285844255425567,
+      "reference_over_candidate_advancing_per_actual_rhs": 1.0285844255425567,
+      "reference_over_candidate_advancing_per_accepted_stage_rhs": 1.028584425542557,
+      "actual_work_counts_equal": true,
+      "common_optimized_euler_dispatch_equal": true,
+      "unconfounded_equal_trajectory_execution_cost_eligible": true,
+      "source": "One completed usable trajectory per arm; actual native counts, no repeat-based uncertainty estimate"
+    },
+    "fixed-wmma-fp64--fixed-wmma-production": {
+      "role": "solution-update-fusion",
+      "reference_over_candidate_application_wall": 1.0095221608122145,
+      "reference_over_candidate_advancing": 1.0078400835786023,
+      "reference_over_candidate_advancing_per_actual_rhs": 1.0078400835786023,
+      "reference_over_candidate_advancing_per_accepted_stage_rhs": 1.007840083578602,
+      "actual_work_counts_equal": true,
+      "common_optimized_euler_dispatch_equal": true,
+      "unconfounded_equal_trajectory_execution_cost_eligible": true,
+      "source": "One completed usable trajectory per arm; actual native counts, no repeat-based uncertainty estimate"
+    }
+  },
+  "production_IGR_overhead": {
+    "production_IGR_over_noIGR_application": 1.7282572605667192,
+    "production_IGR_over_noIGR_advancing": 2.581617629873293,
+    "production_IGR_over_noIGR_advancing_per_accepted_stage_rhs": 2.581617629873293,
+    "actual_work_counts_equal": true,
+    "meaning": "Cost of current production IGR relative to physical Euler/Rusanov; both unprofiled and same GPU, but flows/CFL counts may differ."
+  },
+  "conserved_integral_drift": {
+    "no-igr": {
+      "density": {
+        "initial": 0.9999999999998576,
+        "final": 0.9999999999995514,
+        "signed_drift": -3.0619951019161817e-13,
+        "absolute_drift": 3.0619951019161817e-13,
+        "absolute_drift_over_initial_gl_l1": 3.061995101916618e-13
+      },
+      "momentum_x": {
+        "initial": 0.0,
+        "final": 3.3219720042708585e-14,
+        "signed_drift": 3.3219720042708585e-14,
+        "absolute_drift": 3.3219720042708585e-14,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "momentum_y": {
+        "initial": 0.0,
+        "final": 3.749478077194959e-14,
+        "signed_drift": 3.749478077194959e-14,
+        "absolute_drift": 3.749478077194959e-14,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "energy": {
+        "initial": 3.499988835753095,
+        "final": 3.4999888357521587,
+        "signed_drift": -9.36140054363932e-13,
+        "absolute_drift": 9.36140054363932e-13,
+        "absolute_drift_over_initial_gl_l1": 2.6746944013108603e-13
+      }
+    },
+    "fixed-simt-fp64": {
+      "density": {
+        "initial": 0.9999999999998576,
+        "final": 0.9999999999995499,
+        "signed_drift": -3.076428001236309e-13,
+        "absolute_drift": 3.076428001236309e-13,
+        "absolute_drift_over_initial_gl_l1": 3.076428001236747e-13
+      },
+      "momentum_x": {
+        "initial": 0.0,
+        "final": -2.0095568648101375e-11,
+        "signed_drift": -2.0095568648101375e-11,
+        "absolute_drift": 2.0095568648101375e-11,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "momentum_y": {
+        "initial": 0.0,
+        "final": -2.0091236203748693e-11,
+        "signed_drift": -2.0091236203748693e-11,
+        "absolute_drift": 2.0091236203748693e-11,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "energy": {
+        "initial": 3.499988835753095,
+        "final": 3.4999888357521605,
+        "signed_drift": -9.343636975245317e-13,
+        "absolute_drift": 9.343636975245317e-13,
+        "absolute_drift_over_initial_gl_l1": 2.669619079866248e-13
+      }
+    },
+    "fixed-wmma-fp64": {
+      "density": {
+        "initial": 0.9999999999998576,
+        "final": 0.9999999999995499,
+        "signed_drift": -3.076428001236309e-13,
+        "absolute_drift": 3.076428001236309e-13,
+        "absolute_drift_over_initial_gl_l1": 3.076428001236747e-13
+      },
+      "momentum_x": {
+        "initial": 0.0,
+        "final": -2.0095568648101375e-11,
+        "signed_drift": -2.0095568648101375e-11,
+        "absolute_drift": 2.0095568648101375e-11,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "momentum_y": {
+        "initial": 0.0,
+        "final": -2.0091236203748693e-11,
+        "signed_drift": -2.0091236203748693e-11,
+        "absolute_drift": 2.0091236203748693e-11,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "energy": {
+        "initial": 3.499988835753095,
+        "final": 3.4999888357521605,
+        "signed_drift": -9.343636975245317e-13,
+        "absolute_drift": 9.343636975245317e-13,
+        "absolute_drift_over_initial_gl_l1": 2.669619079866248e-13
+      }
+    },
+    "fixed-wmma-production": {
+      "density": {
+        "initial": 0.9999999999998576,
+        "final": 0.9999999999995499,
+        "signed_drift": -3.076428001236309e-13,
+        "absolute_drift": 3.076428001236309e-13,
+        "absolute_drift_over_initial_gl_l1": 3.076428001236747e-13
+      },
+      "momentum_x": {
+        "initial": 0.0,
+        "final": -2.0095568648101375e-11,
+        "signed_drift": -2.0095568648101375e-11,
+        "absolute_drift": 2.0095568648101375e-11,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "momentum_y": {
+        "initial": 0.0,
+        "final": -2.0091236203748693e-11,
+        "signed_drift": -2.0091236203748693e-11,
+        "absolute_drift": 2.0091236203748693e-11,
+        "absolute_drift_over_initial_gl_l1": null
+      },
+      "energy": {
+        "initial": 3.499988835753095,
+        "final": 3.4999888357521605,
+        "signed_drift": -9.343636975245317e-13,
+        "absolute_drift": 9.343636975245317e-13,
+        "absolute_drift_over_initial_gl_l1": 2.669619079866248e-13
+      }
+    }
+  },
+  "interpretation_limits": [
+    "No-IGR/IGR differences measure a change in numerical method, not accuracy against an analytic or discretization-error reference.",
+    "SIMT/WMMA hardware controls both use separate solution updates; the fourth WMMA arm separately measures production update fusion.",
+    "The same frozen numerical source, binary, Q2 mesh, p5 GLL discretization, CFL, output cadence, and one allocated GPU are shared across fresh trajectories.",
+    "All positivity/modal limiting and optional nonfinite/admissibility/conservation scans are off. Complete saved fields are checked offline.",
+    "Timing is one unprofiled full trajectory per arm, not repeated-trial confidence intervals; native host sub-timers are not exclusive GPU phase costs.",
+    "Both total native RHS and three-times-accepted-step stage RHS denominators are reported; no-IGR may have different lifecycle or CFL work.",
+    "Fixed IGR has no residual convergence certificate. Rounded FP64 execution differences are reported separately from the regularization effect.",
+    "GL8 positivity and extrema are sampled at saved endpoints, not continuous/all-time positivity guarantees. Initial/final conserved integrals are separately reported when analyses complete.",
+    "Only this fixed large 2D mapped p5 DGSEM case is measured; no lower-precision, 3D or MPI performance claim."
+  ],
+  "receipts": [
+    {
+      "file": "result.json",
+      "bytes": 264158,
+      "sha256": "deec582c45858d50d8157abe89042eb7ab71e65dde6d9e9b64e6efa35cd94583"
+    },
+    {
+      "file": "submission.json",
+      "bytes": 1668,
+      "sha256": "85d364c24739e32b692f3bed61cf73b47de60a342911fbcf51d284e91ea4972f"
+    },
+    {
+      "file": "case-work/case.json",
+      "bytes": 37784,
+      "sha256": "ad738004d0448dd567d480aa1311deac9340b82dbd717c6d20a02207edcc82ba"
+    },
+    {
+      "file": "harness/hashes.json",
+      "bytes": 2943,
+      "sha256": "98524f3cd6f350b8551031484d509d9df3dd7e68338022820bcad33d437bd561"
+    },
+    {
+      "file": "harness-independent-review.json",
+      "bytes": 5907,
+      "sha256": "a8e63fac2d42085b21f914ed1c6f4ac460af5174fcfec8ff65dc789de0072659"
+    }
+  ],
+  "remote_root": "/projects/bdiy/jarias9/igrlab-deltaai-wmma-20261016/dgsem-sedov-rusanov-wmma-20261024",
+  "retained_final_labels": [
+    "no-igr",
+    "fixed-wmma-production"
+  ],
+  "bulk_fields_downloaded": false,
+  "no_application_build_or_source_changes": true,
+  "allocation_runtime": {
+    "authority": "Slurm sacct",
+    "jobs": [
+      {
+        "job": "3450759",
+        "state": "COMPLETED",
+        "elapsed_seconds": 1425,
+        "exit_code": "0:0",
+        "allocated_TRES": "billing=1000,cpu=8,gres/gpu=1,mem=96G,node=1"
+      }
+    ],
+    "GPU_count": 1,
+    "allocated_GPU_hours": 0.3958333333333333,
+    "billed_credits_claim": false
+  },
+  "final_retention_receipt": {
+    "schema": "dgsem-sedov-rusanov-wmma-bundle-v1",
+    "files": [
+      {
+        "path": "bootstrap.py",
+        "bytes": 1518,
+        "sha256": "1b2aa626e0ffbc669a55d78559478c8defe687ec9fe781c37ab749b5079f2b65"
+      },
+      {
+        "path": "bounded_process.py",
+        "bytes": 3197,
+        "sha256": "fe73e97d1aa8803ff4135a975fdb6bc1be802e211af63e5468ccb146d1d5cffc"
+      },
+      {
+        "path": "case-review.json",
+        "bytes": 15223,
+        "sha256": "876bbd002e184a6378867eb37ebac1ca04ea70a049c1031379887579410b3098"
+      },
+      {
+        "path": "case.json",
+        "bytes": 37784,
+        "sha256": "ad738004d0448dd567d480aa1311deac9340b82dbd717c6d20a02207edcc82ba"
+      },
+      {
+        "path": "comparator-self-check.json",
+        "bytes": 3044,
+        "sha256": "ff9355f63fb1be7370877265594b6a1e19285e4d8f85e3c8d769fe07e1e9fcfe"
+      },
+      {
+        "path": "compare-curved-q5-fields.py",
+        "bytes": 44667,
+        "sha256": "c5ae85fb31c77469e0fe9fe702803c66dd53e762ae55d1eff16fdaaf1c46cb86"
+      },
+      {
+        "path": "fixed-simt-fp64/final-metadata-only.pvtu",
+        "bytes": 1226,
+        "sha256": "7155e9819954fbeca22fdef45f0f24f590675a0388bfe279b6b5ef122a8c87b1"
+      },
+      {
+        "path": "fixed-simt-fp64/initial-metadata-only.pvtu",
+        "bytes": 1226,
+        "sha256": "7155e9819954fbeca22fdef45f0f24f590675a0388bfe279b6b5ef122a8c87b1"
+      },
+      {
+        "path": "fixed-simt-fp64/original-series-metadata-only.pvd",
+        "bytes": 640,
+        "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff"
+      },
+      {
+        "path": "fixed-simt-fp64/run_metadata.json",
+        "bytes": 7751,
+        "sha256": "f10a0f683e53350ec45546e250b7c20d39689e52ab59441c7301bb323f1d2a67"
+      },
+      {
+        "path": "fixed-simt-fp64/stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "fixed-simt-fp64/stdout.log",
+        "bytes": 53100,
+        "sha256": "a776aa96ea61f2eef06fa25f629060ff39135ad780035305165871362d30a8a6"
+      },
+      {
+        "path": "fixed-simt-fp64--fixed-wmma-fp64.json",
+        "bytes": 21071,
+        "sha256": "691edc13442416a7bea39eda796d70c538197102383d9a157901f70d1f56c8e2"
+      },
+      {
+        "path": "fixed-simt-fp64--fixed-wmma-fp64.stderr.log",
+        "bytes": 445,
+        "sha256": "1945252878d96a36e87747349379302207238cb1bbe745e5357aec8f2cfe4c97"
+      },
+      {
+        "path": "fixed-simt-fp64--fixed-wmma-fp64.stdout.log",
+        "bytes": 210,
+        "sha256": "62627c0dae64da381a2a30374ace929f33f1a01e70364bc673a70f529a5ea030"
+      },
+      {
+        "path": "fixed-simt-fp64-initial.json",
+        "bytes": 15677,
+        "sha256": "7d0ee5c0f35dc4d9a8991e9359df7756696a8d75555129fd4cebc3bcccedfb11"
+      },
+      {
+        "path": "fixed-simt-fp64-initial.stderr.log",
+        "bytes": 357,
+        "sha256": "0450ae740e00fef6b80b89060c43726621f1756367b5e8b8958075f0797d28ef"
+      },
+      {
+        "path": "fixed-simt-fp64-initial.stdout.log",
+        "bytes": 197,
+        "sha256": "38d12f679342e2f876448d0383e621d4e6c30b5d5626d503b2f0dea06044254e"
+      },
+      {
+        "path": "fixed-wmma-fp64/final-metadata-only.pvtu",
+        "bytes": 1226,
+        "sha256": "7155e9819954fbeca22fdef45f0f24f590675a0388bfe279b6b5ef122a8c87b1"
+      },
+      {
+        "path": "fixed-wmma-fp64/initial-metadata-only.pvtu",
+        "bytes": 1226,
+        "sha256": "7155e9819954fbeca22fdef45f0f24f590675a0388bfe279b6b5ef122a8c87b1"
+      },
+      {
+        "path": "fixed-wmma-fp64/original-series-metadata-only.pvd",
+        "bytes": 640,
+        "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff"
+      },
+      {
+        "path": "fixed-wmma-fp64/run_metadata.json",
+        "bytes": 7746,
+        "sha256": "2d787b065ac94b436c84d29fc3b0d1dd200353fae196699e3ba679e5a7c79564"
+      },
+      {
+        "path": "fixed-wmma-fp64/stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "fixed-wmma-fp64/stdout.log",
+        "bytes": 53107,
+        "sha256": "7c8ea5e166951705d6c2c4174e1515fd3a81db02d4fc4ce495a63aadaef94491"
+      },
+      {
+        "path": "fixed-wmma-fp64--fixed-wmma-production.json",
+        "bytes": 21083,
+        "sha256": "ce00179017576947845b50b2827d195dd33e2f3b27eee04bd30b5cf6224a38e1"
+      },
+      {
+        "path": "fixed-wmma-fp64--fixed-wmma-production.stderr.log",
+        "bytes": 451,
+        "sha256": "e1ea38f920d2f965cb56ab93854858ced46b78141e5eee4e64e3d748aa62cec1"
+      },
+      {
+        "path": "fixed-wmma-fp64--fixed-wmma-production.stdout.log",
+        "bytes": 216,
+        "sha256": "9a4031e0220a97fc6f7ccb5c1dcdfe197600086906d4c92f50931cc7a63f4b4a"
+      },
+      {
+        "path": "fixed-wmma-fp64-initial.json",
+        "bytes": 15677,
+        "sha256": "62a1c261ee5c3303711232a25b499de59664b8bb552838415ddb8fb8264cdc0d"
+      },
+      {
+        "path": "fixed-wmma-fp64-initial.stderr.log",
+        "bytes": 357,
+        "sha256": "704c603669957120838903a5e825809b0559de241ad64be12938abbd8e8768e9"
+      },
+      {
+        "path": "fixed-wmma-fp64-initial.stdout.log",
+        "bytes": 197,
+        "sha256": "019d0a63f8dcbab1f5289b80b7a7fa122cf51713099f4250b39fa04adc5b5a43"
+      },
+      {
+        "path": "fixed-wmma-production/final-metadata-only.pvtu",
+        "bytes": 1226,
+        "sha256": "7155e9819954fbeca22fdef45f0f24f590675a0388bfe279b6b5ef122a8c87b1"
+      },
+      {
+        "path": "fixed-wmma-production/final.vtu",
+        "bytes": 1160774963,
+        "sha256": "abcfb2eea0d3e02d57669128f13b2c5e820a8ab1b7e42b1f606b86d335bb8114"
+      },
+      {
+        "path": "fixed-wmma-production/initial-metadata-only.pvtu",
+        "bytes": 1226,
+        "sha256": "7155e9819954fbeca22fdef45f0f24f590675a0388bfe279b6b5ef122a8c87b1"
+      },
+      {
+        "path": "fixed-wmma-production/original-series-metadata-only.pvd",
+        "bytes": 640,
+        "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff"
+      },
+      {
+        "path": "fixed-wmma-production/run_metadata.json",
+        "bytes": 7769,
+        "sha256": "bb5bfc608507340448b00abf9dc5b18999711800545ec255e33345b7c93a1fe3"
+      },
+      {
+        "path": "fixed-wmma-production/stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "fixed-wmma-production/stdout.log",
+        "bytes": 53274,
+        "sha256": "06cd51eb7ce8539c1a98c3c20d3507987d09f7946b3f3af6c63b88d270ec313d"
+      },
+      {
+        "path": "fixed-wmma-production-initial.json",
+        "bytes": 15687,
+        "sha256": "15d55baaa58235b8a3e759ab733a64d1de9ed09b50a1b5ef674f53a184da5b0b"
+      },
+      {
+        "path": "fixed-wmma-production-initial.stderr.log",
+        "bytes": 363,
+        "sha256": "dcb05358690c1b11d536dab03d16ebf42ec27190b604974fc6a6cec199c342b1"
+      },
+      {
+        "path": "fixed-wmma-production-initial.stdout.log",
+        "bytes": 201,
+        "sha256": "2edce5e42c1165a7267562b522376c0af1c5c7389df088dee89e7040068dbccb"
+      },
+      {
+        "path": "frozen_campaign.py",
+        "bytes": 27636,
+        "sha256": "770f745674118985d607022008719fbf5add86d48edfe2921e3ed98b1af097b0"
+      },
+      {
+        "path": "hashes.json",
+        "bytes": 2943,
+        "sha256": "98524f3cd6f350b8551031484d509d9df3dd7e68338022820bcad33d437bd561"
+      },
+      {
+        "path": "host-checks.json",
+        "bytes": 3790,
+        "sha256": "496e0795d803b41bf2b4451dd553b353aebad9c1e7efe5fc1bf2111c15fffd53"
+      },
+      {
+        "path": "host_checks.py",
+        "bytes": 13750,
+        "sha256": "d0e846e600c70fafbec3de1e3a192ca0098186ab8168ecd42641fa002a9cb50f"
+      },
+      {
+        "path": "job.slurm",
+        "bytes": 1413,
+        "sha256": "6b6a20e5c16016b82a0393a4a3856f9208567c00fab02f4e7dbc74d890ad7b00"
+      },
+      {
+        "path": "no-igr/final-metadata-only.pvtu",
+        "bytes": 1144,
+        "sha256": "9010fdd87944ce89c7d076dfc436f975d5385875ebd08aac3c100cb17bb391c7"
+      },
+      {
+        "path": "no-igr/final.vtu",
+        "bytes": 1060111565,
+        "sha256": "d0cebf4e2b9f9216e5115ffecf4471d15fa1d9072724c650b5deb43b6d973fb1"
+      },
+      {
+        "path": "no-igr/initial-metadata-only.pvtu",
+        "bytes": 1144,
+        "sha256": "9010fdd87944ce89c7d076dfc436f975d5385875ebd08aac3c100cb17bb391c7"
+      },
+      {
+        "path": "no-igr/original-series-metadata-only.pvd",
+        "bytes": 640,
+        "sha256": "b4fd1a166e09a2e5fee5afd9b4777814b798580a47ddf9e69fde5955e721c7ff"
+      },
+      {
+        "path": "no-igr/run_metadata.json",
+        "bytes": 5010,
+        "sha256": "84244d6010b1d4a937700c398f7214db3185af4c6d39f2c5798ea35e58271943"
+      },
+      {
+        "path": "no-igr/stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "no-igr/stdout.log",
+        "bytes": 36886,
+        "sha256": "4e7f2f322701cb6d8c19e4dbe9ee49052b5a947102c44258bcd22d961d64fa27"
+      },
+      {
+        "path": "no-igr--fixed-wmma-production.json",
+        "bytes": 22022,
+        "sha256": "dd8fea56b656027bd12d8577aa315339378ebb70537df8d87e3a8707d4ac496b"
+      },
+      {
+        "path": "no-igr--fixed-wmma-production.stderr.log",
+        "bytes": 442,
+        "sha256": "6be2fefdb5ab423706a7a1a774a1b2273f292c72c0965e4f6d0e103b522378fb"
+      },
+      {
+        "path": "no-igr--fixed-wmma-production.stdout.log",
+        "bytes": 206,
+        "sha256": "b262c9934b0a6f3fcae1b6146f463b85e85def26e9efbda243705f61bb17bbac"
+      },
+      {
+        "path": "no-igr-initial.json",
+        "bytes": 15668,
+        "sha256": "4924b4e8830893a1d67c723a1cfeee08b0d197805558e93d4aacc792ab1a0c72"
+      },
+      {
+        "path": "no-igr-initial.stderr.log",
+        "bytes": 348,
+        "sha256": "193869948f2ddb6ccdf59db69c551d8cb2f41661d0cf2959c9675deeda8cc49f"
+      },
+      {
+        "path": "no-igr-initial.stdout.log",
+        "bytes": 187,
+        "sha256": "151088db39beeee4ed0af4a19af7d02607488093e89cb45a3662db10839e8c59"
+      },
+      {
+        "path": "plan.json",
+        "bytes": 24911,
+        "sha256": "b92e86d9d7ce6da06a294a38e0bb410379256c15f3a5806fae64f6534f4f90f1"
+      },
+      {
+        "path": "run.json",
+        "bytes": 264158,
+        "sha256": "deec582c45858d50d8157abe89042eb7ab71e65dde6d9e9b64e6efa35cd94583"
+      },
+      {
+        "path": "run.py",
+        "bytes": 40276,
+        "sha256": "f67991c7ce5956411b37bcc63280414431225ed946849cb054bff29f51be4889"
+      }
+    ],
+    "archive": {
+      "path": "/tmp/igrlab-3450759-v_voll4z/run/comparison/selected-results.tar.gz",
+      "bytes": 1388275968,
+      "sha256": "6d70ccfd8ee4be547dfe1f9d782c6f55c86e2577ffbd9e0e5b547d82f9fadaf6"
+    },
+    "retained_fields": [
+      "fixed-wmma-production/final.vtu",
+      "no-igr/final.vtu"
+    ],
+    "compact_source_bytes": 852219,
+    "source_bytes": 2221738747,
+    "fields_pruned_for_archive_cap": false,
+    "no_binary_profiles_or_intermediate_vtk": true,
+    "large_fields_downloaded": false
+  },
+  "native_metadata_receipts": [
+    {
+      "file": "native-metadata/fixed-simt-fp64.json",
+      "bytes": 7751,
+      "sha256": "f10a0f683e53350ec45546e250b7c20d39689e52ab59441c7301bb323f1d2a67"
+    },
+    {
+      "file": "native-metadata/fixed-wmma-fp64.json",
+      "bytes": 7746,
+      "sha256": "2d787b065ac94b436c84d29fc3b0d1dd200353fae196699e3ba679e5a7c79564"
+    },
+    {
+      "file": "native-metadata/fixed-wmma-production.json",
+      "bytes": 7769,
+      "sha256": "bb5bfc608507340448b00abf9dc5b18999711800545ec255e33345b7c93a1fe3"
+    },
+    {
+      "file": "native-metadata/no-igr.json",
+      "bytes": 5010,
+      "sha256": "84244d6010b1d4a937700c398f7214db3185af4c6d39f2c5798ea35e58271943"
+    }
+  ],
+  "measured_summary": {
+    "all_arms_completed_t0p1": true,
+    "accepted_steps_per_arm": 6663,
+    "total_rhs_per_arm": 19990,
+    "rejections_per_arm": 0,
+    "no_IGR_sigma_calls": 0,
+    "three_IGR_final_VTUs_byte_identical": true,
+    "no_IGR_vs_production_max_conserved_relative_L2": 2.8482307280998328e-05,
+    "WMMA_vs_SIMT_advancing_time_reduction_percent": 2.779006256825156,
+    "WMMA_vs_SIMT_application_time_reduction_percent": 1.0811227741543306,
+    "fusion_advancing_time_reduction_percent": 0.7779094825008381
+  }
+}
